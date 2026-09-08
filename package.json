@@ -1,0 +1,27 @@
+{
+  "name": "pi-chat",
+  "version": "0.1.0",
+  "description": "A small AI chat app built with SolidJS, Tailwind, Kobalte, and Tauri.",
+  "type": "module",
+  "scripts": {
+    "start": "vite",
+    "dev": "vite",
+    "build": "vite build",
+    "serve": "vite preview",
+    "tauri": "tauri"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@kobalte/core": "^0.13.14",
+    "@tauri-apps/api": "^2",
+    "solid-js": "^1.9.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16",
+    "vite-plugin-solid": "^2.11.12"
+  }
+}
