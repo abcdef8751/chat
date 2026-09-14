@@ -1,9 +1,21 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Class-based dark mode: `.dark` on <html> (default) selects dark: utilities. */
+@custom-variant dark (&:where(.dark, .dark *));
 
 html,
 body,
 #root {
   height: 100%;
+}
+
+html {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
 }
 
 body {

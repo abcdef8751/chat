@@ -43,9 +43,9 @@ App (SolidJS SPA)
 ├─ Main
 │   ├─ Header — model picker, settings, price meter, "near limit" banner
 │   ├─ MessageList — markdown/code render, virtualized
-│   └─ ChatBar — textarea, send/stop, thinking-level selector
+│   └─ ChatBar — textarea, attach files, send/stop, thinking-level selector
 └─ Dialogs (Kobalte)
-    ├─ Settings — baseUrl, apiKey, profile/memory prefs
+    ├─ Settings — baseUrl, apiKey, user preferences
     └─ Memory tab — list/edit/delete memory entries
 
 Rust backend (Tauri commands)
@@ -108,8 +108,10 @@ CREATE TABLE messages (
   model TEXT,
   provider TEXT,
   thinking_level TEXT,
+  thinking TEXT,                    -- reasoning trace (reasoning_content), shown behind a toggle
   usage JSON,                       -- token/cost
   stop_reason TEXT,
+  attachments TEXT,                 -- JSON array of file attachments (path-read: image dataURL / text / metadata)
   created_at INTEGER
 );
 
@@ -163,9 +165,9 @@ User prefers dark mode; dislikes bright themes.
 
 **Write path (`save_memory`):**
 ```
-save_memory(content, category, importance)
+save_memory(content, path?, category?, importance)
 ```
-- Maps `category` → a canonical file (`preferences.md`, etc.), **appending/updating** rather than creating one file per thought.
+- Maps `category` → a canonical file (`preferences.md`, etc.), **appending/updating** rather than creating one file per thought. The model may instead pass an explicit `path` to write to a specific existing or new file; `path` overrides `category`.
 - Regenerates the entry's `summary` and `index.md` automatically.
 - Dedupe on write: if the entry already exists, merge/update instead of duplicating.
 - User can always edit/delete via the **Memory tab** (which is literally these MD files).
@@ -178,18 +180,29 @@ save_memory(content, category, importance)
 
 ---
 
+## File attachments (v1)
+
+Attach files to a message from the composer. The paperclip button opens the native picker (Tauri dialog plugin); files can also be dropped onto the window (Tauri's native drag-drop event). Pending files preview above the composer (image thumbnail, or a document chip with name + size + remove). Once sent, files render inside the user bubble and persist with the message (`messages.attachments` JSON).
+
+- **Reading:** `attachments.rs` reads each path on the blocking pool. Images become a base64 data URL; text-like files carry their contents; everything else keeps metadata only.
+- **Sending:** text-file contents are folded into the message text (`--- File: name ---`); images are sent as multimodal `image_url` content parts. This requires a vision-capable model for images.
+- **Storage:** the `Attachment` JSON (`id`, `name`, `mime`, `size`, `kind`, `dataUrl`, `text`) is stored on the user row and replayed from history.
+
+---
+
 ## Tool surface
 
 Introduce tools through the same loop, so they're visible, gateable, and aborted like everything else.
 
 ```rust
 // Approval-gated (local side effects / local data): approve/deny/abort per call.
+// bash runs in a per-conversation persistent shell: cd/export/functions persist across calls.
 bash(command: string)
 read_file(path: string)
 write_file(path: string, content: string)
 
 // Memory tools
-save_memory(content: string, category: ..., importance: 0-5)
+save_memory(content: string, path?: string, category?: ..., importance: 0-5)
 read_memory(path: string)
 
 // Web search — reused MCP server, read-only (not gated)
@@ -218,13 +231,13 @@ trait ToolExecutor {
 ## Configuration & providers
 
 - **Settings dialog:** user is prompted for `baseUrl` + `apiKey` (stored in OS keychain) plus profile/memory prefs. The client is a **generic OpenAI-compatible client** — any endpoint the user enters works. The Fireworks endpoint (`https://api.fireworks.ai/inference/v1`) is prefilled as a convenient default for v1, but nothing is hardcoded to Fireworks.
-- **Models:** fetch `GET /v1/models` on the configured base URL; **show all** chat-capable ids (don't filter by price, don't pre-fetch prices). Cache the raw list.
+- **Models:** for an endpoint that matches a **models.dev** provider (the default Fireworks does), the picker lists that catalog with real names, context windows, and reasoning metadata — no API key needed. Only an unmatched/self-hosted endpoint falls back to its own `GET /v1/models`. The catalog is pulled at startup (cached rows render immediately, then replaced when the fetch resolves) and re-pulled when the base URL or API key changes; there is no manual "Load"/refresh in Settings, and the header picker is the only place the model changes (persisted immediately; closing Settings never changes it).
 - **Thinking levels:** map to `reasoning_effort`; per-model `thinkingLevelMap` marks supported levels; the chat-bar selector is filtered accordingly. Non-reasoning models hide the selector. Because servers vary, the thinking-field mapping is an **advanced compat override** the user can set.
-- **Price meter:** each assistant message stores full `usage` (input/output/cacheRead/cacheWrite tokens) — request `stream_options.include_usage` so the stream reports it. Cost = usage × rates. Rates are resolved **lazily**: when a user selects a model, look up its per-1M rates and **cache them in `model_prices`**, so repeated/offline use is instant. Models with no known rate show "—".
+- **Price meter:** each assistant message stores full `usage` (input/output/cacheRead/cacheWrite tokens) — request `stream_options.include_usage` so the stream reports it. Cost is `usage × rates`, computed per turn and **frozen** on the message at the model/rates in effect at that time, so switching models never retroactively re-prices past turns. Rates are resolved **lazily** and **cached in `model_prices`** (models.dev, refreshed at startup and on endpoint/key change). Models with no known rate show "—".
 
 **Compat layer:** `async-openai` is tuned to *real OpenAI's* exact request/response shape. A small `CompatConfig` normalizes the knobs a server deviates on (thinking field, `max_tokens` field, `developer` vs `system` role, `usage` in stream). For v1 it defaults to OpenAI-shaped behavior with **advanced overrides the user can set** — nothing Fireworks-specific. Preset dropdown only if we add more providers.
 
-**Usage vs rates (pricing):** OpenAI-compatible APIs return token `usage`, never dollar cost — `/v1/models` carries only metadata, and there's no price-per-token in the response. So cost is `usage × rates`. There's **no reliable Fireworks first-party pricing API** (prices live on the docs/pricing pages or third-party aggregators like Requesty), so v1 uses a **bundled curated table resolved lazily and cached per-model** in `model_prices` rather than querying on every call. This mirrors pi (`cost` rates in the model catalog + `usage` from the API). A third-party pricing source could be wired in v2 for auto-refresh.
+**Usage vs rates (pricing):** OpenAI-compatible APIs return token `usage`, never dollar cost — `/v1/models` carries only metadata, and there's no price-per-token in the response. So cost is `usage × rates`. Fireworks exposes **no usable public pricing API** (`/models` omits prices; the schema's `skuInfos` is only populated by an undocumented, forbidden `ListServerlessModels`), so prices are fetched from the free public **models.dev** catalog (`api.json`), which keys models by their exact API id and carries per-1M rates + context windows. Resolution order: **user override → fetched row cached in `model_prices` → bundled fallback table**. Cost per turn splits prompt tokens into uncached / cache-read / cache-write buckets (no overlap) and is frozen on the message. Fetching happens at startup and when the endpoint/key changes — no background polling and no manual refresh. This mirrors pi (`cost` rates in the model catalog + `usage` from the API).
 
 ---
 
@@ -240,17 +253,22 @@ trait ToolExecutor {
 
 ## V1 scope (ship it)
 
-1. Tauri + SolidJS + Tailwind + Kobalte scaffold.
-2. SQLite schema for conversations/messages + `compaction_summary`.
-3. Settings dialog: `baseUrl`, `apiKey` (keychain), profile block.
-4. Model auto-fetch (`GET /v1/models`) + cache (Fireworks).
-5. Rust streaming loop (OpenAI-compatible SSE) emitting `delta` events; failure-handling contract implemented.
-6. Tool surface: `bash`, `read_file`, `write_file` (approve-gated) + `save_memory`, `read_memory`.
-7. Memory as Markdown files + auto-generated `index.md`, Memory tab (list/edit/delete).
-8. Sidebar (conversations, new chat, search) + chat shell (markdown/code render).
-9. Thinking-level selector (per-model supported levels).
-10. Context management: reserve + near-limit banner ("compact or new chat"), per-conversation compaction.
-11. Price meter — capture per-message usage (`stream_options.include_usage`), compute running cost from a bundled Fireworks pricing table; show in header + conversation list.
+Status markers reflect the current state (see AGENTS.md for detail).
+
+1. ✅ Tauri + SolidJS + Tailwind + Kobalte scaffold.
+2. ✅ SQLite schema for conversations/messages + `compaction_summary` (column exists; compaction logic is milestone 7).
+3. ✅ Settings dialog: `baseUrl`, `apiKey` (keychain), user preferences. ⬜ profile block.
+4. ✅ Model catalog from models.dev (cached, name/context/reasoning) with `GET /v1/models` fallback for unmatched endpoints; fetched at startup + on endpoint/key change. Picker lives in the header (no Settings model loader).
+5. ✅ Rust streaming loop (OpenAI-compatible SSE) emitting `delta` events; failure-handling contract implemented.
+6. ✅ Tool surface: `bash`, `read_file`, `write_file` (approve-gated) plus `save_memory`/`read_memory` (ungated, app-local memory).
+7. ✅ Memory as Markdown files + auto-generated `index.md`, Memory tab (list/edit/delete).
+8. ✅ Sidebar (conversations, new chat, search) + chat shell (markdown/code render).
+9. ✅ Thinking-level selector (per-model supported levels; persisted in config).
+10. ◑ Context counter landed (tokens used / window in the header, from the last turn's usage); reserve + near-limit banner ("compact or new chat") and per-conversation compaction remain.
+11. ✅ Price meter — per-message usage captured (`stream_options.include_usage`); each turn's cost is computed and **frozen** on the message (uncached/cache-read/cache-write/output buckets), priced with the model that produced it. Rates resolve override → models.dev-fetched `model_prices` → bundled fallback; fetched at startup/endpoint change; shown in the header (sidebar readout not yet).
+12. ✅ File attachments — native picker + drag-drop, pending preview, sent files rendered and persisted; text folded in, images as multimodal parts.
+
+**Landed beyond the original scope (M5.5):** dark mode + light/dark toggle, provider reasoning traces (inline bar + popup), and a persistent per-conversation shell for `bash`.
 
 **Explicitly NOT in v1:** vector DB, conversation recall, container isolation, autonomous post-hoc memory extraction.
 
@@ -275,7 +293,7 @@ Still open:
 (none blocking. When we wire the price meter, I'll need the Fireworks model IDs you'll use + their per-1M rates for the bundled table — I can seed it with common Fireworks models as a starting point.)
 
 Defaults I'll take unless you object:
-- **Pricing:** bundled per-model table, resolved **lazily on model selection** and cached in `model_prices`. No Fireworks first-party pricing API; unknown models show "—". (Third-party aggregators like Requesty exist but are fragile — v2 could wire one for auto-refresh.)
+- **Pricing:** bundled per-model table, resolved **lazily on model selection** and cached in `model_prices`; fetched from models.dev at startup and on endpoint/key change. Each turn's cost is frozen on the message with the model that produced it. Unknown models show "—". (Third-party aggregators like Requesty exist but are fragile — v2 could wire one for auto-refresh.)
 - Reserve + banner threshold derived per-model from `contextWindow` (fallback default 200k).
 - Scratch workspace = per-conversation dir under app data; `read_file`/`write_file` take real user-approved paths.
 - Profile block = a few structured fields via a Settings form.
@@ -284,13 +302,15 @@ Defaults I'll take unless you object:
 
 ## Build order / milestones
 
-1. **Scaffold:** Tauri + SolidJS project, Tailwind, Kobalte set up, SQLite wiring. ✅ done (see AGENTS.md)
-2. **Loop:** Rust streaming command (via `async-openai`) + events; a single hardcoded OpenAI-compatible model works end-to-end.
-3. **Config + models:** Settings dialog, keychain storage, model fetch + picker.
-4. **Conversations:** SQLite schema, sidebar, new chat, message persistence.
-5. **Tools:** approve-gate + `bash/read_file/write_file`; `web_search` via `rmcp` MCP client; tool loop.
-6. **Memory:** MD files + `index.md` + `save_memory`/`read_memory` + Memory tab.
-7. **Context:** reserve/banner logic + per-conversation compaction.
-8. **Price meter:** capture usage (include_usage) + bundled Fireworks pricing table + header/sidebar readout.
-9. **Polish:** markdown/code render, virtualized message list, thinking selector.
-10. **V2:** conversation-recall vector index (only when explicitly opted in).
+Status as of the latest session (details in AGENTS.md):
+
+1. ✅ **Scaffold:** Tauri + SolidJS project, Tailwind, Kobalte set up, SQLite wiring.
+2. ✅ **Loop:** Rust streaming command + events; an OpenAI-compatible model works end-to-end.
+3. ✅ **Config + models:** Settings dialog, keychain storage, model fetch + picker.
+4. ✅ **Conversations:** SQLite schema, sidebar, new chat, message persistence.
+5. ✅ **Tools:** approve-gate + `bash`/`read_file`/`write_file`; `web_search` via `rmcp` MCP client; tool loop. (GUI-exercised.)
+6. ✅ **Memory:** MD files + `index.md` + `save_memory`/`read_memory` + Memory tab.
+7. ◑ **Context:** header counter done (tokens used / window); reserve/banner + per-conversation compaction remain. ← next
+8. ✅ **Price meter:** capture usage (include_usage) + per-model overrides + models.dev fetch cached in `model_prices` (bundled fallback) + header readout (sidebar readout not yet).
+9. ◑ **Polish:** markdown/code render (M4), dark mode, reasoning traces, persistent shell (M5.5), thinking-level selector, and file attachments done; virtualized message list remains.
+10. ⬜ **V2:** conversation-recall vector index (only when explicitly opted in).
