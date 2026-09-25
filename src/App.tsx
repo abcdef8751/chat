@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import { Channel } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -207,6 +207,8 @@ export default function App() {
   const [streaming, setStreaming] = createSignal(false);
   const [streamError, setStreamError] = createSignal<string | null>(null);
   const [liveTools, setLiveTools] = createSignal<LiveTool[]>([]);
+  const [nearBottom, setNearBottom] = createSignal(true);
+  let messagesScrollEl: HTMLElement | undefined;
 
   // Files staged for the next message (picked or dropped).
   const [pendingAttachments, setPendingAttachments] = createSignal<Attachment[]>([]);
@@ -369,11 +371,21 @@ export default function App() {
   createEffect(() => {
     const id = activeId();
     setThinkingOpenId(null);
+    setNearBottom(true);
     if (!id) {
       setMessages([]);
       return;
     }
     listMessages(id).then(setMessages);
+  });
+
+  // Keep the newest message in view unless the user has scrolled up.
+  createEffect(() => {
+    messages();
+    liveTools();
+    if (!nearBottom()) return;
+    const el = messagesScrollEl;
+    if (el) el.scrollTop = el.scrollHeight;
   });
 
   async function createNewChat() {
@@ -646,6 +658,7 @@ export default function App() {
     };
 
     setMessages([...messages(), userMsg, assistantMsg]);
+    setNearBottom(true);
     setDraft("");
     setPendingAttachments([]);
     setStreaming(true);
@@ -767,8 +780,12 @@ export default function App() {
     return Boolean(streaming() && m && m.id.startsWith("tmp-assistant-") && !m.content);
   };
 
-  // Context window + cost readouts for the active conversation.
-  const contextWindow = () => pricing()?.contextWindow ?? 200_000;
+  // Context window + cost readouts for the active conversation. The usable
+  // budget is 80% of the model's window, capped at 200k; unknown → 200k.
+  const contextWindow = () => {
+    const ctx = pricing()?.contextWindow;
+    return ctx ? Math.min(ctx * 0.8, 200_000) : 200_000;
+  };
 
   const contextTokens = () => {
     const assistants = messages().filter((m) => m.role === "assistant");
@@ -978,7 +995,7 @@ export default function App() {
             <Show when={activeId()}>
               <div
                 class="hidden items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-neutral-500 sm:flex dark:text-neutral-400"
-                title={`Context: ${contextTokens().toLocaleString()} / ${contextWindow().toLocaleString()} tokens\nInput / output: ${
+                title={`Context: ${Math.min(contextTokens(), contextWindow()).toLocaleString()} / ${contextWindow().toLocaleString()} tokens\nInput / output: ${
                   pricing()?.inputPerMillion ?? "—"
                 } / ${pricing()?.outputPerMillion ?? "—"} USD per 1M\nCache read / write: ${
                   pricing()?.cacheReadPerMillion ?? "—"
@@ -987,7 +1004,8 @@ export default function App() {
                 }`}
               >
                 <span class={contextClass()}>
-                  {formatTokens(contextTokens())} / {formatTokens(contextWindow())} tok
+                  {formatTokens(Math.min(contextTokens(), contextWindow()))} /{" "}
+                  {formatTokens(contextWindow())} tok
                 </span>
                 <span class="text-neutral-300 dark:text-neutral-600">·</span>
                 <span>{costLabel()}</span>
@@ -1058,7 +1076,14 @@ export default function App() {
           </p>
         </Show>
 
-        <section class="flex-1 overflow-y-auto px-6 py-4">
+        <section
+          ref={(el) => (messagesScrollEl = el)}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            setNearBottom(el.scrollHeight - el.scrollTop - el.clientHeight <= 80);
+          }}
+          class="flex-1 overflow-y-auto px-6 py-4"
+        >
           <Show
             when={activeId()}
             fallback={
@@ -1067,139 +1092,151 @@ export default function App() {
               </p>
             }
           >
-            <div class="space-y-3">
-              <For each={messages()}>
+            <div class="flex min-h-full flex-col justify-end space-y-3">
+              <Index each={messages()}>
                 {(m) => {
                   // Hide persisted whitespace-only assistant rows (old turns),
                   // but keep the live streaming bubble.
-                  if (
-                    m.role === "assistant" &&
-                    !m.content.trim() &&
-                    !m.thinking?.trim() &&
-                    !(streaming() && m.id.startsWith("tmp-assistant-"))
-                  ) {
-                    return null;
-                  }
-                  const toolResult = parseToolResult(m);
-                  if (toolResult) {
-                    return (
-                      <div class="flex justify-start">
-                        <details class="max-w-[80%] rounded-xl border border-neutral-200 bg-white px-4 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900">
-                          <summary class="cursor-pointer text-[11px] text-neutral-500 dark:text-neutral-400">
-                            tool · {toolResult.name} {toolResult.error ? "· error" : ""}
-                          </summary>
-                          <pre class="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words text-xs text-neutral-700 dark:text-neutral-300">
-                            {toolResult.output}
-                          </pre>
-                        </details>
-                      </div>
-                    );
-                  }
-                  const toolCalls = parseToolCalls(m);
-                  if (toolCalls) {
-                    return (
-                      <For each={toolCalls}>
-                        {(c) => (
+                  const hidden = () =>
+                    m().role === "assistant" &&
+                    !m().content.trim() &&
+                    !m().thinking?.trim() &&
+                    !(streaming() && m().id.startsWith("tmp-assistant-"));
+                  const toolResult = () => parseToolResult(m());
+                  const toolCalls = () => (toolResult() ? null : parseToolCalls(m()));
+                  const atts = () => parseAttachments(m());
+                  return (
+                    <Show when={!hidden()}>
+                      <Show when={toolResult()} keyed>
+                        {(tr) => (
                           <div class="flex justify-start">
-                            <div class="max-w-[80%] rounded-xl border border-neutral-200 bg-white px-4 py-2 text-xs text-neutral-500 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-400">
-                              <div>
-                                assistant wants{" "}
-                                <span class="font-medium text-neutral-700 dark:text-neutral-200">
-                                  {c.name}
-                                </span>
-                              </div>
-                              <pre class="mt-1 whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
-                                {c.arguments}
+                            <details class="max-w-[80%] rounded-xl border border-neutral-200 bg-white px-4 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900">
+                              <summary class="cursor-pointer text-[11px] text-neutral-500 dark:text-neutral-400">
+                                tool · {tr.name} {tr.error ? "· error" : ""}
+                              </summary>
+                              <pre class="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words text-xs text-neutral-700 dark:text-neutral-300">
+                                {tr.output}
                               </pre>
-                            </div>
+                            </details>
                           </div>
                         )}
-                      </For>
-                    );
-                  }
-                  const isAssistant = m.role === "assistant";
-                  const atts = parseAttachments(m);
-                  const thinking = m.thinking?.trim();
-                  const thinkingLive = isAssistant && streaming() && m.content === "";
-                  return (
-                    <div
-                      class={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-                    >
-                      <div class="max-w-[80%]">
-                        <Show when={isAssistant && thinking}>
-                          <button
-                            onClick={() =>
-                              setThinkingOpenId(
-                                thinkingOpenId() === m.id ? null : m.id,
-                              )
-                            }
-                            title="Show the reasoning trace"
-                            class={`mb-1 flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
-                              thinkingOpenId() === m.id
-                                ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-100"
-                                : "text-neutral-500 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
-                            }`}
-                          >
-                            <span
-                              class={`inline-block h-1.5 w-1.5 rounded-full ${
-                                thinkingLive
-                                  ? "animate-pulse bg-amber-500"
-                                  : "bg-neutral-400 dark:bg-neutral-500"
-                              }`}
-                            />
-                            {thinkingLive ? "Thinking…" : "Thought"}
-                          </button>
-                        </Show>
+                      </Show>
+                      <Show when={toolCalls()} keyed>
+                        {(calls) => (
+                          <For each={calls}>
+                            {(c) => (
+                              <div class="flex justify-start">
+                                <div class="max-w-[80%] rounded-xl border border-neutral-200 bg-white px-4 py-2 text-xs text-neutral-500 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-400">
+                                  <div>
+                                    assistant wants{" "}
+                                    <span class="font-medium text-neutral-700 dark:text-neutral-200">
+                                      {c.name}
+                                    </span>
+                                  </div>
+                                  <pre class="mt-1 whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
+                                    {c.arguments}
+                                  </pre>
+                                </div>
+                              </div>
+                            )}
+                          </For>
+                        )}
+                      </Show>
+                      <Show when={!toolResult() && !toolCalls()}>
                         <div
-                          class={`rounded-xl px-4 py-2.5 text-sm ${
-                            isAssistant
-                              ? "bg-neutral-100 dark:bg-neutral-800"
-                              : "bg-neutral-900 text-white dark:bg-white dark:text-neutral-900"
-                          }`}
+                          class={`flex ${m().role === "user" ? "justify-end" : "justify-start"}`}
                         >
-                          <div class="mb-0.5 text-[11px] opacity-60">
-                            {m.role === "user" ? "you" : "assistant"}
-                            {isAssistant && m.stop_reason === "aborted" && " (aborted)"}
-                            {isAssistant && m.stop_reason === "error" && " (error)"}
-                          </div>
-                          <Show when={atts.length > 0}>
-                            <div class="mb-2 flex flex-wrap items-end gap-2">
-                              <For each={atts}>
-                                {(a) =>
-                                  a.kind === "image" && a.dataUrl ? (
-                                    <img
-                                      src={a.dataUrl}
-                                      alt={a.name}
-                                      class="max-h-64 max-w-full rounded-lg border border-white/20 dark:border-neutral-900/20"
-                                    />
-                                  ) : (
-                                    <div class="flex items-center gap-2 rounded-lg border border-white/25 bg-white/10 px-2.5 py-1.5 text-xs dark:border-neutral-900/20 dark:bg-neutral-900/10">
-                                      <DocIcon />
-                                      <span class="max-w-52 truncate">{a.name}</span>
-                                      <span class="opacity-60">{formatBytes(a.size)}</span>
-                                    </div>
+                          <div class="max-w-[80%]">
+                            <Show when={m().role === "assistant" && m().thinking?.trim()}>
+                              <button
+                                onClick={() =>
+                                  setThinkingOpenId(
+                                    thinkingOpenId() === m().id ? null : m().id,
                                   )
                                 }
-                              </For>
+                                title="Show the reasoning trace"
+                                class={`mb-1 flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
+                                  thinkingOpenId() === m().id
+                                    ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-100"
+                                    : "text-neutral-500 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
+                                }`}
+                              >
+                                <span
+                                  class={`inline-block h-1.5 w-1.5 rounded-full ${
+                                    m().role === "assistant" &&
+                                    streaming() &&
+                                    m().content === ""
+                                      ? "animate-pulse bg-amber-500"
+                                      : "bg-neutral-400 dark:bg-neutral-500"
+                                  }`}
+                                />
+                                {m().role === "assistant" &&
+                                streaming() &&
+                                m().content === ""
+                                  ? "Thinking…"
+                                  : "Thought"}
+                              </button>
+                            </Show>
+                            <div
+                              class={`rounded-xl px-4 py-2.5 text-sm ${
+                                m().role === "assistant"
+                                  ? "bg-neutral-100 dark:bg-neutral-800"
+                                  : "bg-neutral-900 text-white dark:bg-white dark:text-neutral-900"
+                              }`}
+                            >
+                              <div class="mb-0.5 text-[11px] opacity-60">
+                                {m().role === "user" ? "you" : "assistant"}
+                                {m().role === "assistant" &&
+                                  m().stop_reason === "aborted" &&
+                                  " (aborted)"}
+                                {m().role === "assistant" &&
+                                  m().stop_reason === "error" &&
+                                  " (error)"}
+                              </div>
+                              <Show when={atts().length > 0}>
+                                <div class="mb-2 flex flex-wrap items-end gap-2">
+                                  <For each={atts()}>
+                                    {(a) =>
+                                      a.kind === "image" && a.dataUrl ? (
+                                        <img
+                                          src={a.dataUrl}
+                                          alt={a.name}
+                                          class="max-h-64 max-w-full rounded-lg border border-white/20 dark:border-neutral-900/20"
+                                        />
+                                      ) : (
+                                        <div class="flex items-center gap-2 rounded-lg border border-white/25 bg-white/10 px-2.5 py-1.5 text-xs dark:border-neutral-900/20 dark:bg-neutral-900/10">
+                                          <DocIcon />
+                                          <span class="max-w-52 truncate">{a.name}</span>
+                                          <span class="opacity-60">{formatBytes(a.size)}</span>
+                                        </div>
+                                      )
+                                    }
+                                  </For>
+                                </div>
+                              </Show>
+                              <Show
+                                when={m().role === "assistant" && m().content}
+                                fallback={
+                                  <div class="whitespace-pre-wrap break-words">
+                                    {m().content}
+                                  </div>
+                                }
+                              >
+                                <Markdown text={m().content} />
+                              </Show>
+                              {m().role === "assistant" &&
+                                streaming() &&
+                                m().id.startsWith("tmp-assistant-") && (
+                                  <span class="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-neutral-400 align-text-bottom" />
+                                )}
                             </div>
-                          </Show>
-                          <Show
-                            when={isAssistant && m.content}
-                            fallback={
-                              <div class="whitespace-pre-wrap break-words">{m.content}</div>
-                            }
-                          >
-                            <Markdown text={m.content} />
-                          </Show>
-                          {isAssistant && streaming() && m.id.startsWith("tmp-assistant-") && (
-                            <span class="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-neutral-400 align-text-bottom" />
-                          )}
+                          </div>
                         </div>
-                      </div>
-                    </div>
+                      </Show>
+                    </Show>
                   );
                 }}
-              </For>
+              </Index>
 
               <For each={liveTools()}>
                 {(t) => (

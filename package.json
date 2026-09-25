@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "serve": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "e2e": "bash e2e/run.sh"
   },
   "license": "MIT",
   "dependencies": {

@@ -4,11 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use async_openai::types::chat::{
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ImageUrl,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ImageUrl,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -22,7 +21,7 @@ use crate::shell::ShellRegistry;
 use crate::tools::{self, ToolCall, ToolOutput};
 
 const DEFAULT_SYSTEM_PROMPT: &str =
-    "You are a helpful general-purpose assistant. Be concise, accurate, and clear.";
+    r#"You are a helpful general-purpose assistant. Be concise, accurate, and clear."#;
 
 /// Per-conversation cancellation flags so the UI can abort a running stream.
 #[derive(Default)]
@@ -52,7 +51,11 @@ impl StreamRegistry {
 ///
 /// The channel carries one JSON message per event, tagged by `type`.
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "type")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
 pub enum StreamEvent {
     /// A chunk of assistant text.
     Delta { text: String },
@@ -103,6 +106,22 @@ struct RoundAccum {
     tool_calls: Vec<ToolCall>,
 }
 
+/// Join the `data:` payload lines of one raw SSE event, if it has any.
+fn event_payload(event: &str) -> Option<String> {
+    let mut data = Vec::new();
+    for raw in event.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(payload) = line.strip_prefix("data:") {
+            data.push(payload.strip_prefix(' ').unwrap_or(payload).to_string());
+        }
+    }
+    if data.is_empty() {
+        None
+    } else {
+        Some(data.join("\n"))
+    }
+}
+
 /// Extract one complete SSE event (terminated by a blank line) from the front of
 /// `buf`, returning the joined `data:` payload lines. Returns `None` when no
 /// complete event is buffered yet (bytes may still be streaming in).
@@ -128,31 +147,41 @@ fn take_first_event(buf: &mut Vec<u8>) -> Option<String> {
     let (i, len) = delim?;
     let event = String::from_utf8_lossy(&buf[..i]).into_owned();
     buf.drain(..i + len);
+    event_payload(&event)
+}
 
-    let mut data = Vec::new();
-    for raw in event.split('\n') {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if let Some(payload) = line.strip_prefix("data:") {
-            data.push(payload.strip_prefix(' ').unwrap_or(payload).to_string());
-        }
+/// Read a provider error body (`{"error":"..."}` or `{"error":{"message":...}}`)
+/// into a readable message.
+fn error_message(err: &Value) -> String {
+    if let Some(s) = err.as_str() {
+        return s.to_string();
     }
-    if data.is_empty() {
-        None
-    } else {
-        Some(data.join("\n"))
+    if let Some(msg) = err.get("message").and_then(Value::as_str) {
+        return msg.to_string();
     }
+    err.to_string()
 }
 
 /// Apply one parsed stream chunk to the running accumulation, emitting events.
 /// Reads both the classic OpenAI shape (`content` string) and the shapes
 /// providers use for thinking models: a `reasoning_content` string on the
 /// delta, or `content` arrays whose parts carry `type: "thinking"|"reasoning"`.
+/// Returns `true` when the chunk is fatal and the stream must stop consuming.
 fn apply_chunk(
     out: &mut RoundAccum,
     calls: &mut HashMap<u32, (Option<String>, Option<String>, String)>,
     chunk: &Value,
     sink: &dyn EventSink,
-) {
+) -> bool {
+    // Some providers stream an error payload and then close; surface it instead
+    // of silently truncating the turn.
+    if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
+        out.failed = true;
+        sink.emit(StreamEvent::Error {
+            message: error_message(err),
+        });
+        return true;
+    }
     if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
         out.usage = serde_json::to_value(usage).ok();
     }
@@ -161,9 +190,16 @@ fn apply_chunk(
         .and_then(Value::as_array)
         .and_then(|a| a.first())
     else {
-        return;
+        return false;
     };
     if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+        if reason == "error" {
+            out.failed = true;
+            sink.emit(StreamEvent::Error {
+                message: "provider error".to_string(),
+            });
+            return true;
+        }
         if !reason.is_empty() {
             out.finish = Some(reason.to_string());
         }
@@ -186,7 +222,9 @@ fn apply_chunk(
                         if let Some(t) = item.get("text").and_then(Value::as_str) {
                             if !t.is_empty() {
                                 out.text.push_str(t);
-                                sink.emit(StreamEvent::Delta { text: t.to_string() });
+                                sink.emit(StreamEvent::Delta {
+                                    text: t.to_string(),
+                                });
                             }
                         }
                     }
@@ -198,7 +236,9 @@ fn apply_chunk(
                             .unwrap_or_default();
                         if !t.is_empty() {
                             out.thinking.push_str(t);
-                            sink.emit(StreamEvent::ThinkingDelta { text: t.to_string() });
+                            sink.emit(StreamEvent::ThinkingDelta {
+                                text: t.to_string(),
+                            });
                         }
                     }
                     _ => {}
@@ -211,7 +251,9 @@ fn apply_chunk(
     if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
         if !r.is_empty() {
             out.thinking.push_str(r);
-            sink.emit(StreamEvent::ThinkingDelta { text: r.to_string() });
+            sink.emit(StreamEvent::ThinkingDelta {
+                text: r.to_string(),
+            });
         }
     }
     // Streamed tool-call fragments, accumulated by index.
@@ -231,6 +273,25 @@ fn apply_chunk(
                 }
             }
         }
+    }
+    false
+}
+
+/// Apply one already-extracted SSE event payload. Returns `true` when the stream
+/// should stop consuming (the `[DONE]` sentinel or a fatal error).
+fn process_event(
+    out: &mut RoundAccum,
+    calls: &mut HashMap<u32, (Option<String>, Option<String>, String)>,
+    event: &str,
+    sink: &dyn EventSink,
+) -> bool {
+    let event = event.trim();
+    if event == "[DONE]" {
+        return true;
+    }
+    match serde_json::from_str::<Value>(event) {
+        Ok(chunk) => apply_chunk(out, calls, &chunk, sink),
+        Err(_) => false,
     }
 }
 
@@ -294,18 +355,31 @@ async fn run_completion(
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut closed = false;
+    // A persistent deadline so the cancel flag is polled even while chunks keep
+    // arriving faster than the poll interval.
+    let poll = std::time::Duration::from_millis(200);
+    let mut deadline = tokio::time::Instant::now() + poll;
 
-    loop {
-        if let Some(event) = take_first_event(&mut buf) {
-            if event == "[DONE]" {
-                break;
+    'consume: loop {
+        if flag.load(Ordering::SeqCst) {
+            break;
+        }
+        while let Some(event) = take_first_event(&mut buf) {
+            if flag.load(Ordering::SeqCst) {
+                break 'consume;
             }
-            if let Ok(chunk) = serde_json::from_str::<Value>(&event) {
-                apply_chunk(&mut out, &mut calls, &chunk, sink);
+            if process_event(&mut out, &mut calls, &event, sink) {
+                break 'consume;
             }
-            continue;
         }
         if closed {
+            // The body ended without a terminating blank line; flush the final
+            // event so a truncated trailing delta is not dropped.
+            let residual = String::from_utf8_lossy(&buf).into_owned();
+            buf.clear();
+            if let Some(payload) = event_payload(&residual) {
+                process_event(&mut out, &mut calls, &payload, sink);
+            }
             break;
         }
         tokio::select! {
@@ -320,10 +394,11 @@ async fn run_completion(
                     }
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 if flag.load(Ordering::SeqCst) {
                     break;
                 }
+                deadline = tokio::time::Instant::now() + poll;
             }
         }
     }
@@ -363,7 +438,10 @@ fn sum_usage(total: &mut Value, round: &Option<Value>) {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     if cached != 0 {
-        let cur = total.get("cached_tokens").and_then(Value::as_i64).unwrap_or(0);
+        let cur = total
+            .get("cached_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         total["cached_tokens"] = json!(cur + cached);
     }
     if cache_write != 0 {
@@ -380,8 +458,14 @@ fn sum_usage(total: &mut Value, round: &Option<Value>) {
 /// only the final round's prompt plus its output — what gets sent next turn.
 fn track_context(total: &mut Value, round: &Option<Value>) {
     let Some(round) = round else { return };
-    let prompt = round.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
-    let completion = round.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let prompt = round
+        .get("prompt_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion = round
+        .get("completion_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     if prompt > 0 || completion > 0 {
         total["context_tokens"] = json!(prompt + completion);
     }
@@ -450,10 +534,7 @@ fn user_request_message(
     for url in images {
         parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
             ChatCompletionRequestMessageContentPartImage {
-                image_url: ImageUrl {
-                    url,
-                    detail: None,
-                },
+                image_url: ImageUrl { url, detail: None },
             },
         ));
     }
@@ -495,27 +576,34 @@ fn build_messages(
 
     for row in history {
         match row.role.as_str() {
-            "user" => out.push(user_request_message(
-                &row.content,
-                &row_attachments(row),
-            )?),
+            "user" => out.push(user_request_message(&row.content, &row_attachments(row))?),
             "assistant" => {
                 if let Ok(v) = serde_json::from_str::<Value>(&row.content) {
                     if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
                         let mut req_calls = Vec::new();
                         for c in calls {
-                            req_calls.push(async_openai::types::chat::ChatCompletionMessageToolCalls::Function(
-                                async_openai::types::chat::ChatCompletionMessageToolCall {
-                                    id: c.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-                                    function: async_openai::types::chat::FunctionCall {
-                                        name: c.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
-                                        arguments: c
-                                            .get("arguments")
-                                            .map(|a| a.to_string())
-                                            .unwrap_or_else(|| "{}".into()),
+                            req_calls.push(
+                                async_openai::types::chat::ChatCompletionMessageToolCalls::Function(
+                                    async_openai::types::chat::ChatCompletionMessageToolCall {
+                                        id: c
+                                            .get("id")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        function: async_openai::types::chat::FunctionCall {
+                                            name: c
+                                                .get("name")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                            arguments: c
+                                                .get("arguments")
+                                                .map(|a| a.to_string())
+                                                .unwrap_or_else(|| "{}".into()),
+                                        },
                                     },
-                                },
-                            ));
+                                ),
+                            );
                         }
                         out.push(
                             ChatCompletionRequestAssistantMessageArgs::default()
@@ -648,8 +736,7 @@ pub(crate) async fn run_chat_turn(
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
     let model_label = crate::pricing::cached_model_name(db, &cfg.base_url, &cfg.model)
         .unwrap_or_else(|| cfg.model.clone());
-    let system_prompt =
-        build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
+    let system_prompt = build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
     let mut messages = build_messages(&system_prompt, &history, &content, &attachments)?;
     let tools_list = tools::tool_specs(tools::brave_script_available());
 
@@ -847,8 +934,7 @@ pub(crate) async fn run_chat_turn(
 
     // Freeze the turn's price at the model/rates in effect now, so switching
     // models later never retroactively re-prices turns already billed.
-    if usage_total.get("prompt_tokens").is_some()
-        || usage_total.get("completion_tokens").is_some()
+    if usage_total.get("prompt_tokens").is_some() || usage_total.get("completion_tokens").is_some()
     {
         let pricing = crate::pricing::resolve_for(db, cfg, &cfg.model);
         if let Some(cost) = crate::pricing::cost_of_usage(&usage_total, &pricing) {
@@ -896,7 +982,9 @@ pub async fn stream_chat(
     let shell = app.state::<ShellRegistry>();
     let memory = app.state::<crate::memory::MemoryState>();
 
-    let flag = app.state::<StreamRegistry>().register(conversation_id.clone());
+    let flag = app
+        .state::<StreamRegistry>()
+        .register(conversation_id.clone());
     let sink = ChannelSink(&channel);
 
     let result = run_chat_turn(
@@ -928,7 +1016,6 @@ pub fn stop_chat(app: tauri::AppHandle, conversation_id: String) -> Result<(), S
     app.state::<tools::ApprovalRegistry>().deny_all();
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests;

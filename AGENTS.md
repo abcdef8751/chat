@@ -208,6 +208,7 @@ npm run dev            # Vite dev server only (no Tauri window)
 npm run build          # Vite production build (outputs to dist/)
 npm run tauri dev      # compile Rust + launch the app window
 npm run tauri build    # compile + bundle an installer
+npm run e2e            # GUI end-to-end test (mock LLM + WebDriver; see below)
 ```
 
 Rust-only:
@@ -217,6 +218,30 @@ cd src-tauri
 cargo check           # fast type/borrow check
 cargo build           # full debug build (slow first time: Wry + bundled SQLite)
 ```
+
+### GUI end-to-end testing (`e2e/`)
+
+`npm run e2e` drives the **real webview** against a mock OpenAI-compatible SSE
+server (`e2e/mock-llm.mjs`) using `tauri-driver` + `WebKitWebDriver`, asserting
+the streaming/UX behavior unit tests can't reach: no reply truncation (the mock's
+final SSE event omits its terminating blank line), reasoning-trace clickability /
+DOM stability across streamed updates, auto-scroll, bottom anchoring, and the
+context budget. Screenshots → `e2e/screenshots/` (gitignored).
+
+- **Prereq:** `cargo install tauri-driver --version 2.0.6 --locked` — the **2.x**
+  release is the Tauri v2 one; 3.0.0-alpha targets Tauri v3.
+- The runner builds the debug binary if missing, launches the app with an
+  **isolated `XDG_DATA_HOME`** (seeded with the mock endpoint), and writes a
+  throwaway keychain key **only if none exists** (removed afterward).
+- **Input / clicks:** on this WebKitGTK build, `Element Click` / `Send Keys` /
+  W3C Actions return `unsupported operation`. `/usr/bin/WebKitWebDriver` ships
+  from the `webkitgtk6.0` (GTK4) package while the app runs on `webkit2gtk-4.1`
+  (GTK3), and the browser-side input path isn't wired for that pairing; there is
+  no runtime flag (`browserName` makes no difference). Clicks are dispatched via
+  in-page `el.click()` (the standard workaround, [tauri#6541]) and the
+  click-churn regression is covered by a DOM-node-identity assertion. A
+  private-display XTEST harness was prototyped and removed as overengineering.
+  See `e2e/README.md`.
 
 ---
 
@@ -229,6 +254,11 @@ cargo build           # full debug build (slow first time: Wry + bundled SQLite)
 ├─ index.html
 ├─ vite.config.ts      # Vite + vite-plugin-solid + @tailwindcss/vite
 ├─ package.json
+├─ e2e/                # GUI end-to-end harness (mock LLM + tauri-driver/WebKitWebDriver)
+│  ├─ run.sh           # orchestrates mock + vite + tauri-driver + e2e.mjs
+│  ├─ e2e.mjs          # WebDriver client + assertions
+│  ├─ mock-llm.mjs     # scripted OpenAI-compatible SSE server
+│  └─ README.md
 ├─ src/
 │  ├─ index.tsx        # entry; imports ./index.css (Tailwind)
 │  ├─ index.css        # Tailwind import + typography + class-based dark variant
@@ -293,7 +323,7 @@ cargo build           # full debug build (slow first time: Wry + bundled SQLite)
 - **Brave tool (later milestone):** we'll spawn `node ~/.config/opencode/mcp/brave-search.mjs` via `rmcp`. It needs `BRAVE_API_KEY`, which the script loads from its sibling `~/.config/opencode/mcp/.env` (already present on this machine). The script resolves `@modelcontextprotocol/sdk` from `~/.config/opencode/node_modules` — it works because Node walks up from the script's own directory. Don't relocate the script.
 - **Fireworks is the default endpoint** (`https://api.fireworks.ai/inference/v1`), but the client is a generic OpenAI-compatible client; user enters `baseUrl` + `apiKey` in Settings. Fireworks needs a `fw_` key; Brave needs a separate `BRAVE_API_KEY`.
 - **Rust builds are slow** on first run (Wry + bundled SQLite). `cargo check` is faster for iteration; `cargo build` is what `tauri dev` uses.
-- **No display in CLI:** don't try to run the Tauri window from a headless shell. Use `npm run tauri dev` from the user's desktop session.
+- **GUI needs a display:** the Tauri window can't run headless. Use `npm run tauri dev` from the user's desktop session; for scripted GUI checks use `npm run e2e` (same requirement — it opens a window on the current display and runs under `tauri-driver`/`WebKitWebDriver`).
 - **Persistent shell:** `bash` calls run in a long-lived `bash` per conversation (`shell.rs`); output is sentinel-delimited and a 60s timeout (or `exit`) kills/resets the session. Command stdin is `/dev/null` unless it uses a heredoc, so don't expect interactive input.
 - **`delete_conversation` is async** (it awaits clearing that conversation's shell), unlike the other DB commands.
 

@@ -49,6 +49,22 @@
         }
     }
 
+    /// A sink that trips the cancel flag as soon as the first delta lands, so an
+    /// abort can be triggered deterministically mid-stream without a race.
+    struct FlagOnDelta {
+        flag: Arc<AtomicBool>,
+        events: Arc<Mutex<Vec<StreamEvent>>>,
+    }
+
+    impl EventSink for FlagOnDelta {
+        fn emit(&self, ev: StreamEvent) {
+            if matches!(&ev, StreamEvent::Delta { .. }) {
+                self.flag.store(true, Ordering::SeqCst);
+            }
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
@@ -144,6 +160,29 @@
         (port, bodies, handle)
     }
 
+    /// Serve one raw SSE body verbatim — no implicit `[DONE]` and no trailing
+    /// blank line — so framing edge cases can be exercised.
+    fn start_mock_raw(body: String) -> (u16, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = match listener.accept() {
+                Ok(x) => x,
+                Err(_) => return,
+            };
+            let _ = read_request(&mut stream);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+        (port, handle)
+    }
+
     fn delta_chunk(content: &str) -> String {
         format!(
             r#"{{"id":"1","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{{"index":0,"delta":{{"role":"assistant","content":"{content}"}},"finish_reason":null}}]}}"#
@@ -208,6 +247,42 @@
         run_completion(resp, &sink, &AtomicBool::new(false)).await
     }
 
+    /// Like [`complete_once`], but also returns the emitted events.
+    async fn complete_events(port: u16) -> (RoundAccum, Arc<Mutex<Vec<StreamEvent>>>) {
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let body = completion_body(
+            "mock",
+            &build_messages("p", &[], "hi", &[]).unwrap(),
+            &tools::tool_specs(false),
+            "",
+        )
+        .unwrap();
+        let resp = open_completion_stream(&base, "k", &body).await.unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let acc = run_completion(resp, &sink, &AtomicBool::new(false)).await;
+        (acc, events)
+    }
+
+    /// Stream an arbitrary raw SSE body through `run_completion`.
+    async fn complete_raw(body: &str) -> (RoundAccum, Arc<Mutex<Vec<StreamEvent>>>) {
+        let (port, handle) = start_mock_raw(body.to_string());
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let req = completion_body(
+            "mock",
+            &build_messages("p", &[], "hi", &[]).unwrap(),
+            &tools::tool_specs(false),
+            "",
+        )
+        .unwrap();
+        let resp = open_completion_stream(&base, "k", &req).await.unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let acc = run_completion(resp, &sink, &AtomicBool::new(false)).await;
+        let _ = handle.join();
+        (acc, events)
+    }
+
     // ---------- parser tests ----------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -267,6 +342,94 @@
         assert_eq!(acc.tool_calls[0].name, "bash");
         assert_eq!(acc.tool_calls[0].arguments["command"], "ls");
         let _ = handle.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_flushes_unterminated_final_event() {
+        // The body ends without a trailing blank line and without `[DONE]`; the
+        // final delta must still be emitted rather than dropped.
+        let body = format!("data: {}", delta_chunk("tail"));
+        let (acc, events) = complete_raw(&body).await;
+        assert!(!acc.failed);
+        assert_eq!(acc.text, "tail");
+        let guard = events.lock().unwrap();
+        assert!(guard
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Delta { text } if text == "tail")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_reports_mid_stream_error_and_keeps_partial() {
+        let (port, handle) = start_mock(
+            vec![vec![
+                delta_chunk("Partial"),
+                r#"{"error":{"message":"boom","type":"server_error"}}"#.into(),
+            ]],
+            0,
+        );
+        let (acc, events) = complete_events(port).await;
+        let _ = handle.join();
+
+        assert!(acc.failed);
+        assert_eq!(acc.text, "Partial");
+        let guard = events.lock().unwrap();
+        assert!(guard
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error { message } if message.contains("boom"))));
+        assert!(guard
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Delta { text } if text == "Partial")));
+    }
+
+    #[test]
+    fn apply_chunk_treats_string_error_as_fatal() {
+        let mut out = RoundAccum::default();
+        let mut calls = HashMap::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let stop = apply_chunk(&mut out, &mut calls, &json!({"error": "plain boom"}), &sink);
+        assert!(stop);
+        assert!(out.failed);
+        let guard = events.lock().unwrap();
+        assert!(guard
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error { message } if message == "plain boom")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_honors_abort_between_fast_events() {
+        // Deltas arrive back-to-back (no gap), so a per-iteration timer would
+        // never fire; the flag must be honored between events.
+        let (port, handle) = start_mock(
+            vec![vec![
+                delta_chunk("one"),
+                delta_chunk("two"),
+                delta_chunk("three"),
+                finish_chunk("stop"),
+            ]],
+            0,
+        );
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let body = completion_body(
+            "mock",
+            &build_messages("p", &[], "hi", &[]).unwrap(),
+            &tools::tool_specs(false),
+            "",
+        )
+        .unwrap();
+        let resp = open_completion_stream(&base, "k", &body).await.unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = FlagOnDelta {
+            flag: flag.clone(),
+            events: events.clone(),
+        };
+        let acc = run_completion(resp, &sink, &flag).await;
+        let _ = handle.join();
+
+        assert!(flag.load(Ordering::SeqCst));
+        assert_eq!(acc.text, "one");
+        assert_eq!(acc.finish, None);
     }
 
     #[test]
