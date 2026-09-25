@@ -34,6 +34,10 @@ pub struct AppConfig {
     pub preferences: String,
     /// Selected reasoning effort (e.g. `low`/`medium`/`high`); empty = provider default.
     pub thinking_level: String,
+    /// Echo the current turn's reasoning trace back on its assistant tool-call
+    /// message. DeepSeek's thinking mode requires this (HTTP 400 otherwise);
+    /// some providers reject the unknown field, so it can be turned off.
+    pub echo_reasoning_content: bool,
     /// User-supplied per-model price/context overrides, keyed by model id.
     pub model_overrides: HashMap<String, ModelOverride>,
 }
@@ -45,6 +49,7 @@ impl Default for AppConfig {
             model: DEFAULT_MODEL.to_string(),
             preferences: String::new(),
             thinking_level: String::new(),
+            echo_reasoning_content: true,
             model_overrides: HashMap::new(),
         }
     }

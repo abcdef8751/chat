@@ -320,15 +320,39 @@ async fn open_completion_stream(
 }
 
 /// Request body for one completion round.
+///
+/// `reasoning` carries the just-produced reasoning trace for the most recent
+/// assistant tool-call message in `messages` (same turn only). async-openai's
+/// assistant message type has no `reasoning_content` field, so it is injected
+/// into the serialized JSON here. DeepSeek's thinking mode requires it on the
+/// assistant tool-call message or the next round fails with HTTP 400; providers
+/// that reject unknown fields can pass `None` (see
+/// `AppConfig.echo_reasoning_content`).
 fn completion_body(
     model: &str,
     messages: &[ChatCompletionRequestMessage],
     tools: &[async_openai::types::chat::ChatCompletionTools],
     thinking_level: &str,
+    reasoning: Option<&str>,
 ) -> Result<Value, String> {
+    let mut serialized = serde_json::to_value(messages).map_err(|e| e.to_string())?;
+    if let Some(text) = reasoning.filter(|t| !t.trim().is_empty()) {
+        if let Some(arr) = serialized.as_array_mut() {
+            // Attach to the most recent assistant tool-call message; earlier
+            // turns' tool-call rows are replayed reasoning-free.
+            for msg in arr.iter_mut().rev() {
+                if msg.get("role").and_then(Value::as_str) == Some("assistant")
+                    && msg.get("tool_calls").is_some()
+                {
+                    msg["reasoning_content"] = json!(text);
+                    break;
+                }
+            }
+        }
+    }
     let mut body = json!({
         "model": model,
-        "messages": serde_json::to_value(messages).map_err(|e| e.to_string())?,
+        "messages": serialized,
         "stream": true,
         "stream_options": { "include_usage": true },
         "tools": serde_json::to_value(tools).map_err(|e| e.to_string())?,
@@ -745,9 +769,23 @@ pub(crate) async fn run_chat_turn(
     let stop_reason: String;
     let mut final_text = String::new();
     let mut final_thinking: Option<String> = None;
+    // Reasoning produced by the last tool round, echoed on the assistant
+    // tool-call message of this turn's subsequent requests. Never replays
+    // previous turns (build_messages stays reasoning-free).
+    let mut pending_reasoning: Option<String> = None;
 
     loop {
-        let body = completion_body(&cfg.model, &messages, &tools_list, &cfg.thinking_level)?;
+        let body = completion_body(
+            &cfg.model,
+            &messages,
+            &tools_list,
+            &cfg.thinking_level,
+            if cfg.echo_reasoning_content {
+                pending_reasoning.as_deref()
+            } else {
+                None
+            },
+        )?;
         let response = match open_completion_stream(&cfg.base_url, api_key, &body).await {
             Ok(r) => r,
             Err(e) => {
@@ -778,6 +816,7 @@ pub(crate) async fn run_chat_turn(
         if acc.finish.as_deref() == Some("tool_calls") && !acc.tool_calls.is_empty() {
             rounds += 1;
             let thinking = (!acc.thinking.is_empty()).then_some(acc.thinking.clone());
+            pending_reasoning = thinking.clone();
             // Attach the round's reasoning to the first assistant row we store:
             // the preamble text if the model wrote any (ignore whitespace-only
             // preambles), otherwise the tool-call row.

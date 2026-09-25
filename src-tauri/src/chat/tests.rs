@@ -106,6 +106,12 @@
         String::from_utf8_lossy(&buf).into_owned()
     }
 
+    /// Parse the JSON body of a raw HTTP request captured by the mock server.
+    fn request_body(request: &str) -> Value {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or(request);
+        serde_json::from_str(body).unwrap()
+    }
+
     /// A mock OpenAI-compatible SSE endpoint. Each `turn` is served on its own
     /// connection: one `data:` event per string, optionally spaced by `gap_ms`
     /// so a test can abort between chunks. Always closes with `[DONE]`.
@@ -240,6 +246,7 @@
             &build_messages("p", &[], "hi", &[]).unwrap(),
             &tools::tool_specs(false),
             "",
+            None,
         )
         .unwrap();
         let resp = open_completion_stream(&base, "k", &body).await.unwrap();
@@ -255,6 +262,7 @@
             &build_messages("p", &[], "hi", &[]).unwrap(),
             &tools::tool_specs(false),
             "",
+            None,
         )
         .unwrap();
         let resp = open_completion_stream(&base, "k", &body).await.unwrap();
@@ -273,6 +281,7 @@
             &build_messages("p", &[], "hi", &[]).unwrap(),
             &tools::tool_specs(false),
             "",
+            None,
         )
         .unwrap();
         let resp = open_completion_stream(&base, "k", &req).await.unwrap();
@@ -415,6 +424,7 @@
             &build_messages("p", &[], "hi", &[]).unwrap(),
             &tools::tool_specs(false),
             "",
+            None,
         )
         .unwrap();
         let resp = open_completion_stream(&base, "k", &body).await.unwrap();
@@ -818,6 +828,238 @@
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_echoes_reasoning_on_tool_call_message_within_turn() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    reasoning_chunk("I should check. "),
+                    tool_frag(0, "call_1", "bash", ""),
+                    tool_frag(0, "", "", r#"{\"command\":\"echo hi\"}"#),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("All done"), finish_chunk("stop"), usage_chunk()],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("echo-reasoning"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let mcp = tools::McpClient::new();
+        let shell = crate::shell::ShellRegistry::new();
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
+        let cid2 = cid.clone();
+        let memory = temp_memory("echo-reasoning");
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
+                cid2, "run echo hi".into(), Vec::new(),
+            )
+            .await
+        });
+
+        wait_for_event(
+            &events2,
+            |e| matches!(e, StreamEvent::ToolCall { gated: true, name, .. } if name == "bash"),
+            5000,
+        )
+        .await;
+        let call_id = {
+            let guard = events2.lock().unwrap();
+            guard
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::ToolCall { call_id, gated: true, .. } => Some(call_id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        while !approvals.resolve(&call_id, true) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        task.await.unwrap().unwrap();
+        let _ = handle.join();
+
+        let requests = bodies.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        // The first request has no tool-call assistant message yet.
+        assert!(!requests[0].contains("reasoning_content"));
+
+        let second = request_body(&requests[1]);
+        let msgs = second["messages"].as_array().unwrap();
+        let tool_call = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("assistant tool-call message");
+        assert_eq!(tool_call["reasoning_content"], "I should check. ");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_replay_does_not_resend_previous_turn_reasoning() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    reasoning_chunk("I should check. "),
+                    tool_frag(0, "call_1", "bash", ""),
+                    tool_frag(0, "", "", r#"{\"command\":\"echo hi\"}"#),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("All done"), finish_chunk("stop")],
+                vec![delta_chunk("Second"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("echo-replay"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let mcp = tools::McpClient::new();
+        let shell = crate::shell::ShellRegistry::new();
+
+        // First turn: a tool round whose reasoning is persisted on the row.
+        let flag = Arc::new(AtomicBool::new(false));
+        let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
+        let cid2 = cid.clone();
+        let cfg2 = cfg.clone();
+        let memory = temp_memory("echo-replay");
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg2, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
+                cid2, "run echo hi".into(), Vec::new(),
+            )
+            .await
+        });
+        wait_for_event(&events2, |e| matches!(e, StreamEvent::ToolCall { gated: true, .. }), 5000)
+            .await;
+        let call_id = {
+            let guard = events2.lock().unwrap();
+            guard
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::ToolCall { call_id, gated: true, .. } => Some(call_id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        while !approvals.resolve(&call_id, true) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.await.unwrap().unwrap();
+
+        // Second turn: a fresh user message replays the tool-call history.
+        let flag2 = Arc::new(AtomicBool::new(false));
+        let sink2 = TestSink(events.clone());
+        let memory2 = temp_memory("echo-replay-2");
+        let mcp2 = tools::McpClient::new();
+        let shell2 = crate::shell::ShellRegistry::new();
+        run_chat_turn(
+            &db, &cfg, "test-key", &mcp2, &shell2, &memory2, &approvals, flag2, &sink2,
+            cid.clone(), "again".into(), Vec::new(),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        let requests = bodies.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let replayed = request_body(&requests[2]);
+        let msgs = replayed["messages"].as_array().unwrap();
+        // The tool-call row is replayed, but without its reasoning trace.
+        assert!(msgs
+            .iter()
+            .any(|m| m["role"] == "assistant" && m.get("tool_calls").is_some()));
+        assert!(!replayed.to_string().contains("reasoning_content"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_reasoning_echo_can_be_disabled() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    reasoning_chunk("I should check. "),
+                    tool_frag(0, "call_1", "bash", ""),
+                    tool_frag(0, "", "", r#"{\"command\":\"echo hi\"}"#),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("All done"), finish_chunk("stop"), usage_chunk()],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("echo-off"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            echo_reasoning_content: false,
+            ..Default::default()
+        };
+        let mcp = tools::McpClient::new();
+        let shell = crate::shell::ShellRegistry::new();
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
+        let cid2 = cid.clone();
+        let memory = temp_memory("echo-off");
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
+                cid2, "run echo hi".into(), Vec::new(),
+            )
+            .await
+        });
+
+        wait_for_event(
+            &events2,
+            |e| matches!(e, StreamEvent::ToolCall { gated: true, name, .. } if name == "bash"),
+            5000,
+        )
+        .await;
+        let call_id = {
+            let guard = events2.lock().unwrap();
+            guard
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::ToolCall { call_id, gated: true, .. } => Some(call_id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        while !approvals.resolve(&call_id, true) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        task.await.unwrap().unwrap();
+        let _ = handle.join();
+
+        let requests = bodies.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let second = request_body(&requests[1]);
+        let msgs = second["messages"].as_array().unwrap();
+        assert!(msgs
+            .iter()
+            .any(|m| m["role"] == "assistant" && m.get("tool_calls").is_some()));
+        assert!(!second.to_string().contains("reasoning_content"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loop_denied_tool_reports_error_and_keeps_going() {
         let (port, handle) = start_mock(
             vec![
@@ -1013,4 +1255,120 @@ fn build_system_prompt_omits_empty_preferences() {
     let prompt = build_system_prompt("BASE", "mock", "   ", &memory);
     assert!(prompt.starts_with("BASE"));
     assert!(!prompt.contains("User preferences"));
+}
+
+// ---------- live provider smoke test (opt-in) ----------
+
+/// Live smoke test against a real OpenAI-compatible provider: run a tool-call
+/// turn through the real request path, then replay the assistant tool-call
+/// message with a synthetic `reasoning_content` echo and confirm the provider
+/// accepts it (this is the DeepSeek-compat question; the trace is synthetic so
+/// the result does not depend on whether the model emits one).
+///
+/// Ignored by default (network + tokens). Run explicitly:
+///   cargo test --lib -- --ignored live_reasoning_echo
+/// Override the target with `PI_LIVE_BASE_URL` / `PI_LIVE_MODEL`. The API key is
+/// read from the OS keychain and never printed.
+#[tokio::test]
+#[ignore = "hits the real provider API; run explicitly with `--ignored`"]
+async fn live_reasoning_echo_is_accepted_by_provider() {
+    let base = std::env::var("PI_LIVE_BASE_URL")
+        .unwrap_or_else(|_| "https://api.fireworks.ai/inference/v1".to_string());
+    let model = std::env::var("PI_LIVE_MODEL")
+        .unwrap_or_else(|_| "accounts/fireworks/models/deepseek-v4p1-flash".to_string());
+    let Some(key) = crate::secrets::get().expect("keychain read") else {
+        eprintln!("skipping: no API key in the OS keychain");
+        return;
+    };
+
+    let tools = tools::tool_specs(false);
+    let mut messages = build_messages(
+        "You are a tool-using assistant. Think step by step, then call the requested tool.",
+        &[],
+        "Work out 47 * 89 step by step, then use the bash tool to verify it \
+         (e.g. `echo $((47*89))`), and report both your computed answer and the tool output.",
+        &[],
+    )
+    .unwrap();
+
+    // Round 1: the model should request a tool and (for a reasoning model) emit a trace.
+    let sink = TestSink(Arc::new(Mutex::new(Vec::new())));
+    let body = completion_body(&model, &messages, &tools, "high", None).unwrap();
+    let resp = open_completion_stream(&base, &key, &body)
+        .await
+        .expect("round 1 request failed");
+    let round1 = run_completion(resp, &sink, &AtomicBool::new(false)).await;
+    assert!(!round1.failed, "round 1 stream failed");
+
+    if round1.tool_calls.is_empty() {
+        eprintln!("inconclusive: the model did not request a tool; skipping");
+        return;
+    }
+    eprintln!(
+        "round 1: {} tool call(s); model reasoning {} (informational)",
+        round1.tool_calls.len(),
+        if round1.thinking.trim().is_empty() {
+            "empty"
+        } else {
+            "present"
+        }
+    );
+
+    // Replay the assistant tool-call message plus the tool result.
+    let tool_calls = round1
+        .tool_calls
+        .iter()
+        .map(|c| {
+            async_openai::types::chat::ChatCompletionMessageToolCalls::Function(
+                async_openai::types::chat::ChatCompletionMessageToolCall {
+                    id: c.id.clone(),
+                    function: async_openai::types::chat::FunctionCall {
+                        name: c.name.clone(),
+                        arguments: c.arguments.to_string(),
+                    },
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    messages.push(
+        ChatCompletionRequestAssistantMessageArgs::default()
+            .tool_calls(tool_calls)
+            .build()
+            .unwrap()
+            .into(),
+    );
+    for c in &round1.tool_calls {
+        messages.push(
+            ChatCompletionRequestToolMessageArgs::default()
+                .content("hi")
+                .tool_call_id(c.id.clone())
+                .build()
+                .unwrap()
+                .into(),
+        );
+    }
+
+    // Round 2: echo a reasoning trace on the assistant tool-call message and
+    // confirm the provider accepts it. The trace is synthetic so the wire
+    // behaviour is deterministic even when the model emits no reasoning.
+    let reasoning = "I should verify the arithmetic with the bash tool before answering.";
+    let body2 = completion_body(&model, &messages, &tools, "high", Some(reasoning)).unwrap();
+    assert!(
+        body2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m.get("reasoning_content").is_some()),
+        "expected reasoning_content in the round-2 request body"
+    );
+    let resp2 = open_completion_stream(&base, &key, &body2)
+        .await
+        .expect("round 2 rejected the echoed reasoning_content");
+    let round2 = run_completion(resp2, &sink, &AtomicBool::new(false)).await;
+    assert!(!round2.failed, "round 2 stream failed");
+    assert!(
+        !round2.text.trim().is_empty() || !round2.tool_calls.is_empty(),
+        "round 2 produced neither text nor a tool call"
+    );
+    eprintln!("round 2 ok: {} chars", round2.text.len());
 }

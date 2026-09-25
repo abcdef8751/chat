@@ -198,6 +198,30 @@ Per-model context window and token rates resolve from a bundled table with user 
 
 ---
 
+**Reasoning echo between tool calls: ✅ DONE**
+
+A turn's reasoning trace (`reasoning_content`) is echoed on its assistant
+tool-call message for the following rounds of the **same** turn — DeepSeek
+thinking mode requires it (HTTP 400 otherwise) — and is never replayed across
+user turns. `async-openai` has no such field, so `completion_body` injects it
+into the serialized request body. Gated by `AppConfig.echo_reasoning_content`
+(Settings checkbox "Send reasoning back to the model between tool calls"),
+default on, for providers that reject unknown fields.
+
+**Verified:** `cargo test --lib` (72 + 1 ignored, incl. echo-within-turn /
+no-replay-across-turns / disabled-toggle), `cargo clippy --all-targets` clean,
+`tsc --noEmit` + `npm run build`.
+
+A **live** provider check is available (ignored by default; hits the real
+endpoint and costs a few tokens):
+`cargo test --lib -- --ignored live_reasoning_echo`. It runs one real tool-call
+turn and confirms the provider accepts the echoed `reasoning_content` on the
+replayed assistant tool-call message (the trace is synthetic, so the result
+doesn't depend on the model emitting one). Target overrides: `PI_LIVE_BASE_URL`,
+`PI_LIVE_MODEL`; the key is read from the keychain and never printed.
+
+---
+
 ## Commands
 
 Frontend / Tauri tasks, run from the repo root (`/home/rp/chat`):
@@ -342,7 +366,7 @@ Reserve + near-limit banner + per-conversation compaction:
 
 The context **counter** and **price meter** already landed (see the "Context + price counters" section above). Remaining from these milestones: the near-limit banner + compaction here in M7, and an optional sidebar cost readout. Then Milestone 9 — remaining polish (virtualized message list + thinking-level selector; markdown render, dark mode, reasoning traces, persistent shell, and memory already landed in M4/M5.5/M6).
 
-Deferred from Milestone 3 (optional): the `CompatConfig` layer for provider quirks (thinking field, `max_tokens`, developer vs system role). Default OpenAI-shaped behavior is fine until a provider breaks it.
+Deferred from Milestone 3 (optional): the `CompatConfig` layer for provider quirks (thinking field, `max_tokens`, developer vs system role). Default OpenAI-shaped behavior is fine until a provider breaks it. The first knob has landed: `echo_reasoning_content` (reasoning echo between tool calls, see above).
 
 ---
 

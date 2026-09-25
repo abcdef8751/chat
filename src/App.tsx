@@ -228,6 +228,7 @@ export default function App() {
   const [model, setModel] = createSignal("");
   const [preferences, setPreferences] = createSignal("");
   const [thinkingLevel, setThinkingLevel] = createSignal("");
+  const [echoReasoning, setEchoReasoning] = createSignal(true);
   const [thinkingOpts, setThinkingOpts] = createSignal<ThinkingOptions | null>(null);
   const [models, setModels] = createSignal<ModelInfo[]>([]);
   const [modelsLoading, setModelsLoading] = createSignal(false);
@@ -301,6 +302,7 @@ export default function App() {
     setModel(cfg.model);
     setPreferences(cfg.preferences ?? "");
     setThinkingLevel(cfg.thinkingLevel ?? "");
+    setEchoReasoning(cfg.echoReasoningContent ?? true);
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
     // Fast path: cached catalog/prices so the picker and meter render at once.
@@ -421,6 +423,7 @@ export default function App() {
     setModel(cfg.model);
     setPreferences(cfg.preferences ?? "");
     setThinkingLevel(cfg.thinkingLevel ?? "");
+    setEchoReasoning(cfg.echoReasoningContent ?? true);
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
     setKeyDraft("");
@@ -441,6 +444,7 @@ export default function App() {
       model: current.model,
       preferences: preferences(),
       thinkingLevel: current.thinkingLevel,
+      echoReasoningContent: echoReasoning(),
       modelOverrides: current.modelOverrides ?? {},
     });
     let keyChanged = false;
@@ -497,6 +501,7 @@ export default function App() {
         model: id,
         preferences: preferences(),
         thinkingLevel: level,
+        echoReasoningContent: echoReasoning(),
         modelOverrides: modelOverrides(),
       });
     } catch (e) {
@@ -512,6 +517,7 @@ export default function App() {
         model: model(),
         preferences: preferences(),
         thinkingLevel: level,
+        echoReasoningContent: echoReasoning(),
         modelOverrides: modelOverrides(),
       });
     } catch (e) {
@@ -1458,6 +1464,22 @@ export default function App() {
                 />
                 <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
                   Injected at the top of the system prompt for every conversation.
+                </span>
+              </label>
+
+              <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                <span class="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    class="h-4 w-4 rounded border-neutral-300 dark:border-neutral-700"
+                    checked={echoReasoning()}
+                    onChange={(e) => setEchoReasoning(e.currentTarget.checked)}
+                  />
+                  Send reasoning back to the model between tool calls
+                </span>
+                <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                  Required by DeepSeek thinking models; turn off if your provider rejects
+                  unknown fields.
                 </span>
               </label>
 

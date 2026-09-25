@@ -49,6 +49,7 @@ export interface Config {
   model: string;
   preferences: string;
   thinkingLevel: string;
+  echoReasoningContent: boolean;
   modelOverrides: Record<string, ModelOverride>;
 }
 
