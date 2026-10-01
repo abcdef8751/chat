@@ -97,21 +97,41 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
         return Ok(());
     }
 
+    let conversation = db::get_conversation(&db, conversation_id)?
+        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
     let history = db::read_messages(&db, conversation_id)?;
     let before = snapshot_files(&memory);
     // Recent consolidation notes (across chats) so the model doesn't repeat work.
     let recent = db::recent_reflections(&db, 8).unwrap_or_default();
 
+    // Reuse the SAME leading system prompt as a live chat turn so the shared
+    // conversation prefix stays cacheable. The maintenance task goes in a
+    // trailing system message — after the prefix, so it doesn't affect caching.
+    let base_prompt = conversation
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| chat::DEFAULT_SYSTEM_PROMPT.to_string());
+    let model_label = crate::pricing::cached_model_name(&db, &cfg.base_url, &cfg.model)
+        .unwrap_or_else(|| cfg.model.clone());
+    let system_prompt =
+        chat::build_system_prompt(&base_prompt, &model_label, &cfg.preferences, &memory);
+
     let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
     messages.push(
         ChatCompletionRequestSystemMessageArgs::default()
-            .content(reflection_system_prompt(&memory, &recent))
+            .content(system_prompt)
             .build()
             .map_err(|e| e.to_string())?
             .into(),
     );
     messages.extend(chat::build_history_messages(&history)?);
-    messages.push(chat::user_request_message(REFLECTION_INSTRUCTION, &[])?);
+    messages.push(
+        ChatCompletionRequestSystemMessageArgs::default()
+            .content(reflection_tail(&recent))
+            .build()
+            .map_err(|e| e.to_string())?
+            .into(),
+    );
 
     let tools_list = tools::reflection_tool_specs();
     let flag = Arc::new(AtomicBool::new(false));
@@ -212,57 +232,43 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     Ok(())
 }
 
-const REFLECTION_INSTRUCTION: &str = "Review the conversation above and update the shared \
-long-term memory so durable facts are preserved.\n\n\
+const REFLECTION_INSTRUCTION: &str = "You are now acting as the long-term memory maintainer. \
+Review the conversation above and update the shared Markdown memory files shown in your system \
+prompt so durable facts are preserved. Use `read_memory` to see a file's full contents before \
+rewriting it.\n\n\
 Guidance:\n\
 - Save only stable, durable facts (identity, preferences, goals, ongoing projects, and \
 notable details). Ignore transient chit-chat and one-off questions.\n\
 - Route facts to the right file: identity/background → `profile.md`, preferences → \
 `preferences.md`, goals → `goals.md`. Create a new file only for a substantial, recurring \
 subject (e.g. `project-atlas.md`), never for a one-off fact.\n\
-- Prefer the existing files listed above. Use `write_memory` to rewrite a file when merging \
-or deduplicating; use `save_memory` only to append a brand-new fact.\n\
+- Use `write_memory` to rewrite a file when merging or deduplicating; use `save_memory` only \
+to append a brand-new fact.\n\
 - Keep core files concise. Do not duplicate or contradict the explicit user preferences; do \
 not invent facts.\n\
 - If nothing is worth remembering, make no tool calls. When done, reply with one short line \
 describing what you changed, or \"nothing to save\".";
 
-/// System prompt for the reflection pass: instructions, a full dump of the
-/// current memory (the pass needs to see everything to curate it), and the most
-/// recent consolidation notes so it doesn't repeat work.
-fn reflection_system_prompt(memory: &MemoryState, recent: &[db::ReflectionRecord]) -> String {
-    let mut prompt = String::from(
-        "You maintain the long-term memory of a personal AI chat assistant. The memory is a set \
-         of plain Markdown files shared across all conversations.\n\nExplicit user preferences \
-         are set by the user in Settings and are authoritative: never copy them into memory \
-         files, and never record anything that contradicts them.\n",
-    );
+/// Trailing system message for the reflection pass. It sits *after* the
+/// conversation history, so the shared prefix (system prompt + history) stays
+/// cacheable; it carries the maintenance task plus the recent consolidation
+/// notes so the model doesn't repeat work.
+fn reflection_tail(recent: &[db::ReflectionRecord]) -> String {
+    let mut out = String::from(REFLECTION_INSTRUCTION);
     if !recent.is_empty() {
-        prompt.push_str(
-            "\nRecent consolidation activity (newest first) — facts already recorded below are \
+        out.push_str(
+            "\n\nRecent consolidation activity (newest first) — facts already recorded below are \
              already in memory; do not re-save them or re-report them:\n",
         );
         for record in recent {
-            prompt.push_str(&format!(
+            out.push_str(&format!(
                 "- {} — {}\n",
                 format_day(record.created_at),
                 record.note
             ));
         }
     }
-    prompt.push_str("\nCurrent memory files:\n");
-    for name in memory.file_names() {
-        let content = memory.read(&name).unwrap_or_default();
-        let trimmed = content.trim();
-        prompt.push_str(&format!("\n### {name}\n"));
-        if trimmed.is_empty() {
-            prompt.push_str("_(empty)_\n");
-        } else {
-            prompt.push_str(trimmed);
-            prompt.push('\n');
-        }
-    }
-    prompt
+    out
 }
 
 /// Format a millisecond epoch timestamp as `YYYY-MM-DD` (UTC, no chrono dep).
@@ -323,13 +329,6 @@ pub async fn reflect_now(app: AppHandle, conversation_id: String) -> Result<(), 
 mod tests {
     use super::*;
 
-    fn temp_memory(name: &str) -> MemoryState {
-        let mut p = std::env::temp_dir();
-        p.push(format!("pi-chat-reflect-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        MemoryState::load(p).unwrap()
-    }
-
     #[test]
     fn diff_detects_changes_additions_and_removals() {
         let mut before = HashMap::new();
@@ -351,21 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn reflection_prompt_includes_all_files() {
-        let memory = temp_memory("prompt");
-        memory.write("profile.md", "Name is Ravi.").unwrap();
-        memory.write("project-x.md", "Uses Rust.").unwrap();
-        let prompt = reflection_system_prompt(&memory, &[]);
-        assert!(prompt.contains("### profile.md"));
-        assert!(prompt.contains("Name is Ravi."));
-        assert!(prompt.contains("### project-x.md"));
-        assert!(prompt.contains("Uses Rust."));
-        assert!(prompt.contains("Explicit user preferences"));
-    }
-
-    #[test]
-    fn reflection_prompt_lists_recent_consolidations() {
-        let memory = temp_memory("prompt-recent");
+    fn reflection_tail_carries_instruction_and_recent_notes() {
         let recent = vec![
             db::ReflectionRecord {
                 note: "Memory consolidated: profile.md".into(),
@@ -376,11 +361,20 @@ mod tests {
                 created_at: 0,
             },
         ];
-        let prompt = reflection_system_prompt(&memory, &recent);
-        assert!(prompt.contains("Recent consolidation activity"));
-        assert!(prompt.contains("Memory consolidated: profile.md"));
-        assert!(prompt.contains("nothing to save."));
-        assert!(prompt.contains("1970-01-01"));
+        let tail = reflection_tail(&recent);
+        assert!(tail.contains("memory maintainer"));
+        assert!(tail.contains("Review the conversation above"));
+        assert!(tail.contains("Recent consolidation activity"));
+        assert!(tail.contains("Memory consolidated: profile.md"));
+        assert!(tail.contains("nothing to save."));
+        assert!(tail.contains("1970-01-01"));
+    }
+
+    #[test]
+    fn reflection_tail_omits_history_when_empty() {
+        let tail = reflection_tail(&[]);
+        assert!(tail.contains("Review the conversation above"));
+        assert!(!tail.contains("Recent consolidation activity"));
     }
 
     #[test]

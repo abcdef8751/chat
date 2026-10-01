@@ -20,7 +20,7 @@ use crate::db;
 use crate::shell::ShellRegistry;
 use crate::tools::{self, ToolCall, ToolOutput};
 
-const DEFAULT_SYSTEM_PROMPT: &str =
+pub(crate) const DEFAULT_SYSTEM_PROMPT: &str =
     r#"You are a helpful general-purpose assistant. Be concise, accurate, and clear."#;
 
 /// Per-conversation cancellation flags so the UI can abort a running stream.
@@ -700,7 +700,7 @@ fn build_messages(
 /// preferences field is user-authored in Settings, so it is labelled as
 /// authoritative — distinct from anything inferred into memory. Memory bodies
 /// for non-core files stay out of context until `read_memory` is called.
-fn build_system_prompt(
+pub(crate) fn build_system_prompt(
     base: &str,
     model_label: &str,
     preferences: &str,

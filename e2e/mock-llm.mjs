@@ -62,14 +62,15 @@ const server = http.createServer((req, res) => {
       const userText = typeof lastUser?.content === "string" ? lastUser.content : "";
       const hasToolMsg = messages.some((m) => m.role === "tool");
       const toolMode = userText.includes("tooltest");
-      // The idle/consolidation pass is identified by its system prompt. Its
+      // The idle/consolidation pass shares the live system prompt but appends a
+      // trailing system message identifying the memory maintainer. Its
       // transcript may already contain tool rows from the chat, so round 2 is
       // keyed on whether the reflective `save_memory` call itself is present.
       const reflectionMode = messages.some(
         (m) =>
           m.role === "system" &&
           typeof m.content === "string" &&
-          m.content.includes("You maintain the long-term memory"),
+          m.content.includes("long-term memory maintainer"),
       );
       const reflectionSaved = messages.some(
         (m) =>

@@ -150,11 +150,14 @@ topic files.
   **reflection-only** so the chatting model can't clobber curated files.
 - **Idle reflection** (`reflection.rs`): a background scheduler (`spawn`, ~1 min
   tick) reflects one due conversation per tick once it has been idle ≥
-  `memory_reflection_idle_minutes` (default 30, toggle in Settings). It feeds the
-  model the full transcript + all memory files + the most recent consolidation
-  notes (across chats, so it doesn't repeat work), runs the reflection tool loop,
+  `memory_reflection_idle_minutes` (default 30, toggle in Settings). It rebuilds
+  the **same leading system prompt as a live turn** + the full transcript (so the
+  shared prefix stays prompt-cacheable), then appends a **trailing system
+  message** carrying the maintenance task and the most recent consolidation notes
+  (across chats, so it doesn't repeat work). It runs the reflection tool loop,
   diffs the files, records usage/cost, inserts a `memory` note when files changed,
-  and advances `conversations.last_reflected_index`.
+  and advances `conversations.last_reflected_index`. The model reads non-core
+  files on demand via `read_memory` before rewriting them.
 - **Eligibility:** a chat becomes due only when a message is inserted
   (user/assistant/tool). Merely opening a chat does not touch `updated_at`.
 - **Scope:** the Memory tab's **Consolidate this chat** button is per-chat; the
