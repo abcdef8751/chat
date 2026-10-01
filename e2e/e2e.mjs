@@ -222,7 +222,18 @@ async function main() {
   assert(true, "reply complete incl. unterminated final SSE chunk (no cut-off)");
   await shot("05-reply-complete");
 
-  // --- Trace clickable after completion too ---
+  // --- The reasoning + tools compact into one collapsible timeline row ---
+  assert(
+    await exists("xpath", "//button[@title='Show activity timeline']"),
+    "activity timeline toggle is present after the turn",
+  );
+  assert(
+    !(await exists("xpath", "//button[@title='Show the reasoning trace']")),
+    "activity timeline auto-collapses after the turn",
+  );
+
+  // --- Trace clickable after completion too (the timeline auto-collapses) ---
+  await click("//button[@title='Show activity timeline']");
   await click("//button[@title='Show the reasoning trace']");
   const finalPopup = await waitFor("final trace popup", async () => (await popupText()) || null, 6000);
   assert(finalPopup.includes(EXPECT_THINK), "final trace popup contains the reasoning trace");
@@ -244,6 +255,81 @@ async function main() {
   );
   assert(anchor.jc === "flex-end", "empty/short chat is bottom-anchored (justify-content: flex-end)");
   await shot("07-empty-bottom-anchored");
+
+  // --- Tool calls + reasoning compress into one collapsible timeline ---
+  await setInputCss("footer textarea", "tooltest");
+  await click("//button[normalize-space(.)='Send']");
+  await waitFor(
+    "tool approval card",
+    () => find("xpath", "//button[normalize-space(.)='Approve']").catch(() => null),
+    10000,
+  );
+  // While live the timeline is open and shows the reasoning + the tool call.
+  assert(
+    await exists("xpath", "//button[@title='Show activity timeline']"),
+    "live tool turn renders one activity timeline",
+  );
+  assert(
+    (await bodyText()).includes("approval needed"),
+    "gated tool shows its approval state inside the timeline",
+  );
+  await shot("08-tool-approval");
+
+  await click("//button[normalize-space(.)='Approve']");
+  await waitFor(
+    "tool round reply",
+    async () => (await bodyText()).includes("TOOL DONE"),
+    20000,
+  );
+  assert(true, "tool round completed after approval");
+  assert(
+    !(await exists("xpath", "//button[@title='Show the reasoning trace']")),
+    "tool timeline auto-collapses after the turn",
+  );
+
+  // Expanding the collapsed timeline reveals the paired call + result.
+  await click("//button[@title='Show activity timeline']");
+  const toolBody = await waitFor(
+    "tool timeline contents",
+    async () => {
+      const text = await bodyText();
+      return text.includes("timeline-ok") ? text : null;
+    },
+    6000,
+  );
+  assert(toolBody.includes("bash"), "tool call name is shown in the timeline");
+  assert(toolBody.includes("timeline-ok"), "tool result is paired into the timeline");
+  await shot("09-tool-timeline");
+
+  // --- Memory consolidation: manual trigger writes files + leaves a note ---
+  await click("//button[normalize-space(.)='Memory']");
+  await waitFor("memory dialog", () =>
+    find("xpath", "//button[normalize-space(.)='Consolidate this chat']").catch(() => null),
+  );
+  await click("//button[normalize-space(.)='Consolidate this chat']");
+  await waitFor(
+    "consolidation wrote a memory file",
+    async () => ((await bodyText()).includes("e2e-topic.md") ? true : null),
+    20000,
+  );
+  assert(
+    (await bodyText()).includes("e2e-topic.md"),
+    "consolidation created a new plain Markdown memory file",
+  );
+  assert(
+    (await bodyText()).includes("Reflection spend"),
+    "Memory tab shows the separately-tracked reflection spend",
+  );
+  await shot("10-memory-consolidated");
+
+  await click("//button[normalize-space(.)='Close']");
+  await waitFor(
+    "consolidation note in chat",
+    async () => ((await bodyText()).includes("Memory consolidated") ? true : null),
+    10000,
+  );
+  assert(true, "a memory-consolidation note appears in the conversation");
+  await shot("11-consolidation-note");
 
   // --- Cleanup the test key if we added it ---
   if (addedKey) {

@@ -56,21 +56,76 @@ pub(crate) fn truncate(s: String) -> String {
     }
 }
 
-/// OpenAI `tools` array for the chat request. web_search included only when
-/// the MCP server is available — the caller decides via `web_search: bool`.
-pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
-    let tool = |name: &str, desc: &str, params: Value| {
-        ChatCompletionTools::Function(ChatCompletionTool {
-            function: FunctionObject {
-                name: name.into(),
-                description: Some(desc.into()),
-                parameters: Some(params),
-                strict: None,
+/// Build one OpenAI function-tool spec.
+fn fn_tool(name: &str, desc: &str, params: Value) -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: name.into(),
+            description: Some(desc.into()),
+            parameters: Some(params),
+            strict: None,
+        },
+    })
+}
+
+fn memory_save_tool() -> ChatCompletionTools {
+    fn_tool(
+        "save_memory",
+        "Append a durable fact to a long-term memory file. Use for stable preferences, \
+         identity details, goals, and notable details — not transient chat context. The file \
+         is created if it doesn't exist; prefer an existing file (profile.md, preferences.md, \
+         goals.md) unless a new topic file is warranted.",
+        json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "string", "description": "The fact to remember, written as a short self-contained statement" },
+                "path": {
+                    "type": "string",
+                    "description": "Memory file to append to, e.g. profile.md or project-x.md. Created if missing."
+                }
             },
-        })
-    };
+            "required": ["content", "path"]
+        }),
+    )
+}
+
+fn memory_read_tool() -> ChatCompletionTools {
+    fn_tool(
+        "read_memory",
+        "Read the full contents of a long-term memory file on demand (e.g. profile.md, \
+         or any file listed in the memory block).",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Memory file name, e.g. profile.md" }
+            },
+            "required": ["path"]
+        }),
+    )
+}
+
+fn memory_write_tool() -> ChatCompletionTools {
+    fn_tool(
+        "write_memory",
+        "Replace a long-term memory file's entire contents (creates it if missing). Use \
+         to merge, deduplicate, and reorganize memory rather than appending.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Memory file name, e.g. profile.md" },
+                "content": { "type": "string", "description": "The full new contents of the file" }
+            },
+            "required": ["path", "content"]
+        }),
+    )
+}
+
+/// OpenAI `tools` array for a live chat request. `web_search` is included only
+/// when the MCP server is available. `write_memory` is deliberately omitted:
+/// live turns append via `save_memory`, and only the reflection pass curates.
+pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
     let mut tools = vec![
-        tool(
+        fn_tool(
             "bash",
             "Run a bash command and return stdout/stderr.",
             json!({
@@ -79,7 +134,7 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
                 "required": ["command"]
             }),
         ),
-        tool(
+        fn_tool(
             "read_file",
             "Read a file's contents as text.",
             json!({
@@ -88,7 +143,7 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
                 "required": ["path"]
             }),
         ),
-        tool(
+        fn_tool(
             "write_file",
             "Write text content to a file (creates or overwrites).",
             json!({
@@ -100,45 +155,11 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
                 "required": ["path", "content"]
             }),
         ),
-        tool(
-            "save_memory",
-            "Save a stable, user-specific fact to long-term memory. Use for durable \
-             preferences, identity details, goals, and notes — not transient chat context. \
-             Saving the same fact again updates the existing entry. By default the category \
-             routes to a canonical file; pass `path` to write to a specific existing or new file.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "content": { "type": "string", "description": "The fact to remember, written as a short self-contained statement" },
-                    "path": {
-                        "type": "string",
-                        "description": "Memory file to write to, e.g. project-x.md. Overrides category and is created if it doesn't exist. Omit to use a canonical file."
-                    },
-                    "category": {
-                        "type": "string",
-                        "enum": ["preference", "identity", "goal", "note"],
-                        "description": "Which canonical file to use when `path` is omitted"
-                    },
-                    "importance": { "type": "number", "description": "How important this is, 0-5 (default 3)" }
-                },
-                "required": ["content"]
-            }),
-        ),
-        tool(
-            "read_memory",
-            "Read the full contents of a long-term memory file on demand, such as \
-             preferences.md, identity.md, goals.md, notes.md, or index.md.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Memory file name, e.g. preferences.md" }
-                },
-                "required": ["path"]
-            }),
-        ),
+        memory_save_tool(),
+        memory_read_tool(),
     ];
     if web_search {
-        tools.push(tool(
+        tools.push(fn_tool(
             "web_search",
             "Search the web for current information. Returns results with title, URL, and snippet.",
             json!({
@@ -154,8 +175,15 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
     tools
 }
 
+/// Tools available to the idle memory-reflection pass: read the current memory,
+/// append new facts, and rewrite files to curate them. No host/web tools.
+pub fn reflection_tool_specs() -> Vec<ChatCompletionTools> {
+    vec![memory_save_tool(), memory_read_tool(), memory_write_tool()]
+}
+
 /// Execute a host tool (bash/read_file/write_file). Errors are returned as
-/// `ToolOutput::err` text so the model can self-correct (PLANS failure contract).
+/// `ToolOutput::err` text so the model can self-correct (see the failure contract
+/// in AGENTS.md).
 /// `bash` runs in the conversation's persistent shell so `cd`/`export` persist.
 pub async fn execute_host_tool(
     call: &ToolCall,
@@ -451,10 +479,23 @@ mod tests {
         assert_eq!(with.len(), 6);
         let without = tool_specs(false);
         assert_eq!(without.len(), 5);
+        // `write_memory` is reserved for the reflection pass.
+        assert!(!without.iter().any(|t| tool_name(t) == "write_memory"));
+        let reflection = reflection_tool_specs();
+        assert_eq!(reflection.len(), 3);
+        assert!(reflection.iter().any(|t| tool_name(t) == "write_memory"));
         assert!(is_gated("bash"));
         assert!(!is_gated("web_search"));
         assert!(!is_gated("save_memory"));
         assert!(!is_gated("read_memory"));
+        assert!(!is_gated("write_memory"));
+    }
+
+    fn tool_name(t: &ChatCompletionTools) -> &str {
+        match t {
+            ChatCompletionTools::Function(f) => &f.function.name,
+            ChatCompletionTools::Custom(_) => "",
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

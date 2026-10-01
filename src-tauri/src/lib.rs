@@ -5,6 +5,7 @@ mod db;
 mod memory;
 mod models;
 mod pricing;
+mod reflection;
 mod secrets;
 mod shell;
 mod tools;
@@ -42,6 +43,9 @@ pub fn run() {
             )?;
             app.manage(memory);
 
+            // Background idle memory reflection.
+            reflection::spawn(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -64,6 +68,8 @@ pub fn run() {
             memory::list_memory_files,
             memory::write_memory_file,
             memory::delete_memory_file,
+            reflection::reflect_now,
+            db::memory_reflection_stats,
             pricing::get_pricing,
             pricing::refresh_pricing,
             pricing::thinking_options,

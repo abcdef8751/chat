@@ -1,12 +1,12 @@
-//! Markdown-file memory.
+//! Plain-Markdown long-term memory.
 //!
-//! Memory lives outside SQLite as a directory of Markdown files in the app data
-//! dir. Entries carry YAML frontmatter (title/category/importance/created/
-//! summary/…); `save_memory` routes a category to its canonical file and
-//! merge-writes, then regenerates `index.md`. The always-injected thing is only
-//! that title+summary index — bodies are read on demand via `read_memory`.
+//! Memory lives outside SQLite as a directory of flat `.md` files in the app
+//! data dir. There is no frontmatter, no categories, and no generated index:
+//! a small fixed set of **core** files is injected into every system prompt in
+//! full, and every other file is listed by name + first line so the model can
+//! `read_memory` on demand. Live turns may `save_memory` (append to an inbox);
+//! the idle reflection pass curates with `write_memory` (full-file replace).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -14,35 +14,21 @@ use serde_json::Value;
 
 use crate::tools::{ToolCall, ToolOutput};
 
-/// Canonical category → file mapping. Content files in display order.
-const CATEGORY_FILES: &[(&str, &str)] = &[
-    ("preference", "preferences.md"),
-    ("identity", "identity.md"),
-    ("goal", "goals.md"),
-    ("note", "notes.md"),
-];
+/// Files injected into every system prompt in full, in display order. The system
+/// starts with only these; the agent may grow it with new topic files.
+pub const CORE_FILES: &[&str] = &["profile.md", "preferences.md", "goals.md"];
 
-/// Auto-generated index; the model never edits it directly.
-const INDEX_FILE: &str = "index.md";
+/// Legacy generated index; deleted on migration.
+const LEGACY_INDEX_FILE: &str = "index.md";
 
-const MAX_TITLE_CHARS: usize = 60;
-const MAX_SUMMARY_CHARS: usize = 160;
-
-/// Canonical file for a category, if the category is recognized.
-fn canonical_file(category: &str) -> Option<&'static str> {
-    CATEGORY_FILES
-        .iter()
-        .find(|(c, _)| *c == category)
-        .map(|(_, f)| *f)
-}
-
-/// Best-effort category for a file name (defaults to `note` for custom files).
-fn infer_category(file: &str) -> &'static str {
-    CATEGORY_FILES
-        .iter()
-        .find(|(_, f)| *f == file)
-        .map(|(c, _)| *c)
-        .unwrap_or("note")
+/// One memory file, as surfaced to the Memory tab.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryFile {
+    pub name: String,
+    pub content: String,
+    /// Core files are always injected in full and pinned first in the UI.
+    pub core: bool,
 }
 
 /// Shared memory state installed into Tauri. Holds the memory directory; files
@@ -51,63 +37,34 @@ pub struct MemoryState {
     dir: PathBuf,
 }
 
-/// One memory file, as surfaced to the Memory tab.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryFile {
-    pub name: String,
-    pub content: String,
-    /// `index.md` is generated from the entry files and is not directly editable.
-    pub generated: bool,
-}
-
-/// A parsed entry (frontmatter + body).
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct MemoryEntry {
-    title: String,
-    category: String,
-    importance: u8,
-    created: String,
-    source_conversation: Option<String>,
-    summary: String,
-    body: String,
-}
-
 impl MemoryState {
-    /// Load (creating if needed) the memory directory at `dir`.
+    /// Load (creating if needed) the memory directory at `dir`, migrating any
+    /// frontmatter-formatted files from the previous memory system.
     pub fn load(dir: PathBuf) -> Result<Self, String> {
         let state = Self { dir };
         state.ensure()?;
+        state.migrate_legacy()?;
         Ok(state)
     }
 
     fn ensure_dir(&self) -> Result<(), String> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| format!("create memory dir: {e}"))
+        std::fs::create_dir_all(&self.dir).map_err(|e| format!("create memory dir: {e}"))
     }
 
-    /// Create the directory, the canonical content files, and `index.md`.
+    /// Create the directory and the core files (empty when new).
     fn ensure(&self) -> Result<(), String> {
         self.ensure_dir()?;
-        for (_, file) in CATEGORY_FILES {
+        for file in CORE_FILES {
             let path = self.dir.join(file);
             if !path.exists() {
                 std::fs::write(&path, "").map_err(|e| format!("create {file}: {e}"))?;
             }
-        }
-        if !self.dir.join(INDEX_FILE).exists() {
-            self.regenerate_index()?;
         }
         Ok(())
     }
 
     fn path_for(&self, name: &str) -> PathBuf {
         self.dir.join(name)
-    }
-
-    fn read_file(&self, name: &str) -> Result<String, String> {
-        let name = normalize_name(name)?;
-        std::fs::read_to_string(self.path_for(&name)).map_err(|e| format!("read {name}: {e}"))
     }
 
     /// Write a file atomically (temp + rename) so a crash can't truncate it.
@@ -119,218 +76,168 @@ impl MemoryState {
         std::fs::rename(&tmp, &path).map_err(|e| format!("write {name}: {e}"))
     }
 
-    fn read_entries(&self, file: &str) -> Result<Vec<MemoryEntry>, String> {
-        let path = self.dir.join(file);
-        if !path.exists() {
-            return Ok(Vec::new());
+    /// One-time conversion of legacy frontmatter entries into plain Markdown,
+    /// and removal of the generated `index.md`.
+    fn migrate_legacy(&self) -> Result<(), String> {
+        let legacy_index = self.dir.join(LEGACY_INDEX_FILE);
+        if legacy_index.exists() {
+            let _ = std::fs::remove_file(&legacy_index);
         }
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("read {file}: {e}"))?;
-        Ok(parse_entries(&text))
-    }
-
-    fn write_entries(&self, file: &str, entries: &[MemoryEntry]) -> Result<(), String> {
-        self.write_file_raw(file, &serialize_entries(entries))
-    }
-
-    /// Every memory file that should appear in the index: the canonical files
-    /// first (in a stable order), then any extra `.md` files the model created.
-    fn indexable_files(&self) -> Vec<String> {
-        let mut files: Vec<String> = CATEGORY_FILES.iter().map(|(_, f)| f.to_string()).collect();
-        if let Ok(rd) = std::fs::read_dir(&self.dir) {
-            let mut extras: Vec<String> = rd
-                .flatten()
-                .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-                .filter(|name| {
-                    name.ends_with(".md") && name != INDEX_FILE && !files.contains(name)
-                })
-                .collect();
-            extras.sort();
-            files.extend(extras);
-        }
-        files
-    }
-
-    /// Regenerate `index.md` from the title+summary of every entry.
-    fn regenerate_index(&self) -> Result<(), String> {
-        let mut out = String::from("# Memory index\n");
-        let mut any = false;
-        for file in self.indexable_files() {
-            let entries = self.read_entries(&file)?;
-            if entries.is_empty() {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return Ok(());
+        };
+        for entry in rd.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.ends_with(".md") || name.starts_with('.') {
                 continue;
             }
-            any = true;
-            out.push_str(&format!("\n## {file}\n"));
-            for e in entries {
-                if e.summary.is_empty() {
-                    out.push_str(&format!("- {}\n", e.title));
-                } else {
-                    out.push_str(&format!("- {} — {}\n", e.title, e.summary));
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            if let Some(converted) = legacy_to_plain(&raw) {
+                self.write_file_raw(&name, &converted)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every `.md` file in the memory dir, core files first, then others sorted.
+    pub fn file_names(&self) -> Vec<String> {
+        let mut core: Vec<String> = CORE_FILES.iter().map(|f| f.to_string()).collect();
+        let mut extras: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for entry in rd.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".md")
+                        && !name.starts_with('.')
+                        && !core.iter().any(|c| c == name)
+                        && !extras.iter().any(|e| e == name)
+                    {
+                        extras.push(name.to_string());
+                    }
                 }
             }
         }
-        if !any {
-            out.push_str("\n_No memories saved yet._\n");
+        extras.sort();
+        core.extend(extras);
+        core
+    }
+
+    /// Read a file's full contents (empty when it doesn't exist).
+    pub fn read(&self, path: &str) -> Result<String, String> {
+        let name = normalize_name(path)?;
+        match std::fs::read_to_string(self.path_for(&name)) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(format!("read {name}: {e}")),
         }
-        self.write_file_raw(INDEX_FILE, &out)
     }
 
-    /// The bounded block injected into every system prompt.
-    pub fn context_block(&self) -> String {
-        let index = match self.read_file(INDEX_FILE) {
-            Ok(s) => s,
-            Err(_) => return String::new(),
-        };
-        format!(
-            "## Long-term memory\n\
-             You have a long-term memory kept as Markdown files. The index below lists saved \
-             entries with one-line summaries.\n\
-             - Use `read_memory(path)` to read a file's full contents on demand.\n\
-             - Use `save_memory(content, path, category, importance)` to store a stable, \
-             user-specific fact. Pass `path` to write to a specific file (created if missing), \
-             or omit it and let `category` (preference | identity | goal | note) pick the file. \
-             importance is 0-5. Only save durable facts, not transient chat context.\n\n{}",
-            index.trim()
-        )
-    }
-
-    /// Save (or update) an entry. An explicit `path` selects the target file
-    /// (created if missing); otherwise `category` routes to its canonical file.
-    /// Returns the target file name and the stored entry.
-    pub(crate) fn save_entry(
-        &self,
-        content: &str,
-        path: Option<&str>,
-        category: Option<&str>,
-        importance: i64,
-        source_conversation: &str,
-    ) -> Result<(String, MemoryEntry), String> {
+    /// Append a statement to the named file, creating it if needed. Returns the
+    /// file name. A file name is always required (there is no default inbox).
+    pub(crate) fn append(&self, content: &str, path: &str) -> Result<String, String> {
         self.ensure()?;
         let content = content.trim();
         if content.is_empty() {
             return Err("save_memory: 'content' is empty".into());
         }
-        let explicit = path.map(str::trim).filter(|p| !p.is_empty());
-        let category = category
-            .map(|c| c.trim().to_ascii_lowercase())
-            .filter(|c| !c.is_empty());
+        let name = normalize_name(path)?;
+        let existing = self.read(&name)?;
+        let mut out = existing;
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        for line in content.lines() {
+            out.push_str("- ");
+            out.push_str(line.trim());
+            out.push('\n');
+        }
+        self.write_file_raw(&name, &out)?;
+        Ok(name)
+    }
 
-        // An explicit path wins; otherwise route the category to its file.
-        let file = match explicit {
-            Some(path) => normalize_name(path)?,
-            None => {
-                let cat = category
-                    .clone()
-                    .ok_or_else(|| "save_memory: provide either 'path' or 'category'".to_string())?;
-                canonical_file(&cat).map(str::to_string).ok_or_else(|| {
-                    format!("save_memory: unknown category '{cat}' (use preference, identity, goal, or note)")
-                })?
-            }
-        };
-        let category = category.unwrap_or_else(|| infer_category(&file).to_string());
+    /// Full-file replace (curation), creating the file if needed.
+    pub(crate) fn write(&self, name: &str, content: &str) -> Result<(), String> {
+        let name = normalize_name(name)?;
+        self.write_file_raw(&name, content)
+    }
 
-        let mut entries = self.read_entries(&file)?;
-        let title = derive_title(content);
-        let existing = entries
-            .iter()
-            .position(|e| e.title.eq_ignore_ascii_case(&title));
-
-        let entry = match existing {
-            Some(i) => {
-                let prior = entries[i].clone();
-                MemoryEntry {
-                    // Keep the original title casing on an update.
-                    title: prior.title,
-                    category,
-                    importance: importance.clamp(0, 5) as u8,
-                    created: prior.created,
-                    source_conversation: Some(source_conversation.to_string()),
-                    summary: derive_summary(content),
-                    body: content.to_string(),
+    /// The bounded block injected into every system prompt: core files in full,
+    /// then a listing of the rest.
+    pub fn context_block(&self) -> String {
+        let mut out = String::from(
+            "## Long-term memory\n\
+             You have a long-term memory kept as plain Markdown files. The core files below are \
+             shown in full; other files are listed and can be read on demand.\n\
+             - `read_memory(path)` reads a file's full contents.\n\
+             - `save_memory(content, path)` appends a statement to the named file.\n\
+             - `write_memory(path, content)` replaces a file (use to merge/dedupe).\n\
+             The system starts with the core files below; grow it by creating new files when a \
+             subject warrants one. Route facts by topic: identity/background → profile.md, \
+             preferences → preferences.md, goals → goals.md. Create a new file only for a \
+             substantial, recurring subject. Keep memory to durable, user-specific facts — not \
+             transient chat context.\n\
+             Explicit user preferences are set by the user in Settings and are authoritative; \
+             do not duplicate or contradict them here.\n",
+        );
+        let mut listed: Vec<String> = Vec::new();
+        for name in self.file_names() {
+            let content = self.read(&name).unwrap_or_default();
+            let trimmed = content.trim();
+            if CORE_FILES.contains(&name.as_str()) {
+                out.push_str(&format!("\n### {name}\n"));
+                if trimmed.is_empty() {
+                    out.push_str("_(empty)_\n");
+                } else {
+                    out.push_str(trimmed);
+                    out.push('\n');
+                }
+            } else {
+                let first = first_line(trimmed);
+                if first.is_empty() {
+                    listed.push(format!("- {name}"));
+                } else {
+                    listed.push(format!("- {name} — {first}"));
                 }
             }
-            None => MemoryEntry {
-                title,
-                category,
-                importance: importance.clamp(0, 5) as u8,
-                created: today_utc(),
-                source_conversation: Some(source_conversation.to_string()),
-                summary: derive_summary(content),
-                body: content.to_string(),
-            },
-        };
-
-        match existing {
-            Some(i) => entries[i] = entry.clone(),
-            None => entries.push(entry.clone()),
         }
-        self.write_entries(&file, &entries)?;
-        self.regenerate_index()?;
-        Ok((file, entry))
+        if !listed.is_empty() {
+            out.push_str("\nOther files:\n");
+            out.push_str(&listed.join("\n"));
+            out.push('\n');
+        }
+        out
     }
 
-    /// Body text of a memory file (frontmatter stripped for entry files).
-    pub fn read_body(&self, path: &str) -> Result<String, String> {
-        let name = normalize_name(path)?;
-        let raw = self.read_file(&name)?;
-        let entries = parse_entries(&raw);
-        if entries.is_empty() {
-            return Ok(raw.trim().to_string());
-        }
-        let bodies: Vec<String> = entries
-            .into_iter()
-            .filter(|e| !e.body.trim().is_empty())
-            .map(|e| e.body.trim().to_string())
-            .collect();
-        Ok(bodies.join("\n\n---\n\n"))
-    }
-
-    /// All memory files for the Memory tab (canonical files always present).
+    /// All memory files for the Memory tab (core files always present).
     pub fn list_files(&self) -> Result<Vec<MemoryFile>, String> {
         self.ensure()?;
-        let mut names: Vec<String> = CATEGORY_FILES.iter().map(|(_, f)| f.to_string()).collect();
-        names.push(INDEX_FILE.to_string());
-        if let Ok(rd) = std::fs::read_dir(&self.dir) {
-            for entry in rd.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".md") && !names.iter().any(|n| n == name) {
-                        names.push(name.to_string());
-                    }
-                }
-            }
-        }
-        names.sort();
-        Ok(names
+        Ok(self
+            .file_names()
             .into_iter()
             .map(|name| MemoryFile {
                 content: std::fs::read_to_string(self.dir.join(&name)).unwrap_or_default(),
-                generated: name == INDEX_FILE,
+                core: CORE_FILES.contains(&name.as_str()),
                 name,
             })
             .collect())
     }
 
-    /// Write a user-edited memory file and refresh the index.
+    /// Write a user-edited memory file.
     pub fn write_file(&self, name: &str, content: &str) -> Result<(), String> {
-        let name = normalize_name(name)?;
-        if name == INDEX_FILE {
-            return Err("index.md is generated automatically and cannot be edited".into());
-        }
-        self.write_file_raw(&name, content)?;
-        self.regenerate_index()
+        self.write(name, content)
     }
 
-    /// Delete a memory file and refresh the index.
+    /// Delete a memory file.
     pub fn delete_file(&self, name: &str) -> Result<(), String> {
         let name = normalize_name(name)?;
-        if name == INDEX_FILE {
-            return Err("index.md is generated automatically and cannot be deleted".into());
-        }
         let path = self.path_for(&name);
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| format!("delete {name}: {e}"))?;
         }
-        self.regenerate_index()
+        Ok(())
     }
 }
 
@@ -358,40 +265,48 @@ pub fn delete_memory_file(
 
 /// Execute a memory tool call. Errors come back as tool-error text so the model
 /// can self-correct (never throws), matching the host tools.
-pub async fn execute_tool(call: &ToolCall, source: &str, memory: &MemoryState) -> ToolOutput {
+pub async fn execute_tool(call: &ToolCall, memory: &MemoryState) -> ToolOutput {
     match call.name.as_str() {
         "save_memory" => {
             let content = call.arguments.get("content").and_then(Value::as_str);
-            let path = call.arguments.get("path").and_then(Value::as_str);
-            let category = call.arguments.get("category").and_then(Value::as_str);
-            let importance = call
+            let path = call
                 .arguments
-                .get("importance")
-                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-                .unwrap_or(3);
-            match content {
-                Some(content) => {
-                    match memory.save_entry(content, path, category, importance, source) {
-                        Ok((file, entry)) => ToolOutput::ok(format!(
-                            "Saved to {file} (importance {}): {}",
-                            entry.importance, entry.title
-                        )),
-                        Err(e) => ToolOutput::err(e),
-                    }
-                }
-                None => ToolOutput::err("save_memory: missing 'content' argument".into()),
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            match (content, path) {
+                (Some(content), Some(path)) => match memory.append(content, path) {
+                    Ok(file) => ToolOutput::ok(format!("Saved to {file}.")),
+                    Err(e) => ToolOutput::err(e),
+                },
+                (None, _) => ToolOutput::err("save_memory: missing 'content' argument".into()),
+                (_, None) => ToolOutput::err(
+                    "save_memory: missing 'path' argument (choose a memory file, e.g. profile.md, \
+                     or create a new one)"
+                        .into(),
+                ),
             }
         }
         "read_memory" => match call.arguments.get("path").and_then(Value::as_str) {
-            Some(path) => match memory.read_body(path) {
-                Ok(text) if text.is_empty() => {
-                    ToolOutput::ok(format!("{path} is empty."))
-                }
+            Some(path) => match memory.read(path) {
+                Ok(text) if text.trim().is_empty() => ToolOutput::ok(format!("{path} is empty.")),
                 Ok(text) => ToolOutput::ok(text),
                 Err(e) => ToolOutput::err(e),
             },
             None => ToolOutput::err("read_memory: missing 'path' argument".into()),
         },
+        "write_memory" => {
+            let name = call.arguments.get("path").and_then(Value::as_str);
+            let content = call.arguments.get("content").and_then(Value::as_str);
+            match (name, content) {
+                (Some(name), Some(content)) => match memory.write(name, content) {
+                    Ok(()) => ToolOutput::ok(format!("Wrote {name}.")),
+                    Err(e) => ToolOutput::err(e),
+                },
+                _ => ToolOutput::err("write_memory: missing 'path' or 'content' argument".into()),
+            }
+        }
         other => ToolOutput::err(format!("unknown memory tool: {other}")),
     }
 }
@@ -407,86 +322,46 @@ fn normalize_name(name: &str) -> Result<String, String> {
         || name.contains("..")
         || !name.to_ascii_lowercase().ends_with(".md")
     {
-        return Err(format!("invalid memory path: '{name}' (expected a .md file name)"));
+        return Err(format!(
+            "invalid memory path: '{name}' (expected a .md file name)"
+        ));
     }
     Ok(name.to_ascii_lowercase())
 }
 
-/// First line (or first sentence) of the content, trimmed to a title.
-fn derive_title(content: &str) -> String {
-    let first = content
+/// First non-empty line, trimmed and capped — the listing hint for non-core files.
+fn first_line(content: &str) -> String {
+    let line = content
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    let stripped = first.trim_start_matches(['-', '*', '#', '>', ' ']);
-    let end = stripped.find(['.', '!', '?', ';']).filter(|p| *p > 0);
-    let base = end.map(|p| &stripped[..p]).unwrap_or(stripped).trim();
-    let mut title: String = base.chars().take(MAX_TITLE_CHARS).collect();
-    if base.chars().count() > MAX_TITLE_CHARS {
-        title.push('…');
-    }
-    if title.is_empty() {
-        "Memory".to_string()
-    } else {
-        title
-    }
-}
-
-/// One-line summary: the first sentence, capped.
-fn derive_summary(content: &str) -> String {
-    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.is_empty() {
-        return String::new();
-    }
-    let end = flat.find(['.', '!', '?']).map(|p| p + 1).unwrap_or(flat.len());
-    let cap = end.min(MAX_SUMMARY_CHARS);
-    let mut summary: String = flat.chars().take(cap).collect();
-    if flat.chars().count() > cap {
-        summary.push('…');
-    }
-    summary.trim().to_string()
-}
-
-fn serialize_entries(entries: &[MemoryEntry]) -> String {
-    let mut out = String::new();
-    for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str("---\n");
-        out.push_str(&format!("title: {}\n", yaml_quote(&e.title)));
-        out.push_str(&format!("category: {}\n", e.category));
-        out.push_str(&format!("importance: {}\n", e.importance));
-        out.push_str(&format!("created: {}\n", e.created));
-        if let Some(source) = &e.source_conversation {
-            out.push_str(&format!("source_conversation: {}\n", yaml_quote(source)));
-        }
-        out.push_str(&format!("summary: {}\n", yaml_quote(&e.summary)));
-        out.push_str("---\n");
-        out.push_str(e.body.trim());
-        out.push('\n');
+    let mut out: String = line.chars().take(100).collect();
+    if line.chars().count() > 100 {
+        out.push('…');
     }
     out
 }
 
-/// Parse one or more frontmatter-delimited entries. A standalone `---` line
-/// closes the frontmatter or starts the next entry; body text must therefore
-/// not contain a bare `---` line.
-fn parse_entries(content: &str) -> Vec<MemoryEntry> {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut entries = Vec::new();
+/// Convert a legacy frontmatter-formatted file into plain Markdown. Returns
+/// `None` when the file has no frontmatter (already plain, or empty).
+fn legacy_to_plain(raw: &str) -> Option<String> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut out = String::new();
     let mut i = 0;
+    let mut found = false;
     while i < lines.len() {
         if lines[i].trim() != "---" {
             i += 1;
             continue;
         }
-        let mut fm: HashMap<String, String> = HashMap::new();
+        let mut title = String::new();
         let mut j = i + 1;
         while j < lines.len() && lines[j].trim() != "---" {
             if let Some((key, value)) = lines[j].split_once(':') {
-                fm.insert(key.trim().to_ascii_lowercase(), unquote(value.trim()));
+                if key.trim().eq_ignore_ascii_case("title") {
+                    title = unquote(value.trim());
+                }
             }
             j += 1;
         }
@@ -498,28 +373,22 @@ fn parse_entries(content: &str) -> Vec<MemoryEntry> {
         while k < lines.len() && lines[k].trim() != "---" {
             k += 1;
         }
-        if !fm.is_empty() {
-            entries.push(MemoryEntry {
-                title: fm.remove("title").unwrap_or_default(),
-                category: fm.remove("category").unwrap_or_default(),
-                importance: fm
-                    .remove("importance")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0),
-                created: fm.remove("created").unwrap_or_default(),
-                source_conversation: fm.remove("source_conversation"),
-                summary: fm.remove("summary").unwrap_or_default(),
-                body: lines[body_start..k].join("\n").trim().to_string(),
-            });
+        let body = lines[body_start..k].join("\n");
+        if !title.is_empty() || !body.trim().is_empty() {
+            found = true;
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            if title.is_empty() {
+                out.push_str(body.trim());
+                out.push('\n');
+            } else {
+                out.push_str(&format!("## {title}\n\n{}\n", body.trim()));
+            }
         }
         i = k;
     }
-    entries
-}
-
-fn yaml_quote(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    found.then_some(out)
 }
 
 fn unquote(value: &str) -> String {
@@ -533,30 +402,6 @@ fn unquote(value: &str) -> String {
     } else {
         value.to_string()
     }
-}
-
-/// Current UTC date as `YYYY-MM-DD` (no chrono dependency).
-fn today_utc() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// Howard Hinnant's days-from-civil, inverted (days since 1970-01-01 → y/m/d).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -575,130 +420,67 @@ mod tests {
     }
 
     #[test]
-    fn load_creates_canonical_files_and_index() {
+    fn load_creates_core_files() {
         let s = state("create");
-        for (_, file) in CATEGORY_FILES {
+        for file in CORE_FILES {
             assert!(s.dir.join(file).exists(), "{file} missing");
         }
-        let index = s.read_file(INDEX_FILE).unwrap();
-        assert!(index.contains("No memories saved yet"));
     }
 
     #[test]
-    fn save_entry_writes_frontmatter_and_regenerates_index() {
-        let s = state("save");
-        let (file, entry) = s
-            .save_entry(
-                "User prefers dark mode. Dislikes bright themes.",
-                None,
-                Some("preference"),
-                4,
-                "conv_1",
-            )
-            .unwrap();
-        assert_eq!(file, "preferences.md");
-        assert_eq!(entry.category, "preference");
-        assert_eq!(entry.importance, 4);
-        assert_eq!(entry.source_conversation.as_deref(), Some("conv_1"));
-
-        let raw = s.read_file("preferences.md").unwrap();
-        assert!(raw.contains("title: \""));
-        assert!(raw.contains("category: preference"));
-        assert!(raw.contains("importance: 4"));
-        assert!(raw.contains("source_conversation: \"conv_1\""));
-        assert!(raw.contains(&entry.body));
-
-        let index = s.read_file(INDEX_FILE).unwrap();
-        assert!(index.contains("preferences.md"));
-        assert!(index.contains(&entry.title));
-        assert!(index.contains(&entry.summary));
+    fn append_requires_a_file_and_creates_it() {
+        let s = state("append");
+        let file = s.append("User prefers dark mode.", "profile.md").unwrap();
+        assert_eq!(file, "profile.md");
+        assert!(s.read("profile.md").unwrap().contains("User prefers dark mode."));
+        // Appending again accumulates rather than replacing.
+        s.append("Likes tea.", "profile.md").unwrap();
+        let body = s.read("profile.md").unwrap();
+        assert!(body.contains("dark mode"));
+        assert!(body.contains("Likes tea"));
     }
 
     #[test]
-    fn save_entry_updates_existing_title_instead_of_duplicating() {
-        let s = state("dedupe");
-        s.save_entry("Likes tea.", None, Some("preference"), 1, "c1")
-            .unwrap();
-        s.save_entry("Likes tea. Also likes coffee.", None, Some("preference"), 5, "c2")
-            .unwrap();
-        let entries = s.read_entries("preferences.md").unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].importance, 5);
-        assert_eq!(entries[0].source_conversation.as_deref(), Some("c2"));
-        assert!(entries[0].body.contains("coffee"));
+    fn append_can_create_a_topic_file() {
+        let s = state("append-core");
+        s.append("Uses Rust.", "project-x.md").unwrap();
+        assert!(s.read("project-x.md").unwrap().contains("Rust"));
     }
 
     #[test]
-    fn save_entry_can_target_a_custom_or_existing_file() {
-        let s = state("custompath");
-        let (file, entry) = s
-            .save_entry("Project X uses Rust.", Some("project-x.md"), None, 2, "c")
-            .unwrap();
-        assert_eq!(file, "project-x.md");
-        assert_eq!(entry.category, "note"); // inferred for a non-canonical file
-        assert!(s.dir.join("project-x.md").exists());
-
-        // The custom file appears in the index and is readable on demand.
-        let index = s.read_file(INDEX_FILE).unwrap();
-        assert!(index.contains("project-x.md"));
-        assert!(index.contains(&entry.title));
-        assert!(s.read_body("project-x.md").unwrap().contains("Rust"));
-
-        // Writing the same fact to the existing file updates in place.
-        let (file2, _) = s
-            .save_entry("Project X uses Rust.", Some("project-x.md"), None, 3, "c2")
-            .unwrap();
-        assert_eq!(file2, "project-x.md");
-        let entries = s.read_entries("project-x.md").unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].importance, 3);
-
-        // A path overrides the category mapping.
-        let (file3, _) = s
-            .save_entry("Actually likes light mode.", Some("project-x.md"), Some("preference"), 4, "c3")
-            .unwrap();
-        assert_eq!(file3, "project-x.md");
-        assert!(s.read_entries("preferences.md").unwrap().is_empty());
+    fn context_block_injects_core_in_full_and_lists_others() {
+        let s = state("context");
+        s.write("profile.md", "Name is Ravi.").unwrap();
+        s.write("project-x.md", "Project X uses Rust.\nMore detail.").unwrap();
+        let block = s.context_block();
+        assert!(block.contains("### profile.md"));
+        assert!(block.contains("Name is Ravi."));
+        // Non-core file: name + first line only, not the second line.
+        assert!(block.contains("- project-x.md — Project X uses Rust."));
+        assert!(!block.contains("More detail."));
+        assert!(!block.contains("notes.md"));
     }
 
     #[test]
-    fn categories_route_to_canonical_files() {
-        let s = state("categories");
-        s.save_entry("Name is Ravi", None, Some("identity"), 3, "c")
-            .unwrap();
-        s.save_entry("Ship v1", None, Some("goal"), 2, "c")
-            .unwrap();
-        s.save_entry("A random note", None, Some("note"), 0, "c")
-            .unwrap();
-        assert!(!s.read_entries("identity.md").unwrap().is_empty());
-        assert!(!s.read_entries("goals.md").unwrap().is_empty());
-        assert!(!s.read_entries("notes.md").unwrap().is_empty());
-        assert!(s.read_entries("preferences.md").unwrap().is_empty());
-        assert!(s.save_entry("x", None, Some("bogus"), 3, "c").is_err());
-        assert!(s.save_entry("x", None, None, 3, "c").is_err());
+    fn write_replaces_and_delete_removes() {
+        let s = state("write-delete");
+        s.write("profile.md", "one").unwrap();
+        s.write("profile.md", "two").unwrap();
+        assert_eq!(s.read("profile.md").unwrap(), "two");
+        s.delete_file("profile.md").unwrap();
+        assert!(!s.dir.join("profile.md").exists());
     }
 
     #[test]
-    fn read_body_strips_frontmatter() {
-        let s = state("readbody");
-        s.save_entry("Prefers dark mode.", None, Some("preference"), 3, "c")
-            .unwrap();
-        let body = s.read_body("preferences.md").unwrap();
-        assert_eq!(body, "Prefers dark mode.");
-        assert!(!body.contains("---"));
-    }
-
-    #[test]
-    fn edit_and_delete_refresh_index() {
-        let s = state("editdelete");
-        s.save_entry("Prefers dark mode.", None, Some("preference"), 3, "c")
-            .unwrap();
-        s.write_file("preferences.md", "").unwrap();
-        assert!(s.read_file(INDEX_FILE).unwrap().contains("No memories"));
-        assert!(s.write_file(INDEX_FILE, "x").is_err());
-        assert!(s.delete_file(INDEX_FILE).is_err());
-        s.delete_file("preferences.md").unwrap();
-        assert!(!s.dir.join("preferences.md").exists());
+    fn list_files_marks_core_first() {
+        let s = state("list");
+        s.write("zebra.md", "z").unwrap();
+        let files = s.list_files().unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(&names[..CORE_FILES.len()], CORE_FILES);
+        assert!(names.contains(&"zebra.md"));
+        assert!(files.iter().find(|f| f.name == "profile.md").unwrap().core);
+        assert!(!files.iter().find(|f| f.name == "zebra.md").unwrap().core);
     }
 
     #[test]
@@ -706,72 +488,68 @@ mod tests {
         assert!(normalize_name("../../etc/passwd").is_err());
         assert!(normalize_name("preferences.txt").is_err());
         assert!(normalize_name("sub/dir.md").is_err());
-        assert_eq!(normalize_name("memory/Preferences.MD").unwrap(), "preferences.md");
+        assert_eq!(
+            normalize_name("memory/Preferences.MD").unwrap(),
+            "preferences.md"
+        );
         assert_eq!(normalize_name("./notes.md").unwrap(), "notes.md");
     }
 
     #[test]
-    fn entries_roundtrip_through_serialize_parse() {
-        let entry = MemoryEntry {
-            title: "A \"quoted\" title".into(),
-            category: "note".into(),
-            importance: 2,
-            created: "2026-09-10".into(),
-            source_conversation: Some("conv_x".into()),
-            summary: "One line.".into(),
-            body: "line one\nline two".into(),
-        };
-        let text = serialize_entries(std::slice::from_ref(&entry));
-        let parsed = parse_entries(&text);
-        assert_eq!(parsed, vec![entry]);
+    fn migrates_legacy_frontmatter_to_plain_markdown() {
+        let dir = temp_dir("migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("preferences.md"),
+            "---\ntitle: \"Dark mode\"\ncategory: preference\nimportance: 4\ncreated: 2026-09-10\nsummary: \"Likes dark.\"\n---\nUser prefers dark mode.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("index.md"), "# Memory index\n").unwrap();
+        let s = MemoryState::load(dir).unwrap();
+        let plain = s.read("preferences.md").unwrap();
+        assert!(plain.contains("## Dark mode"));
+        assert!(plain.contains("User prefers dark mode."));
+        assert!(!plain.contains("importance"));
+        assert!(!s.dir.join("index.md").exists());
     }
 
     #[test]
-    fn today_is_well_formed() {
-        let today = today_utc();
-        assert_eq!(today.len(), 10);
-        assert_eq!(&today[4..5], "-");
-        assert_eq!(&today[7..8], "-");
+    fn legacy_to_plain_returns_none_without_frontmatter() {
+        assert!(legacy_to_plain("# Just a note\n\nhello").is_none());
+        assert!(legacy_to_plain("").is_none());
     }
 
     #[tokio::test]
-    async fn execute_tool_saves_and_reads() {
+    async fn execute_tool_saves_reads_and_writes() {
         let s = state("execute");
-        let call = ToolCall {
+        let save = ToolCall {
             id: "t".into(),
             name: "save_memory".into(),
-            arguments: serde_json::json!({
-                "content": "User's name is Ravi.",
-                "category": "identity",
-                "importance": 5
-            }),
+            arguments: serde_json::json!({"content": "User's name is Ravi.", "path": "profile.md"}),
         };
-        let out = execute_tool(&call, "conv_9", &s).await;
+        let out = execute_tool(&save, &s).await;
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("identity.md"));
+        assert!(out.content.contains("profile.md"));
 
         let read = ToolCall {
             id: "t".into(),
             name: "read_memory".into(),
-            arguments: serde_json::json!({"path": "identity.md"}),
+            arguments: serde_json::json!({"path": "profile.md"}),
         };
-        let out = execute_tool(&read, "conv_9", &s).await;
+        let out = execute_tool(&read, &s).await;
         assert!(!out.is_error);
         assert!(out.content.contains("User's name is Ravi."));
 
-        // The model may pick the file explicitly (no category needed).
-        let by_path = ToolCall {
+        let write = ToolCall {
             id: "t".into(),
-            name: "save_memory".into(),
+            name: "write_memory".into(),
             arguments: serde_json::json!({
-                "content": "Pinned to the tools project.",
-                "path": "tools-project.md",
-                "importance": 2
+                "path": "profile.md",
+                "content": "## Identity\n\nName is Ravi.\n"
             }),
         };
-        let out = execute_tool(&by_path, "conv_9", &s).await;
+        let out = execute_tool(&write, &s).await;
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("tools-project.md"));
-        assert!(s.read_body("tools-project.md").unwrap().contains("tools project"));
+        assert_eq!(s.read("profile.md").unwrap(), "## Identity\n\nName is Ravi.\n");
     }
 }

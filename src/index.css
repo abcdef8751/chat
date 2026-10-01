@@ -1,5 +1,19 @@
 @import "tailwindcss";
+@import "@fontsource-variable/inter/wght.css";
+@import "@fontsource-variable/jetbrains-mono/wght.css";
 @plugin "@tailwindcss/typography";
+
+/* Typography: bundle the UI + code fonts instead of relying on `system-ui`.
+   `system-ui` resolved to whatever the desktop prefers (Cantarell on GNOME),
+   which renders soft at UI sizes; Inter is hinted for small-screen text. */
+@theme {
+  --font-sans:
+    "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
 
 /* Class-based dark mode: `.dark` on <html> (default) selects dark: utilities. */
 @custom-variant dark (&:where(.dark, .dark *));
@@ -20,8 +34,7 @@ html.dark {
 
 body {
   margin: 0;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  -webkit-font-smoothing: antialiased;
+  font-family: var(--font-sans);
 }
 
 /* Thin, unobtrusive scrollbars */

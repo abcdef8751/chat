@@ -551,7 +551,7 @@
         let _ = handle.join();
 
         let request = bodies.lock().unwrap().first().cloned().unwrap();
-        assert!(request.contains("User preferences:"));
+        assert!(request.contains("Explicit user preferences"));
         assert!(request.contains("Talk like me."));
         assert!(request.contains("running as the model"));
         assert!(request.contains("mock"));
@@ -1175,6 +1175,69 @@
         ));
     }
 
+/// The extracted loop used by the reflection pass runs without a DB and still
+/// executes memory tools (writes land in the memory dir, nothing persisted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_loop_without_persistence_runs_memory_tool() {
+    let (port, handle) = start_mock(
+        vec![
+            vec![
+                tool_frag(0, "call_1", "save_memory", ""),
+                tool_frag(
+                    0,
+                    "",
+                    "",
+                    r#"{\"content\":\"User likes tea.\",\"path\":\"profile.md\"}"#,
+                ),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("noted"), finish_chunk("stop"), usage_chunk()],
+        ],
+        0,
+    );
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let mcp = tools::McpClient::new();
+    let shell = crate::shell::ShellRegistry::new();
+    let memory = temp_memory("loop-nopersist");
+    let approvals = tools::ApprovalRegistry::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+
+    let messages = build_messages("p", &[], "remember I like tea", &[]).unwrap();
+    let tools_list = tools::tool_specs(false);
+    let result = run_tool_loop(
+        &cfg,
+        "test-key",
+        &mcp,
+        &shell,
+        &memory,
+        &approvals,
+        "conv_reflect",
+        messages,
+        &tools_list,
+        flag,
+        &sink,
+        None,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    assert_eq!(result.stop_reason, "stop");
+    assert_eq!(result.text, "noted");
+    assert_eq!(result.usage["total_tokens"], 5);
+    assert!(memory.read("profile.md").unwrap().contains("User likes tea."));
+    let guard = events.lock().unwrap();
+    assert!(guard
+        .iter()
+        .any(|e| matches!(e, StreamEvent::ToolResult { ok: true, .. })));
+}
+
 #[test]
 fn stream_events_serialize_camel_case_fields() {
     // The frontend reads `callId`/`stopReason`; enum-level `rename_all` only
@@ -1235,10 +1298,11 @@ fn sum_usage_normalizes_cached_tokens_across_shapes() {
 fn build_system_prompt_orders_preferences_base_model_and_memory() {
     let memory = temp_memory("prompt");
     memory
-        .save_entry("User prefers dark mode.", None, Some("preference"), 3, "conv_p")
+        .write("preferences.md", "User prefers dark mode.")
         .unwrap();
     let prompt = build_system_prompt("BASE", "DeepSeek V4 Pro", "Talk like a pirate.", &memory);
-    assert!(prompt.starts_with("User preferences:\nTalk like a pirate."));
+    assert!(prompt.starts_with("Explicit user preferences"));
+    assert!(prompt.contains("Talk like a pirate."));
     assert!(prompt.contains("BASE"));
     assert!(prompt.contains("running as the model \"DeepSeek V4 Pro\""));
     assert!(prompt.contains("Long-term memory"));
@@ -1254,7 +1318,7 @@ fn build_system_prompt_omits_empty_preferences() {
     let memory = temp_memory("prompt-empty");
     let prompt = build_system_prompt("BASE", "mock", "   ", &memory);
     assert!(prompt.starts_with("BASE"));
-    assert!(!prompt.contains("User preferences"));
+    assert!(!prompt.contains("Explicit user preferences (set directly"));
 }
 
 // ---------- live provider smoke test (opt-in) ----------

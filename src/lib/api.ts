@@ -50,6 +50,8 @@ export interface Config {
   preferences: string;
   thinkingLevel: string;
   echoReasoningContent: boolean;
+  memoryReflectionEnabled: boolean;
+  memoryReflectionIdleMinutes: number;
   modelOverrides: Record<string, ModelOverride>;
 }
 
@@ -84,7 +86,13 @@ export interface ThinkingOptions {
 export interface MemoryFile {
   name: string;
   content: string;
-  generated: boolean;
+  core: boolean;
+}
+
+export interface ReflectionStats {
+  count: number;
+  cost: number;
+  lastAt: number;
 }
 
 export type StreamEvent =
@@ -205,4 +213,12 @@ export function writeMemoryFile(name: string, content: string): Promise<void> {
 
 export function deleteMemoryFile(name: string): Promise<void> {
   return invoke<void>("delete_memory_file", { name });
+}
+
+export function memoryReflectionStats(): Promise<ReflectionStats> {
+  return invoke<ReflectionStats>("memory_reflection_stats");
+}
+
+export function reflectNow(conversationId: string): Promise<void> {
+  return invoke<void>("reflect_now", { conversationId });
 }

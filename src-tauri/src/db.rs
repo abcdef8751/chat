@@ -8,7 +8,7 @@ use uuid::Uuid;
 /// Shared database state installed into Tauri via `manage`.
 pub struct Db(pub Mutex<Connection>);
 
-/// Schema as defined in PLANS.md (conversations, messages, model_prices).
+/// SQLite schema (conversations, messages, model_prices, memory_reflections).
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   model TEXT,
   system_prompt TEXT,
   compaction_summary TEXT,
+  last_reflected_index INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -54,8 +55,20 @@ CREATE TABLE IF NOT EXISTS model_prices (
   PRIMARY KEY (provider, model_id)
 );
 
+CREATE TABLE IF NOT EXISTS memory_reflections (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  model TEXT,
+  usage TEXT,
+  cost REAL,
+  files TEXT,
+  note TEXT,
+  created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, "index");
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reflections_conv ON memory_reflections(conversation_id);
 "#;
 
 /// Open (or create) the SQLite database at `path` and run the schema migration.
@@ -72,6 +85,11 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     let _ = conn.execute("ALTER TABLE model_prices ADD COLUMN reasoning_options TEXT", []);
     // Older databases predate message file attachments.
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT", []);
+    // Older databases predate the per-conversation memory reflection watermark.
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN last_reflected_index INTEGER",
+        [],
+    );
     Ok(conn)
 }
 
@@ -271,7 +289,9 @@ pub fn insert_message_full(
     )
     .map_err(|e| e.to_string())?;
     // Keep the conversation fresh in the sidebar order and auto-title the
-    // first user message when the conversation is still unnamed.
+    // first user message when the conversation is still unnamed. Memory
+    // consolidation notes are background bookkeeping, so they don't reorder
+    // the sidebar.
     if role == "user" {
         conn.execute(
             "UPDATE conversations
@@ -281,7 +301,7 @@ pub fn insert_message_full(
             params![conversation_id, now, derive_title(&content)],
         )
         .map_err(|e| e.to_string())?;
-    } else {
+    } else if role != "memory" {
         conn.execute(
             "UPDATE conversations SET updated_at = ?2 WHERE id = ?1",
             params![conversation_id, now],
@@ -459,6 +479,128 @@ pub fn search_conversations(
         out.push(row.map_err(|e| e.to_string())?);
     }
     Ok(out)
+}
+
+/// Current wall-clock time in milliseconds since the epoch.
+pub fn now_ms() -> i64 {
+    now()
+}
+
+/// Highest index of a *reflectable* message (user/assistant/tool). Memory
+/// consolidation notes are excluded so they never make a conversation look
+/// dirty for reflection.
+pub fn max_reflectable_index(db: &Db, conversation_id: &str) -> Result<Option<i64>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT MAX(\"index\") FROM messages WHERE conversation_id = ?1 AND role != 'memory'",
+        [conversation_id],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// The message index already consolidated into memory, if any.
+pub fn last_reflected_index(db: &Db, conversation_id: &str) -> Result<Option<i64>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT last_reflected_index FROM conversations WHERE id = ?1",
+        [conversation_id],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn set_last_reflected_index(db: &Db, conversation_id: &str, index: i64) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE conversations SET last_reflected_index = ?2 WHERE id = ?1",
+        params![conversation_id, index],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Conversations idle since `cutoff_ms` that have messages newer than their
+/// reflection watermark, newest first. Empty conversations are excluded.
+pub fn conversations_due_for_reflection(db: &Db, cutoff_ms: i64) -> Result<Vec<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id FROM conversations c
+             WHERE c.updated_at <= ?1
+               AND COALESCE(c.last_reflected_index, -1) <
+                   COALESCE((SELECT MAX(m.\"index\") FROM messages m
+                             WHERE m.conversation_id = c.id AND m.role != 'memory'), -1)
+             ORDER BY c.updated_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([cutoff_ms], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+/// Record one memory-consolidation run (usage/cost kept separate from chat cost).
+#[allow(clippy::too_many_arguments)]
+pub fn insert_reflection(
+    db: &Db,
+    conversation_id: &str,
+    model: &str,
+    usage: Option<&str>,
+    cost: Option<f64>,
+    files: &[String],
+    note: &str,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO memory_reflections
+         (id, conversation_id, model, usage, cost, files, note, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            id,
+            conversation_id,
+            model,
+            usage,
+            cost,
+            serde_json::to_string(files).unwrap_or_else(|_| "[]".into()),
+            note,
+            now(),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Aggregate reflection spend for the header tooltip + Memory tab.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReflectionStats {
+    pub count: i64,
+    pub cost: f64,
+    pub last_at: i64,
+}
+
+#[tauri::command]
+pub fn memory_reflection_stats(db: tauri::State<'_, Db>) -> Result<ReflectionStats, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(cost), 0), COALESCE(MAX(created_at), 0)
+         FROM memory_reflections",
+        [],
+        |r| {
+            Ok(ReflectionStats {
+                count: r.get(0)?,
+                cost: r.get(1)?,
+                last_at: r.get(2)?,
+            })
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

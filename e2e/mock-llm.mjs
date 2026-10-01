@@ -53,11 +53,139 @@ const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (d) => (body += d));
     req.on("end", async () => {
+      let parsed = {};
+      try {
+        parsed = JSON.parse(body || "{}");
+      } catch {}
+      const messages = parsed.messages || [];
+      const lastUser = [...messages].reverse().find((m) => m.role === "user");
+      const userText = typeof lastUser?.content === "string" ? lastUser.content : "";
+      const hasToolMsg = messages.some((m) => m.role === "tool");
+      const toolMode = userText.includes("tooltest");
+      // The idle/consolidation pass is identified by its system prompt. Its
+      // transcript may already contain tool rows from the chat, so round 2 is
+      // keyed on whether the reflective `save_memory` call itself is present.
+      const reflectionMode = messages.some(
+        (m) =>
+          m.role === "system" &&
+          typeof m.content === "string" &&
+          m.content.includes("You maintain the long-term memory"),
+      );
+      const reflectionSaved = messages.some(
+        (m) =>
+          m.role === "assistant" &&
+          Array.isArray(m.tool_calls) &&
+          m.tool_calls.some((tc) => tc.function?.name === "save_memory"),
+      );
+
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
       });
+
+      // Memory consolidation: round 1 saves a fact, round 2 replies.
+      if (reflectionMode && !reflectionSaved) {
+        sse(
+          res,
+          chunk({
+            role: "assistant",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_mem_1",
+                type: "function",
+                function: { name: "save_memory", arguments: "" },
+              },
+            ],
+          }),
+        );
+        sse(
+          res,
+          chunk(
+            {
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    arguments: JSON.stringify({
+                      content: "User greeted the assistant in the e2e run.",
+                      path: "e2e-topic.md",
+                    }),
+                  },
+                },
+              ],
+            },
+            { finish_reason: "tool_calls" },
+          ),
+        );
+        res.end();
+        return;
+      }
+      if (reflectionMode && reflectionSaved) {
+        sse(res, chunk({ role: "assistant", content: "consolidated" }));
+        sse(res, {
+          id: "chatcmpl-mock",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "mock-model",
+          choices: [],
+          usage: { prompt_tokens: 30, completion_tokens: 4, total_tokens: 34 },
+        });
+        sse(res, chunk({ content: "" }, { finish_reason: "stop" }));
+        res.end();
+        return;
+      }
+
+      // Tool scenario: round 1 requests a gated `bash`, round 2 answers.
+      if (toolMode && !hasToolMsg) {
+        sse(res, chunk({ role: "assistant", reasoning_content: "I should run a quick command." }));
+        await sleep(THINK_GAP);
+        sse(
+          res,
+          chunk({
+            role: "assistant",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_mock_1",
+                type: "function",
+                function: { name: "bash", arguments: "" },
+              },
+            ],
+          }),
+        );
+        sse(
+          res,
+          chunk(
+            {
+              tool_calls: [
+                {
+                  index: 0,
+                  function: { arguments: JSON.stringify({ command: "echo timeline-ok" }) },
+                },
+              ],
+            },
+            { finish_reason: "tool_calls" },
+          ),
+        );
+        res.end();
+        return;
+      }
+      if (toolMode && hasToolMsg) {
+        sse(res, chunk({ role: "assistant", content: "TOOL DONE" }));
+        sse(res, {
+          id: "chatcmpl-mock",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "mock-model",
+          choices: [],
+          usage: { prompt_tokens: 20, completion_tokens: 3, total_tokens: 23 },
+        });
+        sse(res, chunk({ content: "" }, { finish_reason: "stop" }));
+        res.end();
+        return;
+      }
 
       for (const t of THINKING) {
         sse(res, chunk({ role: "assistant", reasoning_content: t }));

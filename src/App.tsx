@@ -1,6 +1,17 @@
-import { createEffect, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
+import {
+  createEffect,
+  createSignal,
+  For,
+  Index,
+  Match,
+  onCleanup,
+  onMount,
+  Show,
+  Switch,
+} from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import { Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -16,7 +27,9 @@ import {
   listMemoryFiles,
   listMessages,
   listModels,
+  memoryReflectionStats,
   readAttachments,
+  reflectNow,
   renameConversation,
   searchConversations,
   setApiKey,
@@ -32,6 +45,7 @@ import {
   type ModelInfo,
   type ModelOverride,
   type Pricing,
+  type ReflectionStats,
   type StreamEvent,
   type ThinkingOptions,
 } from "./lib/api";
@@ -49,17 +63,24 @@ interface LiveTool {
   output?: string;
 }
 
-function parseToolResult(m: Message): { name: string; output: string; error: boolean } | null {
+function parseToolResult(
+  m: Message,
+): { name: string; output: string; error: boolean; callId: string | null } | null {
   if (m.role !== "tool") return null;
   try {
     const v = JSON.parse(m.content);
     if (v && typeof v === "object" && "tool_call_id" in v && "output" in v) {
-      return { name: String(v.name ?? "tool"), output: String(v.output), error: Boolean(v.error) };
+      return {
+        name: String(v.name ?? "tool"),
+        output: String(v.output),
+        error: Boolean(v.error),
+        callId: v.tool_call_id != null ? String(v.tool_call_id) : null,
+      };
     }
   } catch {
     // fall through
   }
-  return { name: "tool", output: m.content, error: false };
+  return { name: "tool", output: m.content, error: false, callId: null };
 }
 
 function formatToolArgs(raw: unknown): string {
@@ -86,14 +107,17 @@ function formatToolArgs(raw: unknown): string {
   return String(value ?? "");
 }
 
-function parseToolCalls(m: Message): { name: string; arguments: string }[] | null {
+function parseToolCallList(
+  m: Message,
+): { id: string; name: string; arguments: unknown }[] | null {
   if (m.role !== "assistant") return null;
   try {
     const v = JSON.parse(m.content);
     if (v && typeof v === "object" && Array.isArray(v.tool_calls)) {
       return v.tool_calls.map((c: any) => ({
+        id: String(c?.id ?? c?.name ?? ""),
         name: String(c?.name ?? ""),
-        arguments: formatToolArgs(c?.arguments),
+        arguments: c?.arguments,
       }));
     }
   } catch {
@@ -199,6 +223,307 @@ function costOfUsage(u: Record<string, number>, p: Pricing): number | null {
   );
 }
 
+type ProcessEntry =
+  | { kind: "thought"; id: string; text: string }
+  | { kind: "text"; id: string; text: string }
+  | {
+      kind: "call";
+      id: string;
+      callId: string;
+      name: string;
+      arguments: string;
+      result: { output: string; error: boolean } | null;
+      live?: LiveTool;
+    };
+
+type CallEntry = Extract<ProcessEntry, { kind: "call" }>;
+
+interface Turn {
+  key: string;
+  user: Message | null;
+  entries: ProcessEntry[];
+  answer: Message | null;
+  live: boolean;
+  /// A memory-consolidation note attached to this turn (background bookkeeping).
+  note: Message | null;
+}
+
+/// Turn a turn's process rows into an ordered list of timeline entries,
+/// pairing each tool call with the result row that follows it.
+function buildEntries(rows: Message[]): ProcessEntry[] {
+  const entries: ProcessEntry[] = [];
+  const calls = new Map<string, CallEntry>();
+  for (const m of rows) {
+    if (m.thinking?.trim()) entries.push({ kind: "thought", id: m.id, text: m.thinking });
+    const toolCalls = parseToolCallList(m);
+    if (toolCalls) {
+      for (const c of toolCalls) {
+        const entry: CallEntry = {
+          kind: "call",
+          id: `${m.id}:${c.id}`,
+          callId: c.id,
+          name: c.name,
+          arguments: formatToolArgs(c.arguments),
+          result: null,
+        };
+        entries.push(entry);
+        calls.set(c.id, entry);
+      }
+      continue;
+    }
+    const tr = parseToolResult(m);
+    if (tr) {
+      const entry = tr.callId ? calls.get(tr.callId) : undefined;
+      if (entry) entry.result = { output: tr.output, error: tr.error };
+      else if (tr.output.trim()) entries.push({ kind: "text", id: m.id, text: tr.output });
+      continue;
+    }
+    if (m.content.trim()) entries.push({ kind: "text", id: m.id, text: m.content });
+  }
+  return entries;
+}
+
+/// Group a flat message list into turns: a user row opens a turn, the final
+/// non-user row is the answer, and everything before it is process activity.
+/// While streaming, the live turn's entries come from `liveTools` plus the
+/// in-flight assistant's reasoning instead.
+function groupTurns(messages: Message[], liveTools: LiveTool[], streaming: boolean): Turn[] {
+  const turns: Turn[] = [];
+  const rowsByTurn = new Map<Turn, Message[]>();
+  let current: Turn | null = null;
+  const flush = () => {
+    if (current) turns.push(current);
+    current = null;
+  };
+  for (const m of messages) {
+    if (m.role === "user") {
+      flush();
+      current = { key: m.id, user: m, entries: [], answer: null, live: false, note: null };
+      rowsByTurn.set(current, []);
+      continue;
+    }
+    if (m.role === "memory") {
+      if (!current) {
+        current = { key: m.id, user: null, entries: [], answer: null, live: false, note: m };
+        rowsByTurn.set(current, []);
+      } else {
+        current.note = m;
+      }
+      continue;
+    }
+    if (!current) {
+      current = { key: m.id, user: null, entries: [], answer: null, live: false, note: null };
+      rowsByTurn.set(current, []);
+    }
+    rowsByTurn.get(current)!.push(m);
+  }
+  flush();
+
+  for (const turn of turns) {
+    const rows = rowsByTurn.get(turn) ?? [];
+    const last = rows[rows.length - 1];
+    let answer: Message | null = null;
+    let processRows = rows;
+    if (last && last.role === "assistant" && !parseToolCallList(last) && !parseToolResult(last)) {
+      answer = last;
+      processRows = rows.slice(0, -1);
+    }
+    turn.answer = answer;
+    turn.entries = buildEntries(processRows);
+  }
+
+  const live = turns[turns.length - 1];
+  if (live && streaming && messages.some((m) => m.id.startsWith("tmp-assistant-"))) {
+    live.live = true;
+    // Keep the live thought first so its DOM node survives streamed updates as
+    // tool entries append after it.
+    const thought = live.answer?.id.startsWith("tmp-assistant-")
+      ? live.answer?.thinking?.trim()
+      : null;
+    live.entries = [];
+    if (thought && live.answer) {
+      live.entries.push({ kind: "thought", id: live.answer.id, text: thought });
+    }
+    for (const t of liveTools) {
+      live.entries.push({
+        kind: "call",
+        id: `live:${t.callId}`,
+        callId: t.callId,
+        name: t.name,
+        arguments: t.arguments,
+        result: t.state === "done" ? { output: t.output ?? "", error: !t.ok } : null,
+        live: t,
+      });
+    }
+  } else {
+    // Persisted turns: the answer row's reasoning is a trailing timeline entry.
+    for (const turn of turns) {
+      if (turn.answer?.thinking?.trim()) {
+        turn.entries.push({ kind: "thought", id: turn.answer.id, text: turn.answer.thinking });
+      }
+    }
+  }
+  return turns;
+}
+
+function ThoughtRow(props: {
+  id: string;
+  live: boolean;
+  open: boolean;
+  onToggle: (id: string) => void;
+}) {
+  return (
+    <button
+      onClick={() => props.onToggle(props.id)}
+      title="Show the reasoning trace"
+      class={`flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
+        props.open
+          ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-100"
+          : "text-neutral-500 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
+      }`}
+    >
+      <span
+        class={`inline-block h-1.5 w-1.5 rounded-full ${
+          props.live ? "animate-pulse bg-amber-500" : "bg-neutral-400 dark:bg-neutral-500"
+        }`}
+      />
+      {props.live ? "Thinking…" : "Thought"}
+    </button>
+  );
+}
+
+function CallRow(props: {
+  entry: CallEntry;
+  onApprove: (callId: string) => void;
+  onDeny: (callId: string) => void;
+}) {
+  const live = () => props.entry.live;
+  const state = () => live()?.state;
+  return (
+    <div class="rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs dark:border-neutral-800 dark:bg-neutral-900">
+      <div class="mb-1 text-[11px] text-neutral-500 dark:text-neutral-400">
+        {state() === "pending" && "approval needed · "}
+        {state() === "running" && "running · "}
+        {state() === "done" && (live()?.ok ? "done · " : "error · ")}
+        <span class="font-medium text-neutral-700 dark:text-neutral-200">{props.entry.name}</span>
+      </div>
+      <pre class="max-h-40 overflow-auto whitespace-pre-wrap break-words text-neutral-600 dark:text-neutral-400">
+        {props.entry.arguments}
+      </pre>
+      <Show when={state() === "pending"}>
+        <div class="mt-2 flex gap-2">
+          <button
+            class="rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+            onClick={() => props.onApprove(props.entry.callId)}
+          >
+            Approve
+          </button>
+          <button
+            class="rounded-md border border-neutral-300 px-3 py-1 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+            onClick={() => props.onDeny(props.entry.callId)}
+          >
+            Deny
+          </button>
+        </div>
+      </Show>
+      <Show when={props.entry.result}>
+        <div class="mt-2">
+          <div class="text-[11px] text-neutral-500 dark:text-neutral-400">
+            {props.entry.result!.error ? "error" : "result"}
+          </div>
+          <pre class="mt-0.5 max-h-60 overflow-auto whitespace-pre-wrap break-words text-neutral-700 dark:text-neutral-300">
+            {props.entry.result!.output}
+          </pre>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+/// One collapsible activity timeline for a turn: reasoning, preamble text and
+/// tool calls/results in order. Expands while live and collapses when done.
+function Timeline(props: {
+  entries: ProcessEntry[];
+  live: boolean;
+  openThoughtId: string | null;
+  onToggleThought: (id: string) => void;
+  onApprove: (callId: string) => void;
+  onDeny: (callId: string) => void;
+}) {
+  const [open, setOpen] = createSignal(props.live);
+  let prevLive = false;
+  createEffect(() => {
+    const live = props.live;
+    if (live) setOpen(true);
+    else if (prevLive) setOpen(false);
+    prevLive = live;
+  });
+
+  const summary = () => {
+    const thoughts = props.entries.filter((e) => e.kind === "thought").length;
+    const calls = props.entries.filter((e) => e.kind === "call").length;
+    const parts: string[] = [];
+    if (thoughts) parts.push("Thought");
+    if (calls) parts.push(`${calls} tool${calls === 1 ? "" : "s"}`);
+    return parts.join(" · ") || "Activity";
+  };
+
+  return (
+    <div class="flex justify-start">
+      <div class="w-full max-w-[80%]">
+        <button
+          onClick={() => setOpen((o) => !o)}
+          title="Show activity timeline"
+          class={`mb-1 flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
+            open()
+              ? "text-neutral-600 dark:text-neutral-300"
+              : "text-neutral-500 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
+          }`}
+        >
+          <span
+            class={`inline-block h-1.5 w-1.5 rounded-full ${
+              props.live ? "animate-pulse bg-amber-500" : "bg-neutral-400 dark:bg-neutral-500"
+            }`}
+          />
+          <span>{summary()}</span>
+          <span class="opacity-60">{open() ? "▾" : "▸"}</span>
+        </button>
+        <Show when={open()}>
+          <div class="space-y-2 border-l-2 border-neutral-200 pl-3 dark:border-neutral-800">
+            <Index each={props.entries}>
+              {(entry) => (
+                <Switch>
+                  <Match when={entry().kind === "thought"}>
+                    <ThoughtRow
+                      id={entry().id}
+                      live={props.live}
+                      open={props.openThoughtId === entry().id}
+                      onToggle={props.onToggleThought}
+                    />
+                  </Match>
+                  <Match when={entry().kind === "text"}>
+                    <Markdown
+                      text={(entry() as Extract<ProcessEntry, { kind: "text" }>).text}
+                      class="prose-sm"
+                    />
+                  </Match>
+                  <Match when={entry().kind === "call"}>
+                    <CallRow
+                      entry={entry() as CallEntry}
+                      onApprove={props.onApprove}
+                      onDeny={props.onDeny}
+                    />
+                  </Match>
+                </Switch>
+              )}
+            </Index>
+          </div>
+        </Show>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [conversations, setConversations] = createSignal<Conversation[]>([]);
   const [activeId, setActiveId] = createSignal<string | null>(null);
@@ -235,6 +560,9 @@ export default function App() {
   const [settingsError, setSettingsError] = createSignal<string | null>(null);
   const [keyDraft, setKeyDraft] = createSignal("");
   const [hasKey, setHasKey] = createSignal(false);
+  const [reflectionEnabled, setReflectionEnabled] = createSignal(true);
+  const [reflectionIdleMinutes, setReflectionIdleMinutes] = createSignal(30);
+  const [reflectionStats, setReflectionStats] = createSignal<ReflectionStats | null>(null);
 
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
@@ -247,6 +575,7 @@ export default function App() {
   const [memoryDraft, setMemoryDraft] = createSignal("");
   const [memoryError, setMemoryError] = createSignal<string | null>(null);
   const [memoryConfirmDelete, setMemoryConfirmDelete] = createSignal<string | null>(null);
+  const [memoryPreview, setMemoryPreview] = createSignal(true);
 
   // Model pricing/context: resolved rates (models.dev cache + bundled table +
   // user overrides) for the selected model, plus a per-model cache so turns
@@ -292,6 +621,20 @@ export default function App() {
     });
     onCleanup(() => unlistenDrop());
 
+    // Background memory consolidation finished: reveal its note + refresh spend.
+    const unlistenReflect = await listen<{ conversationId: string }>(
+      "memory-reflection",
+      (event) => {
+        void refreshReflectionStats();
+        const id = activeId();
+        if (id && event.payload.conversationId === id && !streaming()) {
+          listMessages(id).then(setMessages);
+        }
+        refreshConversations().catch(() => {});
+      },
+    );
+    onCleanup(() => unlistenReflect());
+
     const rows = await listConversations();
     setConversations(rows);
     setVisibleConversations(rows);
@@ -303,8 +646,11 @@ export default function App() {
     setPreferences(cfg.preferences ?? "");
     setThinkingLevel(cfg.thinkingLevel ?? "");
     setEchoReasoning(cfg.echoReasoningContent ?? true);
+    setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
+    setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
+    void refreshReflectionStats();
     // Fast path: cached catalog/prices so the picker and meter render at once.
     // Without a key the picker falls back to the configured model.
     await loadModels(false).catch(() => {});
@@ -424,6 +770,8 @@ export default function App() {
     setPreferences(cfg.preferences ?? "");
     setThinkingLevel(cfg.thinkingLevel ?? "");
     setEchoReasoning(cfg.echoReasoningContent ?? true);
+    setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
+    setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
     setKeyDraft("");
@@ -445,6 +793,8 @@ export default function App() {
       preferences: preferences(),
       thinkingLevel: current.thinkingLevel,
       echoReasoningContent: echoReasoning(),
+      memoryReflectionEnabled: reflectionEnabled(),
+      memoryReflectionIdleMinutes: reflectionIdleMinutes(),
       modelOverrides: current.modelOverrides ?? {},
     });
     let keyChanged = false;
@@ -502,6 +852,8 @@ export default function App() {
         preferences: preferences(),
         thinkingLevel: level,
         echoReasoningContent: echoReasoning(),
+        memoryReflectionEnabled: reflectionEnabled(),
+        memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
       });
     } catch (e) {
@@ -518,6 +870,8 @@ export default function App() {
         preferences: preferences(),
         thinkingLevel: level,
         echoReasoningContent: echoReasoning(),
+        memoryReflectionEnabled: reflectionEnabled(),
+        memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
       });
     } catch (e) {
@@ -532,6 +886,14 @@ export default function App() {
     setMemoryError(null);
   }
 
+  async function refreshReflectionStats() {
+    try {
+      setReflectionStats(await memoryReflectionStats());
+    } catch {
+      // non-fatal
+    }
+  }
+
   // Reload the file list, keeping (or choosing) a selection.
   async function reloadMemory(prefer?: string) {
     try {
@@ -539,9 +901,10 @@ export default function App() {
       setMemoryFiles(files);
       const wanted =
         files.find((f) => f.name === (prefer ?? memorySelected())) ??
-        files.find((f) => !f.generated) ??
+        files.find((f) => f.core) ??
         files[0];
       if (wanted) selectMemoryFile(wanted);
+      void refreshReflectionStats();
     } catch (e) {
       setMemoryError(String(e));
     }
@@ -551,6 +914,23 @@ export default function App() {
     setMemoryError(null);
     setMemoryOpen(true);
     await reloadMemory();
+  }
+
+  // Manually run memory consolidation over the active conversation.
+  const [consolidating, setConsolidating] = createSignal(false);
+  async function consolidateNow() {
+    const id = activeId();
+    if (!id || consolidating()) return;
+    setConsolidating(true);
+    try {
+      await reflectNow(id);
+      await reloadMemory(memorySelected() ?? undefined);
+      if (activeId() === id) listMessages(id).then(setMessages);
+    } catch (e) {
+      setMemoryError(String(e));
+    } finally {
+      setConsolidating(false);
+    }
   }
 
   async function saveSelectedMemory() {
@@ -747,6 +1127,23 @@ export default function App() {
     }
   }
 
+  function approveLiveTool(callId: string) {
+    setLiveTools((prev) =>
+      prev.map((x) => (x.callId === callId ? { ...x, state: "running" } : x)),
+    );
+    approveTool(callId).catch(() => {});
+  }
+
+  function denyLiveTool(callId: string) {
+    setLiveTools((prev) =>
+      prev.map((x) => (x.callId === callId ? { ...x, state: "running" } : x)),
+    );
+    denyTool(callId).catch(() => {});
+  }
+
+  // Group messages into per-turn timelines, augmented with live tool activity.
+  const turns = () => groupTurns(messages(), liveTools(), streaming());
+
   const activeTitle = () => {
     const id = activeId();
     return conversations().find((c) => c.id === id)?.title ?? "New chat";
@@ -843,6 +1240,13 @@ export default function App() {
   const costLabel = () => {
     const c = conversationCost();
     return c == null ? "—" : formatCost(c);
+  };
+
+  // Reflection spend (kept separate from conversation cost).
+  const reflectionLabel = () => {
+    const s = reflectionStats();
+    if (!s || s.count <= 0) return null;
+    return `${formatCost(s.cost)} across ${s.count} ${s.count === 1 ? "run" : "runs"}`;
   };
 
   const contextPct = () => {
@@ -1007,7 +1411,7 @@ export default function App() {
                   pricing()?.cacheReadPerMillion ?? "—"
                 } / ${pricing()?.cacheWritePerMillion ?? "—"} USD per 1M${
                   pricing()?.overridden ? "\n(using your overrides)" : ""
-                }`}
+                }${reflectionLabel() ? `\nMemory reflection: ${reflectionLabel()}` : ""}`}
               >
                 <span class={contextClass()}>
                   {formatTokens(Math.min(contextTokens(), contextWindow()))} /{" "}
@@ -1099,118 +1503,84 @@ export default function App() {
             }
           >
             <div class="flex min-h-full flex-col justify-end space-y-3">
-              <Index each={messages()}>
-                {(m) => {
-                  // Hide persisted whitespace-only assistant rows (old turns),
-                  // but keep the live streaming bubble.
-                  const hidden = () =>
-                    m().role === "assistant" &&
-                    !m().content.trim() &&
-                    !m().thinking?.trim() &&
-                    !(streaming() && m().id.startsWith("tmp-assistant-"));
-                  const toolResult = () => parseToolResult(m());
-                  const toolCalls = () => (toolResult() ? null : parseToolCalls(m()));
-                  const atts = () => parseAttachments(m());
+              <Index each={turns()}>
+                {(turn) => {
+                  const t = () => turn();
+                  const answer = () => t().answer;
+                  const showAnswer = () =>
+                    !!answer() &&
+                    (!!answer()!.content.trim() ||
+                      (t().live && !!answer()!.id.startsWith("tmp-assistant-")));
                   return (
-                    <Show when={!hidden()}>
-                      <Show when={toolResult()} keyed>
-                        {(tr) => (
-                          <div class="flex justify-start">
-                            <details class="max-w-[80%] rounded-xl border border-neutral-200 bg-white px-4 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900">
-                              <summary class="cursor-pointer text-[11px] text-neutral-500 dark:text-neutral-400">
-                                tool · {tr.name} {tr.error ? "· error" : ""}
-                              </summary>
-                              <pre class="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words text-xs text-neutral-700 dark:text-neutral-300">
-                                {tr.output}
-                              </pre>
-                            </details>
+                    <div class="space-y-3">
+                      <Show when={t().user}>
+                        {(u) => (
+                          <div class="flex justify-end">
+                            <div class="max-w-[80%]">
+                              <div class="rounded-xl bg-neutral-900 px-4 py-2.5 text-sm text-white dark:bg-white dark:text-neutral-900">
+                                <div class="mb-0.5 text-[11px] opacity-60">you</div>
+                                <Show when={parseAttachments(u()).length > 0}>
+                                  <div class="mb-2 flex flex-wrap items-end gap-2">
+                                    <For each={parseAttachments(u())}>
+                                      {(a) =>
+                                        a.kind === "image" && a.dataUrl ? (
+                                          <img
+                                            src={a.dataUrl}
+                                            alt={a.name}
+                                            class="max-h-64 max-w-full rounded-lg border border-white/20 dark:border-neutral-900/20"
+                                          />
+                                        ) : (
+                                          <div class="flex items-center gap-2 rounded-lg border border-white/25 bg-white/10 px-2.5 py-1.5 text-xs dark:border-neutral-900/20 dark:bg-neutral-900/10">
+                                            <DocIcon />
+                                            <span class="max-w-52 truncate">{a.name}</span>
+                                            <span class="opacity-60">{formatBytes(a.size)}</span>
+                                          </div>
+                                        )
+                                      }
+                                    </For>
+                                  </div>
+                                </Show>
+                                <div class="whitespace-pre-wrap break-words">{u().content}</div>
+                              </div>
+                            </div>
                           </div>
                         )}
                       </Show>
-                      <Show when={toolCalls()} keyed>
-                        {(calls) => (
-                          <For each={calls}>
-                            {(c) => (
-                              <div class="flex justify-start">
-                                <div class="max-w-[80%] rounded-xl border border-neutral-200 bg-white px-4 py-2 text-xs text-neutral-500 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-400">
-                                  <div>
-                                    assistant wants{" "}
-                                    <span class="font-medium text-neutral-700 dark:text-neutral-200">
-                                      {c.name}
-                                    </span>
-                                  </div>
-                                  <pre class="mt-1 whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
-                                    {c.arguments}
-                                  </pre>
-                                </div>
-                              </div>
-                            )}
-                          </For>
-                        )}
+
+                      <Show when={t().entries.length > 0}>
+                        <Timeline
+                          entries={t().entries}
+                          live={t().live}
+                          openThoughtId={thinkingOpenId()}
+                          onToggleThought={(id) =>
+                            setThinkingOpenId(thinkingOpenId() === id ? null : id)
+                          }
+                          onApprove={approveLiveTool}
+                          onDeny={denyLiveTool}
+                        />
                       </Show>
-                      <Show when={!toolResult() && !toolCalls()}>
-                        <div
-                          class={`flex ${m().role === "user" ? "justify-end" : "justify-start"}`}
-                        >
+
+                      <Show when={showAnswer()}>
+                        <div class="flex justify-start">
                           <div class="max-w-[80%]">
-                            <Show when={m().role === "assistant" && m().thinking?.trim()}>
-                              <button
-                                onClick={() =>
-                                  setThinkingOpenId(
-                                    thinkingOpenId() === m().id ? null : m().id,
-                                  )
-                                }
-                                title="Show the reasoning trace"
-                                class={`mb-1 flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
-                                  thinkingOpenId() === m().id
-                                    ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-100"
-                                    : "text-neutral-500 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
-                                }`}
-                              >
-                                <span
-                                  class={`inline-block h-1.5 w-1.5 rounded-full ${
-                                    m().role === "assistant" &&
-                                    streaming() &&
-                                    m().content === ""
-                                      ? "animate-pulse bg-amber-500"
-                                      : "bg-neutral-400 dark:bg-neutral-500"
-                                  }`}
-                                />
-                                {m().role === "assistant" &&
-                                streaming() &&
-                                m().content === ""
-                                  ? "Thinking…"
-                                  : "Thought"}
-                              </button>
-                            </Show>
-                            <div
-                              class={`rounded-xl px-4 py-2.5 text-sm ${
-                                m().role === "assistant"
-                                  ? "bg-neutral-100 dark:bg-neutral-800"
-                                  : "bg-neutral-900 text-white dark:bg-white dark:text-neutral-900"
-                              }`}
-                            >
+                            <div class="rounded-xl bg-neutral-100 px-4 py-2.5 text-sm dark:bg-neutral-800">
                               <div class="mb-0.5 text-[11px] opacity-60">
-                                {m().role === "user" ? "you" : "assistant"}
-                                {m().role === "assistant" &&
-                                  m().stop_reason === "aborted" &&
-                                  " (aborted)"}
-                                {m().role === "assistant" &&
-                                  m().stop_reason === "error" &&
-                                  " (error)"}
+                                assistant
+                                {answer()!.stop_reason === "aborted" && " (aborted)"}
+                                {answer()!.stop_reason === "error" && " (error)"}
                               </div>
-                              <Show when={atts().length > 0}>
+                              <Show when={parseAttachments(answer()!).length > 0}>
                                 <div class="mb-2 flex flex-wrap items-end gap-2">
-                                  <For each={atts()}>
+                                  <For each={parseAttachments(answer()!)}>
                                     {(a) =>
                                       a.kind === "image" && a.dataUrl ? (
                                         <img
                                           src={a.dataUrl}
                                           alt={a.name}
-                                          class="max-h-64 max-w-full rounded-lg border border-white/20 dark:border-neutral-900/20"
+                                          class="max-h-64 max-w-full rounded-lg border border-neutral-300 dark:border-neutral-700"
                                         />
                                       ) : (
-                                        <div class="flex items-center gap-2 rounded-lg border border-white/25 bg-white/10 px-2.5 py-1.5 text-xs dark:border-neutral-900/20 dark:bg-neutral-900/10">
+                                        <div class="flex items-center gap-2 rounded-lg border border-neutral-300 bg-neutral-100 px-2.5 py-1.5 text-xs dark:border-neutral-700 dark:bg-neutral-800">
                                           <DocIcon />
                                           <span class="max-w-52 truncate">{a.name}</span>
                                           <span class="opacity-60">{formatBytes(a.size)}</span>
@@ -1221,83 +1591,36 @@ export default function App() {
                                 </div>
                               </Show>
                               <Show
-                                when={m().role === "assistant" && m().content}
+                                when={answer()!.content}
                                 fallback={
                                   <div class="whitespace-pre-wrap break-words">
-                                    {m().content}
+                                    {answer()!.content}
                                   </div>
                                 }
                               >
-                                <Markdown text={m().content} />
+                                <Markdown text={answer()!.content} />
                               </Show>
-                              {m().role === "assistant" &&
-                                streaming() &&
-                                m().id.startsWith("tmp-assistant-") && (
-                                  <span class="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-neutral-400 align-text-bottom" />
-                                )}
+                              {t().live && answer()!.id.startsWith("tmp-assistant-") && (
+                                <span class="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-neutral-400 align-text-bottom" />
+                              )}
                             </div>
                           </div>
                         </div>
                       </Show>
-                    </Show>
+
+                      <Show when={t().note}>
+                        {(n) => (
+                          <div class="flex justify-center">
+                            <span class="rounded-full bg-neutral-100 px-3 py-1 text-[11px] text-neutral-500 dark:bg-neutral-900 dark:text-neutral-400">
+                              {n().content}
+                            </span>
+                          </div>
+                        )}
+                      </Show>
+                    </div>
                   );
                 }}
               </Index>
-
-              <For each={liveTools()}>
-                {(t) => (
-                  <div class="flex justify-start">
-                    <div class="max-w-[80%] rounded-xl border border-neutral-300 bg-white px-4 py-2.5 text-sm shadow-sm dark:border-neutral-700 dark:bg-neutral-900">
-                      <div class="mb-1 text-[11px] text-neutral-500 dark:text-neutral-400">
-                        {t.state === "pending" && "approval needed · "}
-                        {t.state === "running" && "running · "}
-                        {t.state === "done" && (t.ok ? "done · " : "error · ")}
-                        <span class="font-medium text-neutral-700 dark:text-neutral-200">
-                          {t.name}
-                        </span>
-                      </div>
-                      <pre class="max-h-40 overflow-auto whitespace-pre-wrap break-words text-xs text-neutral-600 dark:text-neutral-400">
-                        {t.arguments}
-                      </pre>
-                      <Show when={t.state === "pending"}>
-                        <div class="mt-2 flex gap-2">
-                          <button
-                            class="rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
-                            onClick={() => {
-                              setLiveTools((prev) =>
-                                prev.map((x) =>
-                                  x.callId === t.callId ? { ...x, state: "running" } : x,
-                                ),
-                              );
-                              approveTool(t.callId).catch(() => {});
-                            }}
-                          >
-                            Approve
-                          </button>
-                          <button
-                            class="rounded-md border border-neutral-300 px-3 py-1 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
-                            onClick={() => {
-                              setLiveTools((prev) =>
-                                prev.map((x) =>
-                                  x.callId === t.callId ? { ...x, state: "running" } : x,
-                                ),
-                              );
-                              denyTool(t.callId).catch(() => {});
-                            }}
-                          >
-                            Deny
-                          </button>
-                        </div>
-                      </Show>
-                      <Show when={t.state === "done" && t.output}>
-                        <pre class="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words text-xs text-neutral-600 dark:text-neutral-400">
-                          {t.output}
-                        </pre>
-                      </Show>
-                    </div>
-                  </div>
-                )}
-              </For>
 
               <Show when={messages().length === 0}>
                 <p class="text-sm text-neutral-400 dark:text-neutral-500">No messages yet.</p>
@@ -1455,7 +1778,7 @@ export default function App() {
               </label>
 
               <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
-                User preferences
+                Explicit user preferences
                 <textarea
                   class="mt-1 min-h-20 w-full resize-y rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
                   placeholder="e.g. Prefer concise answers. Call me Sam. Always show units."
@@ -1463,7 +1786,8 @@ export default function App() {
                   onInput={(e) => setPreferences(e.currentTarget.value)}
                 />
                 <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
-                  Injected at the top of the system prompt for every conversation.
+                  Injected at the top of every system prompt and treated as authoritative.
+                  The assistant's inferred long-term memory lives in the Memory tab.
                 </span>
               </label>
 
@@ -1482,6 +1806,38 @@ export default function App() {
                   unknown fields.
                 </span>
               </label>
+
+              <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+                <label class="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                  <input
+                    type="checkbox"
+                    class="h-4 w-4 rounded border-neutral-300 dark:border-neutral-700"
+                    checked={reflectionEnabled()}
+                    onChange={(e) => setReflectionEnabled(e.currentTarget.checked)}
+                  />
+                  Consolidate memory after conversations go idle
+                </label>
+                <div class="mt-2 flex items-center gap-2">
+                  <span class="text-xs text-neutral-500 dark:text-neutral-400">Idle for</span>
+                  <input
+                    type="number"
+                    min="1"
+                    class="w-20 rounded-lg border border-neutral-300 px-2 py-1 text-sm outline-none focus:border-neutral-500 disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-800"
+                    disabled={!reflectionEnabled()}
+                    value={reflectionIdleMinutes()}
+                    onInput={(e) =>
+                      setReflectionIdleMinutes(
+                        Math.max(1, Number(e.currentTarget.value) || 1),
+                      )
+                    }
+                  />
+                  <span class="text-xs text-neutral-500 dark:text-neutral-400">minutes</span>
+                </div>
+                <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                  A background pass reads the conversation and rewrites the Markdown memory
+                  files. Spends tokens; cost is tracked separately.
+                </span>
+              </div>
 
               <Show when={settingsError()}>
                 <p class="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-400">
@@ -1509,13 +1865,18 @@ export default function App() {
           <Dialog.Content class="fixed left-1/2 top-1/2 z-50 flex h-[70vh] w-full max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900">
             <Dialog.Title class="text-base font-semibold">Memory</Dialog.Title>
             <Dialog.Description class="mt-1 text-sm text-neutral-500 dark:text-neutral-400">
-              Long-term memory is stored as Markdown files in the app data dir. index.md is
-              generated automatically and is read-only.
+              Long-term memory is plain Markdown files. Core files (profile, preferences,
+              goals) are always shown to the assistant; other files are listed and read on
+              demand. The idle reflection pass curates these files. Explicit user preferences
+              are set in Settings and kept separate.
             </Dialog.Description>
 
             <div class="mt-4 flex min-h-0 flex-1 gap-4">
               <div class="flex w-44 shrink-0 flex-col gap-1 overflow-y-auto">
-                <For each={memoryFiles()}>
+                <p class="px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                  Core
+                </p>
+                <For each={memoryFiles().filter((f) => f.core)}>
                   {(f) => (
                     <button
                       onClick={() => selectMemoryFile(f)}
@@ -1526,10 +1887,28 @@ export default function App() {
                       }`}
                     >
                       {f.name}
-                      {f.generated ? " · auto" : ""}
                     </button>
                   )}
                 </For>
+                <Show when={memoryFiles().some((f) => !f.core)}>
+                  <p class="mt-3 px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                    Other
+                  </p>
+                  <For each={memoryFiles().filter((f) => !f.core)}>
+                    {(f) => (
+                      <button
+                        onClick={() => selectMemoryFile(f)}
+                        class={`truncate rounded-md px-2 py-1.5 text-left text-xs transition ${
+                          memorySelected() === f.name
+                            ? "bg-neutral-200 font-medium dark:bg-neutral-800"
+                            : "text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                        }`}
+                      >
+                        {f.name}
+                      </button>
+                    )}
+                  </For>
+                </Show>
               </div>
 
               <div class="flex min-w-0 flex-1 flex-col">
@@ -1541,55 +1920,63 @@ export default function App() {
                     </p>
                   }
                 >
-                  <textarea
-                    class="min-h-0 flex-1 resize-none rounded-lg border border-neutral-300 bg-white p-3 font-mono text-xs outline-none focus:border-neutral-500 disabled:opacity-70 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
-                    spellcheck={false}
-                    readonly={selectedMemoryFile()?.generated}
-                    value={memoryDraft()}
-                    onInput={(e) => setMemoryDraft(e.currentTarget.value)}
-                  />
+                  <Show
+                    when={!memoryPreview()}
+                    fallback={
+                      <div class="min-h-0 flex-1 overflow-y-auto rounded-lg border border-neutral-300 bg-white p-4 dark:border-neutral-700 dark:bg-neutral-950">
+                        <Show
+                          when={memoryDraft().trim()}
+                          fallback={
+                            <p class="text-xs text-neutral-400 dark:text-neutral-500">
+                              (empty)
+                            </p>
+                          }
+                        >
+                          <Markdown text={memoryDraft()} class="prose-sm" />
+                        </Show>
+                      </div>
+                    }
+                  >
+                    <textarea
+                      class="min-h-0 flex-1 resize-none rounded-lg border border-neutral-300 bg-white p-3 font-mono text-xs outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
+                      spellcheck={false}
+                      value={memoryDraft()}
+                      onInput={(e) => setMemoryDraft(e.currentTarget.value)}
+                    />
+                  </Show>
                   <div class="mt-3 flex items-center justify-between gap-3">
                     <Show
-                      when={!selectedMemoryFile()?.generated}
+                      when={memoryConfirmDelete() === selectedMemoryFile()?.name}
                       fallback={
-                        <span class="text-[11px] text-neutral-400 dark:text-neutral-500">
-                          Generated from the memory entries above — read only.
-                        </span>
+                        <button
+                          onClick={() =>
+                            setMemoryConfirmDelete(selectedMemoryFile()?.name ?? null)
+                          }
+                          class="text-[11px] text-red-600 transition hover:underline dark:text-red-400"
+                        >
+                          Delete file
+                        </button>
                       }
                     >
-                      <Show
-                        when={memoryConfirmDelete() === selectedMemoryFile()?.name}
-                        fallback={
-                          <button
-                            onClick={() =>
-                              setMemoryConfirmDelete(selectedMemoryFile()?.name ?? null)
-                            }
-                            class="text-[11px] text-red-600 transition hover:underline dark:text-red-400"
-                          >
-                            Delete file
-                          </button>
-                        }
-                      >
-                        <div class="flex items-center gap-2">
-                          <span class="text-[11px] text-neutral-500 dark:text-neutral-400">
-                            Delete {selectedMemoryFile()?.name}?
-                          </span>
-                          <button
-                            onClick={() =>
-                              void removeMemoryFile(selectedMemoryFile()?.name ?? "")
-                            }
-                            class="rounded bg-red-600 px-2 py-1 text-[11px] text-white transition hover:bg-red-500"
-                          >
-                            Delete
-                          </button>
-                          <button
-                            onClick={() => setMemoryConfirmDelete(null)}
-                            class="text-[11px] text-neutral-500 transition hover:underline dark:text-neutral-400"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </Show>
+                      <div class="flex items-center gap-2">
+                        <span class="text-[11px] text-neutral-500 dark:text-neutral-400">
+                          Delete {selectedMemoryFile()?.name}?
+                        </span>
+                        <button
+                          onClick={() =>
+                            void removeMemoryFile(selectedMemoryFile()?.name ?? "")
+                          }
+                          class="rounded bg-red-600 px-2 py-1 text-[11px] text-white transition hover:bg-red-500"
+                        >
+                          Delete
+                        </button>
+                        <button
+                          onClick={() => setMemoryConfirmDelete(null)}
+                          class="text-[11px] text-neutral-500 transition hover:underline dark:text-neutral-400"
+                        >
+                          Cancel
+                        </button>
+                      </div>
                     </Show>
 
                     <div class="flex items-center gap-2">
@@ -1599,9 +1986,14 @@ export default function App() {
                         </span>
                       </Show>
                       <button
+                        onClick={() => setMemoryPreview((p) => !p)}
+                        class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                      >
+                        {memoryPreview() ? "Edit" : "Preview"}
+                      </button>
+                      <button
                         onClick={() => void saveSelectedMemory()}
-                        disabled={selectedMemoryFile()?.generated}
-                        class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                        class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
                       >
                         Save
                       </button>
@@ -1611,7 +2003,28 @@ export default function App() {
               </div>
             </div>
 
-            <div class="mt-4 flex justify-end">
+            <div class="mt-4 flex items-center justify-between gap-3">
+              <div class="flex items-center gap-3">
+                <button
+                  onClick={() => void consolidateNow()}
+                  disabled={!activeId() || consolidating()}
+                  title={
+                    activeId()
+                      ? "Run the memory consolidation pass over the open conversation now"
+                      : "Open a conversation first"
+                  }
+                  class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                >
+                  {consolidating() ? "Consolidating…" : "Consolidate this chat"}
+                </button>
+                <Show when={reflectionStats() && reflectionStats()!.count > 0}>
+                  <span class="text-[11px] text-neutral-400 dark:text-neutral-500">
+                    Reflection spend: {formatCost(reflectionStats()!.cost)} across{" "}
+                    {reflectionStats()!.count}{" "}
+                    {reflectionStats()!.count === 1 ? "run" : "runs"}
+                  </span>
+                </Show>
+              </div>
               <Dialog.CloseButton class="rounded-md border border-neutral-300 px-4 py-1.5 text-sm text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800">
                 Close
               </Dialog.CloseButton>

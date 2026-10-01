@@ -38,6 +38,11 @@ pub struct AppConfig {
     /// message. DeepSeek's thinking mode requires this (HTTP 400 otherwise);
     /// some providers reject the unknown field, so it can be turned off.
     pub echo_reasoning_content: bool,
+    /// Whether to run the idle memory-consolidation pass after conversations
+    /// go quiet (spends tokens in the background).
+    pub memory_reflection_enabled: bool,
+    /// Minutes a conversation must be idle before reflection runs over it.
+    pub memory_reflection_idle_minutes: u32,
     /// User-supplied per-model price/context overrides, keyed by model id.
     pub model_overrides: HashMap<String, ModelOverride>,
 }
@@ -50,6 +55,8 @@ impl Default for AppConfig {
             preferences: String::new(),
             thinking_level: String::new(),
             echo_reasoning_content: true,
+            memory_reflection_enabled: true,
+            memory_reflection_idle_minutes: 30,
             model_overrides: HashMap::new(),
         }
     }

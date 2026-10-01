@@ -45,6 +45,12 @@ impl StreamRegistry {
     pub fn remove(&self, id: &str) {
         self.flags.lock().unwrap().remove(id);
     }
+
+    /// Whether a chat turn is currently streaming for this conversation. Used by
+    /// the memory-reflection scheduler to avoid running mid-turn.
+    pub fn is_streaming(&self, id: &str) -> bool {
+        self.flags.lock().unwrap().contains_key(id)
+    }
 }
 
 /// Events pushed to the frontend over the stream channel.
@@ -519,7 +525,7 @@ fn encode_tool_result(call_id: &str, name: &str, output: &ToolOutput) -> String 
 
 /// Build a user request message, folding text-file contents into the text and
 /// images into multimodal `image_url` parts (so vision models receive them).
-fn user_request_message(
+pub(crate) fn user_request_message(
     text: &str,
     attachments: &[crate::attachments::Attachment],
 ) -> Result<ChatCompletionRequestMessage, String> {
@@ -577,27 +583,14 @@ fn row_attachments(row: &db::MessageRow) -> Vec<crate::attachments::Attachment> 
         .unwrap_or_default()
 }
 
-/// Convert an existing message row and a fresh user turn into request messages.
-/// Assistant rows holding a tool-call payload and tool rows holding results
-/// are converted back into their request shapes so multi-round history works.
-fn build_messages(
-    system_prompt: &str,
+/// Convert stored message rows into request messages (no system prompt, no
+/// trailing turn). Assistant rows holding a tool-call payload and tool rows
+/// holding results are converted back into their request shapes so multi-round
+/// history works. `memory` notes are bookkeeping and are skipped.
+pub(crate) fn build_history_messages(
     history: &[db::MessageRow],
-    user_content: &str,
-    user_attachments: &[crate::attachments::Attachment],
 ) -> Result<Vec<ChatCompletionRequestMessage>, String> {
     let mut out = Vec::new();
-
-    if !system_prompt.trim().is_empty() {
-        out.push(
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content(system_prompt.to_string())
-                .build()
-                .map_err(|e| e.to_string())?
-                .into(),
-        );
-    }
-
     for row in history {
         match row.role.as_str() {
             "user" => out.push(user_request_message(&row.content, &row_attachments(row))?),
@@ -676,15 +669,37 @@ fn build_messages(
             _ => {}
         }
     }
-
-    out.push(user_request_message(user_content, user_attachments)?);
-
     Ok(out)
 }
 
-/// Base system prompt, with user preferences injected at the top and the
-/// active model named, then the bounded memory index (titles + summaries)
-/// appended. Memory bodies stay out of context until `read_memory` is called.
+/// Convert a system prompt, existing history and a fresh user turn into request
+/// messages.
+fn build_messages(
+    system_prompt: &str,
+    history: &[db::MessageRow],
+    user_content: &str,
+    user_attachments: &[crate::attachments::Attachment],
+) -> Result<Vec<ChatCompletionRequestMessage>, String> {
+    let mut out = Vec::new();
+    if !system_prompt.trim().is_empty() {
+        out.push(
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(system_prompt.to_string())
+                .build()
+                .map_err(|e| e.to_string())?
+                .into(),
+        );
+    }
+    out.extend(build_history_messages(history)?);
+    out.push(user_request_message(user_content, user_attachments)?);
+    Ok(out)
+}
+
+/// Base system prompt, with explicit user preferences injected at the top and
+/// the active model named, then the bounded memory block appended. The
+/// preferences field is user-authored in Settings, so it is labelled as
+/// authoritative — distinct from anything inferred into memory. Memory bodies
+/// for non-core files stay out of context until `read_memory` is called.
 fn build_system_prompt(
     base: &str,
     model_label: &str,
@@ -693,7 +708,11 @@ fn build_system_prompt(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !preferences.trim().is_empty() {
-        parts.push(format!("User preferences:\n{}", preferences.trim()));
+        parts.push(format!(
+            "Explicit user preferences (set directly by the user; authoritative — these take \
+             precedence over anything inferred in long-term memory):\n{}",
+            preferences.trim()
+        ));
     }
     parts.push(base.trim().to_string());
     if !model_label.trim().is_empty() {
@@ -711,59 +730,61 @@ fn build_system_prompt(
     prompt
 }
 
-/// The chat loop proper, factored out of the Tauri command so it can be driven
-/// by tests with an in-memory DB, a mock SSE endpoint, and an owned registry:
-/// persist the user turn, run the capped tool loop, persist each round, and
-/// finish by storing the final assistant turn (with usage + reasoning).
+/// Everything a completed tool loop produced.
+pub(crate) struct ToolLoopResult {
+    pub usage: Value,
+    pub text: String,
+    pub thinking: Option<String>,
+    pub stop_reason: String,
+}
+
+/// Execute one model-requested tool. Memory tools are handled in-process; host
+/// tools run with per-call approval (gating is handled by the caller).
+async fn dispatch_tool(
+    call: &ToolCall,
+    mcp: &tools::McpClient,
+    shell: &ShellRegistry,
+    memory: &crate::memory::MemoryState,
+    source: &str,
+) -> ToolOutput {
+    if call.name == "web_search" {
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let count = call.arguments.get("count").and_then(Value::as_u64);
+        mcp.web_search(query, count).await
+    } else if matches!(
+        call.name.as_str(),
+        "save_memory" | "read_memory" | "write_memory"
+    ) {
+        crate::memory::execute_tool(call, memory).await
+    } else {
+        tools::execute_host_tool(call, shell, source).await
+    }
+}
+
+/// The capped tool loop, factored out of [`run_chat_turn`] so the memory
+/// reflection pass can reuse it. Streams deltas/tool events to `sink`, echoes a
+/// turn's reasoning between tool rounds, and returns the accumulated usage and
+/// final text. When `persist` is `Some`, intermediate assistant/tool rows are
+/// written to the DB (live chat); when `None`, the loop is purely in memory.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_chat_turn(
-    db: &db::Db,
+pub(crate) async fn run_tool_loop(
     cfg: &AppConfig,
     api_key: &str,
     mcp: &tools::McpClient,
     shell: &ShellRegistry,
     memory: &crate::memory::MemoryState,
     approvals: &tools::ApprovalRegistry,
+    source: &str,
+    mut messages: Vec<ChatCompletionRequestMessage>,
+    tools_list: &[async_openai::types::chat::ChatCompletionTools],
     flag: Arc<AtomicBool>,
     sink: &dyn EventSink,
-    conversation_id: String,
-    content: String,
-    attachments: Vec<crate::attachments::Attachment>,
-) -> Result<(), String> {
-    let conversation = db::get_conversation(db, &conversation_id)?
-        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
-    let history = db::read_messages(db, &conversation_id)?;
-
-    // Persist the incoming user turn before streaming so it survives an abort/error.
-    let attachments_json = if attachments.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&attachments).map_err(|e| e.to_string())?)
-    };
-    db::insert_message_full(
-        db,
-        conversation_id.clone(),
-        "user".into(),
-        content.clone(),
-        Some(cfg.model.clone()),
-        Some(cfg.base_url.clone()),
-        None,
-        None,
-        None,
-        None,
-        attachments_json,
-    )?;
-
-    let base_prompt = conversation
-        .system_prompt
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    let model_label = crate::pricing::cached_model_name(db, &cfg.base_url, &cfg.model)
-        .unwrap_or_else(|| cfg.model.clone());
-    let system_prompt = build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
-    let mut messages = build_messages(&system_prompt, &history, &content, &attachments)?;
-    let tools_list = tools::tool_specs(tools::brave_script_available());
-
+    persist: Option<&db::Db>,
+) -> Result<ToolLoopResult, String> {
     let mut usage_total = json!({});
     let mut rounds: u32 = 0;
     let stop_reason: String;
@@ -771,14 +792,14 @@ pub(crate) async fn run_chat_turn(
     let mut final_thinking: Option<String> = None;
     // Reasoning produced by the last tool round, echoed on the assistant
     // tool-call message of this turn's subsequent requests. Never replays
-    // previous turns (build_messages stays reasoning-free).
+    // previous turns (build_history_messages stays reasoning-free).
     let mut pending_reasoning: Option<String> = None;
 
     loop {
         let body = completion_body(
             &cfg.model,
             &messages,
-            &tools_list,
+            tools_list,
             &cfg.thinking_level,
             if cfg.echo_reasoning_content {
                 pending_reasoning.as_deref()
@@ -822,32 +843,36 @@ pub(crate) async fn run_chat_turn(
             // preambles), otherwise the tool-call row.
             let has_preamble = !acc.text.trim().is_empty();
             if has_preamble {
+                if let Some(db) = persist {
+                    db::insert_message(
+                        db,
+                        source.to_string(),
+                        "assistant".into(),
+                        acc.text,
+                        Some(cfg.model.clone()),
+                        Some(cfg.base_url.clone()),
+                        None,
+                        thinking.clone(),
+                        None,
+                        None,
+                    )?;
+                }
+            }
+            let tool_row_thinking = if has_preamble { None } else { thinking };
+            if let Some(db) = persist {
                 db::insert_message(
                     db,
-                    conversation_id.clone(),
+                    source.to_string(),
                     "assistant".into(),
-                    acc.text,
+                    encode_tool_calls(&acc.tool_calls),
                     Some(cfg.model.clone()),
                     Some(cfg.base_url.clone()),
                     None,
-                    thinking.clone(),
+                    tool_row_thinking,
                     None,
                     None,
                 )?;
             }
-            let tool_row_thinking = if has_preamble { None } else { thinking };
-            db::insert_message(
-                db,
-                conversation_id.clone(),
-                "assistant".into(),
-                encode_tool_calls(&acc.tool_calls),
-                Some(cfg.model.clone()),
-                Some(cfg.base_url.clone()),
-                None,
-                tool_row_thinking,
-                None,
-                None,
-            )?;
             messages.push(
                 ChatCompletionRequestAssistantMessageArgs::default()
                     .tool_calls::<Vec<_>>(
@@ -899,19 +924,7 @@ pub(crate) async fn run_chat_turn(
                 }
 
                 let output = if approved {
-                    if call.name == "web_search" {
-                        let query = call
-                            .arguments
-                            .get("query")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let count = call.arguments.get("count").and_then(Value::as_u64);
-                        mcp.web_search(query, count).await
-                    } else if matches!(call.name.as_str(), "save_memory" | "read_memory") {
-                        crate::memory::execute_tool(call, &conversation_id, memory).await
-                    } else {
-                        tools::execute_host_tool(call, shell, &conversation_id).await
-                    }
+                    dispatch_tool(call, mcp, shell, memory, source).await
                 } else {
                     ToolOutput {
                         content: "The user denied this tool call.".into(),
@@ -926,18 +939,20 @@ pub(crate) async fn run_chat_turn(
                     output: output.content.clone(),
                 });
 
-                db::insert_message(
-                    db,
-                    conversation_id.clone(),
-                    "tool".into(),
-                    encode_tool_result(&call.id, &call.name, &output),
-                    Some(cfg.model.clone()),
-                    Some(cfg.base_url.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
+                if let Some(db) = persist {
+                    db::insert_message(
+                        db,
+                        source.to_string(),
+                        "tool".into(),
+                        encode_tool_result(&call.id, &call.name, &output),
+                        Some(cfg.model.clone()),
+                        Some(cfg.base_url.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?;
+                }
                 messages.push(
                     ChatCompletionRequestToolMessageArgs::default()
                         .content(output.content.clone())
@@ -969,15 +984,91 @@ pub(crate) async fn run_chat_turn(
         break;
     }
 
+    Ok(ToolLoopResult {
+        usage: usage_total,
+        text: final_text,
+        thinking: final_thinking,
+        stop_reason,
+    })
+}
+
+/// The live chat turn: persist the user message, run the capped tool loop with
+/// DB persistence, freeze the turn's price, and store the final assistant turn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_chat_turn(
+    db: &db::Db,
+    cfg: &AppConfig,
+    api_key: &str,
+    mcp: &tools::McpClient,
+    shell: &ShellRegistry,
+    memory: &crate::memory::MemoryState,
+    approvals: &tools::ApprovalRegistry,
+    flag: Arc<AtomicBool>,
+    sink: &dyn EventSink,
+    conversation_id: String,
+    content: String,
+    attachments: Vec<crate::attachments::Attachment>,
+) -> Result<(), String> {
+    let conversation = db::get_conversation(db, &conversation_id)?
+        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
+    let history = db::read_messages(db, &conversation_id)?;
+
+    // Persist the incoming user turn before streaming so it survives an abort/error.
+    let attachments_json = if attachments.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&attachments).map_err(|e| e.to_string())?)
+    };
+    db::insert_message_full(
+        db,
+        conversation_id.clone(),
+        "user".into(),
+        content.clone(),
+        Some(cfg.model.clone()),
+        Some(cfg.base_url.clone()),
+        None,
+        None,
+        None,
+        None,
+        attachments_json,
+    )?;
+
+    let base_prompt = conversation
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let model_label = crate::pricing::cached_model_name(db, &cfg.base_url, &cfg.model)
+        .unwrap_or_else(|| cfg.model.clone());
+    let system_prompt = build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
+    let messages = build_messages(&system_prompt, &history, &content, &attachments)?;
+    let tools_list = tools::tool_specs(tools::brave_script_available());
+
+    let mut result = run_tool_loop(
+        cfg,
+        api_key,
+        mcp,
+        shell,
+        memory,
+        approvals,
+        &conversation_id,
+        messages,
+        &tools_list,
+        flag,
+        sink,
+        Some(db),
+    )
+    .await?;
+
     approvals.deny_all();
 
     // Freeze the turn's price at the model/rates in effect now, so switching
     // models later never retroactively re-prices turns already billed.
-    if usage_total.get("prompt_tokens").is_some() || usage_total.get("completion_tokens").is_some()
+    if result.usage.get("prompt_tokens").is_some()
+        || result.usage.get("completion_tokens").is_some()
     {
         let pricing = crate::pricing::resolve_for(db, cfg, &cfg.model);
-        if let Some(cost) = crate::pricing::cost_of_usage(&usage_total, &pricing) {
-            usage_total["cost"] = json!(cost);
+        if let Some(cost) = crate::pricing::cost_of_usage(&result.usage, &pricing) {
+            result.usage["cost"] = json!(cost);
         }
     }
 
@@ -985,16 +1076,18 @@ pub(crate) async fn run_chat_turn(
         db,
         conversation_id.clone(),
         "assistant".into(),
-        final_text.clone(),
+        result.text.clone(),
         Some(cfg.model.clone()),
         Some(cfg.base_url.clone()),
         None,
-        final_thinking,
-        Some(usage_total.to_string()),
-        Some(stop_reason.clone()),
+        result.thinking,
+        Some(result.usage.to_string()),
+        Some(result.stop_reason.clone()),
     )?;
 
-    sink.emit(StreamEvent::Done { stop_reason });
+    sink.emit(StreamEvent::Done {
+        stop_reason: result.stop_reason,
+    });
     Ok(())
 }
 

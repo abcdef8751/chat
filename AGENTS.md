@@ -1,8 +1,9 @@
 # AGENTS.md — Pi Chat
 
-This is the working document for agents (and humans) building **Pi Chat**, a small desktop AI chat app.
-
-**Read this first.** It tells you where things are, how to build, what's done, and what's next. The broader product spec/decisions live in [`PLANS.md`](./PLANS.md) — this file is the _project-operations_ layer: status, commands, conventions, and next-step instructions.
+This is the single working document for **Pi Chat**, a small desktop AI chat app:
+what it is, how it's built, where things are, and what's next. (The old
+`PLANS.md` product spec was folded in here — the sections below are the source of
+truth for both architecture and status.)
 
 ---
 
@@ -10,221 +11,195 @@ This is the working document for agents (and humans) building **Pi Chat**, a sma
 
 A general-purpose AI chat app (not a coding agent) with:
 
-- An expandable sidebar listing past conversations
-- Streaming assistant replies (OpenAI-compatible API)
-- Optional tools (`read_file`/`write_file`; `bash` runs in a **per-conversation persistent shell** so `cd`/`export` survive; `web_search` via Brave)
+- An expandable sidebar listing past conversations (search, rename, delete)
+- Streaming assistant replies over any OpenAI-compatible endpoint
+- Optional tools — `bash` (a **per-conversation persistent shell**), `read_file`,
+  `write_file` (all approval-gated), and `web_search` (Brave via MCP, ungated)
 - Reasoning traces from thinking models (inline "Thought" bar → popup)
-- Dark mode by default (header light/dark toggle)
-- Markdown-file memory + per-conversation compaction
-- A price meter
-- File attachments (native picker + drag-drop; images as vision parts, documents folded into the prompt)
+- Per-turn **activity timeline** grouping reasoning, preamble text, and tool calls
+- Plain-Markdown long-term **memory** curated by an idle reflection pass
+- Context + price counters (per-turn cost is frozen at the model that produced it)
+- File attachments (native picker + drag-drop; images as vision parts, documents
+  folded into the prompt)
+- Dark mode by default (header toggle)
 
-**Stack:** SolidJS + Tailwind v4 + Kobalte + Tauri v2 (Rust). Backend logic lives in Rust (`src-tauri`); the UI is a Solid SPA.
+**Stack:** SolidJS + Tailwind v4 + Kobalte + Tauri v2 (Rust). Backend logic lives
+in `src-tauri`; the UI is a Solid SPA.
 
-**Key architectural stance (from PLANS.md):** no agent framework. We implement a stripped-down loop in Rust. We reuse `async-openai` for LLM streaming and `rmcp` to talk to an existing Brave MCP server. We do **not** import pi or any agent SDK.
+**Guiding principles & key stances**
+
+- **Small and self-contained.** One Tauri binary, one SQLite file, a directory of
+  Markdown files for memory. No microservices.
+- **No agent framework.** The core loop is simple and implemented directly in
+  Rust. pi is a *pattern reference only* — we don't import or vendor it. We reuse
+  `async-openai` for LLM types and `rmcp` for the Brave MCP server.
+- **The model decides; the user controls.** Tools and memory writes are surfaced,
+  gateable, and auditable.
+- **Separate storage size from injected context size.** We can store a lot; we
+  inject a small, bounded subset at prompt time.
+- **Generic OpenAI-compatible client.** Fireworks is only a prefilled default;
+  nothing is hardcoded to a provider. Secrets stay in the OS keychain and never
+  cross the IPC boundary.
 
 ---
 
 ## Current status
 
-**Milestone 1 — scaffold: ✅ DONE**
+`cargo test --lib`: **75 passed, 1 ignored** (the opt-in live reasoning-echo
+check). Clippy, `tsc --noEmit`, `npm run build`, and `npm run e2e` are clean.
 
-The stack is wired and both halves build. What exists today:
-
-| Area         | What's there                                                                                                             |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| App shell    | `src/App.tsx` — sidebar (conversation list) + main chat area, styled with Tailwind, uses Kobalte `Dialog` for "New chat" |
-| Frontend API | `src/lib/api.ts` — typed `invoke` wrappers + `Conversation`/`Message` types                                              |
-| Tailwind     | v4 via `@tailwindcss/vite`, imported in `src/index.css`                                                                  |
-| SQLite       | `src-tauri/src/db.rs` — rusqlite (bundled), schema for `conversations`/`messages`/`model_prices`, migration on open      |
-| Commands     | `list_conversations`, `create_conversation`, `list_messages`, `add_message` registered in `src-tauri/src/lib.rs`         |
-| Config       | `src-tauri/tauri.conf.json` — product `pi-chat`, window "Pi Chat"                                                        |
-
-**Verified:** `npm run build` (Vite, succeeded) and `cargo build` in `src-tauri` (succeeded, ~2m51s).
-
-**Not yet run:** the GUI itself. `npm run tauri dev` will compile + launch the window; it needs a display session (won't work headless). Run it once to confirm the SQLite list + "New chat" create flow end-to-end.
+| Area              | State | Notes                                                                                                     |
+| ----------------- | ----- | --------------------------------------------------------------------------------------------------------- |
+| Stack / scaffold  | ✅    | SolidJS + Tailwind v4 + Kobalte + Tauri v2; SQLite via rusqlite (bundled)                                  |
+| Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, capped tool loop                        |
+| Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; price overrides                  |
+| Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline                                 |
+| Tools             | ✅    | `bash` (persistent shell), `read_file`/`write_file` (gated), `web_search` (MCP, ungated)                   |
+| Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost                  |
+| Context + price   | ◑     | Context counter + frozen per-turn cost done; **near-limit banner + compaction (M7) remain**                |
+| GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
 
 ---
 
-**Milestone 2 — streaming loop: ✅ DONE**
+## Core loop (trimmed)
 
-An end-to-end streaming turn works against a configurable OpenAI-compatible endpoint (default Fireworks). `cargo build`, `cargo clippy`, and `cargo test` (incl. a mock-SSE streaming integration test) all pass; `npm run build` passes.
+`chat.rs` `run_tool_loop` (shared by live chat and reflection):
 
-| Area              | What's there                                                                                                                                               |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| LLM client        | `src-tauri/src/chat.rs` — `async-openai` streaming via `Client.chat().create_stream`; `event-stream` deltas emitted to the frontend over a Tauri `Channel` |
-| Config            | `src-tauri/src/config.rs` — `get_config`/`set_config`, persisted as JSON in the app data dir (`config.json`). Plaintext for now (keychain is Milestone 3)  |
-| Models            | `src-tauri/src/models.rs` — `list_models` calls `GET /models` on the configured base URL                                                                   |
-| Streaming command | `chat::stream_chat` — reads conversation + history, persists the user turn, streams, persifies the assistant turn with `usage` + `stop_reason`             |
-| Abort             | `chat::stop_chat` — sets a per-conversation cancel flag; partial text is preserved (`stop_reason = "aborted"`)                                             |
-| Failure contract  | Stream error keeps partial text (`stop_reason = "error"`); missing key/model returns a command error the UI surfaces                                       |
-| Frontend          | `src/App.tsx` — chat bar wired (Send / Stop), live assistant bubble via `Channel`, minimal Settings dialog (baseUrl/apiKey/model + model picker)           |
+```
+prompt(userMessage)
+├─ build context (system + explicit preferences + memory + history [+ compaction summary])
+├─ stream deltas ─────────────────────────── emit `delta` / `thinkingDelta` events
+├─ if assistant emits tool calls:
+│   ├─ gate each call (approve / deny / abort)
+│   ├─ execute tool
+│   ├─ on error: return a tool-error result (model self-corrects)
+│   └─ loop back to the LLM (MAX_TOOL_ROUNDS = 8)
+├─ persist message + usage + stopReason
+└─ emit final message event
+```
 
-**Verified:** `cargo build`, `cargo clippy --all-targets`, and `cargo test --lib` (5 tests) succeed in `src-tauri`; `npm run build` succeeds. Still needs a live GUI run from a display session.
+Guards: capped tool rounds; idempotent abort that preserves partial text; stream
+errors keep partial text and mark `stop_reason = "error"`. Within a turn, each
+tool-call round's reasoning is echoed on its assistant tool-call message for the
+following rounds (DeepSeek thinking mode requires it, else HTTP 400); traces are
+**never** replayed across user turns. Toggle: `AppConfig.echo_reasoning_content`.
 
----
+**Failure-handling contract**
 
-**Milestone 3 — config + models polish: ✅ DONE**
-
-API key now lives in the OS keychain (never on disk, never crosses the IPC boundary), the header has a working model picker backed by a cached, chat-filtered model list, and Settings persists on close with inline errors.
-
-| Area                  | What's there                                                                                                                                                                                         |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Secrets               | `src-tauri/src/secrets.rs` — `keyring` v4 (Secret Service on Linux / Keychain on macOS / Credential Manager on Windows). Commands `has_api_key`, `set_api_key` (empty/None → delete)                  |
-| Config                | `config.rs` — `AppConfig` is now `base_url`/`model` only; a legacy plaintext `apiKey` in `config.json` is migrated to the keychain on first load and stripped from the file                          |
-| Key stays server-side | `list_models` and `stream_chat` read the key from the keychain in Rust; the frontend only ever sees a boolean. (`tauri-plugin-keyring` was skipped deliberately: its JS-facing API would put the key through the frontend, violating the PLANS decision.) |
-| Model picker          | Header `<select>` lists chat-capable models from `list_models`, shows the current model even when the list is empty/fetch failed; changing it persists immediately via `set_config`                   |
-| Filtering + cache     | `models.rs` — heuristic denylist for clearly non-chat ids (embedding/whisper/tts/flux/rerank/…); raw list cached in memory per base URL (`ModelCache` state), `refresh: true` re-fetches              |
-| Settings dialog       | Persists on close (`onOpenChange(false)` → `persistSettings`); API key field is write-only (placeholder shows "saved in keychain"), "Remove saved key" button; "Load" saves the draft first, then fetches so connection errors show inline; post-close errors show as a header banner |
-
-**Verified:** `cargo build`, `cargo clippy --all-targets`, `cargo test --lib` (11 tests, incl. a live keychain roundtrip) in `src-tauri`; `npx tsc --noEmit` + `npm run build` for the frontend. Still needs a live GUI run from a display session.
+- Stream error mid-turn → keep partial text, `stop_reason = "error"`, offer retry.
+- Tool error → convert to a tool-error result so the model can self-correct; never throw.
+- Abort → signal, close stream, persist partial; idempotent.
+- Runaway guard → hard cap on consecutive tool rounds.
 
 ---
 
-**Milestone 4 — conversations polish: ✅ DONE**
+## Data model (SQLite)
 
-| Area            | What's there                                                                                                                                                        |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Auto-title      | `db.rs` `insert_message` — first user message titles an untitled conversation (`derive_title`: first line, 60 chars)                                                 |
-| updated_at      | Maintained on every insert; sidebar sorts by it (list query already ordered)                                                                                           |
-| Rename/delete   | Commands `rename_conversation`, `delete_conversation` (FK cascade via `PRAGMA foreign_keys = ON`); sidebar hover ✎ / ✕ with inline confirm                               |
-| Search          | Command `search_conversations` — case-insensitive substring over title AND message content; sidebar search box (debounced)                                              |
-| Markdown render | `src/lib/Markdown.tsx` — `marked` + DOMPurify + `@tailwindcss/typography` (prose); assistant bodies render markdown, user stays plain text                              |
-| Auto-create     | Sending with no active conversation creates one on the fly; sidebar refreshes after each turn (new titles/bumped chats)                                                |
+Schema lives in `db.rs` `SCHEMA` (idempotent `CREATE TABLE IF NOT EXISTS`), with
+best-effort `ALTER TABLE ... ADD COLUMN` migrations in `open()`.
 
-**Verified:** `cargo test --lib` (12 tests), clippy clean, `tsc --noEmit`, `npm run build`.
+```sql
+conversations(
+  id, title, model, system_prompt, compaction_summary,
+  last_reflected_index,          -- memory-reflection watermark
+  created_at, updated_at)
 
----
+messages(
+  id, conversation_id, role,     -- user | assistant | tool | memory
+  "index",                        -- per-conversation monotonic order
+  content, model, provider, thinking_level, thinking,
+  usage,                          -- JSON token/cost (frozen `cost` per turn)
+  stop_reason, attachments,       -- JSON attachment array
+  created_at)
 
-**Milestone 5 — tools: ✅ DONE**
+model_prices(                     -- models.dev cache
+  provider, model_id, input_per_million, output_per_million,
+  cache_read_per_million, cache_write_per_million, context_window,
+  name, reasoning, reasoning_options, fetched_at, PRIMARY KEY(provider, model_id))
 
-The chat command now runs a capped tool loop; tools are visible, gateable, and persisted like any other turn.
+memory_reflections(               -- reflection spend, kept separate from chat cost
+  id, conversation_id, model, usage, cost, files, note, created_at)
+```
 
-| Area             | What's there                                                                                                                                                                                                                                            |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Tool loop        | `chat.rs` `stream_chat` — up to `MAX_TOOL_ROUNDS` (8) rounds; streamed tool-call fragments accumulated by index; per-round text persisted, usage summed across rounds; cap reached → `stop_reason = "length"`                                             |
-| Host tools       | `tools.rs` — `bash` (60s timeout, stdout+stderr+exit, output truncated at 20k chars), `read_file`, `write_file`; all errors become tool-error text the model can self-correct (never throws)                                                              |
-| Approval gate    | `ApprovalRegistry` + `approve_tool`/`deny_tool` commands — stream emits a `toolCall` event, awaits a oneshot; bash/read/write gated, Stop denies pending calls; UI shows an Approve/Deny card per gated call                                              |
-| web_search       | `tools.rs` `McpClient` — long-lived `rmcp` stdio client spawning `node ~/.config/opencode/mcp/brave-search.mjs` (ungated); kept alive via stored `RunningService` (dropping the peer alone closes the transport!), re-spawned once on failure            |
-| History format   | Assistant tool-request rows: `{"tool_calls":[{id,name,arguments}]}`; tool-result rows (role `tool`): `{"tool_call_id","name","error","output"}` — `build_messages` converts both back to request shapes so multi-round history replays correctly          |
-| Events/UX        | `StreamEvent` gained `toolCall`/`toolResult`; live cards show args + Approve/Deny while streaming; persisted tool turns render as collapsible result blocks and "assistant wants X" cards                                                                   |
-
-**Verified:** `cargo build`, `cargo clippy --all-targets`, `cargo test --lib` (22 tests at the time — incl. mock-SSE tool-call fragment accumulation and a live MCP handshake/list_tools against the real Brave server), `tsc --noEmit`, `npm run build`. GUI-exercised during M5.5 below.
-
----
-
-**Milestone 5.5 — UX, reasoning traces, persistent shell: ✅ DONE**
-
-Post-M5 additions driven by live GUI use. `cargo test --lib` is now 31 tests; clippy, `tsc --noEmit`, and `npm run build` clean.
-
-| Area             | What's there                                                                                                                                                                                                                                                                                    |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Layout/theme     | `App.tsx` — user messages right-aligned; class-based dark mode (`@custom-variant dark` in `index.css`) defaults to dark with a header Light/Dark toggle persisted in `localStorage`; `Markdown.tsx` adds `dark:prose-invert`                                                                     |
-| Reasoning traces | The chat command parses the raw SSE itself (not async-openai's typed stream) so provider `reasoning_content` / thinking content-parts aren't dropped. `StreamEvent::ThinkingDelta` streams live; `messages.thinking` stores the trace; the UI shows an inline "Thinking…/Thought" bar opening a live-updating popup |
-| Persistent shell | `shell.rs` — one long-lived `bash --noprofile --norc` per conversation; `cd`/`export`/functions persist across calls. Sentinel-delimited output, `exec 2>&1` merges stderr, 60s timeout kills+respawns, `kill_on_drop`; registry keyed by conversation id; `delete_conversation` (now async) clears it |
-| Chat-loop tests  | Tests moved to `src/chat/tests.rs` (`#[cfg(test)] mod tests;`). Mock-SSE server covers deltas/usage, reasoning capture, tool-call fragments, approved + denied tool rounds, thinking persistence, abort-with-partial, and SSE framing                          |
-| Bug fixes        | `StreamEvent` fields now use `rename_all_fields = "camelCase"` — without it `callId` arrived `undefined` and Approve silently hung. Tool args render single-field values raw (bash → the command) and multi-field as pretty JSON. Whitespace-only preambles are no longer persisted/rendered |
-
-**Verified:** `cargo test --lib` (31), `cargo clippy --all-targets` clean, `tsc --noEmit` + `npm run build`. GUI-exercised live: streaming, tool Approve/Deny (`pwd`/`date` via bash), the reasoning "Thought" bar, and dark mode. Persistent shell not yet GUI-tested (needs an app restart).
+- **`role`:** `memory` rows are low-key consolidation notes; `build_history_messages`
+  skips them and the UI renders them as a centered note, not a turn.
+- **Tool-turn persistence:** assistant tool-request rows are
+  `{"tool_calls":[{id,name,arguments}]}`; tool-result rows (`role="tool"`) are
+  `{"tool_call_id","name","error","output"}`. Frontend parsers in `App.tsx`
+  (`parseToolCallList`/`parseToolResult`) and `groupTurns`/`buildEntries` must stay
+  in sync.
+- **Pricing** is resolved lazily and cached: **override → fetched `model_prices` →
+  bundled fallback → default**. Cost is frozen on the message at the rates in
+  effect, so switching models never re-prices past turns.
 
 ---
 
-**Milestone 6 — memory: ✅ DONE**
+## Memory system
 
-Markdown-file memory + the two memory tools + a Memory tab. `cargo test --lib` is now 42 tests; clippy, `tsc --noEmit`, and `npm run build` clean.
+Plain Markdown files in the app data dir — **no frontmatter, no index, no inbox**.
+The system starts with only the **core** files and the agent grows it with its own
+topic files.
 
-| Area             | What's there                                                                                                                                                                                                                     |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Memory files     | `memory.rs` `MemoryState` — `memory/` dir in app data with `index.md` (auto-generated titles+summaries) + `preferences.md`/`identity.md`/`goals.md`/`notes.md`; entries are YAML-frontmatter blocks; writes are atomic (temp + rename) |
-| save_memory      | `save_memory(content, path?, category?, importance)` — explicit `path` targets any existing/new `.md` file (overrides `category`); else category→canonical-file routing. Dedupe-by-title merge/update, summary auto-derived, `index.md` regenerated (indexes custom files too) |
-| read_memory      | `read_memory(path)` — on-demand body reads (frontmatter stripped); file names sanitized (no `/`, `..`, non-`.md`) so reads stay inside the memory dir                                                                                |
-| Context injection| `chat.rs` `system_prompt_with_memory` appends the bounded index block to every system prompt; bodies only enter context via `read_memory`                                                                                          |
-| Commands         | `list_memory_files`, `write_memory_file`, `delete_memory_file` (registered in `lib.rs`)                                                                                                                                             |
-| Memory tab       | Header "Memory" dialog — file list + editor, explicit Save, delete-with-confirm; `index.md` is read-only and regenerated on save                                                                                                   |
-| Gating           | Both memory tools are **ungated** (confirmed with user); writes stay visible via the Memory tab and the injected index                                                                                                             |
-
-**Verified:** `cargo test --lib` (42, incl. save/dedupe/category-routing/parse-roundtrip/traversal-rejection and system-prompt injection), `cargo clippy --all-targets` clean, `tsc --noEmit` + `npm run build`. GUI-exercise still pending a display session.
-
----
-
-**Context + price counters: ✅ DONE** (counters only — M7/M8 remainder below)
-
-Per-model context window and token rates resolve from a bundled table with user overrides; the header shows context used/window and the conversation's estimated cost.
-
-| Area             | What's there                                                                                                                                                                                                                     |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pricing data     | `pricing.rs` — bundled pattern→(context window, $/1M in/out) fallback table; `get_pricing(modelId)` resolves **override → fetched cache → bundled → default**                                                                      |
-| Price fetching   | `refresh_pricing` fetches the free public **models.dev** catalog (`api.json`), matches the provider by the configured base URL, and upserts every model's `cost` + `limit.context` into `model_prices` (no API key needed)          |
-| Context tracking | `chat.rs` `track_context` stores the final tool round's `prompt + completion` as `usage.context_tokens`; `sum_usage` also normalizes provider cached-token counts into `usage.cached_tokens`/`cache_write_tokens`                     |
-| Overrides        | `AppConfig.modelOverrides` persisted in `config.json`; Settings "Pricing & context" fields + "Reset to default"                                                                                                                    |
-| Header readout   | `tokens used / window` (color at 75%/90%) + conversation cost; "—" when rates unknown; tooltip shows rates + an override note                                                                                                      |
-| Settings refresh | "Refresh prices" button → `refreshPricing()`, reports "Updated N models from `<provider>`"; `Pricing.source` (`override`/`fetched`/`bundled`/`default`) drives the caption                                                |
-| Cost             | sum over assistant messages of `uncached×input + cached×cache_read + cache_write×cache_write + completion×output`; unknown cache rates fall back to the input rate (budget: single active model)                                      |
-| Cache rates      | `cache_read`/`cache_write` flow override → fetched `model_prices` → (bundled has none); editable in Settings and shown in the header tooltip                                                                                        |
-
-**Verified:** `cargo test --lib` (51, incl. models.dev provider matching/parse, cached-token normalization across provider shapes, bundled/override/partial-override resolution, and `context_tokens`), `cargo clippy --all-targets` clean, `tsc --noEmit` + `npm run build`. Live fetch manually validated against models.dev (Fireworks provider `api` matches the configured base URL; 22 models incl. all current Fireworks ids).
+- **Core files** (`profile.md`, `preferences.md`, `goals.md`) are injected into
+  every system prompt **in full**. Other files are listed by name + first line and
+  read on demand.
+- **Tools:** `save_memory(content, path)` appends to the named file (path
+  required, file created if missing); `read_memory(path)`; `write_memory(path,
+  content)` replaces a file for curation. No `importance`/`category`.
+- **Live vs idle:** live chat has `save_memory`/`read_memory`; `write_memory` is
+  **reflection-only** so the chatting model can't clobber curated files.
+- **Idle reflection** (`reflection.rs`): a background scheduler (`spawn`, ~1 min
+  tick) reflects one due conversation per tick once it has been idle ≥
+  `memory_reflection_idle_minutes` (default 30, toggle in Settings). It feeds the
+  model the full transcript + all memory files, runs the reflection tool loop,
+  diffs the files, records usage/cost, inserts a `memory` note when files changed,
+  and advances `conversations.last_reflected_index`.
+- **Eligibility:** a chat becomes due only when a message is inserted
+  (user/assistant/tool). Merely opening a chat does not touch `updated_at`.
+- **Scope:** the Memory tab's **Consolidate this chat** button is per-chat; the
+  scheduler sweeps all chats over time. Memory files themselves are global.
+- **Explicit vs inferred preferences:** the Settings **"Explicit user preferences"**
+  field is injected at the top of every system prompt and labelled authoritative
+  (takes precedence over inferred memory); the memory block and reflection prompt
+  both say not to duplicate or contradict it. Memory files hold what the assistant
+  *infers*.
+- **Migration:** `MemoryState::migrate_legacy` converts old frontmatter files to
+  plain `## title` + body and deletes `index.md` on first load. Existing extra
+  files are kept as ordinary files.
 
 ---
 
-**User preferences, model identity, real model names + thinking levels: ✅ DONE**
+## Tool surface
 
-| Area             | What's there                                                                                                                                                                                                                                                        |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Preferences      | `AppConfig.preferences` (persisted in `config.json`); Settings "User preferences" textarea. Injected at the **top** of every system prompt (`User preferences:\n…`).                                                                                                  |
-| Model identity   | `chat.rs` `build_system_prompt` appends `You are currently running as the model "<name>"`; the name is resolved from the models.dev cache with the id as fallback.                                                                                                   |
-| Real model names | **The picker list comes from models.dev** for a matched endpoint (`pricing::provider_model_ids`), so every entry has a real `name` (plus context/reasoning). `models::list_models` refreshes the catalog on demand (`ensure_cached`), caches ids in memory per base URL, and falls back to the endpoint's own `GET /models` only when models.dev has no matching provider (self-hosted). `ModelInfo` carries `name`; header picker and Settings render `name ?? id`. |
-| Thinking levels  | `pricing::thinking_options(modelId)` → `{options, source, supportsReasoning}`. Uses models.dev `reasoning_options` `effort.values` when present; otherwise the OpenAI levels (`minimal`/`low`/`medium`/`high`). Non-reasoning models expose none (selector hidden). Header selector persists `AppConfig.thinkingLevel` immediately; non-empty → `reasoning_effort` on each request. |
-| Cache schema     | `model_prices` gained `name`/`reasoning`/`reasoning_options` (+`ALTER TABLE` migration); `has_cached` requires names so pre-migration rows re-fetch once.                                                                                                              |
+Introduced through the same loop, so they're visible, gateable, and aborted like
+everything else.
 
-**Verified:** `cargo test --lib` (55, incl. thinking-option derivation and system-prompt ordering), `cargo clippy --all-targets` clean, `tsc --noEmit` + `npm run build`. GUI-exercise pending a display session.
+```rust
+// Approval-gated (local side effects / local data)
+bash(command)                     // runs in the conversation's persistent shell
+read_file(path)
+write_file(path, content)
 
----
+// Memory — ungated, app-local. write_memory is reflection-only.
+save_memory(content, path)        // append; path required
+read_memory(path)
+write_memory(path, content)       // replace (curation)
 
-**Settings UX + accurate per-turn pricing + file attachments: ✅ DONE**
+// Web search — reused Brave MCP server, read-only (ungated)
+web_search(query, count?)
+```
 
-| Area              | What's there                                                                                                                                                                                                                                                                                                                        |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Settings close    | `persistSettings` reads the persisted config back and writes only `baseUrl` + `preferences` (+ a typed key), so pressing **Done** never changes the active model. The header picker owns the model and persists immediately. The catalog is re-fetched only when the base URL or key changed.                                            |
-| Settings layout   | Model loader, manual "Pricing & context" editor, and the "Available models" list removed. Dialog is `max-h-[85vh] overflow-y-auto` (shrinks + scrolls).                                                                                                                                                                               |
-| Catalog fetch     | Startup shows cached prices/models immediately, then a background `list_models(true)` replaces them when models.dev resolves (`catalogVersion` re-runs pricing/thinking). No periodic polling.                                                                                                                                       |
-| Model picker      | Options are derived (`modelOptions`) with the active model always first; a `ref` + effect re-applies `select.value` after the list is rebuilt. WebKit clears a `<select>` when its selected `<option>` is removed, and Solid's `value` binding doesn't re-run because `model` is unchanged — hence the explicit re-sync. Never disabled/grayed while loading. |
-| Preferences/model | `build_system_prompt` injects `User preferences:` at the top (empty → omitted) and the active-model line; a request-body test asserts both reach the provider.                                                                                                                                                                       |
-| Pricing accuracy  | `pricing::resolve_for` + `cost_of_usage` bill uncached/cache-read/cache-write/output buckets without overlap. `run_chat_turn` **freezes** the turn's cost into `usage.cost` (priced with the model actually used), so switching models never retroactively re-prices past turns. The header sums frozen costs; legacy turns without `cost` are priced per-message-model via `pricingByModel`. |
-| Attachments       | Paperclip button (left of the composer) opens the native picker via `tauri-plugin-dialog`; native drag-drop via `getCurrentWebview().onDragDropEvent` with a drop overlay. `attachments.rs` `read_attachments` reads paths on the blocking pool (images → base64 data URL; text files → contents; else metadata). Pending files preview above the composer (image thumbnail, or doc chip + size + remove). Sent files render inside the user bubble and persist in `messages.attachments`. Text files fold into the message; images go as multimodal `image_url` parts. |
-
-**Verified:** `cargo test --lib` (65, incl. base64 vectors, attachment read/persist/send, frozen cost, request body), `cargo clippy --all-targets` clean, `tsc --noEmit` + `npm run build`. GUI-exercise pending (native picker + drag-drop can't run headless).
-
-**Deps/config added:** `tauri-plugin-dialog` (Rust) + `@tauri-apps/plugin-dialog` (JS); capability `dialog:default`.
-
----
-
-**Reasoning echo between tool calls: ✅ DONE**
-
-A turn's reasoning trace (`reasoning_content`) is echoed on its assistant
-tool-call message for the following rounds of the **same** turn — DeepSeek
-thinking mode requires it (HTTP 400 otherwise) — and is never replayed across
-user turns. `async-openai` has no such field, so `completion_body` injects it
-into the serialized request body. Gated by `AppConfig.echo_reasoning_content`
-(Settings checkbox "Send reasoning back to the model between tool calls"),
-default on, for providers that reject unknown fields.
-
-**Verified:** `cargo test --lib` (72 + 1 ignored, incl. echo-within-turn /
-no-replay-across-turns / disabled-toggle), `cargo clippy --all-targets` clean,
-`tsc --noEmit` + `npm run build`.
-
-A **live** provider check is available (ignored by default; hits the real
-endpoint and costs a few tokens):
-`cargo test --lib -- --ignored live_reasoning_echo`. It runs one real tool-call
-turn and confirms the provider accepts the echoed `reasoning_content` on the
-replayed assistant tool-call message (the trace is synthetic, so the result
-doesn't depend on the model emitting one). Target overrides: `PI_LIVE_BASE_URL`,
-`PI_LIVE_MODEL`; the key is read from the keychain and never printed.
+**MCP integration:** `tools.rs` `McpClient` spawns
+`node ~/.config/opencode/mcp/brave-search.mjs` once and keeps a long-lived `rmcp`
+stdio client (the `RunningService`, not just its `Peer` — dropping the service
+closes the transport). Re-spawned once on failure. `BRAVE_API_KEY` is loaded by
+the script from its sibling `.env`.
 
 ---
 
 ## Commands
 
-Frontend / Tauri tasks, run from the repo root (`/home/rp/chat`):
+Run from the repo root (`/home/rp/chat`):
 
 ```bash
 npm install            # install JS deps (first time)
@@ -240,32 +215,38 @@ Rust-only:
 ```bash
 cd src-tauri
 cargo check           # fast type/borrow check
+cargo test --lib      # unit + mock-SSE integration tests
 cargo build           # full debug build (slow first time: Wry + bundled SQLite)
+```
+
+Optional live provider check (ignored by default; hits the real endpoint):
+
+```bash
+cargo test --lib -- --ignored live_reasoning_echo
+# overrides: PI_LIVE_BASE_URL, PI_LIVE_MODEL; key read from the keychain
 ```
 
 ### GUI end-to-end testing (`e2e/`)
 
 `npm run e2e` drives the **real webview** against a mock OpenAI-compatible SSE
-server (`e2e/mock-llm.mjs`) using `tauri-driver` + `WebKitWebDriver`, asserting
-the streaming/UX behavior unit tests can't reach: no reply truncation (the mock's
-final SSE event omits its terminating blank line), reasoning-trace clickability /
-DOM stability across streamed updates, auto-scroll, bottom anchoring, and the
-context budget. Screenshots → `e2e/screenshots/` (gitignored).
+server (`e2e/mock-llm.mjs`) using `tauri-driver` + `WebKitWebDriver`. It asserts
+the behavior unit tests can't reach: no reply truncation (the mock's final SSE
+event omits its terminating blank line), reasoning-trace clickability / DOM
+stability across streamed updates, auto-scroll, bottom anchoring, the live
+activity timeline + tool approval, and memory consolidation. Screenshots →
+`e2e/screenshots/` (gitignored).
 
-- **Prereq:** `cargo install tauri-driver --version 2.0.6 --locked` — the **2.x**
-  release is the Tauri v2 one; 3.0.0-alpha targets Tauri v3.
-- The runner builds the debug binary if missing, launches the app with an
-  **isolated `XDG_DATA_HOME`** (seeded with the mock endpoint), and writes a
-  throwaway keychain key **only if none exists** (removed afterward).
+- **Prereq:** `cargo install tauri-driver --version 2.0.6 --locked` (the **2.x**
+  release is the Tauri v2 one; 3.0.0-alpha targets Tauri v3).
+- The runner builds the debug binary **only if missing** — after changing Rust
+  code, `cargo build` first so the harness picks it up.
+- It launches the app with an **isolated `XDG_DATA_HOME`** (seeded with the mock
+  endpoint) and writes a throwaway keychain key **only if none exists**.
 - **Input / clicks:** on this WebKitGTK build, `Element Click` / `Send Keys` /
-  W3C Actions return `unsupported operation`. `/usr/bin/WebKitWebDriver` ships
-  from the `webkitgtk6.0` (GTK4) package while the app runs on `webkit2gtk-4.1`
-  (GTK3), and the browser-side input path isn't wired for that pairing; there is
-  no runtime flag (`browserName` makes no difference). Clicks are dispatched via
-  in-page `el.click()` (the standard workaround, [tauri#6541]) and the
-  click-churn regression is covered by a DOM-node-identity assertion. A
-  private-display XTEST harness was prototyped and removed as overengineering.
-  See `e2e/README.md`.
+  W3C Actions return `unsupported operation` (`/usr/bin/WebKitWebDriver` is the
+  GTK4 build while the app runs on `webkit2gtk-4.1`). Clicks are dispatched via
+  in-page `el.click()`; the click-churn regression is covered by a DOM-node
+  identity assertion. See `e2e/README.md`.
 
 ---
 
@@ -273,8 +254,7 @@ context budget. Screenshots → `e2e/screenshots/` (gitignored).
 
 ```
 /home/rp/chat
-├─ PLANS.md            # product spec + decisions + v1/v2 scope + build order
-├─ AGENTS.md           # this file (project operations / status / next steps)
+├─ AGENTS.md           # this file (single source of truth)
 ├─ index.html
 ├─ vite.config.ts      # Vite + vite-plugin-solid + @tailwindcss/vite
 ├─ package.json
@@ -286,28 +266,29 @@ context budget. Screenshots → `e2e/screenshots/` (gitignored).
 ├─ src/
 │  ├─ index.tsx        # entry; imports ./index.css (Tailwind)
 │  ├─ index.css        # Tailwind import + typography + class-based dark variant
-│  ├─ App.tsx          # UI shell (sidebar, dialogs, messages, tool cards, reasoning popup, theme)
+│  ├─ App.tsx          # UI shell (sidebar, dialogs, messages, timeline, theme)
 │  └─ lib/
 │     ├─ api.ts        # typed invoke wrappers over Tauri commands
 │     └─ Markdown.tsx  # marked + DOMPurify renderer (prose + dark:prose-invert)
 └─ src-tauri/
    ├─ tauri.conf.json  # v2 config (productName, window, devUrl, frontendDist)
-   ├─ Cargo.toml       # tauri, serde, serde_json, rusqlite [bundled], uuid, async-openai, keyring, rmcp, reqwest, tokio, tokio-stream
+   ├─ Cargo.toml       # tauri, serde, rusqlite [bundled], uuid, async-openai, keyring, rmcp, reqwest, tokio, tokio-stream
    ├─ capabilities/default.json
    ├─ build.rs
    └─ src/
       ├─ main.rs       # thin entry -> chat_app_lib::run()
-      ├─ lib.rs        # Builder, setup (SQLite + config + MCP + registries), invoke_handler
-      ├─ db.rs         # Db state, schema migration, conversation/message commands + helpers
-      ├─ config.rs     # AppConfig (base_url/model/preferences/thinking_level), config.json persistence, legacy key migration
-      ├─ secrets.rs    # OS-keychain API key storage (keyring crate) + has/set_api_key commands
-      ├─ models.rs     # list_models (models.dev catalog, /models fallback), chat-capable filter, per-baseUrl cache
+      ├─ lib.rs        # Builder, setup (SQLite + config + MCP + registries + reflection), invoke_handler
+      ├─ db.rs         # Db state, schema/migration, conversation/message commands + helpers
+      ├─ config.rs     # AppConfig, config.json persistence, legacy key migration
+      ├─ secrets.rs    # OS-keychain API key storage (keyring crate) + has/set_api_key
+      ├─ models.rs     # list_models (models.dev catalog, /models fallback), chat filter, per-baseUrl cache
       ├─ tools.rs      # tool specs, host executor, approval registry, MCP web_search
       ├─ shell.rs      # persistent per-conversation bash sessions (ShellRegistry)
-      ├─ memory.rs     # Markdown-file memory: entries, index.md, save/read tools, commands
-      ├─ attachments.rs # read file paths → Attachment (image data URL / text / metadata); read_attachments command
-      ├─ pricing.rs    # pricing + models.dev metadata cache (name/reasoning); overrides -> cache -> bundled; thinking_options; cost_of_usage
-      ├─ chat.rs       # stream_chat/stop_chat, raw SSE parsing, StreamRegistry, StreamEvent
+      ├─ memory.rs     # Plain-Markdown memory: core files, listing, save/read/write, migration
+      ├─ reflection.rs # Idle memory-consolidation scheduler + per-conversation pass
+      ├─ attachments.rs # read paths -> Attachment (image data URL / text / metadata)
+      ├─ pricing.rs    # pricing + models.dev metadata cache; overrides -> cache -> bundled
+      ├─ chat.rs       # stream_chat/stop_chat, raw SSE, run_tool_loop, StreamRegistry, StreamEvent
       └─ chat/
          └─ tests.rs   # chat-loop tests (mock SSE: tools, reasoning, abort, usage)
 ```
@@ -320,61 +301,53 @@ context budget. Screenshots → `e2e/screenshots/` (gitignored).
 
 - Use `createSignal` / `createEffect` / `For` / `Show` from `solid-js`. No class components.
 - All Tauri calls go through typed wrappers in `src/lib/api.ts`; components never call `invoke` directly.
-- Style with Tailwind utility classes only (no separate CSS modules). Tailwind scans `src/**` automatically.
-- Kobalte components are namespaced: `import { Dialog } from "@kobalte/core/dialog"` then `<Dialog.Root>`, `<Dialog.Trigger>`, etc. Trigger defaults to a `<button>`; pass `class` to style.
+- Style with Tailwind utility classes only (no CSS modules). Tailwind scans `src/**`.
+- Kobalte components are namespaced: `import { Dialog } from "@kobalte/core/dialog"` then `<Dialog.Root>`, `<Dialog.Trigger>`, etc.
 
 ### Backend (Rust / Tauri)
 
-- Add a new module (e.g. `src-tauri/src/<x>.rs`), declare `mod x;` in `lib.rs`, register commands via `tauri::generate_handler![...]`.
-- Commands take `tauri::State<'_, Db>` for DB access; lock the `Mutex<Connection>` for the duration of the command (short-lived, sequential).
+- New module → `src-tauri/src/<x>.rs`, declare `mod x;` in `lib.rs`, register commands in `tauri::generate_handler![...]`.
+- Commands take `tauri::State<'_, Db>` for DB access; lock the `Mutex<Connection>` briefly.
 - Errors return `Result<T, String>`.
-- Tauri v2 maps JS `camelCase` args to Rust `snake_case` params automatically (e.g. `conversationId` → `conversation_id`).
-- `StreamEvent` is serialized straight to the frontend. Enum-level `rename_all` only renames **variants**, so multi-word fields need `rename_all_fields = "camelCase"` (e.g. `call_id` → `callId`); keep the `StreamEvent` union in `src/lib/api.ts` in sync.
-- `bash` runs in a persistent per-conversation shell (`shell.rs`); never assume a fresh process/cwd/env. `read_file`/`write_file` remain direct host calls.
-- Chat-loop tests live in `src/chat/tests.rs` (`#[cfg(test)] mod tests;`); add loop/tool tests there.
+- Tauri v2 maps JS `camelCase` args to Rust `snake_case` params automatically (`conversationId` → `conversation_id`).
+- `StreamEvent` is serialized straight to the frontend. Enum-level `rename_all` only renames **variants**, so fields need `rename_all_fields = "camelCase"` (e.g. `call_id` → `callId`); keep the `StreamEvent` union in `src/lib/api.ts` in sync.
+- `bash` runs in a persistent per-conversation shell; never assume a fresh process/cwd/env. `read_file`/`write_file` are direct host calls.
+- Chat-loop tests live in `src/chat/tests.rs`; add loop/tool tests there.
 
 ### SQLite
 
-- DB file lives in the app data dir at `chat.sqlite`. On Linux: `~/.local/share/com.rp.chat/chat.sqlite`.
-- Schema is maintained in `db.rs` `SCHEMA` (idempotent `CREATE TABLE IF NOT EXISTS`). Add new tables/columns there.
-- `messages.index` is a per-conversation mono­tonic int (assignment in `add_message`). `usage`/`stop_reason` are JSON/text scalars; `thinking` holds the model's reasoning trace (nullable); `attachments` holds the JSON array of file attachments (nullable; `insert_message_full` writes it, `insert_message` passes `None`).
-- Adding a column to an existing DB: append it to `SCHEMA` and add a best-effort `ALTER TABLE ... ADD COLUMN` in `open()` (ignore the duplicate-column error). See `thinking` in `db.rs`.
+- DB file: app data dir `chat.sqlite`. On Linux: `~/.local/share/com.rp.chat/chat.sqlite`.
+- Add tables/columns to `db.rs` `SCHEMA`; for existing DBs add a best-effort `ALTER TABLE ... ADD COLUMN` in `open()` and ignore the duplicate-column error.
 
 ---
 
 ## Environment gotchas
 
-- **Brave tool (later milestone):** we'll spawn `node ~/.config/opencode/mcp/brave-search.mjs` via `rmcp`. It needs `BRAVE_API_KEY`, which the script loads from its sibling `~/.config/opencode/mcp/.env` (already present on this machine). The script resolves `@modelcontextprotocol/sdk` from `~/.config/opencode/node_modules` — it works because Node walks up from the script's own directory. Don't relocate the script.
-- **Fireworks is the default endpoint** (`https://api.fireworks.ai/inference/v1`), but the client is a generic OpenAI-compatible client; user enters `baseUrl` + `apiKey` in Settings. Fireworks needs a `fw_` key; Brave needs a separate `BRAVE_API_KEY`.
-- **Rust builds are slow** on first run (Wry + bundled SQLite). `cargo check` is faster for iteration; `cargo build` is what `tauri dev` uses.
-- **GUI needs a display:** the Tauri window can't run headless. Use `npm run tauri dev` from the user's desktop session; for scripted GUI checks use `npm run e2e` (same requirement — it opens a window on the current display and runs under `tauri-driver`/`WebKitWebDriver`).
-- **Persistent shell:** `bash` calls run in a long-lived `bash` per conversation (`shell.rs`); output is sentinel-delimited and a 60s timeout (or `exit`) kills/resets the session. Command stdin is `/dev/null` unless it uses a heredoc, so don't expect interactive input.
-- **`delete_conversation` is async** (it awaits clearing that conversation's shell), unlike the other DB commands.
+- **Brave MCP script:** `~/.config/opencode/mcp/brave-search.mjs`, spawned via `rmcp`. It loads `BRAVE_API_KEY` from its sibling `.env` and resolves `@modelcontextprotocol/sdk` from `~/.config/opencode/node_modules` (Node walks up). Don't relocate the script.
+- **Fireworks is the default endpoint** (`https://api.fireworks.ai/inference/v1`) but the client is generic; the user enters `baseUrl` + `apiKey` in Settings. Fireworks needs a `fw_` key; Brave needs a separate `BRAVE_API_KEY`.
+- **Rust builds are slow** on first run (Wry + bundled SQLite). `cargo check` is faster for iteration.
+- **GUI needs a display:** use `npm run tauri dev` from the desktop session; scripted checks use `npm run e2e` (same requirement).
+- **Persistent shell:** `bash` runs in a long-lived `bash` per conversation; sentinel-delimited output, 60s timeout (or `exit`) kills/resets. stdin is `/dev/null` unless the command uses a heredoc.
+- **`delete_conversation` is async** (it awaits clearing that conversation's shell).
+- **Keychain entry:** service `com.rp.chat`, user `api_key`. A legacy plaintext `apiKey` in `config.json` auto-migrates on first launch.
 
 ---
 
-## Next milestone
+## Next / open items
 
-### Milestone 7 — context (from PLANS.md build order)
+**Milestone 7 — context** (the last functional gap):
 
-Reserve + near-limit banner + per-conversation compaction:
+1. Reserve + **near-limit banner**: "near context limit — compact or new chat" (non-blocking; never silently compact).
+2. Per-conversation compaction: summarize older messages into `conversations.compaction_summary` and feed that into `build_messages` instead of the full history.
+3. Optional: sidebar cost readout; virtualized message list.
 
-1. Derive a per-model context window (fallback ~200k) minus a reserve; compute remaining budget from the conversation's stored `usage`.
-2. Show a **non-blocking** banner when near the limit: "near context limit — compact or new chat." User chooses; never silently compact.
-3. Per-conversation compaction: summarize older messages into `conversations.compaction_summary` (the column already exists) and feed that summary into `build_messages` instead of the full history.
-4. pi's compaction summary format is the reference; no framework import.
+**V2 (deferred):** conversation recall via a vector index (sqlite-vec + embedder;
+behind a retrieval seam); container/sandbox tool execution; richer cross-conversation
+memory conflict resolution.
 
-The context **counter** and **price meter** already landed (see the "Context + price counters" section above). Remaining from these milestones: the near-limit banner + compaction here in M7, and an optional sidebar cost readout. Then Milestone 9 — remaining polish (virtualized message list + thinking-level selector; markdown render, dark mode, reasoning traces, persistent shell, and memory already landed in M4/M5.5/M6).
+**Also deferred:** the `CompatConfig` layer for provider quirks (thinking field,
+`max_tokens`, developer-vs-system role). Default OpenAI-shaped behavior is fine
+until a provider breaks it; the first knob (`echo_reasoning_content`) has landed.
 
-Deferred from Milestone 3 (optional): the `CompatConfig` layer for provider quirks (thinking field, `max_tokens`, developer vs system role). Default OpenAI-shaped behavior is fine until a provider breaks it. The first knob has landed: `echo_reasoning_content` (reasoning echo between tool calls, see above).
-
----
-
-## Open items / notes for the next session
-
-- **GUI status:** M2–M5.5 core flows are now GUI-exercised (streaming, Stop/partial, keychain, model picker, tool Approve/Deny, reasoning "Thought" bar, dark mode). Still to verify in the GUI: the persistent shell (`cd`/`export` across calls) after an app restart, and the file attachments flow (native picker + drag-drop) since it can't run headless.
-- **Keychain entry:** service `com.rp.chat`, user `api_key` (Secret Service on Linux). A legacy plaintext `apiKey` in `config.json` auto-migrates on first launch.
-- **Tool turn persistence format** (see M5 table): assistant `{"tool_calls":…}` / role `tool` `{"tool_call_id","name","error","output"}` JSON in `messages.content`. Frontend parsers in `App.tsx` (`parseToolCalls`/`parseToolResult`) must stay in sync.
-- **MCP client lifetime gotcha:** keep the `RunningService` in state, not just the `Peer` — dropping the service closes the transport (bit us once; see `McpClient`).
-- **Pricing source:** Fireworks has no usable public pricing API; `refresh_pricing` pulls from the free models.dev catalog (`api.json`) matched by base URL, caching into `model_prices`. Resolution is override → fetched → bundled. Bundled fallback rates are approximate.
-- Scratch workspace (per-conversation dir for read/write tools) is not implemented; host tools operate on real paths with per-call approval, per the v1 PLANS note.
+**Known gaps:** the per-conversation scratch workspace for `read_file`/`write_file`
+is not implemented — host tools operate on real paths with per-call approval.
