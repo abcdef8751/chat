@@ -120,9 +120,10 @@ fn memory_write_tool() -> ChatCompletionTools {
     )
 }
 
-/// OpenAI `tools` array for a live chat request. `web_search` is included only
-/// when the MCP server is available. `write_memory` is deliberately omitted:
-/// live turns append via `save_memory`, and only the reflection pass curates.
+/// OpenAI `tools` array for a request. `web_search` is included only when the
+/// MCP server is available. The list is **identical for live and reflection
+/// turns** (so the prompt-cache prefix matches); `write_memory` is present in
+/// both but refused during live turns by `run_tool_loop`'s `memory_only` mode.
 pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
     let mut tools = vec![
         fn_tool(
@@ -157,6 +158,7 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
         ),
         memory_save_tool(),
         memory_read_tool(),
+        memory_write_tool(),
     ];
     if web_search {
         tools.push(fn_tool(
@@ -173,12 +175,6 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
         ));
     }
     tools
-}
-
-/// Tools available to the idle memory-reflection pass: read the current memory,
-/// append new facts, and rewrite files to curate them. No host/web tools.
-pub fn reflection_tool_specs() -> Vec<ChatCompletionTools> {
-    vec![memory_save_tool(), memory_read_tool(), memory_write_tool()]
 }
 
 /// Execute a host tool (bash/read_file/write_file). Errors are returned as
@@ -476,14 +472,12 @@ mod tests {
     #[test]
     fn tool_specs_shape() {
         let with = tool_specs(true);
-        assert_eq!(with.len(), 6);
+        assert_eq!(with.len(), 7);
         let without = tool_specs(false);
-        assert_eq!(without.len(), 5);
-        // `write_memory` is reserved for the reflection pass.
-        assert!(!without.iter().any(|t| tool_name(t) == "write_memory"));
-        let reflection = reflection_tool_specs();
-        assert_eq!(reflection.len(), 3);
-        assert!(reflection.iter().any(|t| tool_name(t) == "write_memory"));
+        assert_eq!(without.len(), 6);
+        // The list is identical for live and reflection (cache alignment);
+        // `write_memory` is present but gated by mode at execution time.
+        assert!(without.iter().any(|t| tool_name(t) == "write_memory"));
         assert!(is_gated("bash"));
         assert!(!is_gated("web_search"));
         assert!(!is_gated("save_memory"));

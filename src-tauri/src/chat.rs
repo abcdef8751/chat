@@ -666,6 +666,19 @@ pub(crate) fn build_history_messages(
                         .into(),
                 );
             }
+            // Consolidation notes are background bookkeeping, but surface them to
+            // the model as lightweight system messages so it knows memory was
+            // updated (and doesn't re-save). Both live and reflection build
+            // history through here, so the shared prefix stays identical.
+            "memory" => {
+                out.push(
+                    ChatCompletionRequestSystemMessageArgs::default()
+                        .content(row.content.clone())
+                        .build()
+                        .map_err(|e| e.to_string())?
+                        .into(),
+                );
+            }
             _ => {}
         }
     }
@@ -770,6 +783,9 @@ async fn dispatch_tool(
 /// turn's reasoning between tool rounds, and returns the accumulated usage and
 /// final text. When `persist` is `Some`, intermediate assistant/tool rows are
 /// written to the DB (live chat); when `None`, the loop is purely in memory.
+/// When `memory_only` is set, any non-memory tool call is refused (so a
+/// reflection turn can send the live tool list for prompt-cache reuse without
+/// being able to run host tools).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_loop(
     cfg: &AppConfig,
@@ -784,6 +800,7 @@ pub(crate) async fn run_tool_loop(
     flag: Arc<AtomicBool>,
     sink: &dyn EventSink,
     persist: Option<&db::Db>,
+    memory_only: bool,
 ) -> Result<ToolLoopResult, String> {
     let mut usage_total = json!({});
     let mut rounds: u32 = 0;
@@ -905,30 +922,55 @@ pub(crate) async fn run_tool_loop(
                     gated: tools::is_gated(&call.name),
                 });
 
-                let mut approved = !tools::is_gated(&call.name);
-                if !approved {
-                    let mut rx = approvals.register(call.id.clone());
-                    loop {
-                        tokio::select! {
-                            verdict = &mut rx => {
-                                approved = verdict.unwrap_or(false);
-                                break;
-                            }
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                                if flag.load(Ordering::SeqCst) {
+                let is_memory_tool = matches!(
+                    call.name.as_str(),
+                    "save_memory" | "read_memory" | "write_memory"
+                );
+                // Live and reflection share one tool list (cache alignment), so
+                // access is enforced here by mode: live turns may not rewrite
+                // memory, and reflection turns may not touch host/web tools.
+                let refused = if memory_only && !is_memory_tool {
+                    Some(format!(
+                        "{} is not available during memory consolidation; use save_memory, \
+                         read_memory, or write_memory.",
+                        call.name
+                    ))
+                } else if !memory_only && call.name == "write_memory" {
+                    Some(
+                        "write_memory is only available during memory consolidation; use \
+                         save_memory to add a fact."
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
+                let output = if let Some(message) = refused {
+                    ToolOutput::err(message)
+                } else {
+                    let mut approved = !tools::is_gated(&call.name);
+                    if !approved {
+                        let mut rx = approvals.register(call.id.clone());
+                        loop {
+                            tokio::select! {
+                                verdict = &mut rx => {
+                                    approved = verdict.unwrap_or(false);
                                     break;
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                                    if flag.load(Ordering::SeqCst) {
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-
-                let output = if approved {
-                    dispatch_tool(call, mcp, shell, memory, source).await
-                } else {
-                    ToolOutput {
-                        content: "The user denied this tool call.".into(),
-                        is_error: true,
+                    if approved {
+                        dispatch_tool(call, mcp, shell, memory, source).await
+                    } else {
+                        ToolOutput {
+                            content: "The user denied this tool call.".into(),
+                            is_error: true,
+                        }
                     }
                 };
 
@@ -1056,6 +1098,7 @@ pub(crate) async fn run_chat_turn(
         flag,
         sink,
         Some(db),
+        false,
     )
     .await?;
 

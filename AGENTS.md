@@ -121,8 +121,10 @@ memory_reflections(               -- reflection spend, kept separate from chat c
   id, conversation_id, model, usage, cost, files, note, created_at)
 ```
 
-- **`role`:** `memory` rows are low-key consolidation notes; `build_history_messages`
-  skips them and the UI renders them as a centered note, not a turn.
+- **`role`:** `memory` rows are consolidation notes. `build_history_messages`
+  surfaces them to the model as lightweight `system` messages (so they're part of
+  the cacheable prefix in both live and reflection turns), and the UI renders them
+  as a centered note, not a turn.
 - **Tool-turn persistence:** assistant tool-request rows are
   `{"tool_calls":[{id,name,arguments}]}`; tool-result rows (`role="tool"`) are
   `{"tool_call_id","name","error","output"}`. Frontend parsers in `App.tsx`
@@ -146,8 +148,12 @@ topic files.
 - **Tools:** `save_memory(content, path)` appends to the named file (path
   required, file created if missing); `read_memory(path)`; `write_memory(path,
   content)` replaces a file for curation. No `importance`/`category`.
-- **Live vs idle:** live chat has `save_memory`/`read_memory`; `write_memory` is
-  **reflection-only** so the chatting model can't clobber curated files.
+- **Live vs idle:** the tool list is identical for live and reflection turns (so
+  the prompt-cache prefix matches). `run_tool_loop`'s `memory_only` flag enforces
+  access by mode: live turns may `save_memory`/`read_memory` but **not**
+  `write_memory`; reflection turns may use all three memory tools but are refused
+  host/web tools. This keeps the chatting model from clobbering curated files
+  without splitting the tool list.
 - **Idle reflection** (`reflection.rs`): a background scheduler (`spawn`, ~1 min
   tick) reflects one due conversation per tick once it has been idle ≥
   `memory_reflection_idle_minutes` (default 30, toggle in Settings). It rebuilds
@@ -184,7 +190,8 @@ bash(command)                     // runs in the conversation's persistent shell
 read_file(path)
 write_file(path, content)
 
-// Memory — ungated, app-local. write_memory is reflection-only.
+// Memory — ungated, app-local. All three are in the shared tool list; access
+// is enforced by mode (write_memory is refused during live turns).
 save_memory(content, path)        // append; path required
 read_memory(path)
 write_memory(path, content)       // replace (curation)
@@ -192,6 +199,10 @@ write_memory(path, content)       // replace (curation)
 // Web search — reused Brave MCP server, read-only (ungated)
 web_search(query, count?)
 ```
+
+The tool list is byte-identical for live and reflection turns so the prompt-cache
+prefix matches; `run_tool_loop` refuses disallowed calls by mode instead of
+splitting the list (live: no `write_memory`; reflection: no host/web tools).
 
 **MCP integration:** `tools.rs` `McpClient` spawns
 `node ~/.config/opencode/mcp/brave-search.mjs` once and keeps a long-lived `rmcp`

@@ -1223,6 +1223,7 @@ async fn tool_loop_without_persistence_runs_memory_tool() {
         flag,
         &sink,
         None,
+        true,
     )
     .await
     .unwrap();
@@ -1236,6 +1237,107 @@ async fn tool_loop_without_persistence_runs_memory_tool() {
     assert!(guard
         .iter()
         .any(|e| matches!(e, StreamEvent::ToolResult { ok: true, .. })));
+}
+
+/// `write_memory` is in the shared tool list but only usable during reflection:
+/// a live turn must refuse it and leave the file untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_memory_is_refused_live_and_allowed_in_reflection() {
+    async fn run(memory_only: bool, memory: &crate::memory::MemoryState) -> Arc<Mutex<Vec<StreamEvent>>> {
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag(0, "c1", "write_memory", ""),
+                    tool_frag(
+                        0,
+                        "",
+                        "",
+                        r#"{\"path\":\"profile.md\",\"content\":\"REWRITTEN\"}"#,
+                    ),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("done"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let mcp = tools::McpClient::new();
+        let shell = crate::shell::ShellRegistry::new();
+        let approvals = tools::ApprovalRegistry::default();
+        let flag = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let messages = build_messages("p", &[], "hi", &[]).unwrap();
+        let tools_list = tools::tool_specs(false);
+        run_tool_loop(
+            &cfg,
+            "test-key",
+            &mcp,
+            &shell,
+            memory,
+            &approvals,
+            "conv",
+            messages,
+            &tools_list,
+            flag,
+            &sink,
+            None,
+            memory_only,
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+        events
+    }
+
+    // Live: refused, file stays empty.
+    let live_memory = temp_memory("wm-live");
+    let live_events = run(false, &live_memory).await;
+    assert!(live_memory.read("profile.md").unwrap().is_empty());
+    {
+        let guard = live_events.lock().unwrap();
+        assert!(guard.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolResult { ok: false, output, .. }
+                if output.contains("only available during memory consolidation")
+        )));
+    }
+
+    // Reflection: allowed, file is replaced.
+    let reflect_memory = temp_memory("wm-reflect");
+    let reflect_events = run(true, &reflect_memory).await;
+    assert_eq!(reflect_memory.read("profile.md").unwrap(), "REWRITTEN");
+    let guard = reflect_events.lock().unwrap();
+    assert!(guard
+        .iter()
+        .any(|e| matches!(e, StreamEvent::ToolResult { ok: true, .. })));
+}
+
+#[test]
+fn build_history_messages_includes_memory_notes_as_system() {
+    let row = crate::db::MessageRow {
+        id: "m".into(),
+        conversation_id: "c".into(),
+        role: "memory".into(),
+        index: 0,
+        content: "Memory consolidated: profile.md".into(),
+        model: None,
+        provider: None,
+        thinking_level: None,
+        thinking: None,
+        usage: None,
+        stop_reason: None,
+        attachments: None,
+        created_at: 0,
+    };
+    let msgs = build_history_messages(&[row]).unwrap();
+    let value = serde_json::to_value(&msgs).unwrap();
+    assert_eq!(value[0]["role"], "system");
+    assert_eq!(value[0]["content"], "Memory consolidated: profile.md");
 }
 
 #[test]
