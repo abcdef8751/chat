@@ -603,6 +603,37 @@ pub fn memory_reflection_stats(db: tauri::State<'_, Db>) -> Result<ReflectionSta
     .map_err(|e| e.to_string())
 }
 
+/// One past consolidation, surfaced to the reflection prompt so the model can
+/// avoid re-doing work it already reported.
+pub struct ReflectionRecord {
+    pub note: String,
+    pub created_at: i64,
+}
+
+/// The most recent consolidation notes across all conversations, newest first.
+pub fn recent_reflections(db: &Db, limit: i64) -> Result<Vec<ReflectionRecord>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT note, created_at FROM memory_reflections
+             ORDER BY created_at DESC LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([limit], |r| {
+            Ok(ReflectionRecord {
+                note: r.get(0)?,
+                created_at: r.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::derive_title;

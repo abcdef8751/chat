@@ -99,11 +99,13 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
 
     let history = db::read_messages(&db, conversation_id)?;
     let before = snapshot_files(&memory);
+    // Recent consolidation notes (across chats) so the model doesn't repeat work.
+    let recent = db::recent_reflections(&db, 8).unwrap_or_default();
 
     let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
     messages.push(
         ChatCompletionRequestSystemMessageArgs::default()
-            .content(reflection_system_prompt(&memory))
+            .content(reflection_system_prompt(&memory, &recent))
             .build()
             .map_err(|e| e.to_string())?
             .into(),
@@ -225,15 +227,29 @@ not invent facts.\n\
 - If nothing is worth remembering, make no tool calls. When done, reply with one short line \
 describing what you changed, or \"nothing to save\".";
 
-/// System prompt for the reflection pass: instructions plus a full dump of the
-/// current memory (the pass needs to see everything to curate it).
-fn reflection_system_prompt(memory: &MemoryState) -> String {
+/// System prompt for the reflection pass: instructions, a full dump of the
+/// current memory (the pass needs to see everything to curate it), and the most
+/// recent consolidation notes so it doesn't repeat work.
+fn reflection_system_prompt(memory: &MemoryState, recent: &[db::ReflectionRecord]) -> String {
     let mut prompt = String::from(
         "You maintain the long-term memory of a personal AI chat assistant. The memory is a set \
          of plain Markdown files shared across all conversations.\n\nExplicit user preferences \
          are set by the user in Settings and are authoritative: never copy them into memory \
          files, and never record anything that contradicts them.\n",
     );
+    if !recent.is_empty() {
+        prompt.push_str(
+            "\nRecent consolidation activity (newest first) — facts already recorded below are \
+             already in memory; do not re-save them or re-report them:\n",
+        );
+        for record in recent {
+            prompt.push_str(&format!(
+                "- {} — {}\n",
+                format_day(record.created_at),
+                record.note
+            ));
+        }
+    }
     prompt.push_str("\nCurrent memory files:\n");
     for name in memory.file_names() {
         let content = memory.read(&name).unwrap_or_default();
@@ -247,6 +263,22 @@ fn reflection_system_prompt(memory: &MemoryState) -> String {
         }
     }
     prompt
+}
+
+/// Format a millisecond epoch timestamp as `YYYY-MM-DD` (UTC, no chrono dep).
+fn format_day(ms: i64) -> String {
+    let days = (ms / 1000).div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 fn snapshot_files(memory: &MemoryState) -> HashMap<String, String> {
@@ -323,11 +355,38 @@ mod tests {
         let memory = temp_memory("prompt");
         memory.write("profile.md", "Name is Ravi.").unwrap();
         memory.write("project-x.md", "Uses Rust.").unwrap();
-        let prompt = reflection_system_prompt(&memory);
+        let prompt = reflection_system_prompt(&memory, &[]);
         assert!(prompt.contains("### profile.md"));
         assert!(prompt.contains("Name is Ravi."));
         assert!(prompt.contains("### project-x.md"));
         assert!(prompt.contains("Uses Rust."));
         assert!(prompt.contains("Explicit user preferences"));
+    }
+
+    #[test]
+    fn reflection_prompt_lists_recent_consolidations() {
+        let memory = temp_memory("prompt-recent");
+        let recent = vec![
+            db::ReflectionRecord {
+                note: "Memory consolidated: profile.md".into(),
+                created_at: 0,
+            },
+            db::ReflectionRecord {
+                note: "Memory consolidation: nothing to save.".into(),
+                created_at: 0,
+            },
+        ];
+        let prompt = reflection_system_prompt(&memory, &recent);
+        assert!(prompt.contains("Recent consolidation activity"));
+        assert!(prompt.contains("Memory consolidated: profile.md"));
+        assert!(prompt.contains("nothing to save."));
+        assert!(prompt.contains("1970-01-01"));
+    }
+
+    #[test]
+    fn format_day_matches_known_dates() {
+        assert_eq!(format_day(0), "1970-01-01");
+        // 2026-01-01T00:00:00Z
+        assert_eq!(format_day(1_767_225_600_000), "2026-01-01");
     }
 }
