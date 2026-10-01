@@ -1,6 +1,6 @@
 //! Tool surface: OpenAI-style tool specs, a host executor (bash/read/write,
 //! approval-gated), and `web_search` via a long-lived `rmcp` MCP stdio client
-//! (Brave server, read-only → ungated).
+//! (the official `@brave/brave-search-mcp-server`, read-only → ungated).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -163,12 +163,13 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
     if web_search {
         tools.push(fn_tool(
             "web_search",
-            "Search the web for current information. Returns results with title, URL, and snippet.",
+            "Search the web for current information via the Brave Search API. Returns results with \
+             title, URL, and snippet.",
             json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search query" },
-                    "count": { "type": "number", "description": "Number of results (default 5, max 20)" }
+                    "query": { "type": "string", "description": "Search query (max 400 chars, 50 words)" },
+                    "count": { "type": "number", "description": "Number of results (1-20, default 10)" }
                 },
                 "required": ["query"]
             }),
@@ -218,33 +219,80 @@ pub async fn execute_host_tool(
     }
 }
 
-/// Long-lived `rmcp` client for the Brave search MCP server (stdio).
+/// Long-lived `rmcp` client for the official Brave Search MCP server (stdio).
 /// Spawned lazily on first `web_search`; invalidated and re-spawned if the
 /// child process dies (a failed call is retried once on a fresh server).
 /// The `RunningService` (not just its `Peer`) is kept alive — dropping it
 /// closes the transport.
 pub struct McpClient {
-    script: std::path::PathBuf,
+    entry: std::path::PathBuf,
     service: AsyncMutex<Option<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>>,
 }
 
-fn brave_script_path() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(
-        std::env::var("HOME").unwrap_or_else(|_| "/home/rp".to_string()),
-    );
-    p.push(".config/opencode/mcp/brave-search.mjs");
+fn home_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/rp".to_string()))
+}
+
+/// Entry point of the official Brave Search MCP server
+/// (`@brave/brave-search-mcp-server`, npm). Installed next to the OpenCode
+/// config so it resolves without a network install.
+fn brave_server_entry() -> std::path::PathBuf {
+    let mut p = home_dir();
+    p.push(".config/opencode/node_modules/@brave/brave-search-mcp-server/dist/index.js");
     p
 }
 
-/// Whether the Brave MCP server script exists (i.e. web_search can be offered).
-pub fn brave_script_available() -> bool {
-    brave_script_path().exists()
+/// dotenv file beside the OpenCode MCP config that holds `BRAVE_API_KEY`.
+fn brave_env_file() -> std::path::PathBuf {
+    let mut p = home_dir();
+    p.push(".config/opencode/mcp/.env");
+    p
+}
+
+/// Extract `KEY=value` from dotenv-style text (quotes and a leading `export`
+/// stripped). Pure so it can be unit-tested.
+fn parse_env_value(text: &str, key: &str) -> Option<String> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        let line = line.strip_prefix("export").map(str::trim_start).unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Resolve the Brave API key: the process environment first, then the OpenCode
+/// MCP `.env` (the same file the former hand-rolled script read).
+fn read_brave_api_key() -> Option<String> {
+    if let Ok(key) = std::env::var("BRAVE_API_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            return Some(key.to_string());
+        }
+    }
+    let text = std::fs::read_to_string(brave_env_file()).ok()?;
+    parse_env_value(&text, "BRAVE_API_KEY")
+        .or_else(|| parse_env_value(&text, "BRAVE_SEARCH_API_KEY"))
+}
+
+/// Whether the official Brave MCP server and an API key are both present, i.e.
+/// `web_search` can be offered to the model.
+pub fn web_search_available() -> bool {
+    brave_server_entry().exists() && read_brave_api_key().is_some()
 }
 
 impl McpClient {
     pub fn new() -> Self {
         Self {
-            script: brave_script_path(),
+            entry: brave_server_entry(),
             service: AsyncMutex::new(None),
         }
     }
@@ -253,8 +301,13 @@ impl McpClient {
         &self,
     ) -> Result<rmcp::service::RunningService<rmcp::service::RoleClient, ()>, String> {
         use tokio::process::Command;
+        let key = read_brave_api_key().ok_or_else(|| {
+            "Brave API key not found (set BRAVE_API_KEY or ~/.config/opencode/mcp/.env)".to_string()
+        })?;
         let mut cmd = Command::new("node");
-        cmd.arg(&self.script);
+        cmd.arg(&self.entry);
+        cmd.arg("--transport").arg("stdio");
+        cmd.env("BRAVE_API_KEY", key);
         let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)
             .map_err(|e| format!("spawn MCP server: {e}"))?;
         // `()` is the no-callback client handler.
@@ -281,9 +334,9 @@ impl McpClient {
     /// Run `web_search` through the MCP server, retrying once on a fresh
     /// server if the cached one has died.
     pub async fn web_search(&self, query: &str, count: Option<u64>) -> ToolOutput {
-        if !self.script.exists() {
+        if !self.entry.exists() {
             return ToolOutput::err(
-                "web_search: MCP server script not found (~/.config/opencode/mcp/brave-search.mjs)"
+                "web_search: Brave MCP server not found (~/.config/opencode/node_modules/@brave/brave-search-mcp-server)"
                     .into(),
             );
         }
@@ -297,7 +350,9 @@ impl McpClient {
             if let Some(count) = count {
                 arguments.insert("count".into(), json!(count));
             }
-            let mut params = rmcp::model::CallToolRequestParams::new("web_search");
+            // The app advertises a stable `web_search` tool; the official
+            // server names its web tool `brave_web_search`.
+            let mut params = rmcp::model::CallToolRequestParams::new("brave_web_search");
             params.arguments = Some(arguments);
             match peer.call_tool(params).await {
                 Ok(res) => {
@@ -493,9 +548,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mcp_server_handshake_lists_web_search() {
-        if !brave_script_available() {
-            return; // machine without the Brave MCP script — skip
+    async fn mcp_server_handshake_lists_brave_web_search() {
+        if !web_search_available() {
+            return; // machine without the official Brave MCP server/key — skip
         }
         let client = McpClient::new();
         let peer = client.get_or_spawn().await.expect("spawn MCP server");
@@ -503,6 +558,24 @@ mod tests {
             .list_tools(Default::default())
             .await
             .expect("list tools");
-        assert!(tools.tools.iter().any(|t| t.name == "web_search"));
+        assert!(tools.tools.iter().any(|t| t.name == "brave_web_search"));
+    }
+
+    #[test]
+    fn parse_env_value_handles_export_quotes_and_comments() {
+        let text = "# comment\nexport BRAVE_API_KEY=\"abc-123\"\nOTHER=1\n";
+        assert_eq!(
+            parse_env_value(text, "BRAVE_API_KEY").as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(
+            parse_env_value("BRAVE_API_KEY=plain\n", "BRAVE_API_KEY").as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            parse_env_value("BRAVE_API_KEY='q'\n", "BRAVE_API_KEY").as_deref(),
+            Some("q")
+        );
+        assert_eq!(parse_env_value("OTHER=1\n", "BRAVE_API_KEY"), None);
     }
 }

@@ -1083,7 +1083,7 @@ pub(crate) async fn run_chat_turn(
         .unwrap_or_else(|| cfg.model.clone());
     let system_prompt = build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
     let messages = build_messages(&system_prompt, &history, &content, &attachments)?;
-    let tools_list = tools::tool_specs(tools::brave_script_available());
+    let tools_list = tools::tool_specs(tools::web_search_available());
 
     let mut result = run_tool_loop(
         cfg,

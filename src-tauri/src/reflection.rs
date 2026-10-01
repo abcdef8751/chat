@@ -133,7 +133,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
             .into(),
     );
 
-    let tools_list = tools::tool_specs(tools::brave_script_available());
+    let tools_list = tools::tool_specs(tools::web_search_available());
     let flag = Arc::new(AtomicBool::new(false));
 
     // Abort the pass if a real chat turn starts on this conversation.

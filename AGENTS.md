@@ -204,11 +204,15 @@ The tool list is byte-identical for live and reflection turns so the prompt-cach
 prefix matches; `run_tool_loop` refuses disallowed calls by mode instead of
 splitting the list (live: no `write_memory`; reflection: no host/web tools).
 
-**MCP integration:** `tools.rs` `McpClient` spawns
-`node ~/.config/opencode/mcp/brave-search.mjs` once and keeps a long-lived `rmcp`
-stdio client (the `RunningService`, not just its `Peer` — dropping the service
-closes the transport). Re-spawned once on failure. `BRAVE_API_KEY` is loaded by
-the script from its sibling `.env`.
+**MCP integration:** `tools.rs` `McpClient` spawns the official
+`@brave/brave-search-mcp-server` (`node .../dist/index.js --transport stdio`,
+installed under `~/.config/opencode/node_modules`) once and keeps a long-lived
+`rmcp` stdio client (the `RunningService`, not just its `Peer` — dropping the
+service closes the transport). Re-spawned once on failure. The app advertises a
+stable `web_search` tool that proxies to the server's `brave_web_search`.
+`BRAVE_API_KEY` is read from the process environment or the sibling
+`~/.config/opencode/mcp/.env` and passed to the child; `web_search` is offered
+only when the server entry and a key are both present.
 
 ---
 
@@ -338,7 +342,11 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
 
 ## Environment gotchas
 
-- **Brave MCP script:** `~/.config/opencode/mcp/brave-search.mjs`, spawned via `rmcp`. It loads `BRAVE_API_KEY` from its sibling `.env` and resolves `@modelcontextprotocol/sdk` from `~/.config/opencode/node_modules` (Node walks up). Don't relocate the script.
+- **Brave MCP:** the official `@brave/brave-search-mcp-server` (npm), spawned via
+  `rmcp` from `~/.config/opencode/node_modules/@brave/brave-search-mcp-server/dist/index.js`.
+  `BRAVE_API_KEY` is read from the environment or `~/.config/opencode/mcp/.env`
+  and passed to the child process. Needs a separate `BRAVE_API_KEY` from the LLM
+  provider key.
 - **Fireworks is the default endpoint** (`https://api.fireworks.ai/inference/v1`) but the client is generic; the user enters `baseUrl` + `apiKey` in Settings. Fireworks needs a `fw_` key; Brave needs a separate `BRAVE_API_KEY`.
 - **Rust builds are slow** on first run (Wry + bundled SQLite). `cargo check` is faster for iteration.
 - **GUI needs a display:** use `npm run tauri dev` from the desktop session; scripted checks use `npm run e2e` (same requirement).
