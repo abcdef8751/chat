@@ -16,6 +16,10 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   approveTool,
+  backfillMemories,
+  backfillStatus,
+  cancelBackfill,
+  clearExtractions,
   createConversation,
   deleteConversation,
   deleteMemoryFile,
@@ -23,10 +27,12 @@ import {
   getConfig,
   getPricing,
   hasApiKey,
+  importConversations,
   listConversations,
   listMemoryFiles,
   listMessages,
   listModels,
+  memoryExtractionStats,
   memoryReflectionStats,
   readAttachments,
   reflectNow,
@@ -39,7 +45,10 @@ import {
   thinkingOptions,
   writeMemoryFile,
   type Attachment,
+  type BackfillStatus,
   type Conversation,
+  type ExtractionStats,
+  type ImportReport,
   type MemoryFile,
   type Message,
   type ModelInfo,
@@ -556,6 +565,7 @@ export default function App() {
   const [echoReasoning, setEchoReasoning] = createSignal(true);
   const [thinkingOpts, setThinkingOpts] = createSignal<ThinkingOptions | null>(null);
   const [models, setModels] = createSignal<ModelInfo[]>([]);
+  const [attachmentWarning, setAttachmentWarning] = createSignal<string | null>(null);
   const [modelsLoading, setModelsLoading] = createSignal(false);
   const [settingsError, setSettingsError] = createSignal<string | null>(null);
   const [keyDraft, setKeyDraft] = createSignal("");
@@ -563,6 +573,9 @@ export default function App() {
   const [reflectionEnabled, setReflectionEnabled] = createSignal(true);
   const [reflectionIdleMinutes, setReflectionIdleMinutes] = createSignal(30);
   const [reflectionStats, setReflectionStats] = createSignal<ReflectionStats | null>(null);
+  const [backfill, setBackfill] = createSignal<BackfillStatus | null>(null);
+  const [extractionStats, setExtractionStats] = createSignal<ExtractionStats | null>(null);
+  const [importReport, setImportReport] = createSignal<ImportReport | null>(null);
 
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
@@ -634,6 +647,25 @@ export default function App() {
       },
     );
     onCleanup(() => unlistenReflect());
+
+    // Backfill progress: extraction passes, then the consolidation batches.
+    let backfillTick = 0;
+    const unlistenBackfill = await listen<BackfillStatus>(
+      "memory-backfill",
+      (event) => {
+        setBackfill(event.payload);
+        if (!event.payload.running) {
+          void refreshExtractionStats();
+          void refreshReflectionStats();
+          void reloadMemory();
+        } else if (++backfillTick % 25 === 0) {
+          // The staged/pending line is otherwise frozen at whatever it was when
+          // the dialog opened, for the whole run.
+          void refreshExtractionStats();
+        }
+      },
+    );
+    onCleanup(() => unlistenBackfill());
 
     const rows = await listConversations();
     setConversations(rows);
@@ -837,6 +869,8 @@ export default function App() {
   async function changeModel(id: string) {
     if (!id) return;
     setModel(id);
+    // The warning is about the previous model; re-check against the new one.
+    setAttachmentWarning(null);
     // Adopt the new model's thinking levels; drop a level it doesn't accept.
     const opts = await thinkingOptions(id).catch(() => null);
     setThinkingOpts(opts);
@@ -894,6 +928,65 @@ export default function App() {
     }
   }
 
+  async function refreshExtractionStats() {
+    try {
+      setExtractionStats(await memoryExtractionStats());
+    } catch {
+      // non-fatal
+    }
+  }
+
+  // Backfill: extract from every conversation in parallel, then consolidate the
+  // staged summaries into memory in one serial pass. The command returns
+  // immediately; progress arrives on the `memory-backfill` event.
+  async function startBackfill() {
+    setMemoryError(null);
+    try {
+      setBackfill(await backfillMemories());
+    } catch (e) {
+      setMemoryError(String(e));
+    }
+  }
+
+  async function stopBackfill() {
+    try {
+      await cancelBackfill();
+    } catch {
+      // non-fatal
+    }
+  }
+
+  async function discardExtractions() {
+    try {
+      await clearExtractions();
+      await refreshExtractionStats();
+    } catch (e) {
+      setMemoryError(String(e));
+    }
+  }
+
+  // Import an Anthropic-format export. The backend accepts either a single
+  // `conversations.json` or a directory of per-conversation files, so the picker
+  // offers both.
+  async function importChats(directory: boolean) {
+    setMemoryError(null);
+    try {
+      const picked = await open({
+        multiple: false,
+        directory,
+        ...(directory
+          ? {}
+          : { filters: [{ name: "Anthropic export", extensions: ["json"] }] }),
+      });
+      if (typeof picked !== "string") return;
+      setImportReport(await importConversations(picked));
+      await refreshConversations();
+      await refreshExtractionStats();
+    } catch (e) {
+      setMemoryError(String(e));
+    }
+  }
+
   // Reload the file list, keeping (or choosing) a selection.
   async function reloadMemory(prefer?: string) {
     try {
@@ -914,6 +1007,12 @@ export default function App() {
     setMemoryError(null);
     setMemoryOpen(true);
     await reloadMemory();
+    void refreshExtractionStats();
+    try {
+      setBackfill(await backfillStatus());
+    } catch {
+      // non-fatal
+    }
   }
 
   // Manually run memory consolidation over the active conversation.
@@ -958,11 +1057,30 @@ export default function App() {
   const selectedMemoryFile = () =>
     memoryFiles().find((f) => f.name === memorySelected()) ?? null;
 
+  // models.dev knows which models accept image input. Warn rather than let the
+  // provider silently drop the image or reject the whole turn.
+  const currentModelVision = () => {
+    const id = model();
+    if (!id) return null;
+    return models().find((m) => m.id === id)?.vision ?? null;
+  };
+
   async function addAttachmentPaths(paths: string[]) {
     if (paths.length === 0) return;
     try {
       const atts = await readAttachments(paths);
-      if (atts.length > 0) setPendingAttachments((prev) => [...prev, ...atts]);
+      if (atts.length === 0) return;
+      setPendingAttachments((prev) => [...prev, ...atts]);
+      const images = atts.filter((a) => a.kind === "image").length;
+      if (images > 0 && currentModelVision() === false) {
+        setAttachmentWarning(
+          `${model()} isn't marked as accepting image input, so ${
+            images === 1 ? "this image" : "these images"
+          } may be ignored or rejected. Pick a vision model in the header.`,
+        );
+      } else {
+        setAttachmentWarning(null);
+      }
     } catch (e) {
       setStreamError(String(e));
     }
@@ -996,6 +1114,7 @@ export default function App() {
 
   function removeAttachment(id: string) {
     setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
+    setAttachmentWarning(null);
   }
 
   async function send() {
@@ -1156,7 +1275,7 @@ export default function App() {
     const id = model();
     const rest = models().filter((m) => m.id !== id);
     const current = models().find((m) => m.id === id);
-    return [{ id, name: current?.name ?? id }, ...rest];
+    return [{ id, name: current?.name ?? id, vision: current?.vision ?? null }, ...rest];
   };
 
   // Re-apply the selection after the option list is rebuilt. WebKit clears a
@@ -1669,6 +1788,11 @@ export default function App() {
               </For>
             </div>
           </Show>
+          <Show when={attachmentWarning()}>
+            <p class="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+              {attachmentWarning()}
+            </p>
+          </Show>
           <div class="flex items-end gap-2">
             <button
               onClick={() => void pickAttachments()}
@@ -2001,6 +2125,119 @@ export default function App() {
                   </div>
                 </Show>
               </div>
+            </div>
+
+            {/* Import an archive, then backfill it: map (parallel extraction)
+                then reduce (one writer). */}
+            <div class="mt-4 rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+              <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-medium">Imported chats</p>
+                  <p class="mt-0.5 text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">
+                    Import an Anthropic export — a <code>conversations.json</code> or a
+                    folder of per-chat files. Imported chats keep their original dates
+                    and are kept out of the idle reflection sweep. Backfill then
+                    extracts durable facts from them in parallel and consolidates the
+                    summaries into memory in one pass; extraction never writes to
+                    memory, only the final pass does.
+                  </p>
+                  <Show when={importReport()}>
+                    <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                      Imported {importReport()!.conversations} chats ·{' '}
+                      {importReport()!.messages} messages
+                      <Show when={importReport()!.skipped > 0}>
+                        {' '}
+                        · {importReport()!.skipped} skipped
+                      </Show>
+                    </p>
+                  </Show>
+                  <Show when={extractionStats()}>
+                    <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                      {extractionStats()!.staged} staged · {extractionStats()!.pending}{' '}
+                      awaiting extraction
+                    </p>
+                  </Show>
+                </div>
+                <div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                  <button
+                    onClick={() => void importChats(false)}
+                    disabled={backfill()?.running}
+                    class="rounded-md border border-neutral-300 px-2.5 py-1.5 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  >
+                    Import file…
+                  </button>
+                  <button
+                    onClick={() => void importChats(true)}
+                    disabled={backfill()?.running}
+                    class="rounded-md border border-neutral-300 px-2.5 py-1.5 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  >
+                    Import folder…
+                  </button>
+                  <Show when={extractionStats()?.staged}>
+                    <button
+                      onClick={() => void discardExtractions()}
+                      disabled={backfill()?.running}
+                      class="rounded-md border border-neutral-300 px-2.5 py-1.5 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                    >
+                      Discard staged
+                    </button>
+                  </Show>
+                  <Show
+                    when={backfill()?.running}
+                    fallback={
+                      <button
+                        onClick={() => void startBackfill()}
+                        class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                      >
+                        Backfill
+                      </button>
+                    }
+                  >
+                    <button
+                      onClick={() => void stopBackfill()}
+                      class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                    >
+                      Cancel
+                    </button>
+                  </Show>
+                </div>
+              </div>
+
+              <Show when={backfill()?.running}>
+                <div class="mt-2">
+                  <div class="h-1 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+                    <div
+                      class="h-full rounded-full bg-neutral-900 transition-all dark:bg-white"
+                      style={{
+                        width: `${
+                          backfill()!.total > 0
+                            ? Math.round((backfill()!.done / backfill()!.total) * 100)
+                            : 0
+                        }%`,
+                      }}
+                    />
+                  </div>
+                  <p class="mt-1 text-[11px] text-neutral-500 dark:text-neutral-400">
+                    {backfill()!.phase} — {backfill()!.done}/{backfill()!.total}
+                    <Show when={backfill()!.concurrency > 0}>
+                      {' '}
+                      · {backfill()!.concurrency} in flight
+                    </Show>
+                    <Show when={backfill()!.failed > 0}>
+                      {' '}
+                      · {backfill()!.failed} failed
+                    </Show>
+                  </p>
+                </div>
+              </Show>
+              <Show when={backfill()?.lastError}>
+                <p
+                  class="mt-1 truncate text-[11px] text-red-600 dark:text-red-400"
+                  title={backfill()!.lastError ?? ""}
+                >
+                  last error: {backfill()!.lastError}
+                </p>
+              </Show>
             </div>
 
             <div class="mt-4 flex items-center justify-between gap-3">

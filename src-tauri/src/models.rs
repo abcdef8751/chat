@@ -4,6 +4,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
+use crate::pricing::ModelMeta;
+
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelObject>,
@@ -20,6 +22,10 @@ pub struct ModelInfo {
     pub id: String,
     /// Human-readable name from models.dev, when known.
     pub name: Option<String>,
+    /// Whether models.dev says the model accepts image input. `None` when the
+    /// provider isn't in the catalog — the endpoint's own `/models` carries no
+    /// capability metadata, so an unknown model must not be warned about.
+    pub vision: Option<bool>,
 }
 
 /// Substrings identifying clearly non-chat models (embeddings, audio,
@@ -84,12 +90,16 @@ impl ModelCache {
     }
 }
 
-/// Attach cached models.dev display names to a list of model ids.
-fn with_names(ids: Vec<String>, names: &HashMap<String, String>) -> Vec<ModelInfo> {
+/// Attach cached models.dev metadata to a list of model ids.
+fn with_meta(ids: Vec<String>, meta: &HashMap<String, ModelMeta>) -> Vec<ModelInfo> {
     ids.into_iter()
-        .map(|id| ModelInfo {
-            name: names.get(&id).cloned(),
-            id,
+        .map(|id| {
+            let m = meta.get(&id);
+            ModelInfo {
+                name: m.and_then(|m| m.name.clone()),
+                vision: m.map(ModelMeta::vision),
+                id,
+            }
         })
         .collect()
 }
@@ -133,8 +143,8 @@ pub async fn list_models(
 
     if !force {
         if let Some(ids) = app.state::<ModelCache>().get(&base_url) {
-            let names = crate::pricing::names_for_provider(&db, &base_url);
-            return Ok(with_names(ids, &names));
+            let meta = crate::pricing::meta_for_provider(&db, &base_url);
+            return Ok(with_meta(ids, &meta));
         }
     }
 
@@ -159,8 +169,8 @@ pub async fn list_models(
     ids.sort();
     ids.dedup();
     app.state::<ModelCache>().put(base_url.clone(), ids.clone());
-    let names = crate::pricing::names_for_provider(&db, &base_url);
-    Ok(with_names(ids, &names))
+    let meta = crate::pricing::meta_for_provider(&db, &base_url);
+    Ok(with_meta(ids, &meta))
 }
 
 #[cfg(test)]

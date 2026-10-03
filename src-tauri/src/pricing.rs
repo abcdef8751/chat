@@ -91,6 +91,10 @@ pub struct CachedPrice {
     pub reasoning: Option<bool>,
     /// Raw `reasoning_options` JSON array from models.dev, if any.
     pub reasoning_options: Option<String>,
+    /// models.dev's coarse "accepts attachments" flag.
+    pub attachment: Option<bool>,
+    /// Raw `modalities` object from models.dev, e.g. `{"input":["text","image"]}`.
+    pub modalities: Option<String>,
 }
 
 /// Model metadata cached from models.dev (name + reasoning support).
@@ -99,6 +103,27 @@ pub struct ModelMeta {
     pub name: Option<String>,
     pub reasoning: Option<bool>,
     pub reasoning_options: Option<String>,
+    pub attachment: Option<bool>,
+    pub modalities: Option<String>,
+}
+
+impl ModelMeta {
+    /// Whether the model can accept image input.
+    ///
+    /// Prefers models.dev's explicit `modalities.input` list and falls back to
+    /// its coarser `attachment` flag. The two agree on ~93% of the catalog, but
+    /// `modalities` is the precise signal — `attachment` also covers models that
+    /// take documents but not images.
+    pub fn vision(&self) -> bool {
+        if let Some(raw) = self.modalities.as_deref() {
+            if let Ok(value) = serde_json::from_str::<Value>(raw) {
+                if let Some(input) = value.get("input").and_then(Value::as_array) {
+                    return input.iter().any(|i| i.as_str() == Some("image"));
+                }
+            }
+        }
+        self.attachment.unwrap_or(false)
+    }
 }
 
 /// Resolved pricing/context for one model, serialized straight to the frontend.
@@ -278,6 +303,11 @@ fn parse_provider_models(provider: &Value) -> Vec<(String, CachedPrice)> {
                 .get("reasoning_options")
                 .filter(|v| !v.is_null())
                 .map(|v| v.to_string()),
+            attachment: model.get("attachment").and_then(Value::as_bool),
+            modalities: model
+                .get("modalities")
+                .filter(|v| !v.is_null())
+                .map(|v| v.to_string()),
         };
         if price.input.is_some()
             || price.output.is_some()
@@ -305,7 +335,8 @@ fn get_cached(db: &Db, provider: &str, model_id: &str) -> Option<CachedPrice> {
     let conn = db.0.lock().ok()?;
     conn.query_row(
         "SELECT input_per_million, output_per_million, cache_read_per_million,
-                cache_write_per_million, context_window, name, reasoning, reasoning_options
+                cache_write_per_million, context_window, name, reasoning, reasoning_options,
+                attachment, modalities
          FROM model_prices WHERE provider = ?1 AND model_id = ?2",
         params![provider, model_id],
         |r| {
@@ -318,6 +349,8 @@ fn get_cached(db: &Db, provider: &str, model_id: &str) -> Option<CachedPrice> {
                 name: r.get(5)?,
                 reasoning: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
                 reasoning_options: r.get(7)?,
+                attachment: r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
+                modalities: r.get(9)?,
             })
         },
     )
@@ -328,7 +361,7 @@ fn get_cached(db: &Db, provider: &str, model_id: &str) -> Option<CachedPrice> {
 pub fn get_meta(db: &Db, provider: &str, model_id: &str) -> Option<ModelMeta> {
     let conn = db.0.lock().ok()?;
     conn.query_row(
-        "SELECT name, reasoning, reasoning_options
+        "SELECT name, reasoning, reasoning_options, attachment, modalities
          FROM model_prices WHERE provider = ?1 AND model_id = ?2",
         params![provider, model_id],
         |r| {
@@ -336,26 +369,38 @@ pub fn get_meta(db: &Db, provider: &str, model_id: &str) -> Option<ModelMeta> {
                 name: r.get(0)?,
                 reasoning: r.get::<_, Option<i64>>(1)?.map(|v| v != 0),
                 reasoning_options: r.get(2)?,
+                attachment: r.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+                modalities: r.get(4)?,
             })
         },
     )
     .ok()
 }
 
-/// All cached models.dev display names for the provider at `base_url`.
-pub fn names_for_provider(db: &Db, base_url: &str) -> HashMap<String, String> {
+/// All cached models.dev metadata for the provider at `base_url`, keyed by model
+/// id. Used to decorate the model picker with display names and capabilities.
+pub fn meta_for_provider(db: &Db, base_url: &str) -> HashMap<String, ModelMeta> {
     let mut out = HashMap::new();
     let Ok(conn) = db.0.lock() else {
         return out;
     };
     let Ok(mut stmt) = conn.prepare(
-        "SELECT model_id, name FROM model_prices
-         WHERE provider = ?1 AND name IS NOT NULL",
+        "SELECT model_id, name, reasoning, reasoning_options, attachment, modalities
+         FROM model_prices WHERE provider = ?1",
     ) else {
         return out;
     };
     let Ok(rows) = stmt.query_map(params![provider_key(base_url)], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            ModelMeta {
+                name: r.get(1)?,
+                reasoning: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                reasoning_options: r.get(3)?,
+                attachment: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                modalities: r.get(5)?,
+            },
+        ))
     }) else {
         return out;
     };
@@ -404,8 +449,8 @@ fn upsert_cached(
         "INSERT INTO model_prices
            (provider, model_id, input_per_million, output_per_million,
             cache_read_per_million, cache_write_per_million, context_window,
-            name, reasoning, reasoning_options, fetched_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            name, reasoning, reasoning_options, attachment, modalities, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(provider, model_id) DO UPDATE SET
            input_per_million = excluded.input_per_million,
            output_per_million = excluded.output_per_million,
@@ -415,6 +460,8 @@ fn upsert_cached(
            name = COALESCE(excluded.name, model_prices.name),
            reasoning = COALESCE(excluded.reasoning, model_prices.reasoning),
            reasoning_options = COALESCE(excluded.reasoning_options, model_prices.reasoning_options),
+           attachment = COALESCE(excluded.attachment, model_prices.attachment),
+           modalities = COALESCE(excluded.modalities, model_prices.modalities),
            fetched_at = excluded.fetched_at",
         params![
             provider,
@@ -427,6 +474,8 @@ fn upsert_cached(
             price.name,
             price.reasoning.map(|v| v as i64),
             price.reasoning_options,
+            price.attachment.map(|v| v as i64),
+            price.modalities,
             fetched_at
         ],
     )
@@ -789,6 +838,7 @@ mod tests {
             name: Some("DeepSeek V4 Pro 0813".into()),
             reasoning: Some(true),
             reasoning_options: Some(r#"[{"type":"toggle"},{"type":"effort","values":["high","max"]}]"#.into()),
+            ..Default::default()
         };
         let opts = thinking_options_for(Some(meta));
         assert_eq!(opts.source, "models.dev");
@@ -812,6 +862,68 @@ mod tests {
         let unknown = thinking_options_for(None);
         assert_eq!(unknown.source, "openai");
         assert!(unknown.supports_reasoning);
+    }
+
+    /// Opt-in check against the real catalog:
+    /// `cargo test --lib -- --ignored parses_real_models_dev_catalog`
+    /// (override the path with `PI_MODELS_DEV`).
+    #[test]
+    #[ignore = "reads the models.dev catalog from disk"]
+    fn parses_real_models_dev_catalog() {
+        let path = std::env::var("PI_MODELS_DEV")
+            .unwrap_or_else(|_| "/tmp/models-dev.json".to_string());
+        let text = std::fs::read_to_string(&path).expect("read catalog");
+        let root: Value = serde_json::from_str(&text).expect("parse catalog");
+
+        let mut total = 0usize;
+        let mut vision = 0usize;
+        for provider in root.as_object().expect("object").values() {
+            for (_, price) in parse_provider_models(provider) {
+                total += 1;
+                let meta = ModelMeta {
+                    attachment: price.attachment,
+                    modalities: price.modalities.clone(),
+                    ..Default::default()
+                };
+                if meta.vision() {
+                    vision += 1;
+                }
+            }
+        }
+        println!("{total} models parsed, {vision} accept image input");
+        assert!(total > 1000, "catalog parse produced too few rows");
+        assert!(vision > 0, "no model was detected as vision-capable");
+        assert!(vision < total, "every model was detected as vision-capable");
+    }
+
+    #[test]
+    fn vision_prefers_modalities_over_the_attachment_flag() {
+        // An explicit image input wins.
+        let meta = ModelMeta {
+            attachment: Some(false),
+            modalities: Some(r#"{"input":["text","image"],"output":["text"]}"#.into()),
+            ..Default::default()
+        };
+        assert!(meta.vision());
+
+        // Text-only modalities beat a permissive attachment flag: `attachment`
+        // also covers models that take documents but not images.
+        let meta = ModelMeta {
+            attachment: Some(true),
+            modalities: Some(r#"{"input":["text"],"output":["text"]}"#.into()),
+            ..Default::default()
+        };
+        assert!(!meta.vision());
+
+        // No modalities: fall back to the flag.
+        let meta = ModelMeta {
+            attachment: Some(true),
+            ..Default::default()
+        };
+        assert!(meta.vision());
+
+        // Nothing known: never claim vision.
+        assert!(!ModelMeta::default().vision());
     }
 
     #[test]
@@ -847,9 +959,10 @@ mod tests {
         assert_eq!(ids.len(), 3);
         assert!(ids.contains(&"accounts/fireworks/routers/kimi-k3-fast".to_string()));
 
-        let names = names_for_provider(&db, base);
+        let meta = meta_for_provider(&db, base);
         assert_eq!(
-            names.get("accounts/fireworks/models/deepseek-v4-pro-0813").map(String::as_str),
+            meta.get("accounts/fireworks/models/deepseek-v4-pro-0813")
+                .and_then(|m| m.name.as_deref()),
             Some("DeepSeek V4 Pro 0813")
         );
         assert_eq!(

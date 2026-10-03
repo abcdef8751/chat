@@ -1223,7 +1223,7 @@ async fn tool_loop_without_persistence_runs_memory_tool() {
         flag,
         &sink,
         None,
-        true,
+        ToolMode::Reflection,
     )
     .await
     .unwrap();
@@ -1243,7 +1243,7 @@ async fn tool_loop_without_persistence_runs_memory_tool() {
 /// a live turn must refuse it and leave the file untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_memory_is_refused_live_and_allowed_in_reflection() {
-    async fn run(memory_only: bool, memory: &crate::memory::MemoryState) -> Arc<Mutex<Vec<StreamEvent>>> {
+    async fn run(mode: ToolMode, memory: &crate::memory::MemoryState) -> Arc<Mutex<Vec<StreamEvent>>> {
         let (port, handle) = start_mock(
             vec![
                 vec![
@@ -1286,7 +1286,7 @@ async fn write_memory_is_refused_live_and_allowed_in_reflection() {
             flag,
             &sink,
             None,
-            memory_only,
+            mode,
         )
         .await
         .unwrap();
@@ -1296,7 +1296,7 @@ async fn write_memory_is_refused_live_and_allowed_in_reflection() {
 
     // Live: refused, file stays empty.
     let live_memory = temp_memory("wm-live");
-    let live_events = run(false, &live_memory).await;
+    let live_events = run(ToolMode::Live, &live_memory).await;
     assert!(live_memory.read("profile.md").unwrap().is_empty());
     {
         let guard = live_events.lock().unwrap();
@@ -1309,12 +1309,121 @@ async fn write_memory_is_refused_live_and_allowed_in_reflection() {
 
     // Reflection: allowed, file is replaced.
     let reflect_memory = temp_memory("wm-reflect");
-    let reflect_events = run(true, &reflect_memory).await;
+    let reflect_events = run(ToolMode::Reflection, &reflect_memory).await;
     assert_eq!(reflect_memory.read("profile.md").unwrap(), "REWRITTEN");
     let guard = reflect_events.lock().unwrap();
     assert!(guard
         .iter()
         .any(|e| matches!(e, StreamEvent::ToolResult { ok: true, .. })));
+}
+
+/// Extraction advertises no tools at all — it is pure summarization — so any
+/// tool call the model emits anyway is refused rather than dispatched. That is
+/// what makes the map phase safe to run concurrently: it cannot write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extract_mode_refuses_every_tool_call() {
+    let (port, handle) = start_mock(
+        vec![
+            vec![
+                tool_frag(0, "c1", "write_memory", ""),
+                tool_frag(
+                    0,
+                    "",
+                    "",
+                    r#"{\"path\":\"profile.md\",\"content\":\"CLOBBERED\"}"#,
+                ),
+                finish_chunk("tool_calls"),
+            ],
+            vec![
+                tool_frag(0, "c2", "save_memory", ""),
+                tool_frag(
+                    0,
+                    "",
+                    "",
+                    r#"{\"path\":\"profile.md\",\"content\":\"APPENDED\"}"#,
+                ),
+                finish_chunk("tool_calls"),
+            ],
+            vec![
+                tool_frag(0, "c3", "read_memory", ""),
+                tool_frag(0, "", "", r#"{\"path\":\"profile.md\"}"#),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("[profile] likes tea"), finish_chunk("stop")],
+        ],
+        0,
+    );
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let mcp = tools::McpClient::new();
+    let shell = crate::shell::ShellRegistry::new();
+    let memory = temp_memory("extract-mode");
+    let approvals = tools::ApprovalRegistry::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let messages = build_messages("p", &[], "hi", &[]).unwrap();
+    let tools_list = tools::tool_specs(false);
+    let result = run_tool_loop(
+        &cfg,
+        "test-key",
+        &mcp,
+        &shell,
+        &memory,
+        &approvals,
+        "conv_extract",
+        messages,
+        &tools_list,
+        flag,
+        &sink,
+        None,
+        ToolMode::Extract,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    // The summary is the pass's output; memory is untouched.
+    assert_eq!(result.text, "[profile] likes tea");
+    assert!(memory.read("profile.md").unwrap().is_empty());
+
+    let guard = events.lock().unwrap();
+    let refusals: Vec<&String> = guard
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolResult {
+                ok: false, output, ..
+            } => Some(output),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        3,
+        "every tool call must be refused during extraction"
+    );
+    assert!(refusals
+        .iter()
+        .all(|o| o.contains("not available during memory extraction")));
+    assert!(!guard
+        .iter()
+        .any(|e| matches!(e, StreamEvent::ToolResult { ok: true, .. })));
+}
+
+/// The extraction pass advertises no tools, so the request must omit the field
+/// entirely — some providers reject an empty `tools` array.
+#[test]
+fn completion_body_omits_tools_when_none_are_advertised() {
+    let messages = build_messages("p", &[], "hi", &[]).unwrap();
+    let body = completion_body("m", &messages, &[], "", None).unwrap();
+    assert!(body.get("tools").is_none());
+
+    let advertised = tools::tool_specs(false);
+    let body = completion_body("m", &messages, &advertised, "", None).unwrap();
+    assert!(body.get("tools").is_some());
 }
 
 #[test]

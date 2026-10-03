@@ -45,8 +45,9 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **75 passed, 1 ignored** (the opt-in live reasoning-echo
-check). Clippy, `tsc --noEmit`, `npm run build`, and `npm run e2e` are clean.
+`cargo test --lib`: **103 passed, 3 ignored** (the opt-in live reasoning-echo
+check, the real-export import, and the real models.dev catalog parse). Clippy,
+`tsc --noEmit`, `npm run build`, and `npm run e2e` are clean.
 
 | Area              | State | Notes                                                                                                     |
 | ----------------- | ----- | --------------------------------------------------------------------------------------------------------- |
@@ -55,7 +56,7 @@ check). Clippy, `tsc --noEmit`, `npm run build`, and `npm run e2e` are clean.
 | Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; price overrides                  |
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline                                 |
 | Tools             | ✅    | `bash` (persistent shell), `read_file`/`write_file` (gated), `web_search` (MCP, ungated)                   |
-| Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost                  |
+| Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
 | Context + price   | ◑     | Context counter + frozen per-turn cost done; **near-limit banner + compaction (M7) remain**                |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
 
@@ -102,6 +103,7 @@ best-effort `ALTER TABLE ... ADD COLUMN` migrations in `open()`.
 conversations(
   id, title, model, system_prompt, compaction_summary,
   last_reflected_index,          -- memory-reflection watermark
+  imported,                      -- 1 = came from an export; backfill-only
   created_at, updated_at)
 
 messages(
@@ -115,10 +117,19 @@ messages(
 model_prices(                     -- models.dev cache
   provider, model_id, input_per_million, output_per_million,
   cache_read_per_million, cache_write_per_million, context_window,
-  name, reasoning, reasoning_options, fetched_at, PRIMARY KEY(provider, model_id))
+  name, reasoning, reasoning_options, attachment, modalities,
+  fetched_at, PRIMARY KEY(provider, model_id))
 
 memory_reflections(               -- reflection spend, kept separate from chat cost
   id, conversation_id, model, usage, cost, files, note, created_at)
+
+memory_extractions(               -- staged backfill summaries (map-phase output)
+  conversation_id PRIMARY KEY, watermark, model, usage, cost, payload,
+  folded,                         -- 1 = already folded into memory (resume)
+  created_at)
+
+memory_backfill_runs(             -- reduce-pass spend (spans many conversations)
+  id, model, usage, cost, files, note, created_at)
 ```
 
 - **`role`:** `memory` rows are consolidation notes. `build_history_messages`
@@ -133,6 +144,14 @@ memory_reflections(               -- reflection spend, kept separate from chat c
 - **Pricing** is resolved lazily and cached: **override → fetched `model_prices` →
   bundled fallback → default**. Cost is frozen on the message at the rates in
   effect, so switching models never re-prices past turns.
+- **Capabilities** ride along in the same cache: `attachment` and `modalities`
+  from models.dev, surfaced on `ModelInfo.vision` via `ModelMeta::vision()`,
+  which prefers the explicit `modalities.input` list and falls back to the
+  coarser `attachment` flag (they agree on ~93% of the catalog; `attachment`
+  also covers models that take documents but not images). The composer warns
+  when an image is attached to a model that cannot see it, rather than letting
+  the provider drop it or reject the turn. `vision` is `None` when the provider
+  isn't in the catalog, so an unknown model is never warned about.
 
 ---
 
@@ -148,12 +167,13 @@ topic files.
 - **Tools:** `save_memory(content, path)` appends to the named file (path
   required, file created if missing); `read_memory(path)`; `write_memory(path,
   content)` replaces a file for curation. No `importance`/`category`.
-- **Live vs idle:** the tool list is identical for live and reflection turns (so
-  the prompt-cache prefix matches). `run_tool_loop`'s `memory_only` flag enforces
-  access by mode: live turns may `save_memory`/`read_memory` but **not**
-  `write_memory`; reflection turns may use all three memory tools but are refused
-  host/web tools. This keeps the chatting model from clobbering curated files
-  without splitting the tool list.
+- **Live vs idle:** the tool list is identical for live, reflection, and
+  extraction turns (so the prompt-cache prefix matches). `run_tool_loop`'s
+  `ToolMode` enforces access by mode: `Live` may `save_memory`/`read_memory` but
+  **not** `write_memory`; `Reflection` may use all three memory tools but is
+  refused host/web tools; `Extract` advertises no tools and refuses any call.
+  This keeps the chatting model from clobbering curated files without splitting
+  the tool list.
 - **Idle reflection** (`reflection.rs`): a background scheduler (`spawn`, ~1 min
   tick) reflects one due conversation per tick once it has been idle ≥
   `memory_reflection_idle_minutes` (default 30, toggle in Settings). It rebuilds
@@ -173,6 +193,96 @@ topic files.
   (takes precedence over inferred memory); the memory block and reflection prompt
   both say not to duplicate or contradict it. Memory files hold what the assistant
   *infers*.
+- **Import** (`import.rs`): reads an Anthropic-format export — either a single
+  `conversations.json` holding an array, or a directory of per-conversation JSON
+  files. Two properties make it safe over a large archive. **Timestamps are
+  preserved**: nothing goes through `insert_message_full`, which would stamp
+  `now` and re-title the chat, so imported chats sort into the sidebar by their
+  real dates via the existing `ORDER BY updated_at DESC`. And **imported chats
+  are excluded from the idle sweep**: `mark_imported_reflected` sets their
+  `last_reflected_index` to their newest message, so the 60s-tick reflection
+  never wanders into an archive. The export flattens a whole tool round-trip into
+  one assistant message, so `rows_for_message` splits on block boundaries back
+  into the app's native `assistant(text)` → `assistant({"tool_calls":…})` →
+  `tool({…})` rows, which is what makes imported tool calls render in the
+  activity timeline. Re-importing is a no-op (`INSERT OR IGNORE`), not a clobber.
+  Each conversation is written in **one transaction**, so an interrupted import
+  can never leave a chat holding half its messages — which matters because a
+  re-import skips conversations that already exist, so a half-written chat would
+  stay half-written forever. It is also ~2.5× faster than a statement per row,
+  since each of those would otherwise be its own WAL commit. `ImportState`
+  guards against two imports running at once.
+  **Attachments cannot be imported**: the export carries only `{file_uuid,
+  file_name}` references and the accompanying zip holds nothing but the JSON, so
+  `rows_for_message` appends an `[attached: … — contents are not included in the
+  export]` marker instead of silently dropping the context.
+- **Backfill** (`reflection.rs`): restricted to **imported** conversations —
+  chats the user actually had are the sequential pass's job. Reflecting over an
+  imported archive one conversation per 60s tick is both slow (~20h for 1200
+  chats) and unsafe to parallelize naively, because every pass is a
+  read-modify-write on the same Markdown files and `reflection_tail`'s "recent
+  notes" only deduplicates because passes are serial. So it splits in two. The
+  **map** phase runs many extraction passes concurrently (`ToolMode::Extract`), staging a plain-text
+  summary per conversation in `memory_extractions` and never touching memory.
+  Concurrency is under **AIMD**, not a fixed number: Fireworks enforces adaptive
+  TPM limits (not a concurrency cap) whose ceiling depends on account tier and
+  model size tier, so any fixed value is either too timid or over-drives into
+  sustained 429s. It starts at `DEFAULT_CONCURRENCY` (8), grows one permit per
+  full window of clean completions (additive in round-trips, not requests —
+  growing per request would jump from 8 to 700 in seconds), and halves on a
+  throttle down to a floor of 1, capped at 64. Only *transient* failures back
+  off: a 400 or a bad model must not collapse concurrency for the whole run. The
+  live limit is reported in `BackfillStatus.concurrency`.
+  Extraction advertises **no tools at all** — it is pure summarization, which
+  also drops the tool rounds so the map phase is one request per conversation
+  instead of ~3; the `Extract` gate is only a guard against a hallucinated call.
+  It also gets a **minimal task-specific system prompt**, not the live-turn one:
+  the live prompt documents memory tools extraction does not advertise, gives
+  routing guidance that belongs to the reduce, and inlines every core memory
+  file — ~1.9k tokens irrelevant to "list the durable facts in this transcript",
+  paid once per conversation (28% of the map phase's prompt volume). Extraction
+  is deliberately blind to current memory: the map recalls, the reduce dedupes,
+  and showing the extractor what is already known invites it to omit facts.
+  A conversation with nothing durable yields the literal sentinel `NOTHING`,
+  which `is_nothing` normalizes to an empty payload — it is *not* an empty
+  string, so without that the reduce would be handed a "summary" reading
+  `NOTHING`. Empty payloads are retired as folded without a reduce pass.
+  The **reduce** phase is a single serial writer that folds those summaries into
+  memory through the ordinary reflection tool loop. It is **one pass by
+default**; it only chunks when the payload exceeds `CONTEXT_BUDGET` (80%) of the
+  selected model's context window, and then in chronological order. Each pass
+  after the first is told the date memory already covers, because memory entries
+  are undated prose and that is the only thing making "later wins" work across
+  passes. Conversations under `DEFAULT_MIN_CHARS` (200) are skipped. That floor
+  is a *noise* filter, not a cost control: it was 2000 on the theory that short
+  chats are most of the passes but a rounding error of the content, but the
+  passes are cheap and the short tail is not empty of signal — a 1.9k-char chat
+  about audio gear named the user's existing IEMs and their EQ habit. 200 drops
+  the "." and "hm" conversations and keeps everything else. A failed map pass just
+  leaves that conversation un-extracted (no partial memory); the staging area is
+  only cleared when every reduce pass lands. Every pass is wrapped in
+  `with_retry`: Fireworks enforces *adaptive* token-per-minute limits rather than
+  a concurrency cap, and its docs are explicit that ramping up too quickly draws
+  429s, so a cold burst of extraction passes must back off rather than record
+  permanent failures. `is_transient` retries 429/503/timeouts and lets a 400 or
+  an abort fail immediately.
+- **Interruption is resumable in both phases.** The map phase is watermark-based
+  (`memory_extractions.watermark` vs the newest message), so a cancel, crash, or
+  failure leaves it consistent and a re-run skips exactly what is already staged.
+  The reduce phase records progress per batch: `list_extractions` returns only
+  `folded = 0` rows, each batch is marked folded as soon as its pass lands, and
+  `folded_through` recovers the fold date so "later wins" survives a restart.
+  A re-run therefore continues at the first unfolded batch instead of re-folding
+  everything — which would both re-pay for finished work and, because
+  `memory_through` would reset to `None`, silently lose the date hint that makes
+  cross-batch contradiction resolution work. `upsert_extraction` resets `folded`
+  on conflict, so a conversation that grows new messages is consolidated again.
+  **Folded rows are never deleted** — they are the extraction watermark. Clearing
+  them at the end of a successful run would make every conversation look pending
+  again, so the next run would redo the whole archive; and it would erase the
+  distinction between conversations that succeeded and the ones that *failed*
+  (which leave no row at all, and so stay pending — exactly the set a re-run
+  should retry). "Discard staged" therefore drops only `folded = 0` rows.
 - **Migration:** `MemoryState::migrate_legacy` converts old frontmatter files to
   plain `## title` + body and deletes `index.md` on first load. Existing extra
   files are kept as ordinary files.
@@ -304,6 +414,7 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
       ├─ tools.rs      # tool specs, host executor, approval registry, MCP web_search
       ├─ shell.rs      # persistent per-conversation bash sessions (ShellRegistry)
       ├─ memory.rs     # Plain-Markdown memory: core files, listing, save/read/write, migration
+      ├─ import.rs     # Anthropic-export importer (timestamp-preserving, backfill-only)
       ├─ reflection.rs # Idle memory-consolidation scheduler + per-conversation pass
       ├─ attachments.rs # read paths -> Attachment (image data URL / text / metadata)
       ├─ pricing.rs    # pricing + models.dev metadata cache; overrides -> cache -> bundled

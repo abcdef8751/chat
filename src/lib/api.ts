@@ -75,6 +75,11 @@ export interface RefreshResult {
 export interface ModelInfo {
   id: string;
   name: string | null;
+  /**
+   * Whether models.dev says the model accepts image input. `null` when the
+   * provider isn't in the catalog, in which case nothing is warned about.
+   */
+  vision: boolean | null;
 }
 
 export interface ThinkingOptions {
@@ -93,6 +98,32 @@ export interface ReflectionStats {
   count: number;
   cost: number;
   lastAt: number;
+}
+
+/** Staged vs. still-pending memory extractions (the backfill's map phase). */
+export interface ExtractionStats {
+  staged: number;
+  pending: number;
+}
+
+export interface BackfillStatus {
+  running: boolean;
+  phase: string;
+  total: number;
+  done: number;
+  failed: number;
+  /** In-flight passes allowed right now; AIMD moves this during the run. */
+  concurrency: number;
+  /** The most recent failure, so a run that ends with failures is diagnosable. */
+  lastError: string | null;
+}
+
+/** Result of importing an Anthropic-format export. */
+export interface ImportReport {
+  conversations: number;
+  messages: number;
+  skipped: number;
+  files: number;
 }
 
 export type StreamEvent =
@@ -221,4 +252,42 @@ export function memoryReflectionStats(): Promise<ReflectionStats> {
 
 export function reflectNow(conversationId: string): Promise<void> {
   return invoke<void>("reflect_now", { conversationId });
+}
+
+/**
+ * Extract durable facts from every conversation that needs it, in parallel, then
+ * consolidate the staged summaries into memory in one serial pass. Returns
+ * immediately; progress arrives on the `memory-backfill` event.
+ */
+export function backfillMemories(
+  minChars?: number,
+  concurrency?: number,
+): Promise<BackfillStatus> {
+  return invoke<BackfillStatus>("backfill_memories", { minChars, concurrency });
+}
+
+export function backfillStatus(): Promise<BackfillStatus> {
+  return invoke<BackfillStatus>("backfill_status");
+}
+
+export function cancelBackfill(): Promise<void> {
+  return invoke<void>("cancel_backfill");
+}
+
+export function memoryExtractionStats(): Promise<ExtractionStats> {
+  return invoke<ExtractionStats>("memory_extraction_stats");
+}
+
+export function clearExtractions(): Promise<number> {
+  return invoke<number>("clear_extractions");
+}
+
+/**
+ * Import an Anthropic-format export: either a `conversations.json` holding an
+ * array of conversations, or a directory of one-file-per-conversation JSON.
+ * Imported chats keep their original timestamps and are excluded from the idle
+ * reflection sweep; the backfill picks them up instead.
+ */
+export function importConversations(path: string): Promise<ImportReport> {
+  return invoke<ImportReport>("import_conversations", { path });
 }

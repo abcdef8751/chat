@@ -109,6 +109,9 @@ struct RoundAccum {
     usage: Option<Value>,
     finish: Option<String>,
     failed: bool,
+    /// The provider's failure text, kept so a bulk caller can tell a transient
+    /// rate limit from a permanent rejection.
+    error: Option<String>,
     tool_calls: Vec<ToolCall>,
 }
 
@@ -182,10 +185,10 @@ fn apply_chunk(
     // Some providers stream an error payload and then close; surface it instead
     // of silently truncating the turn.
     if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
+        let message = error_message(err);
         out.failed = true;
-        sink.emit(StreamEvent::Error {
-            message: error_message(err),
-        });
+        out.error = Some(message.clone());
+        sink.emit(StreamEvent::Error { message });
         return true;
     }
     if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
@@ -201,6 +204,7 @@ fn apply_chunk(
     if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
         if reason == "error" {
             out.failed = true;
+            out.error = Some("provider error".to_string());
             sink.emit(StreamEvent::Error {
                 message: "provider error".to_string(),
             });
@@ -361,8 +365,12 @@ fn completion_body(
         "messages": serialized,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "tools": serde_json::to_value(tools).map_err(|e| e.to_string())?,
     });
+    // Omit the field entirely when there are no tools: some providers reject an
+    // empty array, and the extraction pass deliberately advertises none.
+    if !tools.is_empty() {
+        body["tools"] = serde_json::to_value(tools).map_err(|e| e.to_string())?;
+    }
     let level = thinking_level.trim();
     if !level.is_empty() && level != "default" {
         body["reasoning_effort"] = json!(level);
@@ -418,8 +426,10 @@ async fn run_completion(
                     None => closed = true,
                     Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
                     Some(Err(e)) => {
+                        let message = format!("stream error: {e}");
                         out.failed = true;
-                        sink.emit(StreamEvent::Error { message: format!("stream error: {e}") });
+                        out.error = Some(message.clone());
+                        sink.emit(StreamEvent::Error { message });
                         break;
                     }
                 }
@@ -749,6 +759,8 @@ pub(crate) struct ToolLoopResult {
     pub text: String,
     pub thinking: Option<String>,
     pub stop_reason: String,
+    /// Set when `stop_reason` is `"error"`: the provider's failure text.
+    pub error: Option<String>,
 }
 
 /// Execute one model-requested tool. Memory tools are handled in-process; host
@@ -778,14 +790,28 @@ async fn dispatch_tool(
     }
 }
 
+/// Which tools a tool loop may actually run. The tool *list* sent to the model is
+/// identical in every mode (so the prompt-cache prefix matches); access is
+/// enforced at dispatch instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ToolMode {
+    /// A live chat turn: memory reads/appends plus host and web tools, but no
+    /// `write_memory` — the chatting model must not clobber curated files.
+    Live,
+    /// Memory consolidation: all three memory tools, no host/web tools.
+    Reflection,
+    /// Memory extraction (the map half of a backfill): no tools are advertised
+    /// at all, because extraction is pure summarization. The gate below is a
+    /// guard in case a model emits a tool call anyway.
+    Extract,
+}
+
 /// The capped tool loop, factored out of [`run_chat_turn`] so the memory
 /// reflection pass can reuse it. Streams deltas/tool events to `sink`, echoes a
 /// turn's reasoning between tool rounds, and returns the accumulated usage and
 /// final text. When `persist` is `Some`, intermediate assistant/tool rows are
 /// written to the DB (live chat); when `None`, the loop is purely in memory.
-/// When `memory_only` is set, any non-memory tool call is refused (so a
-/// reflection turn can send the live tool list for prompt-cache reuse without
-/// being able to run host tools).
+/// `mode` gates which tools may run (see [`ToolMode`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_loop(
     cfg: &AppConfig,
@@ -800,13 +826,14 @@ pub(crate) async fn run_tool_loop(
     flag: Arc<AtomicBool>,
     sink: &dyn EventSink,
     persist: Option<&db::Db>,
-    memory_only: bool,
+    mode: ToolMode,
 ) -> Result<ToolLoopResult, String> {
     let mut usage_total = json!({});
     let mut rounds: u32 = 0;
     let stop_reason: String;
     let mut final_text = String::new();
     let mut final_thinking: Option<String> = None;
+    let mut final_error: Option<String> = None;
     // Reasoning produced by the last tool round, echoed on the assistant
     // tool-call message of this turn's subsequent requests. Never replays
     // previous turns (build_history_messages stays reasoning-free).
@@ -828,6 +855,7 @@ pub(crate) async fn run_tool_loop(
             Ok(r) => r,
             Err(e) => {
                 stop_reason = "error".into();
+                final_error = Some(e.clone());
                 sink.emit(StreamEvent::Error { message: e });
                 break;
             }
@@ -843,6 +871,7 @@ pub(crate) async fn run_tool_loop(
                 stop_reason = "aborted".into();
             } else if acc.failed {
                 stop_reason = "error".into();
+                final_error = acc.error.clone();
             } else {
                 stop_reason = "length".into(); // tool-round cap reached
             }
@@ -926,23 +955,29 @@ pub(crate) async fn run_tool_loop(
                     call.name.as_str(),
                     "save_memory" | "read_memory" | "write_memory"
                 );
-                // Live and reflection share one tool list (cache alignment), so
-                // access is enforced here by mode: live turns may not rewrite
-                // memory, and reflection turns may not touch host/web tools.
-                let refused = if memory_only && !is_memory_tool {
-                    Some(format!(
-                        "{} is not available during memory consolidation; use save_memory, \
-                         read_memory, or write_memory.",
-                        call.name
-                    ))
-                } else if !memory_only && call.name == "write_memory" {
-                    Some(
+                // Live, reflection and extraction share one tool list (cache
+                // alignment), so access is enforced here by mode: live turns
+                // may not rewrite memory, reflection turns may not touch
+                // host/web tools, and extraction turns may only read.
+                let refused = match mode {
+                    ToolMode::Live if call.name == "write_memory" => Some(
                         "write_memory is only available during memory consolidation; use \
                          save_memory to add a fact."
                             .to_string(),
-                    )
-                } else {
-                    None
+                    ),
+                    ToolMode::Reflection if !is_memory_tool => Some(format!(
+                        "{} is not available during memory consolidation; use save_memory, \
+                         read_memory, or write_memory.",
+                        call.name
+                    )),
+                    // Extraction advertises no tools, so a hallucinated call is
+                    // refused here rather than reaching `dispatch_tool`.
+                    ToolMode::Extract => Some(format!(
+                        "{} is not available during memory extraction; reply with the summary \
+                         text instead of calling tools.",
+                        call.name
+                    )),
+                    _ => None,
                 };
                 let output = if let Some(message) = refused {
                     ToolOutput::err(message)
@@ -1031,6 +1066,7 @@ pub(crate) async fn run_tool_loop(
         text: final_text,
         thinking: final_thinking,
         stop_reason,
+        error: final_error,
     })
 }
 
@@ -1098,7 +1134,7 @@ pub(crate) async fn run_chat_turn(
         flag,
         sink,
         Some(db),
-        false,
+        ToolMode::Live,
     )
     .await?;
 

@@ -2,6 +2,7 @@ mod attachments;
 mod chat;
 mod config;
 mod db;
+mod import;
 mod memory;
 mod models;
 mod pricing;
@@ -37,6 +38,8 @@ pub fn run() {
             app.manage(tools::McpClient::new());
             app.manage(tools::ApprovalRegistry::default());
             app.manage(shell::ShellRegistry::new());
+            app.manage(reflection::Backfill::default());
+            app.manage(import::ImportState::default());
 
             let memory = memory::MemoryState::load(dir.join("memory")).map_err(
                 |e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) },
@@ -69,11 +72,17 @@ pub fn run() {
             memory::write_memory_file,
             memory::delete_memory_file,
             reflection::reflect_now,
+            reflection::backfill_memories,
+            reflection::backfill_status,
+            reflection::cancel_backfill,
+            reflection::memory_extraction_stats,
+            reflection::clear_extractions,
             db::memory_reflection_stats,
             pricing::get_pricing,
             pricing::refresh_pricing,
             pricing::thinking_options,
             attachments::read_attachments,
+            import::import_conversations,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
