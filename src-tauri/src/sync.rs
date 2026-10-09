@@ -19,6 +19,8 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::config::ConfigState;
 use crate::db::{self, Db};
@@ -794,6 +796,11 @@ fn clear_memory_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
 /// mid-batch failure just retries the whole set next tick.
 const UPSERT_BATCH_SIZE: usize = 400;
 
+/// How many batches to upload concurrently. Kept modest so we don't re-trip
+/// the Supabase proxy (a single giant request was the original HTTP 520); a
+/// bounded 8-way burst of small POSTs is ordinary web load.
+const PUSH_CONCURRENCY: usize = 8;
+
 async fn post_upsert<F>(
     ctx: &SyncCtx<'_>,
     table: &str,
@@ -805,39 +812,78 @@ async fn post_upsert<F>(
 where
     F: FnMut(&[Value]) -> Result<(), String> + Send,
 {
+    // Fire each batch as its own task, bounded by a semaphore so at most
+    // `PUSH_CONCURRENCY` requests are in flight at once. Every task returns its
+    // chunk on success so the caller can clear that chunk's dirty flags.
+    let semaphore = Arc::new(Semaphore::new(PUSH_CONCURRENCY));
+    let mut set = JoinSet::new();
+    let client = ctx.client.clone();
+    let anon = ctx.anon.to_string();
     let url = format!("{}/rest/v1/{}", ctx.base_url, table);
+    let table = table.to_string();
+    let token = token.to_string();
     for chunk in rows.chunks(UPSERT_BATCH_SIZE) {
         if chunk.is_empty() {
             continue;
         }
-        let resp = ctx
-            .client
-            .post(&url)
-            .header("apikey", ctx.anon)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header("Prefer", "resolution=merge-duplicates")
-            .header(CONTENT_TYPE, "application/json")
-            .json(chunk)
-            .send()
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|e| format!("push {table}: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "push {table} failed (HTTP {}): {}",
-                status.as_u16(),
-                body.chars().take(300).collect::<String>()
-            ));
+            .map_err(|e| e.to_string())?;
+        let client = client.clone();
+        let anon = anon.clone();
+        let url = url.clone();
+        let token = token.clone();
+        let table = table.clone();
+        let chunk = chunk.to_vec();
+        set.spawn(async move {
+            let _permit = permit;
+            let resp = client
+                .post(&url)
+                .header("apikey", &anon)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header("Prefer", "resolution=merge-duplicates")
+                .header(CONTENT_TYPE, "application/json")
+                .json(&chunk)
+                .send()
+                .await
+                .map_err(|e| format!("push {table}: {e}"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "push {table} failed (HTTP {}): {}",
+                    status.as_u16(),
+                    body.chars().take(300).collect::<String>()
+                ));
+            }
+            Ok(chunk)
+        });
+    }
+
+    // A batch either landed (bump pushed + clear its dirty) or failed. Failed
+    // rows stay dirty and are retried next tick; every success is still
+    // recorded even if a sibling batch failed.
+    let mut first_err: Option<String> = None;
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(chunk)) => {
+                if let Err(e) = on_chunk(&chunk) {
+                    return Err(e);
+                }
+                progress.add_pushed(chunk.len() as u64);
+            }
+            Ok(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            Err(e) => {
+                first_err.get_or_insert(format!("push join: {e}"));
+            }
         }
-        // This batch landed: bump the live `pushed` counter and clear the dirty
-        // flags for exactly these rows, so progress updates as we go (not once
-        // the whole entity finishes).
-        progress.add_pushed(chunk.len() as u64);
-        on_chunk(chunk)?;
-        // Give PostgREST a beat between batches — a fresh burst of large
-        // upserts can still trip the proxy even under the size limit.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
     Ok(())
 }
