@@ -5,3 +5,4 @@ e2e/screenshots/
 
 # generated Tauri capability schemas (regenerated on build)
 src-tauri/gen/schemas/
+.env
