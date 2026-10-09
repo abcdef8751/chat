@@ -106,6 +106,7 @@ pub fn run() {
             import::import_conversations,
             sync::sync_sign_in,
             sync::sync_sign_out,
+            sync::sync_sign_up,
             sync::sync_status,
             sync::sync_toggle,
             sync::sync_now,

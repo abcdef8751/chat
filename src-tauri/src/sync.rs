@@ -211,6 +211,51 @@ pub fn sync_sign_out(_app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Create a new account via GoTrue's `/auth/v1/signup`. With "Confirm email" ON
+/// the account is created but not yet active: `Ok(())` means "confirmation email
+/// sent — check your inbox, then sign in". Errors carry a friendly, actionable
+/// message (already registered → sign in instead; weak password; rate limit).
+#[tauri::command]
+pub async fn sync_sign_up(app: AppHandle, email: String, password: String) -> Result<(), String> {
+    let sync = app.state::<SyncState>();
+    let url = format!("{}/auth/v1/signup", sync.base_url);
+    let resp = sync
+        .client
+        .post(&url)
+        .header("apikey", &sync.anon)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .map_err(|e| format!("sign up request: {e}"))?;
+    let http_ok = resp.status().is_success();
+    let body = resp.text().await.unwrap_or_default();
+    if http_ok {
+        // Confirmation email is ON: the account is created but not yet active.
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let code = v.get("error_code").and_then(|x| x.as_str()).unwrap_or("unknown");
+    let detail = v
+        .get("msg")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("error_description").and_then(|x| x.as_str()));
+    let msg = match code {
+        "user_already_exists" | "email_exists" | "user_exists" => {
+            "An account with this email already exists — sign in instead.".to_string()
+        }
+        "weak_password" => "Password is too weak — use at least 6 characters.".to_string(),
+        "signup_disabled" => "Sign-ups are disabled for this project.".to_string(),
+        "over_email_send_rate_limit" => "Too many sign-up attempts — wait a moment and retry."
+            .to_string(),
+        _ => format!(
+            "Sign up failed: {}",
+            detail.unwrap_or(code)
+        ),
+    };
+    Err(msg)
+}
+
 #[tauri::command]
 pub fn sync_status(app: AppHandle) -> Result<SyncStatus, String> {
     Ok(status(&app))

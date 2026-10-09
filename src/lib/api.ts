@@ -324,6 +324,14 @@ export function syncSignIn(email: string, password: string): Promise<SyncStatus>
   return invoke<SyncStatus>("sync_sign_in", { email, password });
 }
 
+/**
+ * Create a new Supabase account. Resolves once the confirmation email is sent —
+ * the user must click the link before they can sign in.
+ */
+export function syncSignUp(email: string, password: string): Promise<void> {
+  return invoke<void>("sync_sign_up", { email, password });
+}
+
 export function syncSignOut(): Promise<void> {
   return invoke<void>("sync_sign_out");
 }

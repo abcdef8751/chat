@@ -47,6 +47,7 @@ import {
   syncNow,
   syncSignIn,
   syncSignOut,
+  syncSignUp,
   syncStatus,
   syncToggle,
   thinkingOptions,
@@ -593,6 +594,9 @@ export default function App() {
   const [syncPassword, setSyncPassword] = createSignal("");
   const [syncError, setSyncError] = createSignal<string | null>(null);
   const [syncBusy, setSyncBusy] = createSignal(false);
+  // "signin" | "signup" — which mode the auth form is in; a confirmation notice.
+  const [syncAuthMode, setSyncAuthMode] = createSignal<"signin" | "signup">("signin");
+  const [syncNotice, setSyncNotice] = createSignal<string | null>(null);
 
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
@@ -907,6 +911,7 @@ export default function App() {
         // Left the feature entirely: clear any signed-in form state.
         setSyncEmail("");
         setSyncPassword("");
+        setSyncNotice(null);
       }
     } catch (e) {
       setSyncError(String(e));
@@ -930,6 +935,32 @@ export default function App() {
       setSyncStatusData(status);
       setSyncPassword("");
       setSyncEmail("");
+    } catch (e) {
+      setSyncError(String(e));
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function submitSyncSignUp() {
+    const email = syncEmail().trim();
+    const password = syncPassword();
+    if (!email || !password) {
+      setSyncError("Enter your email and password.");
+      return;
+    }
+    setSyncBusy(true);
+    setSyncError(null);
+    setSyncNotice(null);
+    try {
+      await syncSignUp(email, password);
+      // Confirmation email is on: switch to sign-in and tell them what's next.
+      setSyncAuthMode("signin");
+      setSyncEmail("");
+      setSyncPassword("");
+      setSyncNotice(
+        `Account created — check ${email} for a confirmation link, then sign in.`,
+      );
     } catch (e) {
       setSyncError(String(e));
     } finally {
@@ -2155,6 +2186,25 @@ export default function App() {
                     when={syncStatusData()?.loggedIn}
                     fallback={
                       <div class="mt-3 space-y-2">
+                        <div class="flex rounded-lg border border-neutral-300 p-0.5 dark:border-neutral-700">
+                          {(["signin", "signup"] as const).map((m) => (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSyncAuthMode(m);
+                                setSyncError(null);
+                                setSyncNotice(null);
+                              }}
+                              class={`flex-1 rounded-md px-2 py-1 text-[11px] font-medium transition ${
+                                syncAuthMode() === m
+                                  ? "bg-neutral-900 text-white dark:bg-white dark:text-neutral-900"
+                                  : "text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200"
+                              }`}
+                            >
+                              {m === "signin" ? "Sign in" : "Create account"}
+                            </button>
+                          ))}
+                        </div>
                         <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
                           Email
                           <input
@@ -2174,17 +2224,30 @@ export default function App() {
                             value={syncPassword()}
                             onInput={(e) => setSyncPassword(e.currentTarget.value)}
                             onKeyDown={(e) => {
-                              if (e.key === "Enter") void submitSyncSignIn();
+                              if (e.key === "Enter") {
+                                void (syncAuthMode() === "signin"
+                                  ? submitSyncSignIn()
+                                  : submitSyncSignUp());
+                              }
                             }}
                           />
                         </label>
                         <button
-                          onClick={() => void submitSyncSignIn()}
+                          onClick={() =>
+                            void (syncAuthMode() === "signin"
+                              ? submitSyncSignIn()
+                              : submitSyncSignUp())
+                          }
                           disabled={syncBusy()}
                           class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
                         >
-                          Sign in
+                          {syncAuthMode() === "signin" ? "Sign in" : "Create account"}
                         </button>
+                        <Show when={syncNotice()}>
+                          <p class="mt-2 rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400">
+                            {syncNotice()}
+                          </p>
+                        </Show>
                       </div>
                     }
                   >
