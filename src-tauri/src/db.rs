@@ -688,7 +688,9 @@ pub fn seed_initial_sync(db: &Db, memory_files: &[String]) -> Result<(), String>
     }
     conn.execute("UPDATE conversations SET dirty = 1", [])
         .map_err(|e| e.to_string())?;
-    conn.execute("UPDATE messages SET dirty = 1", [])
+    // Memory consolidation notes (`role = 'memory'`) are background bookkeeping —
+    // never pushed — so the seed must exclude them, matching the insert path.
+    conn.execute("UPDATE messages SET dirty = 1 WHERE role != 'memory'", [])
         .map_err(|e| e.to_string())?;
     for path in memory_files {
         mark_memory_dirty(&conn, path)?;

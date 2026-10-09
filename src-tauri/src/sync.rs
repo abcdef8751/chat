@@ -931,12 +931,16 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
 /// message: otherwise a pull would shift the watermark's meaning and cause a
 /// cross-device double-reflection (or a skipped chunk).
 fn reindex_messages(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Result<(), String> {
-    // The message the watermark currently points at, if any.
+    // The message the watermark currently points at, if any. Newly-pulled rows
+    // are inserted with a literal `index = 0`, so when the watermark is 0 there
+    // can be several candidates — order by rowid to deterministically prefer the
+    // original message the watermark pointed at before this apply.
     let watermark_id: Option<String> = tx
         .query_row(
             "SELECT m.id FROM conversations c
              JOIN messages m ON m.conversation_id = c.id AND m.\"index\" = c.last_reflected_index
-             WHERE c.id = ?1",
+             WHERE c.id = ?1
+             ORDER BY m.rowid ASC LIMIT 1",
             [conversation_id],
             |r| r.get(0),
         )
@@ -1041,11 +1045,14 @@ fn apply_memory(db: &Db, memory: &MemoryState, rows: &[Value]) -> Result<(), Str
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut max_rev = 0;
+    let mut any_failed = false;
     for (r, ok) in parsed.iter().zip(wrote_ok.iter()) {
         if !ok {
-            // The write failed: keep the file dirty so a later push retries, and
-            // don't advance the watermark past it (local stays authoritative).
-            let _ = tx.execute("UPDATE memory_sync SET dirty = 1 WHERE path = ?1", [&r.path]);
+            // The write failed. Do NOT set dirty (that would make the next push
+            // overwrite a newer remote file with stale local content) and do NOT
+            // advance the high-water (see below), so the next pull re-fetches the
+            // newer remote version and retries the apply.
+            any_failed = true;
             continue;
         }
         max_rev = max_rev.max(r.revision);
@@ -1070,7 +1077,11 @@ fn apply_memory(db: &Db, memory: &MemoryState, rows: &[Value]) -> Result<(), Str
         )
         .map_err(|e| e.to_string())?;
     }
-    advance_watermark(&tx, "memory", max_rev)?;
+    // Only advance when no write failed: otherwise the high-water could eclipse
+    // the failed row's revision and the next pull would never re-arrive it.
+    if !any_failed {
+        advance_watermark(&tx, "memory", max_rev)?;
+    }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
