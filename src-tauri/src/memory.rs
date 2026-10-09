@@ -32,19 +32,39 @@ pub struct MemoryFile {
 }
 
 /// Shared memory state installed into Tauri. Holds the memory directory; files
-/// on disk are the source of truth.
+/// on disk are the source of truth. When a DB handle is attached, file
+/// mutations also mark the file dirty for the sync push (append/replace/delete).
 pub struct MemoryState {
     dir: PathBuf,
+    db: Option<crate::db::Db>,
 }
 
 impl MemoryState {
     /// Load (creating if needed) the memory directory at `dir`, migrating any
     /// frontmatter-formatted files from the previous memory system.
     pub fn load(dir: PathBuf) -> Result<Self, String> {
-        let state = Self { dir };
+        let state = Self { dir, db: None };
         state.ensure()?;
         state.migrate_legacy()?;
         Ok(state)
+    }
+
+    /// Attach the shared DB handle so file mutations mark sync-dirty rows. The
+    /// handle shares the exact same `Arc<Mutex<Connection>>` as the app's `Db`,
+    /// so sync marking serializes on the same lock. Detached (`None`) in tests
+    /// that construct a state without a database.
+    pub fn set_db(&mut self, db: crate::db::Db) {
+        self.db = Some(db);
+    }
+
+    /// Mark a file for a sync push. Used by append/write (live content) and by
+    /// delete (tombstone — the push inspects whether the file still exists).
+    fn mark_dirty(&self, path: &str) {
+        if let Some(db) = &self.db {
+            if let Ok(conn) = db.0.lock() {
+                let _ = crate::db::mark_memory_dirty(&conn, path);
+            }
+        }
     }
 
     fn ensure_dir(&self) -> Result<(), String> {
@@ -135,6 +155,15 @@ impl MemoryState {
         }
     }
 
+    /// Whether a memory file exists on disk (distinguishes a real empty file
+    /// from a deleted/tombstoned one, which [`read`] cannot).
+    pub(crate) fn exists(&self, path: &str) -> bool {
+        match normalize_name(path) {
+            Ok(name) => self.path_for(&name).exists(),
+            Err(_) => false,
+        }
+    }
+
     /// Append a statement to the named file, creating it if needed. Returns the
     /// file name. A file name is always required (there is no default inbox).
     pub(crate) fn append(&self, content: &str, path: &str) -> Result<String, String> {
@@ -155,11 +184,22 @@ impl MemoryState {
             out.push('\n');
         }
         self.write_file_raw(&name, &out)?;
+        self.mark_dirty(&name);
         Ok(name)
     }
 
     /// Full-file replace (curation), creating the file if needed.
     pub(crate) fn write(&self, name: &str, content: &str) -> Result<(), String> {
+        let name = normalize_name(name)?;
+        self.write_file_raw(&name, content)?;
+        self.mark_dirty(&name);
+        Ok(())
+    }
+
+    /// Write a file as part of a sync pull (whole-file replace) WITHOUT marking
+    /// it dirty — the merge is originating-from-cloud, so it must not be pushed
+    /// straight back. The caller advances the `memory_sync` revision instead.
+    pub(crate) fn apply_remote(&self, name: &str, content: &str) -> Result<(), String> {
         let name = normalize_name(name)?;
         self.write_file_raw(&name, content)
     }
@@ -232,6 +272,20 @@ impl MemoryState {
 
     /// Delete a memory file.
     pub fn delete_file(&self, name: &str) -> Result<(), String> {
+        let name = normalize_name(name)?;
+        let path = self.path_for(&name);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| format!("delete {name}: {e}"))?;
+        }
+        // Keep the sync row as a tombstone (dirty) so the push deletes the file
+        // remotely. Push decides live-vs-tombstone by file existence.
+        self.mark_dirty(&name);
+        Ok(())
+    }
+
+    /// Delete a memory file as part of a sync pull (remote tombstone) WITHOUT
+    /// marking it dirty — the deletion originated from another device.
+    pub(crate) fn apply_remote_delete(&self, name: &str) -> Result<(), String> {
         let name = normalize_name(name)?;
         let path = self.path_for(&name);
         if path.exists() {

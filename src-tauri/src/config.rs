@@ -49,6 +49,9 @@ pub struct AppConfig {
     /// shared storage, e.g. `/storage/emulated/0/PiChat`). Empty resolves to
     /// the platform default (desktop: inherit the host cwd). See ANDROID_SHELL.md.
     pub shell_workspace_dir: String,
+    /// Opt-in Supabase backup + sync. Off by default; when off (or logged out)
+    /// the whole sync module is idle and never touches the network.
+    pub sync_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -63,6 +66,7 @@ impl Default for AppConfig {
             memory_reflection_idle_minutes: 30,
             model_overrides: HashMap::new(),
             shell_workspace_dir: String::new(),
+            sync_enabled: false,
         }
     }
 }

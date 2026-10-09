@@ -942,7 +942,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-pricing-{name}-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        crate::db::Db(std::sync::Mutex::new(crate::db::open(&p).unwrap()))
+        crate::db::Db(std::sync::Arc::new(std::sync::Mutex::new(crate::db::open(&p).unwrap())))
     }
 
     #[test]

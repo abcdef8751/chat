@@ -1,12 +1,17 @@
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use uuid::Uuid;
 
 /// Shared database state installed into Tauri via `manage`.
-pub struct Db(pub Mutex<Connection>);
+///
+/// The connection lives behind an `Arc` so the memory module can share the very
+/// same mutex (and thus serialize on the same lock) without holding a second
+/// wrapper around the same connection.
+#[derive(Clone)]
+pub struct Db(pub Arc<Mutex<Connection>>);
 
 /// SQLite schema (conversations, messages, model_prices, memory_reflections).
 const SCHEMA: &str = r#"
@@ -23,7 +28,9 @@ CREATE TABLE IF NOT EXISTS conversations (
   imported INTEGER NOT NULL DEFAULT 0,
   import_batch INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  revision BIGINT NOT NULL DEFAULT 0,
+  dirty INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -39,7 +46,9 @@ CREATE TABLE IF NOT EXISTS messages (
   usage TEXT,
   stop_reason TEXT,
   attachments TEXT,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  revision BIGINT NOT NULL DEFAULT 0,
+  dirty INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS model_prices (
@@ -91,6 +100,25 @@ CREATE TABLE IF NOT EXISTS memory_backfill_runs (
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sync_state (
+  entity TEXT PRIMARY KEY,
+  last_seen_revision BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS memory_sync (
+  path TEXT PRIMARY KEY,
+  revision BIGINT NOT NULL DEFAULT 0,
+  dirty INTEGER NOT NULL DEFAULT 0,
+  last_local_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+  entity TEXT NOT NULL,
+  id TEXT NOT NULL,
+  revision BIGINT NOT NULL,
+  PRIMARY KEY (entity, id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, "index");
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reflections_conv ON memory_reflections(conversation_id);
@@ -132,6 +160,50 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     // Older databases predate resumable consolidation.
     let _ = conn.execute(
         "ALTER TABLE memory_extractions ADD COLUMN folded INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // Older databases predate sync: add per-row revision + dirty flags whose
+    // defaults (0) make every pre-existing row a fresh, unpushed change. The
+    // sync-engine tables are created (idempotently) for databases of any age.
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN revision BIGINT NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN revision BIGINT NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_state (
+           entity TEXT PRIMARY KEY,
+           last_seen_revision BIGINT NOT NULL DEFAULT 0
+         )",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS memory_sync (
+           path TEXT PRIMARY KEY,
+           revision BIGINT NOT NULL DEFAULT 0,
+           dirty INTEGER NOT NULL DEFAULT 0,
+           last_local_at BIGINT NOT NULL
+         )",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_tombstones (
+           entity TEXT NOT NULL,
+           id TEXT NOT NULL,
+           revision BIGINT NOT NULL,
+           PRIMARY KEY (entity, id)
+         )",
         [],
     );
     Ok(conn)
@@ -312,9 +384,16 @@ pub fn insert_message_full(
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
+    // Only real turns are syncable; memory consolidation notes are background
+    // bookkeeping and are never pushed (so they keep revision 0 / dirty 0).
+    let rev = if role == "memory" {
+        0
+    } else {
+        bump_revision_c(&conn)?
+    };
     conn.execute(
-        "INSERT INTO messages (id, conversation_id, role, \"index\", content, model, provider, thinking_level, thinking, usage, stop_reason, attachments, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO messages (id, conversation_id, role, \"index\", content, model, provider, thinking_level, thinking, usage, stop_reason, attachments, created_at, revision, dirty)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             id,
             conversation_id,
@@ -328,27 +407,31 @@ pub fn insert_message_full(
             usage,
             stop_reason,
             attachments,
-            now
+            now,
+            rev,
+            if role == "memory" { 0 } else { 1 }
         ],
     )
     .map_err(|e| e.to_string())?;
     // Keep the conversation fresh in the sidebar order and auto-title the
     // first user message when the conversation is still unnamed. Memory
     // consolidation notes are background bookkeeping, so they don't reorder
-    // the sidebar.
+    // the sidebar. Only real turns bump the conversation's sync revision.
     if role == "user" {
         conn.execute(
             "UPDATE conversations
              SET updated_at = ?2,
-                 title = CASE WHEN title = 'New chat' OR title = '' THEN ?3 ELSE title END
+                 title = CASE WHEN title = 'New chat' OR title = '' THEN ?3 ELSE title END,
+                 revision = ?4,
+                 dirty = 1
              WHERE id = ?1",
-            params![conversation_id, now, derive_title(&content)],
+            params![conversation_id, now, derive_title(&content), rev],
         )
         .map_err(|e| e.to_string())?;
     } else if role != "memory" {
         conn.execute(
-            "UPDATE conversations SET updated_at = ?2 WHERE id = ?1",
-            params![conversation_id, now],
+            "UPDATE conversations SET updated_at = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
+            params![conversation_id, now, rev],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -407,9 +490,11 @@ pub fn create_conversation(
     let id = Uuid::new_v4().to_string();
     let t = title.unwrap_or_else(|| "New chat".to_string());
     let now = now();
+    let rev = bump_revision_c(&conn)?;
     conn.execute(
-        "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
-        params![id, t, now, now],
+        "INSERT INTO conversations (id, title, created_at, updated_at, revision, dirty)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+        params![id, t, now, now, rev],
     )
     .map_err(|e| e.to_string())?;
     Ok(Conversation {
@@ -458,9 +543,10 @@ pub fn rename_conversation(
     title: String,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let rev = bump_revision_c(&conn)?;
     conn.execute(
-        "UPDATE conversations SET title = ?2, updated_at = ?3 WHERE id = ?1",
-        params![conversation_id, title.trim(), now()],
+        "UPDATE conversations SET title = ?2, updated_at = ?3, revision = ?4, dirty = 1 WHERE id = ?1",
+        params![conversation_id, title.trim(), now(), rev],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -473,7 +559,10 @@ pub async fn delete_conversation(
 ) -> Result<(), String> {
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        // Messages cascade via FK (foreign_keys pragma is on from open()).
+        // Record tombstones so the sync push can delete the conversation (and
+        // its messages) on other devices, then hard-delete locally. Messages
+        // cascade via FK (foreign_keys pragma is on from open()).
+        crate::db::tombstone_conversation(&conn, &conversation_id)?;
         conn.execute("DELETE FROM conversations WHERE id = ?1", [&conversation_id])
             .map_err(|e| e.to_string())?;
     }
@@ -525,6 +614,81 @@ pub fn search_conversations(
 /// Current wall-clock time in milliseconds since the epoch.
 pub fn now_ms() -> i64 {
     now()
+}
+
+/// Next monotonic sync revision, seeded from the clock but guaranteed strictly
+/// increasing so two changes within the same millisecond never collide.
+///
+/// The low-water counter is persisted in `sync_state` under a synthetic entity
+/// (which the entity-scoped pull high-water marks never touch), so the sequence
+/// survives restarts. Takes a `&Connection` so it can be called while the caller
+/// already holds the DB lock (the mutators do) without re-entering the mutex.
+pub fn bump_revision_c(conn: &Connection) -> Result<i64, String> {
+    const REV: &str = "\u{0}revision";
+    let cur: i64 = conn
+        .query_row(
+            "SELECT last_seen_revision FROM sync_state WHERE entity = ?1",
+            [REV],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let now = now();
+    let next = if now > cur { now } else { cur + 1 };
+    conn.execute(
+        "INSERT INTO sync_state(entity, last_seen_revision) VALUES (?1, ?2)
+         ON CONFLICT(entity) DO UPDATE SET last_seen_revision = excluded.last_seen_revision",
+        params![REV, next],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(next)
+}
+
+/// Mark a memory file as changed (append/replace) or deleted (tombstone) so the
+/// next push mirrors it. Identity is by path within the user namespace; the push
+/// inspects whether the file still exists to decide live-vs-tombstone. Takes a
+/// `&Connection` for the same lock-safe reason as [`bump_revision_c`].
+pub fn mark_memory_dirty(conn: &Connection, path: &str) -> Result<(), String> {
+    let rev = bump_revision_c(conn)?;
+    conn.execute(
+        "INSERT INTO memory_sync(path, revision, dirty, last_local_at)
+         VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT(path) DO UPDATE SET
+           revision = excluded.revision,
+           dirty = 1,
+           last_local_at = excluded.last_local_at",
+        params![path, rev, now_ms()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Record a locally hard-deleted row as a tombstone to push. Only the
+/// conversation itself is tombstoned (its messages cascade-delete locally and on
+/// consumers, so per-message tombstones would carry no row data anyway).
+pub fn tombstone_conversation(conn: &Connection, conversation_id: &str) -> Result<i64, String> {
+    let rev = bump_revision_c(conn)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_tombstones(entity, id, revision)
+         VALUES ('conversations', ?1, ?2)",
+        params![conversation_id, rev],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(rev)
+}
+
+/// Number of rows locally awaiting a push (dirty rows + pending tombstones).
+pub fn pending_rows(db: &Db) -> Result<u64, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let count = |stmt: &str| -> i64 {
+        conn.query_row(stmt, [], |r| r.get(0)).unwrap_or(0)
+    };
+    let conv = count(
+        "SELECT COUNT(*) FROM conversations WHERE dirty = 1",
+    );
+    let msg = count("SELECT COUNT(*) FROM messages WHERE dirty = 1");
+    let mem = count("SELECT COUNT(*) FROM memory_sync WHERE dirty = 1");
+    let tomb = count("SELECT COUNT(*) FROM sync_tombstones");
+    Ok((conv + msg + mem + tomb) as u64)
 }
 
 /// Highest index of a *reflectable* message (user/assistant/tool). Memory
@@ -1045,7 +1209,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-fold-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        let db = Db(Mutex::new(open(&p).unwrap()));
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
 
         let mk = |id: &str, at: i64| {
             let conn = db.0.lock().unwrap();
@@ -1121,7 +1285,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-pending-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        let db = Db(Mutex::new(open(&p).unwrap()));
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
         let now = now_ms();
 
         let mk = |id: &str| {
@@ -1167,7 +1331,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-extract-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        let db = Db(Mutex::new(open(&p).unwrap()));
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
         let now = now_ms();
 
         let mk = |id: &str, body: &str, imported: i64| {
@@ -1242,7 +1406,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-batch-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        let db = Db(Mutex::new(open(&p).unwrap()));
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
         let now = now_ms();
 
         let mk = |id: &str, batch: i64| {
@@ -1303,7 +1467,7 @@ mod tests {
             .unwrap();
         }
 
-        let db = Db(Mutex::new(open(&p).unwrap()));
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
         {
             let conn = db.0.lock().unwrap();
             let batch: i64 = conn
