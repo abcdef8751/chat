@@ -2139,7 +2139,8 @@ export default function App() {
                     and are kept out of the idle reflection sweep. Backfill then
                     extracts durable facts from them in parallel and consolidates the
                     summaries into memory in one pass; extraction never writes to
-                    memory, only the final pass does.
+                    memory, only the final pass does. Backfill covers only your
+                    most recent import.
                   </p>
                   <Show when={importReport()}>
                     <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
