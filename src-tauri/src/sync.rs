@@ -330,6 +330,7 @@ async fn valid_access_token(sync: &SyncState, session: &Session) -> Result<Strin
 // ---------------------------------------------------------------------------
 
 /// Everything the push/pull helpers need, borrowed for the duration of a sync.
+/// Everything the push/pull helpers need, borrowed for the duration of a sync.
 struct SyncCtx<'a> {
     client: &'a reqwest::Client,
     base_url: &'a str,
@@ -387,7 +388,7 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
 }
 
 /// Fetch a `&Db` reference from the app state (State derefs to Db).
-fn dbref<'a>(app: &'a AppHandle) -> &'a Db {
+fn dbref(app: &AppHandle) -> &Db {
     app.state::<Db>().inner()
 }
 
@@ -643,23 +644,23 @@ struct RemoteMemory {
 
 /// Pull rows newer than the per-entity high-water mark and apply them.
 async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<(), String> {
-    let last_conv = last_seen(ctx, "conversations");
+    let last_conv = last_seen(ctx.db, "conversations");
     let convs = get_table(ctx, "conversations", me, token, last_conv).await?;
-    apply_conversations(ctx, &convs).await?;
+    apply_conversations(ctx.db, &convs).await?;
 
-    let last_msg = last_seen(ctx, "messages");
+    let last_msg = last_seen(ctx.db, "messages");
     let msgs = get_table(ctx, "messages", me, token, last_msg).await?;
-    apply_messages(ctx, &msgs).await?;
+    apply_messages(ctx.db, &msgs).await?;
 
-    let last_mem = last_seen(ctx, "memory");
+    let last_mem = last_seen(ctx.db, "memory");
     let mems = get_table(ctx, "memory_files", me, token, last_mem).await?;
-    apply_memory(ctx, &mems)?;
+    apply_memory(ctx.db, ctx.memory, &mems)?;
 
     Ok(())
 }
 
-fn last_seen(ctx: &SyncCtx<'_>, entity: &str) -> i64 {
-    let Ok(conn) = ctx.db.0.lock() else {
+fn last_seen(db: &Db, entity: &str) -> i64 {
+    let Ok(conn) = db.0.lock() else {
         return 0;
     };
     conn.query_row(
@@ -715,12 +716,12 @@ fn advance_watermark(conn: &rusqlite::Connection, entity: &str, max_rev: i64) ->
     Ok(())
 }
 
-async fn apply_conversations(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), String> {
+async fn apply_conversations(db: &Db, rows: &[Value]) -> Result<(), String> {
     let parsed: Vec<RemoteConversation> = rows
         .iter()
         .filter_map(|v| serde_json::from_value(v.clone()).ok())
         .collect();
-    let mut conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut max_rev = 0;
     for r in &parsed {
@@ -743,6 +744,7 @@ async fn apply_conversations(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), St
         }
         let title = r.title.clone().unwrap_or_default();
         let imported = if r.imported.unwrap_or(false) { 1 } else { 0 };
+        let import_batch = r.import_batch.unwrap_or(0);
         let created_at = r.created_at.unwrap_or_else(now_ms);
         let updated_at = r.updated_at.unwrap_or(created_at);
         if local_rev.is_none() {
@@ -753,7 +755,7 @@ async fn apply_conversations(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), St
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
                 rusqlite::params![
                     r.id, title, r.model, r.system_prompt, r.compaction_summary,
-                    r.last_reflected_index, imported, r.import_batch, created_at, updated_at,
+                    r.last_reflected_index, imported, import_batch, created_at, updated_at,
                     r.revision
                 ],
             )
@@ -767,7 +769,7 @@ async fn apply_conversations(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), St
                  WHERE id = ?1",
                 rusqlite::params![
                     r.id, title, r.model, r.system_prompt, r.compaction_summary,
-                    r.last_reflected_index, imported, r.import_batch, created_at, updated_at,
+                    r.last_reflected_index, imported, import_batch, created_at, updated_at,
                     r.revision
                 ],
             )
@@ -779,12 +781,12 @@ async fn apply_conversations(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), St
     Ok(())
 }
 
-async fn apply_messages(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), String> {
+async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
     let parsed: Vec<RemoteMessage> = rows
         .iter()
         .filter_map(|v| serde_json::from_value(v.clone()).ok())
         .collect();
-    let mut conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut max_rev = 0;
     let mut to_reindex: Vec<String> = Vec::new();
@@ -870,8 +872,7 @@ fn reindex_messages(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Re
         .query_map([conversation_id], |r| r.get::<_, String>(0))
         .map_err(|e| e.to_string())?
         .map(|r| r.map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e)?;
+        .collect::<Result<Vec<_>, String>>()?;
     drop(stmt);
     let mut upd = tx
         .prepare("UPDATE messages SET \"index\" = ?2 WHERE id = ?1")
@@ -888,7 +889,7 @@ fn reindex_messages(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Re
 /// Apply remote memory files (whole-file replace) honoring LWW by revision.
 /// File I/O happens outside the DB lock; the lock is only taken (twice) to
 /// decide the apply set and to record the resulting revisions + high-water.
-fn apply_memory(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), String> {
+fn apply_memory(db: &Db, memory: &MemoryState, rows: &[Value]) -> Result<(), String> {
     let parsed: Vec<RemoteMemory> = rows
         .iter()
         .filter_map(|v| serde_json::from_value(v.clone()).ok())
@@ -900,7 +901,7 @@ fn apply_memory(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), String> {
     // lock during file I/O.
     let mut applies: Vec<bool> = Vec::with_capacity(parsed.len());
     {
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
         for r in &parsed {
             let local_rev: i64 = conn
                 .query_row(
@@ -920,13 +921,13 @@ fn apply_memory(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), String> {
             continue;
         }
         if r.deleted_at.is_some() {
-            let _ = ctx.memory.apply_remote_delete(&r.path);
+            let _ = memory.apply_remote_delete(&r.path);
         } else {
-            let _ = ctx.memory.apply_remote(&r.path, r.content.as_deref().unwrap_or(""));
+            let _ = memory.apply_remote(&r.path, r.content.as_deref().unwrap_or(""));
         }
     }
     // Phase 3: record revisions + advance high-water in one transaction.
-    let mut conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut max_rev = 0;
     for r in &parsed {
@@ -956,3 +957,6 @@ fn apply_memory(ctx: &SyncCtx<'_>, rows: &[Value]) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
