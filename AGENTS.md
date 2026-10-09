@@ -397,13 +397,11 @@ with no network, sync enabled ≠ logged in, or the toggle off, the module is id
 and the app is byte-identical to before. Never blocks the UI.
 
 - **Auth:** email + password against GoTrue (`/auth/v1/token?grant_type=password`)
-  with the publishable (anon) key; the "Confirm email" flag is ON, so
-  `email_not_confirmed` is surfaced as a friendly "check your inbox" error. The
-  session (access/refresh token + user id + email) is stored in the OS keychain
-  under a separate `sync_session` account and never crosses IPC. The service-role
-  key is never compiled in — `build.rs` embeds only `SUPABASE_URL` +
-  `SUPABASE_PUBLISHABLE_KEY` from `.env` (gitignored). RLS (`auth.uid() =
-  user_id`) is the authorization boundary.
+  with the publishable (anon) key. The session (access/refresh token + user id +
+  email) is stored in the OS keychain under a separate `sync_session` account and
+  never crosses IPC. The service-role key is never compiled in — `build.rs` embeds
+  only `SUPABASE_URL` + `SUPABASE_PUBLISHABLE_KEY` from `.env` (gitignored). RLS
+  (`auth.uid() = user_id`) is the authorization boundary.
 - **Sync engine** (`sync.rs`): push upserts `dirty` rows to PostgREST
   (`Prefer: resolution=merge-duplicates`, scoped clear by `(id, revision)` so a
   row written mid-flight isn't dropped); pull fetches `revision > last_seen` and
@@ -422,6 +420,18 @@ and the app is byte-identical to before. Never blocks the UI.
 - **Schema:** `supabase/schema.sql` (run in the Supabase SQL editor) creates
   `conversations`, `messages`, `memory_files` with revision/deleted_at, enables
   RLS, and stores the client revision via a trigger.
+
+> **Production blocker — email confirmation is currently OFF.** For a personal
+> local-first tool we run Supabase Auth with the **"Confirm email"** toggle off
+> (sign-up logs you in immediately; there is no emailed confirmation link). GoTrue
+> `/auth/v1/verify` links therefore never come back into the app. Before shipping
+> to a wider audience you MUST: turn **Confirm email** ON in Supabase Auth, point
+> the **Site URL** /
+> **Redirect URL** away from the default `http://localhost:3000`, and add a
+> confirmation callback to the app (a localhost HTTP verifier or a `pichat://`
+> deep-link) so clicking the emailed link lands back in the app and completes
+> verification. The backend already maps `email_not_confirmed` to a friendly
+> "check your inbox" message, so the auth side is ready for that switch.
 
 ## File layout
 
