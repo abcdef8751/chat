@@ -34,7 +34,7 @@ create table if not exists conversations (
 
 create table if not exists messages (
   id uuid primary key,
-  conversation_id uuid not null references conversations(id) on delete set null,
+  conversation_id uuid not null references conversations(id) on delete cascade,
   role text not null,
   -- NOT the cross-device ordering authority; see the "index strategy" in the
   -- design. Local devices re-index their messages by (created_at, id) on pull.

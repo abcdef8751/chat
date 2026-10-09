@@ -375,6 +375,10 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         db: dbref(app),
         memory: app.state::<MemoryState>().inner(),
     };
+    // First sync: mark all pre-existing rows + memory files dirty so the initial
+    // push backs up full history (a guarded no-op after the first run).
+    let mem_names = ctx.memory.file_names();
+    db::seed_initial_sync(ctx.db, &mem_names)?;
     if let Err(e) = push(&ctx, &token).await {
         sync.set_error(e.clone());
         return Err(e);
@@ -463,14 +467,52 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
 
     let row_count = conv_rows.len() + conv_tombstones.len();
     if !conv_rows.is_empty() || !conv_tombstones.is_empty() {
+        let tomb_keys: Vec<(String, i64)> = conv_tombstones
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("id")?.as_str()?.to_string(),
+                    v.get("revision")?.as_i64()?,
+                ))
+            })
+            .collect();
         let mut body = conv_rows;
         body.extend(conv_tombstones);
         post_upsert(ctx, "conversations", token, &body).await?;
+        // Clear dirty/tombstone only for the exact rows we pushed. A row that was
+        // mutated during the in-flight POST (a new message bumped its revision)
+        // fails the `revision = ?2` guard and stays dirty for the next tick.
+        let keys: Vec<(String, i64)> = body
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("id")?.as_str()?.to_string(),
+                    v.get("revision")?.as_i64()?,
+                ))
+            })
+            .collect();
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        conn.execute("UPDATE conversations SET dirty = 0 WHERE dirty = 1", [])
-            .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM sync_tombstones WHERE entity = 'conversations'", [])
-            .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = conn
+                .prepare("UPDATE conversations SET dirty = 0 WHERE id = ?1 AND revision = ?2")
+                .map_err(|e| e.to_string())?;
+            for (id, rev) in &keys {
+                stmt.execute(rusqlite::params![id, rev])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        {
+            let mut stmt = conn
+                .prepare(
+                    "DELETE FROM sync_tombstones
+                     WHERE entity = 'conversations' AND id = ?1 AND revision = ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            for (id, rev) in &tomb_keys {
+                stmt.execute(rusqlite::params![id, rev])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         total += row_count as u64;
     }
 
@@ -512,9 +554,23 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
     };
     if !msg_rows.is_empty() {
         post_upsert(ctx, "messages", token, &msg_rows).await?;
+        let keys: Vec<(String, i64)> = msg_rows
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("id")?.as_str()?.to_string(),
+                    v.get("revision")?.as_i64()?,
+                ))
+            })
+            .collect();
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        conn.execute("UPDATE messages SET dirty = 0 WHERE dirty = 1", [])
+        let mut stmt = conn
+            .prepare("UPDATE messages SET dirty = 0 WHERE id = ?1 AND revision = ?2")
             .map_err(|e| e.to_string())?;
+        for (id, rev) in &keys {
+            stmt.execute(rusqlite::params![id, rev])
+                .map_err(|e| e.to_string())?;
+        }
         total += msg_rows.len() as u64;
     }
 
@@ -558,8 +614,13 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
     if !mem_body.is_empty() {
         post_upsert(ctx, "memory_files", token, &mem_body).await?;
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        conn.execute("UPDATE memory_sync SET dirty = 0 WHERE dirty = 1", [])
+        let mut stmt = conn
+            .prepare("UPDATE memory_sync SET dirty = 0 WHERE path = ?1 AND revision = ?2")
             .map_err(|e| e.to_string())?;
+        for (path, revision, _) in &mem_rows {
+            stmt.execute(rusqlite::params![path, revision])
+                .map_err(|e| e.to_string())?;
+        }
         total += mem_body.len() as u64;
     }
 
@@ -623,6 +684,8 @@ struct RemoteMessage {
     content: String,
     model: Option<String>,
     provider: Option<String>,
+    #[serde(default)]
+    thinking_level: Option<String>,
     thinking: Option<String>,
     usage: Option<String>,
     stop_reason: Option<String>,
@@ -825,23 +888,24 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
             tx.execute(
                 "INSERT INTO messages
                    (id, conversation_id, role, \"index\", content, model, provider,
-                    thinking, usage, stop_reason, attachments, created_at, revision, dirty)
-                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
+                    thinking_level, thinking, usage, stop_reason, attachments, created_at, revision, dirty)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
                 rusqlite::params![
                     r.id, r.conversation_id, r.role, r.content, r.model, r.provider,
-                    r.thinking, r.usage, r.stop_reason, r.attachments, r.created_at, r.revision
+                    r.thinking_level, r.thinking, r.usage, r.stop_reason, r.attachments,
+                    r.created_at, r.revision
                 ],
             )
             .map_err(|e| e.to_string())?;
         } else {
             tx.execute(
                 "UPDATE messages SET role = ?2, content = ?3, model = ?4, provider = ?5,
-                        thinking = ?6, usage = ?7, stop_reason = ?8, attachments = ?9,
-                        created_at = ?10, revision = ?11, dirty = 0
+                        thinking_level = ?6, thinking = ?7, usage = ?8, stop_reason = ?9,
+                        attachments = ?10, created_at = ?11, revision = ?12, dirty = 0
                  WHERE id = ?1",
                 rusqlite::params![
-                    r.id, r.role, r.content, r.model, r.provider, r.thinking, r.usage,
-                    r.stop_reason, r.attachments, r.created_at, r.revision
+                    r.id, r.role, r.content, r.model, r.provider, r.thinking_level,
+                    r.thinking, r.usage, r.stop_reason, r.attachments, r.created_at, r.revision
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -861,7 +925,24 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
 /// Rewrite a conversation's local `index` to a stable `(created_at, id)` order so
 /// cross-device message ordering is consistent without trusting any device's
 /// counter. Per-conversation monotonic, preserving the UI/grouping contract.
+///
+/// The reflection watermark (`conversations.last_reflected_index`) is a numeric
+/// index into this ordering, so re-ordering must remap it to the same logical
+/// message: otherwise a pull would shift the watermark's meaning and cause a
+/// cross-device double-reflection (or a skipped chunk).
 fn reindex_messages(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Result<(), String> {
+    // The message the watermark currently points at, if any.
+    let watermark_id: Option<String> = tx
+        .query_row(
+            "SELECT m.id FROM conversations c
+             JOIN messages m ON m.conversation_id = c.id AND m.\"index\" = c.last_reflected_index
+             WHERE c.id = ?1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
     let mut stmt = tx
         .prepare(
             "SELECT id FROM messages WHERE conversation_id = ?1
@@ -882,6 +963,26 @@ fn reindex_messages(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Re
         let rowid: &str = id.as_str();
         upd.execute(rusqlite::params![rowid, idx])
             .map_err(|e| e.to_string())?;
+    }
+    drop(upd);
+
+    // Remap the watermark to the new index of the same message.
+    if let Some(watermark_id) = watermark_id {
+        let new_idx: Option<i64> = tx
+            .query_row(
+                "SELECT \"index\" FROM messages WHERE id = ?1",
+                [&watermark_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(idx) = new_idx {
+            tx.execute(
+                "UPDATE conversations SET last_reflected_index = ?2 WHERE id = ?1",
+                rusqlite::params![conversation_id, idx],
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -915,22 +1016,38 @@ fn apply_memory(db: &Db, memory: &MemoryState, rows: &[Value]) -> Result<(), Str
             applies.push(local_rev < r.revision);
         }
     }
-    // Phase 2: file I/O (no DB lock held).
-    for (r, apply) in parsed.iter().zip(applies.iter()) {
-        if !apply {
+    // Phase 2: file I/O (no DB lock held). Record whether each row's write
+    // succeeded so phase 3 only marks successful applies as clean/in-sync.
+    let mut wrote_ok: Vec<bool> = Vec::with_capacity(parsed.len());
+    for (i, r) in parsed.iter().enumerate() {
+        if !applies[i] {
+            wrote_ok.push(true); // skipped because local wins — nothing to write
             continue;
         }
-        if r.deleted_at.is_some() {
-            let _ = memory.apply_remote_delete(&r.path);
+        let res = if r.deleted_at.is_some() {
+            memory.apply_remote_delete(&r.path)
         } else {
-            let _ = memory.apply_remote(&r.path, r.content.as_deref().unwrap_or(""));
+            memory.apply_remote(&r.path, r.content.as_deref().unwrap_or(""))
+        };
+        match res {
+            Ok(()) => wrote_ok.push(true),
+            Err(e) => {
+                eprintln!("sync: memory apply failed for {}: {e}", r.path);
+                wrote_ok.push(false);
+            }
         }
     }
     // Phase 3: record revisions + advance high-water in one transaction.
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut max_rev = 0;
-    for r in &parsed {
+    for (r, ok) in parsed.iter().zip(wrote_ok.iter()) {
+        if !ok {
+            // The write failed: keep the file dirty so a later push retries, and
+            // don't advance the watermark past it (local stays authoritative).
+            let _ = tx.execute("UPDATE memory_sync SET dirty = 1 WHERE path = ?1", [&r.path]);
+            continue;
+        }
         max_rev = max_rev.max(r.revision);
         let local_rev: i64 = tx
             .query_row(

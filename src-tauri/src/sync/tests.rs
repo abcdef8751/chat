@@ -601,3 +601,129 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
         assert!(wm > 0, "high-water missing for {entity}");
     }
 }
+
+/// Advancing the reflection watermark must mark the conversation dirty and bump
+/// its revision, or the sync push would never learn the chat was reflected and a
+/// second device would re-reflect it (C2).
+#[test]
+fn set_last_reflected_index_marks_conversation_dirty() {
+    let db = temp_db("watermark-dirty");
+    let cid = insert_conv(&db);
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET dirty = 0, last_reflected_index = NULL WHERE id = ?1",
+            [&cid],
+        )
+        .unwrap();
+    }
+    let rev_before = rev_of(
+        &db,
+        &format!("SELECT revision FROM conversations WHERE id = '{cid}'"),
+    );
+    db::set_last_reflected_index(&db, &cid, 3).unwrap();
+    assert_eq!(
+        dirty_of(
+            &db,
+            &format!("SELECT dirty FROM conversations WHERE id = '{cid}'")
+        ),
+        1
+    );
+    assert_eq!(
+        rev_of(
+            &db,
+            &format!("SELECT last_reflected_index FROM conversations WHERE id = '{cid}'")
+        ),
+        3
+    );
+    let rev_after = rev_of(
+        &db,
+        &format!("SELECT revision FROM conversations WHERE id = '{cid}'"),
+    );
+    assert!(rev_after > rev_before, "watermark update must bump the revision");
+}
+
+/// The first sync must treat all pre-existing rows as new (back up full history),
+/// and only once — a re-enable must not re-mark everything dirty (C1 + I4).
+#[test]
+fn seed_initial_sync_marks_full_history_dirty_once() {
+    let db = temp_db("seed");
+    let cid = insert_conv(&db);
+    {
+        let conn = db.0.lock().unwrap();
+        let rev = db::bump_revision_c(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at, revision, dirty)
+             VALUES ('m1', ?1, 'user', 0, 'hi', 1, ?2, 1)",
+            rusqlite::params![cid, rev],
+        )
+        .unwrap();
+    }
+    db::seed_initial_sync(&db, &["profile.md".to_string()]).unwrap();
+    assert_eq!(
+        dirty_of(&db, &format!("SELECT dirty FROM conversations WHERE id = '{cid}'")),
+        1
+    );
+    assert_eq!(
+        dirty_of(&db, "SELECT dirty FROM memory_sync WHERE path = 'profile.md'"),
+        1
+    );
+
+    // Idempotent: after clearing everything, a second seed must be a no-op.
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute("UPDATE conversations SET dirty = 0", []).unwrap();
+        conn.execute("UPDATE messages SET dirty = 0", []).unwrap();
+        conn.execute("UPDATE memory_sync SET dirty = 0", []).unwrap();
+    }
+    db::seed_initial_sync(&db, &["profile.md".to_string()]).unwrap();
+    assert_eq!(
+        dirty_of(&db, &format!("SELECT dirty FROM conversations WHERE id = '{cid}'")),
+        0
+    );
+    assert_eq!(
+        dirty_of(&db, "SELECT dirty FROM memory_sync WHERE path = 'profile.md'"),
+        0
+    );
+}
+
+/// Re-indexing a conversation after a pull must remap the reflection watermark to
+/// the same logical message, or a cross-device reorder would shift its meaning
+/// and cause double/skipped reflection (I3).
+#[test]
+fn reindex_preserves_reflection_watermark() {
+    let db = temp_db("reindex-wm");
+    let cid = insert_conv(&db);
+    {
+        let conn = db.0.lock().unwrap();
+        // Out-of-order vs created_at; `index` reflects the current order.
+        for (id, idx, created) in [("m1", 0i64, 300i64), ("m2", 1i64, 100i64), ("m3", 2i64, 200i64)] {
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at, revision, dirty)
+                 VALUES (?1, ?2, 'user', ?3, 'x', ?4, 1, 0)",
+                rusqlite::params![id, cid, idx, created],
+            )
+            .unwrap();
+        }
+        // Watermark points at index 1 (m2).
+        conn.execute(
+            "UPDATE conversations SET last_reflected_index = 1 WHERE id = ?1",
+            [&cid],
+        )
+        .unwrap();
+    }
+    {
+        let mut conn = db.0.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        reindex_messages(&tx, &cid).unwrap();
+        tx.commit().unwrap();
+    }
+    // New order by (created_at,id): m2=0, m3=1, m1=2. Watermark follows m2 → 0.
+    assert_eq!(
+        rev_of(&db, &format!("SELECT last_reflected_index FROM conversations WHERE id = '{cid}'")),
+        0
+    );
+    assert_eq!(rev_of(&db, "SELECT \"index\" FROM messages WHERE id = 'm2'"), 0);
+    assert_eq!(rev_of(&db, "SELECT \"index\" FROM messages WHERE id = 'm3'"), 1);
+    assert_eq!(rev_of(&db, "SELECT \"index\" FROM messages WHERE id = 'm1'"), 2);
+}

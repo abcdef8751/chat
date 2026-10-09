@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -662,6 +662,46 @@ pub fn mark_memory_dirty(conn: &Connection, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One-time seeding for the first sync: mark every pre-existing row (and every
+/// on-disk memory file) dirty so the initial push mirrors full history — the
+/// "backup" slice. Without this, rows that predate the feature (default revision
+/// 0 / dirty 0) would never be pushed and enabling sync on an existing user
+/// would back up nothing.
+///
+/// Guarded by a sentinel row in `sync_state` (entity `\0seeded`), so it runs once
+/// and re-enabling sync never re-marks everything dirty. `memory_files` is the
+/// list of on-disk memory file names (the caller collects them from `MemoryState`
+/// so this module stays free of a dependency on `memory`).
+pub fn seed_initial_sync(db: &Db, memory_files: &[String]) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    const SEEDED: &str = "\u{0}seeded";
+    let already: Option<i64> = conn
+        .query_row(
+            "SELECT last_seen_revision FROM sync_state WHERE entity = ?1",
+            [SEEDED],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if already.is_some() {
+        return Ok(());
+    }
+    conn.execute("UPDATE conversations SET dirty = 1", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("UPDATE messages SET dirty = 1", [])
+        .map_err(|e| e.to_string())?;
+    for path in memory_files {
+        mark_memory_dirty(&conn, path)?;
+    }
+    conn.execute(
+        "INSERT INTO sync_state(entity, last_seen_revision) VALUES (?1, 1)
+         ON CONFLICT(entity) DO NOTHING",
+        [SEEDED],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Record a locally hard-deleted row as a tombstone to push. Only the
 /// conversation itself is tombstoned (its messages cascade-delete locally and on
 /// consumers, so per-message tombstones would carry no row data anyway).
@@ -717,9 +757,13 @@ pub fn last_reflected_index(db: &Db, conversation_id: &str) -> Result<Option<i64
 
 pub fn set_last_reflected_index(db: &Db, conversation_id: &str, index: i64) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // The watermark rides on the conversation row for sync, so advancing it must
+    // mark the row dirty and bump its revision — otherwise the sync push never
+    // learns the conversation was reflected and a second device re-reflects it.
+    let rev = bump_revision_c(&conn)?;
     conn.execute(
-        "UPDATE conversations SET last_reflected_index = ?2 WHERE id = ?1",
-        params![conversation_id, index],
+        "UPDATE conversations SET last_reflected_index = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
+        params![conversation_id, index, rev],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
