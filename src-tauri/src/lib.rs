@@ -11,9 +11,8 @@ mod pricing;
 mod reflection;
 mod secrets;
 mod shell;
+mod sync;
 mod tools;
-
-use std::sync::Mutex;
 
 use tauri::Manager;
 
@@ -33,7 +32,9 @@ pub fn run() {
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             let conn = db::open(&dir.join("chat.sqlite"))
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) })?;
-            app.manage(db::Db(Mutex::new(conn)));
+            let conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
+            let db_handle = db::Db(conn.clone());
+            app.manage(db_handle);
 
             let config = config::ConfigState::load(dir.join("config.json"))
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) })?;
@@ -52,13 +53,20 @@ pub fn run() {
             app.manage(reflection::Backfill::default());
             app.manage(import::ImportState::default());
 
-            let memory = memory::MemoryState::load(dir.join("memory")).map_err(
+            let mut memory = memory::MemoryState::load(dir.join("memory")).map_err(
                 |e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) },
             )?;
+            // Attach the shared DB connection so memory mutations mark rows
+            // dirty for the sync push (shares the same Arc'd mutex as `Db`).
+            memory.set_db(db::Db(conn));
+            app.manage(sync::SyncState::new());
             app.manage(memory);
 
             // Background idle memory reflection.
             reflection::spawn(app.handle().clone());
+
+            // Background sync scheduler (only active when enabled + logged in).
+            sync::spawn(app.handle().clone());
 
             Ok(())
         })
@@ -96,6 +104,11 @@ pub fn run() {
             pricing::thinking_options,
             attachments::read_attachments,
             import::import_conversations,
+            sync::sync_sign_in,
+            sync::sync_sign_out,
+            sync::sync_status,
+            sync::sync_toggle,
+            sync::sync_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

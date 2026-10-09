@@ -613,7 +613,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-import-tx-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        let db = db::Db(std::sync::Mutex::new(db::open(&p).unwrap()));
+        let db = db::Db(std::sync::Arc::new(std::sync::Mutex::new(db::open(&p).unwrap())));
 
         let conversation: RawConversation = serde_json::from_value(serde_json::json!({
             "uuid": "conv-1",
@@ -700,7 +700,7 @@ mod tests {
                 db_path
             }
         };
-        let db = db::Db(std::sync::Mutex::new(db::open(&db_path).unwrap()));
+        let db = db::Db(std::sync::Arc::new(std::sync::Mutex::new(db::open(&db_path).unwrap())));
 
         let import_batch = db::next_import_batch(&db).unwrap();
         let before = counts(&db);

@@ -16,7 +16,7 @@
 
     fn open_db(name: &str) -> Db {
         let conn = crate::db::open(&temp_db_path(name)).unwrap();
-        Db(std::sync::Mutex::new(conn))
+        Db(std::sync::Arc::new(std::sync::Mutex::new(conn)))
     }
 
     fn temp_memory(name: &str) -> crate::memory::MemoryState {

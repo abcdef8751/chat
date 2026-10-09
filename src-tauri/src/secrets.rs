@@ -13,6 +13,9 @@ const USER: &str = "api_key";
 /// Keychain account name for the Brave Search API key (separate from the LLM
 /// key so the two never collide).
 const BRAVE_USER: &str = "brave_key";
+/// Keychain account name for the Supabase sync session (a small JSON blob of
+/// tokens). Kept out of `config.json` so tokens never sit on disk in plaintext.
+const SESSION_USER: &str = "sync_session";
 
 fn entry() -> Result<Entry, String> {
     Entry::new(SERVICE, USER).map_err(|e| format!("open keychain entry: {e}"))
@@ -20,6 +23,10 @@ fn entry() -> Result<Entry, String> {
 
 fn brave_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, BRAVE_USER).map_err(|e| format!("open keychain entry: {e}"))
+}
+
+fn session_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, SESSION_USER).map_err(|e| format!("open keychain entry: {e}"))
 }
 
 /// Read the stored API key. `Ok(None)` when no key has been saved yet.
@@ -78,6 +85,33 @@ fn brave_set(key: &str) -> Result<(), String> {
 
 fn brave_delete() -> Result<(), String> {
     match brave_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete: {e}")),
+    }
+}
+
+// --- Supabase sync session -------------------------------------------------
+
+/// Read the stored sync-session JSON blob. `Ok(None)` when none exists yet.
+pub fn session_get() -> Result<Option<String>, String> {
+    match session_entry()?.get_password() {
+        Ok(s) => Ok(Some(s)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keychain read: {e}")),
+    }
+}
+
+/// Store (or replace) the sync-session JSON blob.
+pub fn session_set(json: &str) -> Result<(), String> {
+    session_entry()?
+        .set_password(json)
+        .map_err(|e| format!("keychain write: {e}"))
+}
+
+/// Remove the stored sync session. Removing a missing entry is a no-op.
+pub fn session_delete() -> Result<(), String> {
+    match session_entry()?.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("keychain delete: {e}")),
