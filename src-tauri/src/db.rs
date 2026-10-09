@@ -914,7 +914,7 @@ pub struct ImportedMessage {
 pub fn next_import_batch(db: &Db) -> Result<i64, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     conn.query_row(
-        "SELECT COALESCE(MAX(import_batch), 0) + 1 FROM conversations",
+        "SELECT COALESCE(MAX(import_batch), 0) + 1 FROM conversations WHERE imported = 1",
         [],
         |r| r.get(0),
     )
@@ -1276,6 +1276,49 @@ mod tests {
 
         // The next import run gets a fresh, higher batch id.
         assert_eq!(next_import_batch(&db).unwrap(), 3);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A database written before import-batch scoping existed must migrate
+    /// cleanly: the new column defaults existing imported chats to batch 0, and
+    /// with no newer import that batch is still the one the backfill targets.
+    #[test]
+    fn import_batch_migration_defaults_existing_imports() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-batch-migrate-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+
+        // A database with the pre-`import_batch` conversations schema.
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE conversations (
+                   id TEXT PRIMARY KEY, title TEXT NOT NULL, model TEXT,
+                   system_prompt TEXT, compaction_summary TEXT,
+                   last_reflected_index INTEGER,
+                   imported INTEGER NOT NULL DEFAULT 0,
+                   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO conversations (id, title, imported, created_at, updated_at)
+                 VALUES ('legacy', 'legacy', 1, 1, 1);",
+            )
+            .unwrap();
+        }
+
+        let db = Db(Mutex::new(open(&p).unwrap()));
+        {
+            let conn = db.0.lock().unwrap();
+            let batch: i64 = conn
+                .query_row(
+                    "SELECT import_batch FROM conversations WHERE id = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(batch, 0);
+        }
+        assert_eq!(next_import_batch(&db).unwrap(), 1);
 
         let _ = std::fs::remove_file(&p);
     }
