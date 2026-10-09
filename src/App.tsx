@@ -44,6 +44,11 @@ import {
   setConfig,
   stopChat,
   streamChat,
+  syncNow,
+  syncSignIn,
+  syncSignOut,
+  syncStatus,
+  syncToggle,
   thinkingOptions,
   writeMemoryFile,
   type Attachment,
@@ -58,6 +63,7 @@ import {
   type Pricing,
   type ReflectionStats,
   type StreamEvent,
+  type SyncStatus,
   type ThinkingOptions,
 } from "./lib/api";
 import Markdown from "./lib/Markdown";
@@ -581,6 +587,12 @@ export default function App() {
   const [backfill, setBackfill] = createSignal<BackfillStatus | null>(null);
   const [extractionStats, setExtractionStats] = createSignal<ExtractionStats | null>(null);
   const [importReport, setImportReport] = createSignal<ImportReport | null>(null);
+  const [syncEnabled, setSyncEnabled] = createSignal(false);
+  const [syncStatusData, setSyncStatusData] = createSignal<SyncStatus | null>(null);
+  const [syncEmail, setSyncEmail] = createSignal("");
+  const [syncPassword, setSyncPassword] = createSignal("");
+  const [syncError, setSyncError] = createSignal<string | null>(null);
+  const [syncBusy, setSyncBusy] = createSignal(false);
 
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
@@ -686,6 +698,7 @@ export default function App() {
     setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
     setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
     setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
+    setSyncEnabled(cfg.syncEnabled ?? false);
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
     void refreshReflectionStats();    // Fast path: cached catalog/prices so the picker and meter render at once.
@@ -810,6 +823,7 @@ export default function App() {
     setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
     setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
     setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
+    setSyncEnabled(cfg.syncEnabled ?? false);
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
     setKeyDraft("");
@@ -818,6 +832,8 @@ export default function App() {
       .catch(() => setHasBraveKeySaved(false)); // never block opening Settings
     setBraveKeyDraft("");
     setSettingsError(null);
+    setSyncError(null);
+    void refreshSync();
     setSettingsOpen(true);
   }
 
@@ -839,6 +855,7 @@ export default function App() {
       memoryReflectionIdleMinutes: reflectionIdleMinutes(),
       modelOverrides: current.modelOverrides ?? {},
       shellWorkspaceDir: shellWorkspaceDir(),
+      syncEnabled: syncEnabled(),
     });
     let keyChanged = false;
     if (keyDraft().trim()) {
@@ -867,6 +884,90 @@ export default function App() {
     } catch (e) {
       setSettingsError(String(e));
     }
+  }
+
+  // --- Cloud backup + sync helpers ---
+
+  async function refreshSync() {
+    try {
+      setSyncStatusData(await syncStatus());
+    } catch {
+      // Feature unavailable/offline: leave status as-is; never block Settings.
+    }
+  }
+
+  async function toggleSync(on: boolean) {
+    setSyncBusy(true);
+    setSyncError(null);
+    try {
+      const status = await syncToggle(on);
+      setSyncStatusData(status);
+      setSyncEnabled(status.enabled);
+      if (!status.enabled) {
+        // Left the feature entirely: clear any signed-in form state.
+        setSyncEmail("");
+        setSyncPassword("");
+      }
+    } catch (e) {
+      setSyncError(String(e));
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function submitSyncSignIn() {
+    const email = syncEmail().trim();
+    const password = syncPassword();
+    if (!email || !password) {
+      setSyncError("Enter your email and password.");
+      return;
+    }
+    setSyncBusy(true);
+    setSyncError(null);
+    try {
+      // On error (e.g. "confirm your email") the backend message surfaces inline.
+      const status = await syncSignIn(email, password);
+      setSyncStatusData(status);
+      setSyncPassword("");
+      setSyncEmail("");
+    } catch (e) {
+      setSyncError(String(e));
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function doSyncSignOut() {
+    setSyncBusy(true);
+    setSyncError(null);
+    try {
+      await syncSignOut();
+      setSyncPassword("");
+      setSyncError(null);
+    } catch (e) {
+      setSyncError(String(e));
+    } finally {
+      setSyncBusy(false);
+      await refreshSync();
+    }
+  }
+
+  async function doSyncNow() {
+    setSyncBusy(true);
+    setSyncError(null);
+    try {
+      setSyncStatusData(await syncNow());
+    } catch (e) {
+      setSyncError(String(e));
+      await refreshSync();
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  function formatLastSync(ms: number | null): string {
+    if (!ms) return "never";
+    return new Date(ms).toLocaleString();
   }
 
   // Pull the model catalog (models.dev when the endpoint matches, else the
@@ -907,6 +1008,7 @@ export default function App() {
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
         shellWorkspaceDir: shellWorkspaceDir(),
+        syncEnabled: syncEnabled(),
       });
     } catch (e) {
       setSettingsError(String(e));
@@ -926,6 +1028,7 @@ export default function App() {
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
         shellWorkspaceDir: shellWorkspaceDir(),
+        syncEnabled: syncEnabled(),
       });
     } catch (e) {
       setSettingsError(String(e));
@@ -2029,6 +2132,107 @@ export default function App() {
                   runs in a fresh shell (no persistent <code>cd</code> / <code>export</code>).
                 </span>
               </label>
+
+              <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+                <label class="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                  <input
+                    type="checkbox"
+                    class="h-4 w-4 rounded border-neutral-300 dark:border-neutral-700"
+                    checked={syncEnabled()}
+                    disabled={syncBusy()}
+                    onChange={(e) => void toggleSync(e.currentTarget.checked)}
+                  />
+                  Cloud backup &amp; sync
+                </label>
+                <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                  Back up and keep your chats, memory, and settings in sync across devices via
+                  Supabase. Off by default — the app stays fully local until you sign in. Your
+                  data is scoped to your account.
+                </span>
+
+                <Show when={syncEnabled()}>
+                  <Show
+                    when={syncStatusData()?.loggedIn}
+                    fallback={
+                      <div class="mt-3 space-y-2">
+                        <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                          Email
+                          <input
+                            type="email"
+                            class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                            placeholder="you@example.com"
+                            value={syncEmail()}
+                            onInput={(e) => setSyncEmail(e.currentTarget.value)}
+                          />
+                        </label>
+                        <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                          Password
+                          <input
+                            type="password"
+                            class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                            placeholder="••••••••"
+                            value={syncPassword()}
+                            onInput={(e) => setSyncPassword(e.currentTarget.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") void submitSyncSignIn();
+                            }}
+                          />
+                        </label>
+                        <button
+                          onClick={() => void submitSyncSignIn()}
+                          disabled={syncBusy()}
+                          class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                        >
+                          Sign in
+                        </button>
+                      </div>
+                    }
+                  >
+                    <div class="mt-3 flex items-center gap-2">
+                      <span class="truncate text-xs text-neutral-600 dark:text-neutral-300">
+                        Signed in as <span class="font-medium">{syncStatusData()?.email}</span>
+                      </span>
+                      <button
+                        onClick={() => void doSyncSignOut()}
+                        disabled={syncBusy()}
+                        class="ml-auto shrink-0 text-[11px] font-normal text-red-600 transition hover:underline disabled:opacity-50 dark:text-red-400"
+                      >
+                        Sign out
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => void doSyncNow()}
+                      disabled={syncBusy() || syncStatusData()?.syncing}
+                      class="mt-2 rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                    >
+                      Sync now
+                    </button>
+                  </Show>
+
+                  <Show when={syncStatusData()?.syncing}>
+                    <p class="mt-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                      Syncing…
+                    </p>
+                  </Show>
+
+                  <p class="mt-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                    Last sync: {formatLastSync(syncStatusData()?.lastSyncAt ?? null)} ·{" "}
+                    {syncStatusData()?.pending ?? 0} pending
+                  </p>
+
+                  <Show when={syncStatusData()?.lastError}>
+                    <p class="mt-1 text-[11px] font-normal text-red-600 dark:text-red-400">
+                      {syncStatusData()?.lastError}
+                    </p>
+                  </Show>
+
+                  <Show when={syncError()}>
+                    <p class="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-400">
+                      {syncError()}
+                    </p>
+                  </Show>
+                </Show>
+              </div>
 
               <Show when={settingsError()}>
                 <p class="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-400">

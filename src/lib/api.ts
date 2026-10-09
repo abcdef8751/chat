@@ -52,6 +52,8 @@ export interface Config {
   echoReasoningContent: boolean;
   memoryReflectionEnabled: boolean;
   memoryReflectionIdleMinutes: number;
+  /** Opt-in "Cloud backup & sync": OFF by default, so the app is local-only. */
+  syncEnabled: boolean;
   modelOverrides: Record<string, ModelOverride>;
   /**
    * Working directory for host shell tools (Android: a directory under shared
@@ -128,6 +130,17 @@ export interface ImportReport {
   conversations: number;
   messages: number;
   skipped: number;
+}
+
+/** Live state of the opt-in Supabase backup + sync feature. */
+export interface SyncStatus {
+  enabled: boolean;
+  loggedIn: boolean;
+  email: string | null;
+  syncing: boolean;
+  pending: number;
+  lastSyncAt: number | null; // ms epoch or null
+  lastError: string | null;
 }
 
 export type StreamEvent =
@@ -303,4 +316,26 @@ export function clearExtractions(): Promise<number> {
  */
 export function importConversations(path: string): Promise<ImportReport> {
   return invoke<ImportReport>("import_conversations", { path });
+}
+
+// --- Cloud backup + sync (opt-in, local-first) ---
+
+export function syncSignIn(email: string, password: string): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_sign_in", { email, password });
+}
+
+export function syncSignOut(): Promise<void> {
+  return invoke<void>("sync_sign_out");
+}
+
+export function syncStatus(): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_status");
+}
+
+export function syncToggle(on: boolean): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_toggle", { on });
+}
+
+export function syncNow(): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_now");
 }
