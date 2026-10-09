@@ -469,7 +469,6 @@ pub fn rename_conversation(
 #[tauri::command]
 pub async fn delete_conversation(
     db: tauri::State<'_, Db>,
-    shell: tauri::State<'_, crate::shell::ShellRegistry>,
     conversation_id: String,
 ) -> Result<(), String> {
     {
@@ -478,8 +477,6 @@ pub async fn delete_conversation(
         conn.execute("DELETE FROM conversations WHERE id = ?1", [&conversation_id])
             .map_err(|e| e.to_string())?;
     }
-    // Drop the conversation's persistent shell, if any.
-    shell.clear(&conversation_id).await;
     Ok(())
 }
 

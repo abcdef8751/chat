@@ -53,6 +53,11 @@ export interface Config {
   memoryReflectionEnabled: boolean;
   memoryReflectionIdleMinutes: number;
   modelOverrides: Record<string, ModelOverride>;
+  /**
+   * Working directory for host shell tools (Android: a directory under shared
+   * storage, e.g. `/storage/emulated/0/PiChat`). Empty = platform default.
+   */
+  shellWorkspaceDir: string;
 }
 
 export interface Pricing {

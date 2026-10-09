@@ -1,221 +1,190 @@
-//! Persistent per-conversation shell sessions.
+//! One-shot host-shell executor.
 //!
-//! Host `bash` tool calls run against a long-lived `bash` process per
-//! conversation so state (`cd`, `export`, shell functions, …) persists across
-//! calls. Completion is detected with a random sentinel printed after each
-//! command; if a command outruns the timeout or kills the shell, the session is
-//! dropped so the next call starts a fresh one.
+//! Every `bash` call is a **fresh** `bash -c <cmd>` process; there is no
+//! persistent per-conversation session (see `ANDROID_SHELL.md`). State
+//! (`cd`, `export`, shell functions, …) does not survive tool calls, which the
+//! agent already assumes. Desktop executes `bash` directly; Android delegates
+//! to the user's installed Termux via the `RUN_COMMAND` intent so host tools
+//! share one coherent filesystem namespace (`crate::android`).
 
-use std::collections::HashMap;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex as AsyncMutex;
+#[cfg(not(mobile))]
+use tokio::process::Command;
 
-use crate::tools::{truncate, ToolOutput};
+use crate::tools::ToolOutput;
+#[cfg(not(mobile))]
+use crate::tools::truncate;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default per-call timeout (matches the old persistent session's).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
-struct ShellSession {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+/// One-shot host-shell executor, platform-agnostic.
+///
+/// A single managed state so `tools.rs` / `chat.rs` / `reflection.rs` share one
+/// instance; it holds no per-conversation state, so it can be a plain value.
+#[derive(Clone)]
+#[cfg_attr(mobile, allow(dead_code))] // desktop-only fields/constructors on Android
+pub struct ShellExecutor {
     timeout: Duration,
+    /// Working directory for each invocation (`None` = inherit the host cwd).
+    workdir: Option<PathBuf>,
+    /// Android only: the app handle used to reach the Termux bridge plugin.
+    #[cfg(mobile)]
+    app: Option<tauri::AppHandle>,
 }
 
-impl ShellSession {
-    fn spawn(timeout: Duration) -> Result<Self, String> {
-        let mut child = Command::new("bash")
-            .arg("--noprofile")
-            .arg("--norc")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("spawn bash: {e}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "bash: no stdin".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "bash: no stdout".to_string())?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            timeout,
-        })
-    }
-
-    /// Run one command, returning its output and whether the session must be
-    /// reset (timeout / shell exit).
-    async fn run(&mut self, command: &str) -> (ToolOutput, bool) {
-        let sentinel = format!("__PI_DONE_{}__", uuid::Uuid::new_v4().simple());
-        // Redirect the command's stdin from /dev/null so it can't swallow the
-        // sentinel line — unless it uses a heredoc, whose body is read from the
-        // script stream itself (and which a `</dev/null` would override).
-        let redirect = if command.contains("<<") { "" } else { " </dev/null" };
-        let script = format!(
-            "exec 2>&1\n{command}{redirect}\nprintf '\\n{sentinel}%s\\n' \"$?\"\n"
-        );
-
-        if let Err(e) = self.stdin.write_all(script.as_bytes()).await {
-            return (
-                ToolOutput {
-                    content: format!("bash: {e}"),
-                    is_error: true,
-                },
-                true,
-            );
-        }
-        if let Err(e) = self.stdin.flush().await {
-            return (
-                ToolOutput {
-                    content: format!("bash: {e}"),
-                    is_error: true,
-                },
-                true,
-            );
-        }
-
-        let res = tokio::time::timeout(
-            self.timeout,
-            Self::read_until(&mut self.stdout, &sentinel),
-        )
-        .await;
-
-        match res {
-            Ok(Ok((output, code))) => {
-                let mut text = truncate(output.trim_end().to_string());
-                if code != 0 {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&format!("[exit: {code}]"));
-                }
-                (
-                    ToolOutput {
-                        content: text,
-                        is_error: code != 0,
-                    },
-                    false,
-                )
-            }
-            Ok(Err(e)) => (
-                ToolOutput {
-                    content: format!("bash: {e}"),
-                    is_error: true,
-                },
-                true,
-            ),
-            Err(_) => (
-                ToolOutput {
-                    content: format!("bash: timed out after {}s", self.timeout.as_secs()),
-                    is_error: true,
-                },
-                true,
-            ),
-        }
-    }
-
-    /// Read lines until the sentinel is seen, returning the captured output and
-    /// the command's exit code.
-    async fn read_until(
-        reader: &mut BufReader<ChildStdout>,
-        sentinel: &str,
-    ) -> Result<(String, i32), String> {
-        let mut output = String::new();
-        loop {
-            let mut line = String::new();
-            let n = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Err("shell exited".to_string());
-            }
-            if let Some(rest) = line.strip_prefix(sentinel) {
-                let code = rest.trim().parse::<i32>().unwrap_or(-1);
-                return Ok((output, code));
-            }
-            // Cap what we keep in memory; keep draining to stay in sync.
-            if output.len() < crate::tools::MAX_OUTPUT_CHARS * 2 {
-                output.push_str(&line);
-            }
-        }
-    }
-}
-
-/// One live shell per conversation id.
-pub struct ShellRegistry {
-    sessions: Mutex<HashMap<String, Arc<AsyncMutex<Option<ShellSession>>>>>,
-    timeout: Duration,
-}
-
-impl Default for ShellRegistry {
+impl Default for ShellExecutor {
     fn default() -> Self {
         Self::with_timeout(DEFAULT_TIMEOUT)
     }
 }
 
-impl ShellRegistry {
+#[cfg_attr(mobile, allow(dead_code))] // desktop-only constructors on Android
+impl ShellExecutor {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
             timeout,
+            workdir: None,
+            #[cfg(mobile)]
+            app: None,
         }
     }
 
-    fn session_for(&self, conversation_id: &str) -> Arc<AsyncMutex<Option<ShellSession>>> {
-        let mut map = self.sessions.lock().unwrap();
-        map.entry(conversation_id.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
-            .clone()
+    /// Android-only constructor carrying the app handle for the Termux bridge.
+    #[cfg(mobile)]
+    pub fn new_mobile(app: tauri::AppHandle) -> Self {
+        Self {
+            timeout: DEFAULT_TIMEOUT,
+            workdir: None,
+            app: Some(app),
+        }
     }
 
-    /// Run `command` in the conversation's shell, spawning it on first use.
-    pub async fn run(&self, conversation_id: &str, command: &str) -> ToolOutput {
-        let slot = self.session_for(conversation_id);
-        let mut guard = slot.lock().await;
-        if guard.is_none() {
-            match ShellSession::spawn(self.timeout) {
-                Ok(session) => *guard = Some(session),
-                Err(e) => {
-                    return ToolOutput {
-                        content: format!("bash: {e}"),
-                        is_error: true,
+    /// Executor that runs every call in `workdir` (Android: the shared-storage
+    /// workspace; desktop: useful for tests).
+    #[cfg(test)]
+    pub fn with_workdir(timeout: Duration, workdir: PathBuf) -> Self {
+        Self {
+            timeout,
+            workdir: Some(workdir),
+            #[cfg(mobile)]
+            app: None,
+        }
+    }
+
+    /// Run one `bash` command, returning captured output and the exit code.
+    pub async fn run(&self, command: &str) -> ToolOutput {
+        #[cfg(mobile)]
+        {
+            let Some(app) = &self.app else {
+                return ToolOutput::err("Termux bridge not initialized".into());
+            };
+            crate::android::run_termux_command(app, command).await
+        }
+        #[cfg(not(mobile))]
+        {
+            self.run_desktop(command).await
+        }
+    }
+
+    /// Read a file as text. Desktop reads the host filesystem directly;
+    /// Android routes through Termux so the same namespace as `bash` is used.
+    pub async fn read_file(&self, path: &str) -> ToolOutput {
+        #[cfg(not(mobile))]
+        {
+            match tokio::fs::read_to_string(path).await {
+                Ok(text) => ToolOutput::ok(truncate(text)),
+                Err(e) => ToolOutput::err(format!("read_file: {e}")),
+            }
+        }
+        #[cfg(mobile)]
+        {
+            self.run(&format!("cat {}", shq(path))).await
+        }
+    }
+
+    /// Write text to a file. Desktop writes the host filesystem directly;
+    /// Android routes through Termux.
+    pub async fn write_file(&self, path: &str, content: &str) -> ToolOutput {
+        #[cfg(not(mobile))]
+        {
+            match tokio::fs::write(path, content).await {
+                Ok(()) => ToolOutput::ok(format!("wrote {} bytes to {path}", content.len())),
+                Err(e) => ToolOutput::err(format!("write_file: {e}")),
+            }
+        }
+        #[cfg(mobile)]
+        {
+            // Heredoc into the target path so arbitrary content round-trips.
+            let script = format!("cat > {} <<'PI_FILE_EOF'\n{}\nPI_FILE_EOF", shq(path), content);
+            self.run(&script).await
+        }
+    }
+
+    #[cfg(not(mobile))]
+    async fn run_desktop(&self, command: &str) -> ToolOutput {
+        use std::process::Stdio;
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(wd) = &self.workdir {
+            cmd.current_dir(wd);
+        }
+        let child = match cmd.kill_on_drop(true).spawn() {
+            Ok(c) => c,
+            Err(e) => return ToolOutput::err(format!("bash: {e}")),
+        };
+        // `kill_on_drop` ensures a timed-out future also kills the child.
+        let res = tokio::time::timeout(self.timeout, async {
+            let out = child.wait_with_output().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(out)
+        })
+        .await;
+
+        match res {
+            Ok(Ok(out)) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                let err = String::from_utf8_lossy(&out.stderr).into_owned();
+                if !err.is_empty() {
+                    if !text.is_empty() {
+                        text.push('\n');
                     }
+                    text.push_str(&err);
+                }
+                let code = out.status.code().unwrap_or(-1);
+                let mut text = truncate(text).trim_end().to_string();
+                if code != 0 {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&format!("[exit: {code}]"));
+                }
+                ToolOutput {
+                    content: text,
+                    is_error: code != 0,
                 }
             }
+            Ok(Err(e)) => ToolOutput::err(format!("bash: {e}")),
+            Err(_) => ToolOutput::err(format!(
+                "bash: timed out after {}s",
+                self.timeout.as_secs()
+            )),
         }
-        let (output, reset) = guard.as_mut().unwrap().run(command).await;
-        if reset {
-            if let Some(mut session) = guard.take() {
-                let _ = session.child.kill().await;
-            }
-        }
-        output
     }
+}
 
-    /// Drop a conversation's shell (used when the conversation is deleted).
-    pub async fn clear(&self, conversation_id: &str) {
-        let slot = self.sessions.lock().unwrap().remove(conversation_id);
-        if let Some(slot) = slot {
-            if let Some(mut session) = slot.lock().await.take() {
-                let _ = session.child.kill().await;
-            }
-        }
-    }
+/// Single-quote a shell argument (paths) so it survives as one token.
+#[cfg(mobile)]
+fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -223,35 +192,26 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn cwd_persists_across_calls() {
-        let reg = ShellRegistry::new();
-        let out = reg.run("c", "cd /tmp").await;
+    async fn runs_and_reports_output() {
+        let ex = ShellExecutor::new();
+        let out = ex.run("echo hello").await;
         assert!(!out.is_error, "{}", out.content);
-        let out = reg.run("c", "pwd").await;
-        assert_eq!(out.content.trim(), "/tmp");
-    }
-
-    #[tokio::test]
-    async fn env_persists_across_calls() {
-        let reg = ShellRegistry::new();
-        let out = reg.run("c", "export PI_SHELL_TEST=hello").await;
-        assert!(!out.is_error, "{}", out.content);
-        let out = reg.run("c", "echo $PI_SHELL_TEST").await;
         assert_eq!(out.content.trim(), "hello");
     }
 
     #[tokio::test]
-    async fn sessions_are_isolated_per_conversation() {
-        let reg = ShellRegistry::new();
-        reg.run("a", "export PI_ONLY_A=1").await;
-        let out = reg.run("b", "echo ${PI_ONLY_A:-unset}").await;
+    async fn fresh_env_each_call() {
+        let ex = ShellExecutor::new();
+        ex.run("export PI_ONE_SHOT=1").await;
+        // A fresh process per call: the variable is gone next time.
+        let out = ex.run("echo ${PI_ONE_SHOT:-unset}").await;
         assert_eq!(out.content.trim(), "unset");
     }
 
     #[tokio::test]
     async fn stderr_and_exit_code_are_reported() {
-        let reg = ShellRegistry::new();
-        let out = reg.run("c", "echo oops >&2; (exit 3)").await;
+        let ex = ShellExecutor::new();
+        let out = ex.run("echo oops >&2; (exit 3)").await;
         assert!(out.is_error);
         assert!(out.content.contains("oops"), "{}", out.content);
         assert!(out.content.contains("[exit: 3]"), "{}", out.content);
@@ -259,28 +219,36 @@ mod tests {
 
     #[tokio::test]
     async fn heredoc_commands_work() {
-        let reg = ShellRegistry::new();
-        let out = reg.run("c", "cat <<EOF\nhi there\nEOF").await;
+        let ex = ShellExecutor::new();
+        let out = ex.run("cat <<EOF\nhi there\nEOF").await;
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(out.content.trim(), "hi there");
     }
 
     #[tokio::test]
-    async fn timeout_resets_session() {
-        let reg = ShellRegistry::with_timeout(Duration::from_secs(2));
-        let out = reg.run("c", "sleep 30").await;
+    async fn timeout_kills_and_reports() {
+        let ex = ShellExecutor::with_timeout(Duration::from_secs(2));
+        let out = ex.run("sleep 30").await;
         assert!(out.is_error);
         assert!(out.content.contains("timed out"), "{}", out.content);
-        let out = reg.run("c", "echo alive").await;
-        assert_eq!(out.content.trim(), "alive");
     }
 
     #[tokio::test]
-    async fn clear_drops_the_session() {
-        let reg = ShellRegistry::new();
-        reg.run("c", "export PI_CLEAR_TEST=1").await;
-        reg.clear("c").await;
-        let out = reg.run("c", "echo ${PI_CLEAR_TEST:-unset}").await;
-        assert_eq!(out.content.trim(), "unset");
+    async fn missing_bash_is_a_tool_error() {
+        // Point at a path that isn't a shell by abusing `HOME`? bash is found on
+        // PATH, so instead confirm a command-not-found is surfaced as an error.
+        let ex = ShellExecutor::new();
+        let out = ex.run("definitely_not_a_real_command_xyz").await;
+        assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn workdir_is_respected() {
+        let dir = std::env::temp_dir().join(format!("pi-shell-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ex = ShellExecutor::with_workdir(Duration::from_secs(10), dir.clone());
+        let out = ex.run("pwd").await;
+        assert_eq!(out.content.trim(), dir.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

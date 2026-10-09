@@ -180,28 +180,22 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
 
 /// Execute a host tool (bash/read_file/write_file). Errors are returned as
 /// `ToolOutput::err` text so the model can self-correct (see the failure contract
-/// in AGENTS.md).
-/// `bash` runs in the conversation's persistent shell so `cd`/`export` persist.
-pub async fn execute_host_tool(
-    call: &ToolCall,
-    shell: &crate::shell::ShellRegistry,
-    conversation_id: &str,
-) -> ToolOutput {
+/// in AGENTS.md). Execution is **one-shot**: `bash` runs a fresh `bash -c <cmd>`
+/// per call (no persistent shell), and on Android everything routes through the
+/// user's Termux (see `ANDROID_SHELL.md`).
+pub async fn execute_host_tool(call: &ToolCall, shell: &crate::shell::ShellExecutor) -> ToolOutput {
     match call.name.as_str() {
         "bash" => {
             let Some(command) = call.arguments.get("command").and_then(Value::as_str) else {
                 return ToolOutput::err("bash: missing 'command' argument".into());
             };
-            shell.run(conversation_id, command).await
+            shell.run(command).await
         }
         "read_file" => {
             let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
                 return ToolOutput::err("read_file: missing 'path' argument".into());
             };
-            match tokio::fs::read_to_string(path).await {
-                Ok(text) => ToolOutput::ok(truncate(text)),
-                Err(e) => ToolOutput::err(format!("read_file: {e}")),
-            }
+            shell.read_file(path).await
         }
         "write_file" => {
             let (Some(path), Some(content)) = (
@@ -210,10 +204,7 @@ pub async fn execute_host_tool(
             ) else {
                 return ToolOutput::err("write_file: missing 'path' or 'content' argument".into());
             };
-            match tokio::fs::write(path, content).await {
-                Ok(()) => ToolOutput::ok(format!("wrote {} bytes to {path}", content.len())),
-                Err(e) => ToolOutput::err(format!("write_file: {e}")),
-            }
+            shell.write_file(path, content).await
         }
         other => ToolOutput::err(format!("unknown tool: {other}")),
     }
@@ -435,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_runs_and_reports_output() {
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let out = execute_host_tool(
             &ToolCall {
                 id: "t1".into(),
@@ -443,7 +434,6 @@ mod tests {
                 arguments: json!({"command": "echo hello"}),
             },
             &shell,
-            "test",
         )
         .await;
         assert!(!out.is_error);
@@ -452,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_error_is_tool_error_not_panic() {
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let out = execute_host_tool(
             &ToolCall {
                 id: "t2".into(),
@@ -460,7 +450,6 @@ mod tests {
                 arguments: json!({"command": "(exit 3)"}),
             },
             &shell,
-            "test",
         )
         .await;
         assert!(out.is_error);
@@ -469,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_and_read_file_roundtrip() {
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let path = std::env::temp_dir().join(format!("pi-chat-tool-test-{}.txt", std::process::id()));
         let w = execute_host_tool(
             &ToolCall {
@@ -478,7 +467,6 @@ mod tests {
                 arguments: json!({"path": path.to_str().unwrap(), "content": "data"}),
             },
             &shell,
-            "test",
         )
         .await;
         assert!(!w.is_error, "{}", w.content);
@@ -490,7 +478,6 @@ mod tests {
                 arguments: json!({"path": path.to_str().unwrap()}),
             },
             &shell,
-            "test",
         )
         .await;
         assert!(!r.is_error);
@@ -500,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_args_become_tool_errors() {
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let out = execute_host_tool(
             &ToolCall {
                 id: "t5".into(),
@@ -508,7 +495,6 @@ mod tests {
                 arguments: json!({}),
             },
             &shell,
-            "test",
         )
         .await;
         assert!(out.is_error);

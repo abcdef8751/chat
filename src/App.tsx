@@ -572,6 +572,7 @@ export default function App() {
   const [hasKey, setHasKey] = createSignal(false);
   const [reflectionEnabled, setReflectionEnabled] = createSignal(true);
   const [reflectionIdleMinutes, setReflectionIdleMinutes] = createSignal(30);
+  const [shellWorkspaceDir, setShellWorkspaceDir] = createSignal("");
   const [reflectionStats, setReflectionStats] = createSignal<ReflectionStats | null>(null);
   const [backfill, setBackfill] = createSignal<BackfillStatus | null>(null);
   const [extractionStats, setExtractionStats] = createSignal<ExtractionStats | null>(null);
@@ -680,10 +681,10 @@ export default function App() {
     setEchoReasoning(cfg.echoReasoningContent ?? true);
     setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
     setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
+    setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
-    void refreshReflectionStats();
-    // Fast path: cached catalog/prices so the picker and meter render at once.
+    void refreshReflectionStats();    // Fast path: cached catalog/prices so the picker and meter render at once.
     // Without a key the picker falls back to the configured model.
     await loadModels(false).catch(() => {});
     // Background: pull fresh data from models.dev and replace values if they
@@ -804,6 +805,7 @@ export default function App() {
     setEchoReasoning(cfg.echoReasoningContent ?? true);
     setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
     setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
+    setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
     setKeyDraft("");
@@ -828,6 +830,7 @@ export default function App() {
       memoryReflectionEnabled: reflectionEnabled(),
       memoryReflectionIdleMinutes: reflectionIdleMinutes(),
       modelOverrides: current.modelOverrides ?? {},
+      shellWorkspaceDir: shellWorkspaceDir(),
     });
     let keyChanged = false;
     if (keyDraft().trim()) {
@@ -889,6 +892,7 @@ export default function App() {
         memoryReflectionEnabled: reflectionEnabled(),
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
+        shellWorkspaceDir: shellWorkspaceDir(),
       });
     } catch (e) {
       setSettingsError(String(e));
@@ -907,6 +911,7 @@ export default function App() {
         memoryReflectionEnabled: reflectionEnabled(),
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
+        shellWorkspaceDir: shellWorkspaceDir(),
       });
     } catch (e) {
       setSettingsError(String(e));
@@ -1959,13 +1964,28 @@ export default function App() {
                 </span>
               </div>
 
+              <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                Shell working directory
+                <input
+                  class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                  placeholder="(default) /storage/emulated/0/PiChat"
+                  value={shellWorkspaceDir()}
+                  onInput={(e) => setShellWorkspaceDir(e.currentTarget.value)}
+                />
+                <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                  Where the bash / file tools work on your files. On Android this is a directory
+                  under shared storage that the agent drives through Termux; on desktop the shell
+                  inherits the app's working directory unless you set one here. Each tool call
+                  runs in a fresh shell (no persistent <code>cd</code> / <code>export</code>).
+                </span>
+              </label>
+
               <Show when={settingsError()}>
                 <p class="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-400">
                   {settingsError()}
                 </p>
               </Show>
             </div>
-
             <p class="mt-5 text-right text-[11px] text-neutral-400 dark:text-neutral-500">
               Changes are saved when the dialog closes.
             </p>

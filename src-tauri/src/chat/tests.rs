@@ -476,7 +476,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
@@ -533,7 +533,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
@@ -575,7 +575,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
         let attachments = vec![
             Attachment {
@@ -656,7 +656,7 @@
             },
         );
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
@@ -700,7 +700,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
@@ -751,7 +751,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
@@ -852,7 +852,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
@@ -929,7 +929,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
 
         // First turn: a tool round whose reasoning is persisted on the row.
         let flag = Arc::new(AtomicBool::new(false));
@@ -966,7 +966,7 @@
         let sink2 = TestSink(events.clone());
         let memory2 = temp_memory("echo-replay-2");
         let mcp2 = tools::McpClient::new();
-        let shell2 = crate::shell::ShellRegistry::new();
+        let shell2 = crate::shell::ShellExecutor::new();
         run_chat_turn(
             &db, &cfg, "test-key", &mcp2, &shell2, &memory2, &approvals, flag2, &sink2,
             cid.clone(), "again".into(), Vec::new(),
@@ -1012,7 +1012,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
@@ -1079,7 +1079,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
@@ -1139,7 +1139,7 @@
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let flag = Arc::new(AtomicBool::new(false));
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
@@ -1201,7 +1201,7 @@ async fn tool_loop_without_persistence_runs_memory_tool() {
         ..Default::default()
     };
     let mcp = tools::McpClient::new();
-    let shell = crate::shell::ShellRegistry::new();
+    let shell = crate::shell::ShellExecutor::new();
     let memory = temp_memory("loop-nopersist");
     let approvals = tools::ApprovalRegistry::default();
     let flag = Arc::new(AtomicBool::new(false));
@@ -1266,7 +1266,7 @@ async fn write_memory_is_refused_live_and_allowed_in_reflection() {
             ..Default::default()
         };
         let mcp = tools::McpClient::new();
-        let shell = crate::shell::ShellRegistry::new();
+        let shell = crate::shell::ShellExecutor::new();
         let approvals = tools::ApprovalRegistry::default();
         let flag = Arc::new(AtomicBool::new(false));
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1359,7 +1359,7 @@ async fn extract_mode_refuses_every_tool_call() {
         ..Default::default()
     };
     let mcp = tools::McpClient::new();
-    let shell = crate::shell::ShellRegistry::new();
+    let shell = crate::shell::ShellExecutor::new();
     let memory = temp_memory("extract-mode");
     let approvals = tools::ApprovalRegistry::default();
     let flag = Arc::new(AtomicBool::new(false));

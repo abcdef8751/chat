@@ -13,7 +13,7 @@ A general-purpose AI chat app (not a coding agent) with:
 
 - An expandable sidebar listing past conversations (search, rename, delete)
 - Streaming assistant replies over any OpenAI-compatible endpoint
-- Optional tools — `bash` (a **per-conversation persistent shell**), `read_file`,
+- Optional tools — `bash` (a **one-shot per-call shell**), `read_file`,
   `write_file` (all approval-gated), and `web_search` (Brave via MCP, ungated)
 - Reasoning traces from thinking models (inline "Thought" bar → popup)
 - Per-turn **activity timeline** grouping reasoning, preamble text, and tool calls
@@ -55,7 +55,7 @@ check, the real-export import, and the real models.dev catalog parse). Clippy,
 | Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, capped tool loop                        |
 | Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; price overrides                  |
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline                                 |
-| Tools             | ✅    | `bash` (persistent shell), `read_file`/`write_file` (gated), `web_search` (MCP, ungated)                   |
+| Tools             | ✅    | `bash` (one-shot shell), `read_file`/`write_file` (gated), `web_search` (MCP, ungated)                   |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
 | Context + price   | ◑     | Context counter + frozen per-turn cost done; **near-limit banner + compaction (M7) remain**                |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
@@ -301,7 +301,8 @@ everything else.
 
 ```rust
 // Approval-gated (local side effects / local data)
-bash(command)                     // runs in the conversation's persistent shell
+bash(command)                     // runs a fresh `bash -c` per call (one-shot); Android
+                                  //   executes inside the user's Termux (see ANDROID_SHELL.md)
 read_file(path)
 write_file(path, content)
 
@@ -417,7 +418,9 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
       ├─ secrets.rs    # OS-keychain API key storage (keyring crate) + has/set_api_key
       ├─ models.rs     # list_models (models.dev catalog, /models fallback), chat filter, per-baseUrl cache
       ├─ tools.rs      # tool specs, host executor, approval registry, MCP web_search
-      ├─ shell.rs      # persistent per-conversation bash sessions (ShellRegistry)
+      ├─ shell.rs      # one-shot host shell executor (fresh `bash -c` per call);
+      │                 #   Android routes to the Termux bridge (android.rs)
+      ├─ android.rs    # Android: Termux RUN_COMMAND bridge (`run_command` plugin) [mobile]
       ├─ memory.rs     # Plain-Markdown memory: core files, listing, save/read/write, migration
       ├─ import.rs     # Anthropic-export importer (timestamp-preserving, backfill-only)
       ├─ reflection.rs # Idle memory-consolidation scheduler + per-conversation pass
@@ -446,7 +449,7 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
 - Errors return `Result<T, String>`.
 - Tauri v2 maps JS `camelCase` args to Rust `snake_case` params automatically (`conversationId` → `conversation_id`).
 - `StreamEvent` is serialized straight to the frontend. Enum-level `rename_all` only renames **variants**, so fields need `rename_all_fields = "camelCase"` (e.g. `call_id` → `callId`); keep the `StreamEvent` union in `src/lib/api.ts` in sync.
-- `bash` runs in a persistent per-conversation shell; never assume a fresh process/cwd/env. `read_file`/`write_file` are direct host calls.
+- `bash` runs a fresh `bash -c <cmd>` process per call — state never persists (`cd`/`export`/functions reset each call; see `ANDROID_SHELL.md`). On Android an executor routes every call into the user's Termux via its `RUN_COMMAND` intent; `read_file`/`write_file` follow the same path (desktop: direct host calls).
 - Chat-loop tests live in `src/chat/tests.rs`; add loop/tool tests there.
 
 ### SQLite
@@ -466,8 +469,8 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
 - **Fireworks is the default endpoint** (`https://api.fireworks.ai/inference/v1`) but the client is generic; the user enters `baseUrl` + `apiKey` in Settings. Fireworks needs a `fw_` key; Brave needs a separate `BRAVE_API_KEY`.
 - **Rust builds are slow** on first run (Wry + bundled SQLite). `cargo check` is faster for iteration.
 - **GUI needs a display:** use `npm run tauri dev` from the desktop session; scripted checks use `npm run e2e` (same requirement).
-- **Persistent shell:** `bash` runs in a long-lived `bash` per conversation; sentinel-delimited output, 60s timeout (or `exit`) kills/resets. stdin is `/dev/null` unless the command uses a heredoc.
-- **`delete_conversation` is async** (it awaits clearing that conversation's shell).
+- **One-shot shell:** `bash` runs a fresh `bash -c` per call — no persistent session, so `cd`/`export` do not survive (the agent already assumes non-persistence; see `ANDROID_SHELL.md`). 60s per-call timeout kills the child. On Android, execution happens inside the user's Termux (`crate::android` + `RunCommandPlugin`).
+- **Android:** `npm run tauri android init` created `src-tauri/gen/android`. The Rust bridge compiles for the aarch64 Android target via `cargo check --target aarch64-linux-android` (set `CC_aarch64_linux_android`/`AR_aarch64_linux_android`/linker to the NDK clang). The actual Termux `RUN_COMMAND` round-trip requires a device.
 - **Keychain entry:** service `com.rp.chat`, user `api_key`. A legacy plaintext `apiKey` in `config.json` auto-migrates on first launch.
 
 ---

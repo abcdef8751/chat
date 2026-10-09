@@ -88,7 +88,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     let db = app.state::<db::Db>();
     let memory = app.state::<MemoryState>();
     let mcp = app.state::<tools::McpClient>();
-    let shell = app.state::<crate::shell::ShellRegistry>();
+    let shell = app.state::<crate::shell::ShellExecutor>();
     let approvals = app.state::<tools::ApprovalRegistry>();
 
     // Snapshot the reflectable message range and skip when nothing is new.
@@ -787,7 +787,7 @@ async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<
     let db = app.state::<db::Db>();
     let memory = app.state::<MemoryState>();
     let mcp = app.state::<tools::McpClient>();
-    let shell = app.state::<crate::shell::ShellRegistry>();
+    let shell = app.state::<crate::shell::ShellExecutor>();
     let approvals = app.state::<tools::ApprovalRegistry>();
 
     let snapshot_max = match db::max_reflectable_index(&db, conversation_id)? {
@@ -994,7 +994,7 @@ async fn run_reduce_pass(
     let db = app.state::<db::Db>();
     let memory = app.state::<MemoryState>();
     let mcp = app.state::<tools::McpClient>();
-    let shell = app.state::<crate::shell::ShellRegistry>();
+    let shell = app.state::<crate::shell::ShellExecutor>();
     let approvals = app.state::<tools::ApprovalRegistry>();
 
     let before = snapshot_files(&memory);

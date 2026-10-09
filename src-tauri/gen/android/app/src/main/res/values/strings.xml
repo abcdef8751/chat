@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">"pi-chat"</string>
+    <string name="main_activity_title">"pi-chat"</string>
+</resources>

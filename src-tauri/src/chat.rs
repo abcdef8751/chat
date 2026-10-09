@@ -17,7 +17,7 @@ use tokio_stream::StreamExt;
 
 use crate::config::{AppConfig, ConfigState};
 use crate::db;
-use crate::shell::ShellRegistry;
+use crate::shell::ShellExecutor;
 use crate::tools::{self, ToolCall, ToolOutput};
 
 pub(crate) const DEFAULT_SYSTEM_PROMPT: &str =
@@ -768,9 +768,8 @@ pub(crate) struct ToolLoopResult {
 async fn dispatch_tool(
     call: &ToolCall,
     mcp: &tools::McpClient,
-    shell: &ShellRegistry,
+    shell: &ShellExecutor,
     memory: &crate::memory::MemoryState,
-    source: &str,
 ) -> ToolOutput {
     if call.name == "web_search" {
         let query = call
@@ -786,7 +785,7 @@ async fn dispatch_tool(
     ) {
         crate::memory::execute_tool(call, memory).await
     } else {
-        tools::execute_host_tool(call, shell, source).await
+        tools::execute_host_tool(call, shell).await
     }
 }
 
@@ -817,7 +816,7 @@ pub(crate) async fn run_tool_loop(
     cfg: &AppConfig,
     api_key: &str,
     mcp: &tools::McpClient,
-    shell: &ShellRegistry,
+    shell: &ShellExecutor,
     memory: &crate::memory::MemoryState,
     approvals: &tools::ApprovalRegistry,
     source: &str,
@@ -1000,7 +999,7 @@ pub(crate) async fn run_tool_loop(
                         }
                     }
                     if approved {
-                        dispatch_tool(call, mcp, shell, memory, source).await
+                        dispatch_tool(call, mcp, shell, memory).await
                     } else {
                         ToolOutput {
                             content: "The user denied this tool call.".into(),
@@ -1078,7 +1077,7 @@ pub(crate) async fn run_chat_turn(
     cfg: &AppConfig,
     api_key: &str,
     mcp: &tools::McpClient,
-    shell: &ShellRegistry,
+    shell: &ShellExecutor,
     memory: &crate::memory::MemoryState,
     approvals: &tools::ApprovalRegistry,
     flag: Arc<AtomicBool>,
@@ -1190,7 +1189,7 @@ pub async fn stream_chat(
     let db = app.state::<db::Db>();
     let approvals = app.state::<tools::ApprovalRegistry>();
     let mcp = app.state::<tools::McpClient>();
-    let shell = app.state::<ShellRegistry>();
+    let shell = app.state::<ShellExecutor>();
     let memory = app.state::<crate::memory::MemoryState>();
 
     let flag = app

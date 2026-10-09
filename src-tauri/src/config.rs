@@ -45,6 +45,10 @@ pub struct AppConfig {
     pub memory_reflection_idle_minutes: u32,
     /// User-supplied per-model price/context overrides, keyed by model id.
     pub model_overrides: HashMap<String, ModelOverride>,
+    /// Working directory for host shell tools (Android: a directory under
+    /// shared storage, e.g. `/storage/emulated/0/PiChat`). Empty resolves to
+    /// the platform default (desktop: inherit the host cwd). See ANDROID_SHELL.md.
+    pub shell_workspace_dir: String,
 }
 
 impl Default for AppConfig {
@@ -58,6 +62,7 @@ impl Default for AppConfig {
             memory_reflection_enabled: true,
             memory_reflection_idle_minutes: 30,
             model_overrides: HashMap::new(),
+            shell_workspace_dir: String::new(),
         }
     }
 }
