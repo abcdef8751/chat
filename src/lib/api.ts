@@ -325,11 +325,12 @@ export function syncSignIn(email: string, password: string): Promise<SyncStatus>
 }
 
 /**
- * Create a new Supabase account. Resolves once the confirmation email is sent —
- * the user must click the link before they can sign in.
+ * Create a new Supabase account. Returns the resulting status: if email
+ * confirmation is off (current setup) the user is signed in immediately; if it's
+ * on, `loggedIn` is false and a confirmation link was emailed.
  */
-export function syncSignUp(email: string, password: string): Promise<void> {
-  return invoke<void>("sync_sign_up", { email, password });
+export function syncSignUp(email: string, password: string): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_sign_up", { email, password });
 }
 
 export function syncSignOut(): Promise<void> {

@@ -953,14 +953,21 @@ export default function App() {
     setSyncError(null);
     setSyncNotice(null);
     try {
-      await syncSignUp(email, password);
-      // Confirmation email is on: switch to sign-in and tell them what's next.
-      setSyncAuthMode("signin");
-      setSyncEmail("");
-      setSyncPassword("");
-      setSyncNotice(
-        `Account created — check ${email} for a confirmation link, then sign in.`,
-      );
+      const status = await syncSignUp(email, password);
+      if (status.loggedIn) {
+        // Confirm-email off (current setup): account is active immediately.
+        setSyncStatusData(status);
+        setSyncPassword("");
+        setSyncEmail("");
+      } else {
+        // Confirm-email on: account created but not yet active.
+        setSyncAuthMode("signin");
+        setSyncEmail("");
+        setSyncPassword("");
+        setSyncNotice(
+          `Account created — check ${email} for a confirmation link, then sign in.`,
+        );
+      }
     } catch (e) {
       setSyncError(String(e));
     } finally {

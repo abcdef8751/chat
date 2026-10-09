@@ -211,12 +211,18 @@ pub fn sync_sign_out(_app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Create a new account via GoTrue's `/auth/v1/signup`. With "Confirm email" ON
-/// the account is created but not yet active: `Ok(())` means "confirmation email
-/// sent — check your inbox, then sign in". Errors carry a friendly, actionable
-/// message (already registered → sign in instead; weak password; rate limit).
+/// Create a new account via GoTrue's `/auth/v1/signup`. Returns the resulting
+/// status so the UI knows whether the user is now signed in.
+///
+/// With **Confirm email OFF** (the current personal-tool setup) GoTrue returns a
+/// session immediately, so we persist it and the user is signed in. With it ON,
+/// the response carries no `access_token` and the account stays logged-out until
+/// the emailed link is clicked — the frontend shows a confirmation notice.
+///
+/// Errors carry a friendly, actionable message (already registered → sign in
+/// instead; weak password; rate limit).
 #[tauri::command]
-pub async fn sync_sign_up(app: AppHandle, email: String, password: String) -> Result<(), String> {
+pub async fn sync_sign_up(app: AppHandle, email: String, password: String) -> Result<SyncStatus, String> {
     let sync = app.state::<SyncState>();
     let url = format!("{}/auth/v1/signup", sync.base_url);
     let resp = sync
@@ -231,8 +237,17 @@ pub async fn sync_sign_up(app: AppHandle, email: String, password: String) -> Re
     let http_ok = resp.status().is_success();
     let body = resp.text().await.unwrap_or_default();
     if http_ok {
-        // Confirmation email is ON: the account is created but not yet active.
-        return Ok(());
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        // Confirm-email OFF → a session is returned: auto sign-in. Confirm ON →
+        // no token yet: stay logged out (the emailed link completes verification).
+        if let Ok(session) = session_from_value(&v) {
+            save_session(&session)?;
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = do_sync(&app2).await;
+            });
+        }
+        return Ok(status(&app));
     }
     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let code = v.get("error_code").and_then(|x| x.as_str()).unwrap_or("unknown");
@@ -322,10 +337,18 @@ async fn parse_gotrue_session(resp: reqwest::Response) -> Result<Session, String
             body.chars().take(200).collect::<String>()
         ));
     }
+    session_from_value(&v)
+}
+
+/// Build a [`Session`] from a GoTrue token response body that carries an
+/// `access_token` (a password sign-in, a token refresh, or a sign-up with email
+/// confirmation disabled). Errors when the response has no usable token.
+fn session_from_value(v: &Value) -> Result<Session, String> {
     let access_token = v
         .get("access_token")
         .and_then(|x| x.as_str())
-        .ok_or("auth response missing access_token")?
+        .filter(|s| !s.is_empty())
+        .ok_or("no access_token in auth response")?
         .to_string();
     let refresh_token = v
         .get("refresh_token")
