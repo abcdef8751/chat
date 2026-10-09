@@ -123,7 +123,6 @@ export interface ImportReport {
   conversations: number;
   messages: number;
   skipped: number;
-  files: number;
 }
 
 export type StreamEvent =
@@ -283,10 +282,9 @@ export function clearExtractions(): Promise<number> {
 }
 
 /**
- * Import an Anthropic-format export: either a `conversations.json` holding an
- * array of conversations, or a directory of one-file-per-conversation JSON.
- * Imported chats keep their original timestamps and are excluded from the idle
- * reflection sweep; the backfill picks them up instead.
+ * Import an Anthropic-format export: a `conversations.json` holding an array of
+ * conversations. Imported chats keep their original timestamps and are excluded
+ * from the idle reflection sweep; the backfill picks them up instead.
  */
 export function importConversations(path: string): Promise<ImportReport> {
   return invoke<ImportReport>("import_conversations", { path });

@@ -1,8 +1,7 @@
 //! Import conversations from an Anthropic-format export.
 //!
-//! Two shapes are accepted, because Anthropic's exporter produces both: a single
-//! `conversations.json` holding an array of conversations, and a directory of
-//! one-file-per-conversation JSON objects (the "bulk export").
+//! The export is a single `conversations.json` holding an array of
+//! conversations. (Anthropic's bulk/directory export is not supported yet.)
 //!
 //! Two things make an import safe to run over a large archive:
 //!
@@ -16,7 +15,6 @@
 //!   separate watermark (`memory_extractions`), so they stay available to it.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +30,6 @@ pub struct ImportReport {
     pub messages: usize,
     /// Conversations already present (re-import) or with no usable id/messages.
     pub skipped: usize,
-    pub files: usize,
 }
 
 #[derive(Deserialize)]
@@ -131,49 +128,21 @@ pub struct ImportState {
 
 fn import_inner(app: &tauri::AppHandle, path: &str) -> Result<ImportReport, String> {
     let db = app.state::<db::Db>();
-    let files = collect_files(Path::new(path))?;
-    let mut report = ImportReport {
-        files: files.len(),
-        ..Default::default()
-    };
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    let conversations = parse_conversations(&text).map_err(|e| format!("parse {path}: {e}"))?;
+    let mut report = ImportReport::default();
 
     // One import run = one batch. Stamping every conversation with the same id
     // lets the backfill scope itself to the newest run instead of the archive.
     let import_batch = db::next_import_batch(&db)?;
 
-    for file in files {
-        let text = std::fs::read_to_string(&file)
-            .map_err(|e| format!("read {}: {e}", file.display()))?;
-        let conversations =
-            parse_conversations(&text).map_err(|e| format!("parse {}: {e}", file.display()))?;
-        for conversation in conversations {
-            import_one(&db, &conversation, import_batch, &mut report)?;
-        }
+    for conversation in &conversations {
+        import_one(&db, conversation, import_batch, &mut report)?;
     }
 
     // Only after everything is in: exclude the archive from the idle sweep.
     db::mark_imported_reflected(&db)?;
     Ok(report)
-}
-
-/// A directory of per-conversation files, or a single file.
-fn collect_files(path: &Path) -> Result<Vec<PathBuf>, String> {
-    if !path.is_dir() {
-        return Ok(vec![path.to_path_buf()]);
-    }
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(path).map_err(|e| format!("read dir: {e}"))? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) == Some("json") {
-            out.push(p);
-        }
-    }
-    out.sort();
-    if out.is_empty() {
-        return Err(format!("no .json files in {}", path.display()));
-    }
-    Ok(out)
 }
 
 /// Accepts either an array of conversations or a single conversation object.
@@ -510,6 +479,7 @@ fn parse_iso8601(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn message(json: Value) -> RawMessage {
         serde_json::from_value(json).unwrap()

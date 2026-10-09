@@ -965,18 +965,14 @@ export default function App() {
     }
   }
 
-  // Import an Anthropic-format export. The backend accepts either a single
-  // `conversations.json` or a directory of per-conversation files, so the picker
-  // offers both.
-  async function importChats(directory: boolean) {
+  // Import an Anthropic-format export: a single `conversations.json`.
+  async function importChats() {
     setMemoryError(null);
     try {
       const picked = await open({
         multiple: false,
-        directory,
-        ...(directory
-          ? {}
-          : { filters: [{ name: "Anthropic export", extensions: ["json"] }] }),
+        directory: false,
+        filters: [{ name: "Anthropic export", extensions: ["json"] }],
       });
       if (typeof picked !== "string") return;
       setImportReport(await importConversations(picked));
@@ -2134,13 +2130,12 @@ export default function App() {
                 <div class="min-w-0">
                   <p class="text-xs font-medium">Imported chats</p>
                   <p class="mt-0.5 text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">
-                    Import an Anthropic export — a <code>conversations.json</code> or a
-                    folder of per-chat files. Imported chats keep their original dates
-                    and are kept out of the idle reflection sweep. Backfill then
-                    extracts durable facts from them in parallel and consolidates the
-                    summaries into memory in one pass; extraction never writes to
-                    memory, only the final pass does. Backfill covers only your
-                    most recent import.
+                    Import an Anthropic export — a <code>conversations.json</code> file.
+                    Imported chats keep their original dates and are kept out of the
+                    idle reflection sweep. Backfill then extracts durable facts from
+                    them in parallel and consolidates the summaries into memory in one
+                    pass; extraction never writes to memory, only the final pass does.
+                    Backfill covers only your most recent import.
                   </p>
                   <Show when={importReport()}>
                     <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
@@ -2161,18 +2156,11 @@ export default function App() {
                 </div>
                 <div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
                   <button
-                    onClick={() => void importChats(false)}
+                    onClick={() => void importChats()}
                     disabled={backfill()?.running}
                     class="rounded-md border border-neutral-300 px-2.5 py-1.5 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
                   >
                     Import file…
-                  </button>
-                  <button
-                    onClick={() => void importChats(true)}
-                    disabled={backfill()?.running}
-                    class="rounded-md border border-neutral-300 px-2.5 py-1.5 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
-                  >
-                    Import folder…
                   </button>
                   <Show when={extractionStats()?.staged}>
                     <button

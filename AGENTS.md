@@ -193,10 +193,11 @@ topic files.
   (takes precedence over inferred memory); the memory block and reflection prompt
   both say not to duplicate or contradict it. Memory files hold what the assistant
   *infers*.
-- **Import** (`import.rs`): reads an Anthropic-format export — either a single
-  `conversations.json` holding an array, or a directory of per-conversation JSON
-  files. Two properties make it safe over a large archive. **Timestamps are
-  preserved**: nothing goes through `insert_message_full`, which would stamp
+- **Import** (`import.rs`): reads an Anthropic-format export — a single
+  `conversations.json` holding an array of conversations (bulk/directory exports
+  are not supported yet). Two properties make it safe over a large archive.
+  **Timestamps are preserved**: nothing goes through `insert_message_full`, which
+  would stamp
   `now` and re-title the chat, so imported chats sort into the sidebar by their
   real dates via the existing `ORDER BY updated_at DESC`. And **imported chats
   are excluded from the idle sweep**: `mark_imported_reflected` sets their
