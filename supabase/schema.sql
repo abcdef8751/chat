@@ -2,7 +2,9 @@
 --
 -- Run this in the Supabase SQL editor (or via the local admin script) AFTER
 -- creating the project. Everything is namespaced by the signed-in Supabase user
--- via RLS. Client-generated UUIDs match the local SQLite ids so rows map 1:1.
+-- via RLS. Conversation ids are client-generated UUIDs matching local SQLite;
+-- message ids are text (`<conversation_id>:<index>` or a fresh uuid) — see the
+-- `messages` table comments — so rows map 1:1.
 --
 -- All syncable rows carry:
 --   revision  BIGINT NOT NULL — monotonic per-row version (bumped on every
@@ -33,7 +35,10 @@ create table if not exists conversations (
 );
 
 create table if not exists messages (
-  id uuid primary key,
+  -- Message ids are NOT UUIDs: live-chat turns use a fresh uuid, but imported
+  -- conversations use deterministic "<conversation_id>:<index>" ids (so a
+  -- re-import maps 1:1 and sync stays idempotent). Hence `text`, not `uuid`.
+  id text primary key,
   conversation_id uuid not null references conversations(id) on delete cascade,
   role text not null,
   -- NOT the cross-device ordering authority; see the "index strategy" in the
