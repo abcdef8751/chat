@@ -420,13 +420,20 @@ and the app is byte-identical to before. Never blocks the UI.
   before upload and decrypted on pull, so Supabase only ever holds ciphertext.
   Structural columns (`id`, `revision`, `conversation_id`, `created_at`,
   `deleted_at`, `path`) stay plaintext so LWW/tombstones/ordering still work.
-  The random 256-bit data key is cached in the OS keychain
+  The 256-bit data key is derived deterministically from the passphrase + a
+  stable per-account salt (the Supabase user id) via Argon2id
+  (`crypt::derive_key`/`account_salt`) and cached in the OS keychain
   (`secrets::enc_key_*`, "remember on this device" so background auto-sync works
-  without re-typing) and wrapped with an Argon2id-derived key from the user's
-  passphrase (`secrets::enc_wrap_*`) for verification/recovery. Enabling
-  encryption (`sync_set_encryption`) marks every row dirty so the existing
-  plaintext mirror is re-uploaded as ciphertext; `sync_remove_encryption` does
-  the reverse. **The local SQLite DB is deliberately NOT encrypted** — it lives
+  without re-typing). Deterministic derivation is what makes **multi-device** work
+  with no key transfer and no server state: the same passphrase on any device
+  yields the same key. `sync_set_encryption` verifies the passphrase against the
+  existing remote ciphertext before caching (wrong passphrase is rejected), marks
+  every row dirty so the plaintext mirror is re-uploaded as ciphertext;
+  `sync_remove_encryption` does the reverse. A device without the key that finds
+  an encrypted mirror is **locked**: `do_sync` probes the server
+  (`fetch_encrypted_sample`), refuses to push (so it can never overwrite
+  ciphertext with plaintext), and surfaces `SyncStatus.locked` so the UI asks for
+  the passphrase. **The local SQLite DB is deliberately NOT encrypted** — it lives
   on the user's own machine (OS disk encryption covers idle-at-rest), and keeping
   it plaintext avoids "forgot passphrase = locked out of everything". Key loss
   only costs the cloud backup, never local data.

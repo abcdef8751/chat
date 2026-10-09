@@ -20,10 +20,6 @@ const SESSION_USER: &str = "sync_session";
 /// it here is what makes background auto-sync work without re-entering the
 /// passphrase every launch ("remember on this device").
 const ENC_KEY_USER: &str = "sync_enc_key";
-/// Keychain account for the passphrase-wrapped data key + salt (base64 blob).
-/// Useless without the passphrase; lets us verify a passphrase and re-derive
-/// the key (e.g. on another device) without storing the raw key a second time.
-const ENC_WRAP_USER: &str = "sync_enc_wrap";
 
 fn entry() -> Result<Entry, String> {
     Entry::new(SERVICE, USER).map_err(|e| format!("open keychain entry: {e}"))
@@ -132,10 +128,6 @@ fn enc_key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, ENC_KEY_USER).map_err(|e| format!("open keychain entry: {e}"))
 }
 
-fn enc_wrap_entry() -> Result<Entry, String> {
-    Entry::new(SERVICE, ENC_WRAP_USER).map_err(|e| format!("open keychain entry: {e}"))
-}
-
 /// Read the cached data key (base64) from the keychain. `Ok(None)` = off.
 pub fn enc_key_get() -> Result<Option<String>, String> {
     match enc_key_entry()?.get_password() {
@@ -153,29 +145,6 @@ pub fn enc_key_set(key: &str) -> Result<(), String> {
 
 pub fn enc_key_delete() -> Result<(), String> {
     match enc_key_entry()?.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keychain delete: {e}")),
-    }
-}
-
-/// Read the passphrase-wrapped data key + salt (base64 blob).
-pub fn enc_wrap_get() -> Result<Option<String>, String> {
-    match enc_wrap_entry()?.get_password() {
-        Ok(w) => Ok(Some(w)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keychain read: {e}")),
-    }
-}
-
-pub fn enc_wrap_set(wrapped: &str) -> Result<(), String> {
-    enc_wrap_entry()?
-        .set_password(wrapped)
-        .map_err(|e| format!("keychain write: {e}"))
-}
-
-pub fn enc_wrap_delete() -> Result<(), String> {
-    match enc_wrap_entry()?.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("keychain delete: {e}")),

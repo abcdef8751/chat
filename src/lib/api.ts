@@ -145,6 +145,7 @@ export interface SyncStatus {
   pushed: number;
   pulled: number;
   encryption: boolean; // client-side encryption configured
+  locked: boolean; // remote is encrypted but this device has no key yet
 }
 
 export type StreamEvent =

@@ -629,7 +629,7 @@ async fn encryption_roundtrips_through_push_and_pull() {
     .unwrap();
     memstate.append("secret memory", "profile.md").unwrap();
 
-    let key = crypt::new_key();
+    let key = crypt::derive_key("test passphrase", &crypt::account_salt("user-42"));
     let client = reqwest::Client::new();
     let base = srv.addr.clone();
     let ctx = SyncCtx {
@@ -690,6 +690,47 @@ async fn encryption_roundtrips_through_push_and_pull() {
     };
     assert_eq!(content, "Hello encrypted");
     assert!(memstate.read("goals.md").unwrap().contains("Encrypted goal"));
+}
+
+/// The locked-device probe detects an encrypted remote mirror (so a device
+/// without the key refuses to sync instead of overwriting ciphertext).
+#[tokio::test]
+async fn probe_detects_encrypted_remote() {
+    use crate::crypt;
+
+    let srv = MockRest::spawn();
+    let db = temp_db("probe");
+    let mem = temp_memory("probe", &db);
+    let client = reqwest::Client::new();
+    let base = srv.addr.clone();
+    let key = crypt::derive_key("pw", &crypt::account_salt("u"));
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &base,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        key: Some(key),
+    };
+
+    // Plaintext remote → no encrypted sample.
+    srv.set_get(
+        "conversations",
+        vec![json!({"id": "c1", "title": "plain", "revision": 1})],
+    );
+    assert_eq!(fetch_encrypted_sample(&ctx, "t").await.unwrap(), None);
+
+    // Encrypted remote → the sample comes back and is decryptable with the key.
+    srv.set_get(
+        "conversations",
+        vec![json!({"id": "c1", "title": crypt::encrypt(&key, "secret"), "revision": 1})],
+    );
+    let sample = fetch_encrypted_sample(&ctx, "t").await.unwrap();
+    assert!(sample.is_some());
+    assert_eq!(
+        crypt::decrypt(&key, sample.as_deref().unwrap()).as_deref(),
+        Some("secret")
+    );
 }
 
 /// Advancing the reflection watermark must mark the conversation dirty and bump

@@ -1006,6 +1006,26 @@ export default function App() {
     }
   }
 
+  async function unlockEncryption() {
+    const pass = syncPassphrase();
+    if (!pass) {
+      setSyncError("Enter your passphrase.");
+      return;
+    }
+    setSyncEncBusy(true);
+    setSyncError(null);
+    try {
+      const status = await syncSetEncryption(pass);
+      setSyncStatusData(status);
+      setSyncPassphrase("");
+      setSyncNotice("Unlocked — this device can now decrypt your backup.");
+    } catch (e) {
+      setSyncError(String(e));
+    } finally {
+      setSyncEncBusy(false);
+    }
+  }
+
   async function disableEncryption() {
     if (!confirm("Disable end-to-end encryption? Sync will re-upload all data as plaintext.")) {
       return;
@@ -2363,43 +2383,77 @@ export default function App() {
                           class={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
                             syncStatusData()?.encryption
                               ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400"
-                              : "bg-neutral-200 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+                              : syncStatusData()?.locked
+                                ? "bg-amber-100 text-amber-700 dark:bg-amber-950/50 dark:text-amber-400"
+                                : "bg-neutral-200 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
                           }`}
                         >
-                          {syncStatusData()?.encryption ? "On" : "Off"}
+                          {syncStatusData()?.encryption
+                            ? "On"
+                            : syncStatusData()?.locked
+                              ? "Locked"
+                              : "Off"}
                         </span>
                       </div>
                       <p class="mt-1 text-[11px] leading-snug text-neutral-400 dark:text-neutral-500">
                         {syncStatusData()?.encryption
                           ? "Data sent to Supabase is ciphertext — only this device can read it."
-                          : "Optional: encrypt the sync mirror so Supabase only ever sees ciphertext."}
+                          : syncStatusData()?.locked
+                            ? "This backup is encrypted. Enter your passphrase to unlock it on this device."
+                            : "Optional: encrypt the sync mirror so Supabase only ever sees ciphertext."}
                       </p>
                       <Show
                         when={syncStatusData()?.encryption}
                         fallback={
-                          <div class="mt-2 space-y-2">
-                            <input
-                              type="password"
-                              placeholder="Passphrase (min 6 chars)"
-                              value={syncPassphrase()}
-                              onInput={(e) => setSyncPassphrase(e.currentTarget.value)}
-                              class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                            />
-                            <input
-                              type="password"
-                              placeholder="Confirm passphrase"
-                              value={syncPassphraseConfirm()}
-                              onInput={(e) => setSyncPassphraseConfirm(e.currentTarget.value)}
-                              class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                            />
-                            <button
-                              onClick={() => void enableEncryption()}
-                              disabled={syncEncBusy()}
-                              class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
-                            >
-                              {syncEncBusy() ? "Encrypting…" : "Enable encryption"}
-                            </button>
-                          </div>
+                          <Show
+                            when={syncStatusData()?.locked}
+                            fallback={
+                              <div class="mt-2 space-y-2">
+                                <input
+                                  type="password"
+                                  placeholder="Passphrase (min 6 chars)"
+                                  value={syncPassphrase()}
+                                  onInput={(e) => setSyncPassphrase(e.currentTarget.value)}
+                                  class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                                />
+                                <input
+                                  type="password"
+                                  placeholder="Confirm passphrase"
+                                  value={syncPassphraseConfirm()}
+                                  onInput={(e) => setSyncPassphraseConfirm(e.currentTarget.value)}
+                                  class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                                />
+                                <button
+                                  onClick={() => void enableEncryption()}
+                                  disabled={syncEncBusy()}
+                                  class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                                >
+                                  {syncEncBusy() ? "Encrypting…" : "Enable encryption"}
+                                </button>
+                                <p class="text-[10px] leading-snug text-neutral-400 dark:text-neutral-500">
+                                  Remember this passphrase — it's the only way to read the
+                                  backup on another device. Local data is unaffected if lost.
+                                </p>
+                              </div>
+                            }
+                          >
+                            <div class="mt-2 space-y-2">
+                              <input
+                                type="password"
+                                placeholder="Passphrase"
+                                value={syncPassphrase()}
+                                onInput={(e) => setSyncPassphrase(e.currentTarget.value)}
+                                class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                              />
+                              <button
+                                onClick={() => void unlockEncryption()}
+                                disabled={syncEncBusy()}
+                                class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                              >
+                                {syncEncBusy() ? "Unlocking…" : "Unlock"}
+                              </button>
+                            </div>
+                          </Show>
                         }
                       >
                         <button

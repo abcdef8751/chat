@@ -71,6 +71,9 @@ pub struct SyncStatus {
     // Whether client-side encryption is configured (data sent to Supabase is
     // ciphertext; only this device's keychain can decrypt it).
     pub encryption: bool,
+    // The remote backup is encrypted but this device has no key yet (a second
+    // device that must be unlocked with the passphrase before it may sync).
+    pub locked: bool,
 }
 
 #[derive(Default)]
@@ -80,6 +83,7 @@ struct SyncStats {
     phase: String,
     pushed: u64,
     pulled: u64,
+    locked: bool,
 }
 
 /// Shared sync state installed into Tauri: HTTP client, endpoints, and the
@@ -162,7 +166,13 @@ impl SyncState {
         }
     }
 
-    fn snapshot(&self) -> (bool, Option<i64>, Option<String>, String, u64, u64) {
+    fn set_locked(&self, locked: bool) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.locked = locked;
+        }
+    }
+
+    fn snapshot(&self) -> (bool, Option<i64>, Option<String>, String, u64, u64, bool) {
         let syncing = self.syncing.load(Ordering::SeqCst);
         match self.stats.lock() {
             Ok(s) => (
@@ -172,8 +182,9 @@ impl SyncState {
                 s.phase.clone(),
                 s.pushed,
                 s.pulled,
+                s.locked,
             ),
-            Err(_) => (syncing, None, None, String::new(), 0, 0),
+            Err(_) => (syncing, None, None, String::new(), 0, 0, false),
         }
     }
 }
@@ -213,7 +224,7 @@ fn status(app: &AppHandle) -> SyncStatus {
     let cfg = app.state::<ConfigState>().get();
     let session = load_session().ok().flatten();
     let sync = app.state::<SyncState>();
-    let (syncing, last_sync_at, last_error, phase, pushed, pulled) = sync.snapshot();
+    let (syncing, last_sync_at, last_error, phase, pushed, pulled, locked) = sync.snapshot();
     let pending = db::pending_rows(app.state::<Db>().inner()).unwrap_or(0);
     SyncStatus {
         enabled: cfg.sync_enabled,
@@ -227,34 +238,48 @@ fn status(app: &AppHandle) -> SyncStatus {
         pushed,
         pulled,
         encryption: secrets::has_encryption(),
+        locked,
     }
 }
 
-/// Enable or update client-side encryption with a passphrase. Generates a fresh
-/// data key on first enable, wraps it with a passphrase-derived key, caches the
-/// data key in the OS keychain ("remember on this device"), and marks every
-/// row dirty so the next push re-uploads everything encrypted (migrating any
-/// already-uploaded plaintext). Re-using the same passphrase recovers the same
-/// key; a new/empty project starts fresh.
+/// Enable/unlock client-side encryption with a passphrase. The data key is
+/// derived deterministically from the passphrase + the account's stable salt,
+/// so the same passphrase on any device yields the same key — no key transfer.
+/// If the remote backup is already encrypted, the passphrase is verified
+/// against it first (wrong passphrase is rejected, never overwriting data).
+/// Every row is marked dirty so the mirror is (re-)uploaded encrypted.
 #[tauri::command]
 pub async fn sync_set_encryption(app: AppHandle, passphrase: String) -> Result<SyncStatus, String> {
     let pass = passphrase.trim();
     if pass.len() < 6 {
         return Err("Passphrase too short — use at least 6 characters.".into());
     }
-    // Recover the existing data key if we already have a wrapped copy, so
-    // re-setting the passphrase never rotates the key and orphans the backup.
-    let key: [u8; 32] = match secrets::enc_wrap_get()? {
-        Some(wrapped) => crypt::unwrap_data_key(&wrapped, pass)?,
-        None => {
-            let k = crypt::new_key();
-            let wrapped = crypt::wrap_data_key(&k, pass);
-            secrets::enc_wrap_set(&wrapped)?;
-            k
-        }
+    let Some(session) = load_session()? else {
+        return Err("Sign in before setting up encryption.".into());
     };
+    let key = crypt::derive_key(pass, &crypt::account_salt(&session.user_id));
+
+    // If the server already holds ciphertext, this is an unlock (e.g. a second
+    // device): verify the passphrase can decrypt it before we cache anything.
+    let sync = app.state::<SyncState>();
+    let token = valid_access_token(&sync, &session).await?;
+    let ctx = SyncCtx {
+        client: &sync.client,
+        base_url: &sync.base_url,
+        anon: &sync.anon,
+        db: dbref(&app),
+        memory: app.state::<MemoryState>().inner(),
+        key: Some(key),
+    };
+    if let Some(sample) = fetch_encrypted_sample(&ctx, &token).await? {
+        if crypt::decrypt(&key, &sample).is_none() {
+            return Err("Wrong passphrase — it doesn't decrypt the existing backup.".into());
+        }
+    }
+
     secrets::enc_key_set(&crypt::encode_key(&key))?;
-    db::mark_all_dirty_for_resync(app.state::<Db>().inner())?;
+    db::mark_all_dirty_for_resync(dbref(&app))?;
+    sync.set_locked(false);
     // Kick off a re-upload (now encrypted) shortly after.
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -263,18 +288,52 @@ pub async fn sync_set_encryption(app: AppHandle, passphrase: String) -> Result<S
     Ok(status(&app))
 }
 
-/// Disable client-side encryption: forgets the data key + wrapped passphrase
-/// record and re-marks every row dirty so the next push re-uploads plaintext.
+/// Disable client-side encryption: forgets the data key and re-marks every row
+/// dirty so the next push re-uploads plaintext.
 #[tauri::command]
 pub async fn sync_remove_encryption(app: AppHandle) -> Result<SyncStatus, String> {
     secrets::enc_key_delete()?;
-    secrets::enc_wrap_delete()?;
     db::mark_all_dirty_for_resync(app.state::<Db>().inner())?;
+    app.state::<SyncState>().set_locked(false);
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let _ = do_sync(&app2).await;
     });
     Ok(status(&app))
+}
+
+/// Fetch one content string from the server if it is an encrypted blob. `Ok(None)`
+/// means the account has no encrypted data yet (fresh/first-time enable). Used
+/// both to detect a locked device and to verify a passphrase.
+async fn fetch_encrypted_sample(
+    ctx: &SyncCtx<'_>,
+    token: &str,
+) -> Result<Option<String>, String> {
+    for (table, field) in [("conversations", "title"), ("messages", "content")] {
+        let url = format!("{}/rest/v1/{}?select={}&limit=1", ctx.base_url, table, field);
+        let resp = ctx
+            .client
+            .get(&url)
+            .header("apikey", ctx.anon)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .send()
+            .await
+            .map_err(|e| format!("probe {table}: {e}"))?;
+        if !resp.status().is_success() {
+            continue;
+        }
+        let rows: Vec<Value> = resp.json().await.unwrap_or_default();
+        if let Some(s) = rows
+            .first()
+            .and_then(|v| v.get(field))
+            .and_then(|v| v.as_str())
+        {
+            if crypt::looks_encrypted(s) {
+                return Ok(Some(s.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[tauri::command]
@@ -554,6 +613,18 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     // account's first run).
     let mem_names = ctx.memory.file_names();
     db::seed_initial_sync(ctx.db, &session.user_id, &mem_names)?;
+    // A device without the key must never push plaintext over an encrypted
+    // mirror. Detect it and refuse (the UI then asks for the passphrase).
+    if ctx.key.is_none() {
+        if let Ok(Some(_)) = fetch_encrypted_sample(&ctx, &token).await {
+            sync.set_locked(true);
+            sync.set_error(
+                "This backup is encrypted — enter your passphrase in Settings to unlock.".into(),
+            );
+            return Ok(());
+        }
+    }
+    sync.set_locked(false);
     sync.begin_run();
     // Progress (pushed/pending) is updated per batch inside `push`.
     match push(&ctx, &token, &sync).await {
@@ -1013,18 +1084,30 @@ struct RemoteMemory {
 /// the number of rows fetched (so callers can surface live progress).
 async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<u64, String> {
     let last_conv = last_seen(ctx.db, "conversations");
-    let mut convs = get_table(ctx, "conversations", me, token, last_conv).await?;
+    let convs = get_table(ctx, "conversations", me, token, last_conv).await?;
     let last_msg = last_seen(ctx.db, "messages");
-    let mut msgs = get_table(ctx, "messages", me, token, last_msg).await?;
+    let msgs = get_table(ctx, "messages", me, token, last_msg).await?;
     let last_mem = last_seen(ctx.db, "memory");
-    let mut mems = get_table(ctx, "memory_files", me, token, last_mem).await?;
+    let mems = get_table(ctx, "memory_files", me, token, last_mem).await?;
 
     // Restore plaintext for the content fields before applying to the local DB.
-    if let Some(key) = ctx.key {
-        decrypt_fields(&key, &mut convs, &["title", "system_prompt", "compaction_summary"]);
-        decrypt_fields(&key, &mut msgs, &["content", "thinking", "usage", "attachments"]);
-        decrypt_fields(&key, &mut mems, &["content"]);
-    }
+    // A row whose ciphertext can't be decrypted (wrong key) is dropped rather
+    // than written to the local DB as ciphertext.
+    let convs = if let Some(key) = ctx.key {
+        decrypt_rows(&key, convs, &["title", "system_prompt", "compaction_summary"])
+    } else {
+        convs
+    };
+    let msgs = if let Some(key) = ctx.key {
+        decrypt_rows(&key, msgs, &["content", "thinking", "usage", "attachments"])
+    } else {
+        msgs
+    };
+    let mems = if let Some(key) = ctx.key {
+        decrypt_rows(&key, mems, &["content"])
+    } else {
+        mems
+    };
 
     apply_conversations(ctx.db, &convs).await?;
     apply_messages(ctx.db, &msgs).await?;
@@ -1033,22 +1116,31 @@ async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<u64, String> {
     Ok((convs.len() + msgs.len() + mems.len()) as u64)
 }
 
-/// Decrypt the named string fields of fetched rows in place. Fields that aren't
-/// a recognized ciphertext (pre-encryption plaintext) are left untouched; fields
-/// that fail to decrypt (wrong/missing key) are also left as-is — the local DB
-/// is the source of truth and we never corrupt it with bad decryption.
-fn decrypt_fields(key: &[u8; 32], rows: &mut [Value], fields: &[&str]) {
-    for row in rows.iter_mut() {
+/// Decrypt the named string fields of each row. Rows with no encrypted field are
+/// kept as-is (pre-encryption plaintext); a row whose encrypted field fails to
+/// decrypt is dropped so the local DB never stores ciphertext.
+fn decrypt_rows(key: &[u8; 32], rows: Vec<Value>, fields: &[&str]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let mut ok = true;
         for f in fields {
             if let Some(Value::String(s)) = row.get_mut(f) {
                 if crypt::looks_encrypted(s) {
-                    if let Some(plain) = crypt::decrypt(key, s) {
-                        *s = plain;
+                    match crypt::decrypt(key, s) {
+                        Some(plain) => *s = plain,
+                        None => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
             }
         }
+        if ok {
+            out.push(row);
+        }
     }
+    out
 }
 
 fn last_seen(db: &Db, entity: &str) -> i64 {
