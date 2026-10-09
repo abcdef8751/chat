@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::config::ConfigState;
+use crate::crypt;
 use crate::db::{self, Db};
 use crate::memory::MemoryState;
 use crate::secrets::{self};
@@ -67,6 +68,9 @@ pub struct SyncStatus {
     pub phase: String,
     pub pushed: u64,
     pub pulled: u64,
+    // Whether client-side encryption is configured (data sent to Supabase is
+    // ciphertext; only this device's keychain can decrypt it).
+    pub encryption: bool,
 }
 
 #[derive(Default)]
@@ -222,7 +226,55 @@ fn status(app: &AppHandle) -> SyncStatus {
         phase,
         pushed,
         pulled,
+        encryption: secrets::has_encryption(),
     }
+}
+
+/// Enable or update client-side encryption with a passphrase. Generates a fresh
+/// data key on first enable, wraps it with a passphrase-derived key, caches the
+/// data key in the OS keychain ("remember on this device"), and marks every
+/// row dirty so the next push re-uploads everything encrypted (migrating any
+/// already-uploaded plaintext). Re-using the same passphrase recovers the same
+/// key; a new/empty project starts fresh.
+#[tauri::command]
+pub async fn sync_set_encryption(app: AppHandle, passphrase: String) -> Result<SyncStatus, String> {
+    let pass = passphrase.trim();
+    if pass.len() < 6 {
+        return Err("Passphrase too short — use at least 6 characters.".into());
+    }
+    // Recover the existing data key if we already have a wrapped copy, so
+    // re-setting the passphrase never rotates the key and orphans the backup.
+    let key: [u8; 32] = match secrets::enc_wrap_get()? {
+        Some(wrapped) => crypt::unwrap_data_key(&wrapped, pass)?,
+        None => {
+            let k = crypt::new_key();
+            let wrapped = crypt::wrap_data_key(&k, pass);
+            secrets::enc_wrap_set(&wrapped)?;
+            k
+        }
+    };
+    secrets::enc_key_set(&crypt::encode_key(&key))?;
+    db::mark_all_dirty_for_resync(app.state::<Db>().inner())?;
+    // Kick off a re-upload (now encrypted) shortly after.
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = do_sync(&app2).await;
+    });
+    Ok(status(&app))
+}
+
+/// Disable client-side encryption: forgets the data key + wrapped passphrase
+/// record and re-marks every row dirty so the next push re-uploads plaintext.
+#[tauri::command]
+pub async fn sync_remove_encryption(app: AppHandle) -> Result<SyncStatus, String> {
+    secrets::enc_key_delete()?;
+    secrets::enc_wrap_delete()?;
+    db::mark_all_dirty_for_resync(app.state::<Db>().inner())?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = do_sync(&app2).await;
+    });
+    Ok(status(&app))
 }
 
 #[tauri::command]
@@ -452,6 +504,9 @@ struct SyncCtx<'a> {
     anon: &'a str,
     db: &'a Db,
     memory: &'a MemoryState,
+    /// Client-side encryption key, if configured. When `Some`, sync encrypts
+    /// content on the way out and decrypts on the way in.
+    key: Option<[u8; 32]>,
 }
 
 /// One full sync round: push changed rows, then pull remote changes. Guarded so
@@ -489,6 +544,10 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         anon: &sync.anon,
         db: dbref(app),
         memory: app.state::<MemoryState>().inner(),
+        key: secrets::enc_key_get()
+            .ok()
+            .flatten()
+            .and_then(|k| crypt::decode_key(&k)),
     };
     // First sync: mark all pre-existing rows + memory files dirty so the initial
     // push backs up full history. Scoped per account (a guarded no-op after each
@@ -523,6 +582,19 @@ fn dbref(app: &AppHandle) -> &Db {
 
 // --- Push -------------------------------------------------------------------
 
+/// Encrypt a required string field before upload (no-op when encryption is off).
+fn enc_str(key: Option<[u8; 32]>, s: String) -> String {
+    match key {
+        Some(k) => crypt::encrypt(&k, &s),
+        None => s,
+    }
+}
+
+/// Encrypt an optional string field before upload (no-op when off/None).
+fn enc_opt(key: Option<[u8; 32]>, s: Option<String>) -> Option<String> {
+    s.map(|v| enc_str(key, v))
+}
+
 /// Upsert all locally changed rows (conversations, messages, memory files) plus
 /// conversation tombstones, as PostgREST `merge-duplicates` upserts. Returns the
 /// number of rows pushed. Dirty flags are cleared only for entities whose POST
@@ -541,14 +613,15 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                  FROM conversations WHERE dirty = 1",
             )
             .map_err(|e| e.to_string())?;
+        let key = ctx.key;
         let r = stmt
             .query_map([], |r| {
                 Ok(json!({
                     "id": r.get::<_, String>(0)?,
-                    "title": r.get::<_, String>(1)?,
+                    "title": enc_str(key, r.get::<_, String>(1)?),
                     "model": r.get::<_, Option<String>>(2)?,
-                    "system_prompt": r.get::<_, Option<String>>(3)?,
-                    "compaction_summary": r.get::<_, Option<String>>(4)?,
+                    "system_prompt": enc_opt(key, r.get::<_, Option<String>>(3)?),
+                    "compaction_summary": enc_opt(key, r.get::<_, Option<String>>(4)?),
                     "last_reflected_index": r.get::<_, Option<i64>>(5)?,
                     "imported": r.get::<_, i64>(6)? != 0,
                     "import_batch": r.get::<_, i64>(7)?,
@@ -611,6 +684,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                  FROM messages WHERE dirty = 1",
             )
             .map_err(|e| e.to_string())?;
+        let key = ctx.key;
         let r = stmt
             .query_map([], |r| {
                 Ok(json!({
@@ -618,14 +692,14 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                     "conversation_id": r.get::<_, String>(1)?,
                     "role": r.get::<_, String>(2)?,
                     "seq": r.get::<_, i64>(3)?,
-                    "content": r.get::<_, String>(4)?,
+                    "content": enc_str(key, r.get::<_, String>(4)?),
                     "model": r.get::<_, Option<String>>(5)?,
                     "provider": r.get::<_, Option<String>>(6)?,
                     "thinking_level": r.get::<_, Option<String>>(7)?,
-                    "thinking": r.get::<_, Option<String>>(8)?,
-                    "usage": r.get::<_, Option<String>>(9)?,
+                    "thinking": enc_opt(key, r.get::<_, Option<String>>(8)?),
+                    "usage": enc_opt(key, r.get::<_, Option<String>>(9)?),
                     "stop_reason": r.get::<_, Option<String>>(10)?,
-                    "attachments": r.get::<_, Option<String>>(11)?,
+                    "attachments": enc_opt(key, r.get::<_, Option<String>>(11)?),
                     "created_at": r.get::<_, i64>(12)?,
                     "revision": r.get::<_, i64>(13)?,
                     "deleted_at": Value::Null,
@@ -666,9 +740,10 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
         rows?
     };
     let mut mem_body = Vec::new();
+    let key = ctx.key;
     for (path, revision, last_local_at) in &mem_rows {
         let row = if ctx.memory.exists(path) {
-            let content = ctx.memory.read(path).unwrap_or_default();
+            let content = enc_str(key, ctx.memory.read(path).unwrap_or_default());
             json!({
                 "path": path, "content": content, "revision": revision,
                 "deleted_at": Value::Null,
@@ -869,9 +944,7 @@ where
     while let Some(res) = set.join_next().await {
         match res {
             Ok(Ok(chunk)) => {
-                if let Err(e) = on_chunk(&chunk) {
-                    return Err(e);
-                }
+                on_chunk(&chunk)?;
                 progress.add_pushed(chunk.len() as u64);
             }
             Ok(Err(e)) => {
@@ -940,18 +1013,42 @@ struct RemoteMemory {
 /// the number of rows fetched (so callers can surface live progress).
 async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<u64, String> {
     let last_conv = last_seen(ctx.db, "conversations");
-    let convs = get_table(ctx, "conversations", me, token, last_conv).await?;
-    apply_conversations(ctx.db, &convs).await?;
-
+    let mut convs = get_table(ctx, "conversations", me, token, last_conv).await?;
     let last_msg = last_seen(ctx.db, "messages");
-    let msgs = get_table(ctx, "messages", me, token, last_msg).await?;
-    apply_messages(ctx.db, &msgs).await?;
-
+    let mut msgs = get_table(ctx, "messages", me, token, last_msg).await?;
     let last_mem = last_seen(ctx.db, "memory");
-    let mems = get_table(ctx, "memory_files", me, token, last_mem).await?;
+    let mut mems = get_table(ctx, "memory_files", me, token, last_mem).await?;
+
+    // Restore plaintext for the content fields before applying to the local DB.
+    if let Some(key) = ctx.key {
+        decrypt_fields(&key, &mut convs, &["title", "system_prompt", "compaction_summary"]);
+        decrypt_fields(&key, &mut msgs, &["content", "thinking", "usage", "attachments"]);
+        decrypt_fields(&key, &mut mems, &["content"]);
+    }
+
+    apply_conversations(ctx.db, &convs).await?;
+    apply_messages(ctx.db, &msgs).await?;
     apply_memory(ctx.db, ctx.memory, &mems)?;
 
     Ok((convs.len() + msgs.len() + mems.len()) as u64)
+}
+
+/// Decrypt the named string fields of fetched rows in place. Fields that aren't
+/// a recognized ciphertext (pre-encryption plaintext) are left untouched; fields
+/// that fail to decrypt (wrong/missing key) are also left as-is — the local DB
+/// is the source of truth and we never corrupt it with bad decryption.
+fn decrypt_fields(key: &[u8; 32], rows: &mut [Value], fields: &[&str]) {
+    for row in rows.iter_mut() {
+        for f in fields {
+            if let Some(Value::String(s)) = row.get_mut(f) {
+                if crypt::looks_encrypted(s) {
+                    if let Some(plain) = crypt::decrypt(key, s) {
+                        *s = plain;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn last_seen(db: &Db, entity: &str) -> i64 {

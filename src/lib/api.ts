@@ -144,6 +144,7 @@ export interface SyncStatus {
   phase: string; // "push" | "pull" | "" when idle
   pushed: number;
   pulled: number;
+  encryption: boolean; // client-side encryption configured
 }
 
 export type StreamEvent =
@@ -350,4 +351,18 @@ export function syncToggle(on: boolean): Promise<SyncStatus> {
 
 export function syncNow(): Promise<SyncStatus> {
   return invoke<SyncStatus>("sync_now");
+}
+
+/**
+ * Set the client-side-encryption passphrase. Generates/recovers the data key,
+ * caches it in the OS keychain, and re-uploads all rows encrypted.
+ * The data sent to Supabase is ciphertext from then on.
+ */
+export function syncSetEncryption(passphrase: string): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_set_encryption", { passphrase });
+}
+
+/** Disable client-side encryption and re-upload rows as plaintext. */
+export function syncRemoveEncryption(): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_remove_encryption");
 }

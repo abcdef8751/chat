@@ -48,6 +48,8 @@ import {
   syncSignIn,
   syncSignOut,
   syncSignUp,
+  syncSetEncryption,
+  syncRemoveEncryption,
   syncStatus,
   syncToggle,
   thinkingOptions,
@@ -597,6 +599,10 @@ export default function App() {
   // "signin" | "signup" — which mode the auth form is in; a confirmation notice.
   const [syncAuthMode, setSyncAuthMode] = createSignal<"signin" | "signup">("signin");
   const [syncNotice, setSyncNotice] = createSignal<string | null>(null);
+  // Client-side encryption passphrase entry (enable/disable).
+  const [syncPassphrase, setSyncPassphrase] = createSignal("");
+  const [syncPassphraseConfirm, setSyncPassphraseConfirm] = createSignal("");
+  const [syncEncBusy, setSyncEncBusy] = createSignal(false);
 
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
@@ -972,6 +978,48 @@ export default function App() {
       setSyncError(String(e));
     } finally {
       setSyncBusy(false);
+    }
+  }
+
+  async function enableEncryption() {
+    const pass = syncPassphrase();
+    if (pass !== syncPassphraseConfirm()) {
+      setSyncError("Passphrases don't match.");
+      return;
+    }
+    if (!pass) {
+      setSyncError("Enter a passphrase.");
+      return;
+    }
+    setSyncEncBusy(true);
+    setSyncError(null);
+    try {
+      const status = await syncSetEncryption(pass);
+      setSyncStatusData(status);
+      setSyncPassphrase("");
+      setSyncPassphraseConfirm("");
+      setSyncNotice("Encryption on — your data is now sent to Supabase as ciphertext.");
+    } catch (e) {
+      setSyncError(String(e));
+    } finally {
+      setSyncEncBusy(false);
+    }
+  }
+
+  async function disableEncryption() {
+    if (!confirm("Disable end-to-end encryption? Sync will re-upload all data as plaintext.")) {
+      return;
+    }
+    setSyncEncBusy(true);
+    setSyncError(null);
+    try {
+      const status = await syncRemoveEncryption();
+      setSyncStatusData(status);
+      setSyncNotice("Encryption off — sync now sends plaintext.");
+    } catch (e) {
+      setSyncError(String(e));
+    } finally {
+      setSyncEncBusy(false);
     }
   }
 
@@ -2305,6 +2353,64 @@ export default function App() {
                     >
                       Sync now
                     </button>
+
+                    <div class="mt-4 border-t border-neutral-200 pt-3 dark:border-neutral-700">
+                      <div class="flex items-center gap-2">
+                        <span class="text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                          End-to-end encryption
+                        </span>
+                        <span
+                          class={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                            syncStatusData()?.encryption
+                              ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400"
+                              : "bg-neutral-200 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+                          }`}
+                        >
+                          {syncStatusData()?.encryption ? "On" : "Off"}
+                        </span>
+                      </div>
+                      <p class="mt-1 text-[11px] leading-snug text-neutral-400 dark:text-neutral-500">
+                        {syncStatusData()?.encryption
+                          ? "Data sent to Supabase is ciphertext — only this device can read it."
+                          : "Optional: encrypt the sync mirror so Supabase only ever sees ciphertext."}
+                      </p>
+                      <Show
+                        when={syncStatusData()?.encryption}
+                        fallback={
+                          <div class="mt-2 space-y-2">
+                            <input
+                              type="password"
+                              placeholder="Passphrase (min 6 chars)"
+                              value={syncPassphrase()}
+                              onInput={(e) => setSyncPassphrase(e.currentTarget.value)}
+                              class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                            />
+                            <input
+                              type="password"
+                              placeholder="Confirm passphrase"
+                              value={syncPassphraseConfirm()}
+                              onInput={(e) => setSyncPassphraseConfirm(e.currentTarget.value)}
+                              class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                            />
+                            <button
+                              onClick={() => void enableEncryption()}
+                              disabled={syncEncBusy()}
+                              class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                            >
+                              {syncEncBusy() ? "Encrypting…" : "Enable encryption"}
+                            </button>
+                          </div>
+                        }
+                      >
+                        <button
+                          onClick={() => void disableEncryption()}
+                          disabled={syncEncBusy()}
+                          class="mt-2 text-[11px] font-normal text-neutral-500 underline-offset-2 transition hover:text-red-600 disabled:opacity-50 dark:text-neutral-400 dark:hover:text-red-400"
+                        >
+                          Disable
+                        </button>
+                      </Show>
+                    </div>
                   </Show>
 
                   <Show when={syncStatusData()?.syncing || syncStatusData()?.phase}>

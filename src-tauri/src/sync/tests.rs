@@ -539,6 +539,7 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
         anon: "anon",
         db: &db,
         memory: &mem,
+        key: None,
     };
 
     // --- Push ---
@@ -601,6 +602,94 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
             .unwrap();
         assert!(wm > 0, "high-water missing for {entity}");
     }
+}
+
+/// Client-side encryption: push uploads ciphertext (Supabase never sees
+/// plaintext) and pull restores plaintext into the local DB.
+#[tokio::test]
+async fn encryption_roundtrips_through_push_and_pull() {
+    use crate::crypt;
+
+    let srv = MockRest::spawn();
+    let db = temp_db("enc");
+    let memstate = temp_memory("enc", &db);
+    let cid = insert_conv(&db);
+    db::insert_message(
+        &db,
+        cid.clone(),
+        "user".into(),
+        "top-secret".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("stop".into()),
+    )
+    .unwrap();
+    memstate.append("secret memory", "profile.md").unwrap();
+
+    let key = crypt::new_key();
+    let client = reqwest::Client::new();
+    let base = srv.addr.clone();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &base,
+        anon: "anon",
+        db: &db,
+        memory: &memstate,
+        key: Some(key),
+    };
+    let progress = SyncState::new();
+    push(&ctx, "tok", &progress).await.unwrap();
+
+    // The server received ciphertext, not plaintext...
+    let conv_title = srv.posted("conversations")[0]["title"].as_str().unwrap().to_string();
+    assert!(crypt::looks_encrypted(&conv_title), "title must be ciphertext");
+    let msg_content = srv.posted("messages")[0]["content"].as_str().unwrap().to_string();
+    assert!(crypt::looks_encrypted(&msg_content), "message must be ciphertext");
+    let mem_content = srv.posted("memory_files")[0]["content"].as_str().unwrap().to_string();
+    assert!(crypt::looks_encrypted(&mem_content), "memory must be ciphertext");
+    // ...and it decrypts back to the original with the key.
+    assert_eq!(crypt::decrypt(&key, &msg_content).as_deref(), Some("top-secret"));
+
+    // --- Pull: remote returns encrypted rows; local restores plaintext ---
+    let rcid = "remote-conv".to_string();
+    srv.set_get(
+        "conversations",
+        vec![json!({
+            "id": rcid, "title": crypt::encrypt(&key, "From device B"),
+            "revision": 100, "created_at": 1, "updated_at": 2, "deleted_at": Value::Null
+        })],
+    );
+    srv.set_get(
+        "messages",
+        vec![json!({
+            "id": "remote-msg", "conversation_id": rcid, "role": "assistant",
+            "content": crypt::encrypt(&key, "Hello encrypted"), "created_at": 3,
+            "revision": 101, "deleted_at": Value::Null
+        })],
+    );
+    srv.set_get(
+        "memory_files",
+        vec![json!({
+            "path": "goals.md", "content": crypt::encrypt(&key, "Encrypted goal"),
+            "revision": 102, "deleted_at": Value::Null
+        })],
+    );
+    pull(&ctx, "user-123", "tok").await.unwrap();
+
+    let title: String = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT title FROM conversations WHERE id = ?1", [&rcid], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(title, "From device B");
+    let content: String = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT content FROM messages WHERE id = 'remote-msg'", [], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(content, "Hello encrypted");
+    assert!(memstate.read("goals.md").unwrap().contains("Encrypted goal"));
 }
 
 /// Advancing the reflection watermark must mark the conversation dirty and bump

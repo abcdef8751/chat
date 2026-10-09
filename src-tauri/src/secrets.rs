@@ -16,6 +16,14 @@ const BRAVE_USER: &str = "brave_key";
 /// Keychain account name for the Supabase sync session (a small JSON blob of
 /// tokens). Kept out of `config.json` so tokens never sit on disk in plaintext.
 const SESSION_USER: &str = "sync_session";
+/// Keychain account for the client-side encryption data key (base64). Caching
+/// it here is what makes background auto-sync work without re-entering the
+/// passphrase every launch ("remember on this device").
+const ENC_KEY_USER: &str = "sync_enc_key";
+/// Keychain account for the passphrase-wrapped data key + salt (base64 blob).
+/// Useless without the passphrase; lets us verify a passphrase and re-derive
+/// the key (e.g. on another device) without storing the raw key a second time.
+const ENC_WRAP_USER: &str = "sync_enc_wrap";
 
 fn entry() -> Result<Entry, String> {
     Entry::new(SERVICE, USER).map_err(|e| format!("open keychain entry: {e}"))
@@ -118,10 +126,70 @@ pub fn session_delete() -> Result<(), String> {
     }
 }
 
+// --- Client-side encryption keys --------------------------------------------
+
+fn enc_key_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, ENC_KEY_USER).map_err(|e| format!("open keychain entry: {e}"))
+}
+
+fn enc_wrap_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, ENC_WRAP_USER).map_err(|e| format!("open keychain entry: {e}"))
+}
+
+/// Read the cached data key (base64) from the keychain. `Ok(None)` = off.
+pub fn enc_key_get() -> Result<Option<String>, String> {
+    match enc_key_entry()?.get_password() {
+        Ok(k) => Ok(Some(k)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keychain read: {e}")),
+    }
+}
+
+pub fn enc_key_set(key: &str) -> Result<(), String> {
+    enc_key_entry()?
+        .set_password(key)
+        .map_err(|e| format!("keychain write: {e}"))
+}
+
+pub fn enc_key_delete() -> Result<(), String> {
+    match enc_key_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete: {e}")),
+    }
+}
+
+/// Read the passphrase-wrapped data key + salt (base64 blob).
+pub fn enc_wrap_get() -> Result<Option<String>, String> {
+    match enc_wrap_entry()?.get_password() {
+        Ok(w) => Ok(Some(w)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keychain read: {e}")),
+    }
+}
+
+pub fn enc_wrap_set(wrapped: &str) -> Result<(), String> {
+    enc_wrap_entry()?
+        .set_password(wrapped)
+        .map_err(|e| format!("keychain write: {e}"))
+}
+
+pub fn enc_wrap_delete() -> Result<(), String> {
+    match enc_wrap_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete: {e}")),
+    }
+}
+
+/// Whether client-side encryption is configured (data key present).
+pub fn has_encryption() -> bool {
+    matches!(enc_key_get(), Ok(Some(k)) if !k.is_empty())
+}
+
 /// Whether a Brave Search API key is stored. Used by `tools::brave_available`
 /// to decide whether the ungated Brave web tools are offered at all.
-pub fn has_brave_key() -> bool {
-    match brave_get() {
+pub fn has_brave_key() -> bool {    match brave_get() {
         Ok(Some(k)) => !k.is_empty(),
         _ => false,
     }

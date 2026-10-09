@@ -735,6 +735,21 @@ pub fn pending_rows(db: &Db) -> Result<u64, String> {
     Ok((conv + msg + mem + tomb) as u64)
 }
 
+/// Mark every syncable row dirty so the next push re-uploads it. Used when
+/// toggling client-side encryption: enabling re-uploads everything encrypted,
+/// disabling re-uploads everything plaintext. Memory-role notes are excluded
+/// (they are never synced by design).
+pub fn mark_all_dirty_for_resync(db: &Db) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute("UPDATE conversations SET dirty = 1", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("UPDATE messages SET dirty = 1 WHERE role != 'memory'", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("UPDATE memory_sync SET dirty = 1", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Highest index of a *reflectable* message (user/assistant/tool). Memory
 /// consolidation notes are excluded so they never make a conversation look
 /// dirty for reflection.

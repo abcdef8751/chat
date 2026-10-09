@@ -3,6 +3,7 @@ mod attachments;
 mod android;
 mod chat;
 mod config;
+mod crypt;
 mod db;
 mod import;
 mod memory;
@@ -110,6 +111,8 @@ pub fn run() {
             sync::sync_status,
             sync::sync_toggle,
             sync::sync_now,
+            sync::sync_set_encryption,
+            sync::sync_remove_encryption,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
