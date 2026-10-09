@@ -212,7 +212,7 @@ fn brave_tools() -> Vec<ChatCompletionTools> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
-                    "count": count("Number of results (1-20, default 10)"),
+                    "count": count("Number of results (1-200, default 50)"),
                     "safesearch": { "type": "string", "description": "off|moderate|strict" }
                 },
                 "required": ["query"]
@@ -238,7 +238,7 @@ fn brave_tools() -> Vec<ChatCompletionTools> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
-                    "count": count("Number of results (1-20, default 10)"),
+                    "count": count("Number of results (1-50, default 20)"),
                     "freshness": { "type": "string", "description": "Time filter, e.g. pd, pw, pm, py" }
                 },
                 "required": ["query"]
@@ -246,13 +246,14 @@ fn brave_tools() -> Vec<ChatCompletionTools> {
         ),
         fn_tool(
             "brave_summarizer",
-            "Search and summarize results into a short answer (Pro plan).",
+            "Search and synthesize results into a short answer (requires an Answers/AI \
+             plan). Obtains the summarizer key and calls the Summarizer API automatically.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query to summarize" },
-                    "count": count("Number of results to summarize"),
-                    "extra_snippets": { "type": "boolean", "description": "Include extra snippets" }
+                    "entity_info": { "type": "boolean", "description": "Include extra entity info in the response" },
+                    "inline_references": { "type": "boolean", "description": "Include inline references in the response" }
                 },
                 "required": ["query"]
             }),
@@ -330,14 +331,37 @@ impl BraveSearch {
         }
     }
 
-    /// GET a paginated Brave endpoint with the given query string params.
+    /// Core GET: build headers + a fixed param list, return parsed JSON.
+    async fn get_raw(&self, endpoint: &str, params: &[(&str, String)]) -> Result<Value, String> {
+        let key = crate::secrets::get_brave_key()?.ok_or("Brave API key not set")?;
+        let url = format!("{BRAVE_BASE}/{endpoint}");
+        let mut req = self
+            .http
+            .get(&url)
+            .header("X-Subscription-Token", key)
+            .header("Accept", "application/json");
+        for (k, v) in params {
+            req = req.query(&[(*k, v.as_str())]);
+        }
+        let resp = req.send().await.map_err(|e| format!("brave: {e}"))?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| format!("brave: {e}"))?;
+        if !status.is_success() {
+            let body: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
+            // A missing/expired key (or a Pro-only feature) is the common non-2xx;
+            // keep the message short so the model can self-correct with a hint.
+            return Err(format!("brave: HTTP {status}: {body}"));
+        }
+        serde_json::from_slice(&bytes).map_err(|e| format!("brave: bad response: {e}"))
+    }
+
+    /// GET a paginated endpoint, deriving query params from the tool args.
     async fn get(
         &self,
         endpoint: &str,
         args: &Value,
         extra: &[(&str, String)],
     ) -> Result<Value, String> {
-        let key = crate::secrets::get_brave_key()?.ok_or("Brave API key not set")?;
         let mut params: Vec<(String, String)> = Vec::new();
         if let Some(q) = args.get("query").and_then(Value::as_str) {
             params.push(("q".into(), q.to_string()));
@@ -354,32 +378,14 @@ impl BraveSearch {
         if let Some(s) = args.get("safesearch").and_then(Value::as_str) {
             params.push(("safesearch".into(), s.to_string()));
         }
-        let url = format!("{BRAVE_BASE}/{endpoint}");
-        let mut req = self
-            .http
-            .get(&url)
-            .header("X-Subscription-Token", key)
-            .header("Accept", "application/json");
-        for (k, v) in &params {
-            req = req.query(&[(k.as_str(), v.as_str())]);
-        }
-        let resp = req.send().await.map_err(|e| format!("brave: {e}"))?;
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("brave: {e}"))?;
-        if !status.is_success() {
-            let body: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
-            // A missing/expired key is the most common non-2xx; keep the message
-            // short so the model can self-correct with a clear hint.
-            return Err(format!("brave: HTTP {status}: {body}"));
-        }
-        serde_json::from_slice(&bytes).map_err(|e| format!("brave: bad response: {e}"))
+        let owned: Vec<(&str, String)> =
+            params.iter().map(|p| (p.0.as_str(), p.1.clone())).collect();
+        self.get_raw(endpoint, &owned).await
     }
 
-    /// A paginated results endpoint (web/local share `web/search`; local asks
-    /// Brave to prefer local results via `q_local`).
+    /// A paginated results endpoint. Local search runs against `web/search`
+    /// with `result_filter=locations` (the modern local-discovery path) and
+    /// formats the `locations.results` array.
     async fn page_search(&self, endpoint: &str, args: &Value, local: bool) -> ToolOutput {
         let Some(query) = args.get("query").and_then(Value::as_str) else {
             return ToolOutput::err("missing 'query' argument".into());
@@ -388,7 +394,7 @@ impl BraveSearch {
             return ToolOutput::err("'query' must not be empty".into());
         }
         let extra: &[(&str, String)] = if local {
-            &[("q_local", "1".into())]
+            &[("result_filter", "locations".into())]
         } else {
             &[]
         };
@@ -398,7 +404,11 @@ impl BraveSearch {
         }
     }
 
-    /// `brave_summarizer` — Brave returns a synthesized answer plus sources.
+    /// `brave_summarizer` — the Summarizer API (Pro / Answers plan) requires a
+    /// one-time `key` that is only issued by a web search with `summary=1`, so
+    /// this tool does that handshake itself: (1) `web/search?summary=1` to get
+    /// the key, (2) `summarizer/search?key=` to fetch the synthesized answer.
+    /// Reads `enrichments.raw` + `enrichments.sources`.
     async fn summarizer(&self, args: &Value) -> ToolOutput {
         let Some(query) = args.get("query").and_then(Value::as_str) else {
             return ToolOutput::err("missing 'query' argument".into());
@@ -406,40 +416,55 @@ impl BraveSearch {
         if query.trim().is_empty() {
             return ToolOutput::err("'query' must not be empty".into());
         }
-        let extra: &[(&str, String)] = &[
-            ("summary", "1".into()),
-            (
-                "extra_snippets",
-                if args.get("extra_snippets").and_then(Value::as_bool).unwrap_or(false) {
-                    "1"
-                } else {
-                    "0"
-                }
-                .into(),
-            ),
-        ];
-        match self.get("summarizer/search", args, extra).await {
-            Ok(json) => {
-                let prefix = "summarizer/search";
-                let answer = json
-                    .get("answer")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let mut text = answer.to_string();
-                let sources = format_results(prefix, &json);
-                if !sources.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n\nSources:\n");
-                    }
-                    text.push_str(&sources);
-                }
-                if text.trim().is_empty() {
-                    text = "No summary returned.".to_string();
-                }
-                ToolOutput::ok(truncate(text))
-            }
-            Err(e) => ToolOutput::err(e),
+        let web = match self
+            .get_raw("web/search", &[("q", query.into()), ("summary", "1".into())])
+            .await
+        {
+            Ok(j) => j,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let Some(key) = web.get("summarizer").and_then(|s| s.get("key")).and_then(Value::as_str) else {
+            return ToolOutput::err(
+                "brave_summarizer: plan does not support answers (no summarizer key from web/search)".into(),
+            );
+        };
+        let mut params: Vec<(String, String)> =
+            vec![("key".into(), key.to_string())];
+        if let Some(ei) = args.get("entity_info").and_then(Value::as_bool) {
+            params.push(("entity_info".into(), if ei { "true" } else { "false" }.into()));
         }
+        if let Some(ir) = args.get("inline_references").and_then(Value::as_bool) {
+            params.push(("inline_references".into(), if ir { "true" } else { "false" }.into()));
+        }
+        let owned: Vec<(&str, String)> = params.iter().map(|p| (p.0.as_str(), p.1.clone())).collect();
+        let json = match self.get_raw("summarizer/search", &owned).await {
+            Ok(j) => j,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let mut text = String::new();
+        if let Some(raw) = json.get("enrichments").and_then(|e| e.get("raw")).and_then(Value::as_str) {
+            text.push_str(raw);
+        }
+        if let Some(sources) = json.get("enrichments").and_then(|e| e.get("sources")).and_then(Value::as_array) {
+            for src in sources {
+                let title = src.get("title").and_then(Value::as_str).unwrap_or("");
+                let url = src.get("url").and_then(Value::as_str).unwrap_or("");
+                if title.is_empty() && url.is_empty() {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(title);
+                if !url.is_empty() {
+                    text.push_str(&format!("\n  {url}"));
+                }
+            }
+        }
+        if text.trim().is_empty() {
+            text = "No summary returned.".to_string();
+        }
+        ToolOutput::ok(truncate(text))
     }
 }
 
@@ -448,9 +473,11 @@ impl BraveSearch {
 fn format_results(endpoint: &str, json: &Value) -> String {
     let mut out = String::new();
     let arrays: &[&str] = match endpoint {
-        "web/search" => &["web.results", "local.results", "news.results", "videos.results"],
+        "web/search" => {
+            &["web.results", "locations.results", "news.results", "videos.results", "local.results"]
+        }
         // news/images/videos/summarizer surface their items under "results".
-        _ => &["results", "web.results", "local.results"],
+        _ => &["results", "web.results", "locations.results", "local.results"],
     };
     for path in arrays {
         let mut items: &Value = json;

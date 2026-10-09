@@ -94,7 +94,9 @@ pub fn has_brave_key() -> bool {
 }
 
 /// Whether a Brave Search API key is stored (frontend status check).
-#[tauri::command]
+/// Renamed so the IPC name is `has_brave_key` (the Rust helper above is a plain
+/// function, not a command, so there's no collision).
+#[tauri::command(rename = "has_brave_key")]
 pub fn has_brave_key_cmd() -> bool {
     has_brave_key()
 }

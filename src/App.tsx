@@ -813,7 +813,9 @@ export default function App() {
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
     setKeyDraft("");
-    setHasBraveKeySaved(await hasBraveKey());
+    hasBraveKey()
+      .then(setHasBraveKeySaved)
+      .catch(() => setHasBraveKeySaved(false)); // never block opening Settings
     setBraveKeyDraft("");
     setSettingsError(null);
     setSettingsOpen(true);
