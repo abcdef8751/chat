@@ -216,8 +216,12 @@ topic files.
   file_name}` references and the accompanying zip holds nothing but the JSON, so
   `rows_for_message` appends an `[attached: … — contents are not included in the
   export]` marker instead of silently dropping the context.
-- **Backfill** (`reflection.rs`): restricted to **imported** conversations —
-  chats the user actually had are the sequential pass's job. Reflecting over an
+- **Backfill** (`reflection.rs`): restricted to **imported** conversations, and
+  among those to the **newest import batch** — `conversations.import_batch` is
+  stamped once per import run (`db::next_import_batch`), so importing a second
+  archive never re-sweeps the first one (an older batch that was never finished
+  is left alone). Chats the user actually had are the sequential pass's job.
+  Reflecting over an
   imported archive one conversation per 60s tick is both slow (~20h for 1200
   chats) and unsafe to parallelize naively, because every pass is a
   read-modify-write on the same Markdown files and `reflection_tail`'s "recent
