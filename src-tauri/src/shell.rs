@@ -10,11 +10,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[cfg(not(mobile))]
+#[cfg(not(target_os = "android"))]
 use tokio::process::Command;
 
 use crate::tools::ToolOutput;
-#[cfg(not(mobile))]
+#[cfg(not(target_os = "android"))]
 use crate::tools::truncate;
 
 /// Default per-call timeout (matches the old persistent session's).
@@ -31,7 +31,7 @@ pub struct ShellExecutor {
     /// Working directory for each invocation (`None` = inherit the host cwd).
     workdir: Option<PathBuf>,
     /// Android only: the app handle used to reach the Termux bridge plugin.
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
     app: Option<tauri::AppHandle>,
 }
 
@@ -51,13 +51,13 @@ impl ShellExecutor {
         Self {
             timeout,
             workdir: None,
-            #[cfg(mobile)]
+            #[cfg(target_os = "android")]
             app: None,
         }
     }
 
     /// Android-only constructor carrying the app handle for the Termux bridge.
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
     pub fn new_mobile(app: tauri::AppHandle) -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
@@ -73,21 +73,21 @@ impl ShellExecutor {
         Self {
             timeout,
             workdir: Some(workdir),
-            #[cfg(mobile)]
+            #[cfg(target_os = "android")]
             app: None,
         }
     }
 
     /// Run one `bash` command, returning captured output and the exit code.
     pub async fn run(&self, command: &str) -> ToolOutput {
-        #[cfg(mobile)]
+        #[cfg(target_os = "android")]
         {
             let Some(app) = &self.app else {
                 return ToolOutput::err("Termux bridge not initialized".into());
             };
             crate::android::run_termux_command(app, command).await
         }
-        #[cfg(not(mobile))]
+        #[cfg(not(target_os = "android"))]
         {
             self.run_desktop(command).await
         }
@@ -96,14 +96,14 @@ impl ShellExecutor {
     /// Read a file as text. Desktop reads the host filesystem directly;
     /// Android routes through Termux so the same namespace as `bash` is used.
     pub async fn read_file(&self, path: &str) -> ToolOutput {
-        #[cfg(not(mobile))]
+        #[cfg(not(target_os = "android"))]
         {
             match tokio::fs::read_to_string(path).await {
                 Ok(text) => ToolOutput::ok(truncate(text)),
                 Err(e) => ToolOutput::err(format!("read_file: {e}")),
             }
         }
-        #[cfg(mobile)]
+        #[cfg(target_os = "android")]
         {
             self.run(&format!("cat {}", shq(path))).await
         }
@@ -112,14 +112,14 @@ impl ShellExecutor {
     /// Write text to a file. Desktop writes the host filesystem directly;
     /// Android routes through Termux.
     pub async fn write_file(&self, path: &str, content: &str) -> ToolOutput {
-        #[cfg(not(mobile))]
+        #[cfg(not(target_os = "android"))]
         {
             match tokio::fs::write(path, content).await {
                 Ok(()) => ToolOutput::ok(format!("wrote {} bytes to {path}", content.len())),
                 Err(e) => ToolOutput::err(format!("write_file: {e}")),
             }
         }
-        #[cfg(mobile)]
+        #[cfg(target_os = "android")]
         {
             // Heredoc into the target path so arbitrary content round-trips.
             let script = format!("cat > {} <<'PI_FILE_EOF'\n{}\nPI_FILE_EOF", shq(path), content);
@@ -127,7 +127,7 @@ impl ShellExecutor {
         }
     }
 
-    #[cfg(not(mobile))]
+    #[cfg(not(target_os = "android"))]
     async fn run_desktop(&self, command: &str) -> ToolOutput {
         use std::process::Stdio;
         let mut cmd = Command::new("bash");
@@ -182,7 +182,7 @@ impl ShellExecutor {
 }
 
 /// Single-quote a shell argument (paths) so it survives as one token.
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }

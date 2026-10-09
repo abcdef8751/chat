@@ -1,4 +1,4 @@
-#![cfg(mobile)]
+#![cfg(target_os = "android")]
 //! Android host-shell bridge.
 //!
 //! Executes `bash` / `read_file` / `write_file` **inside the user's installed
@@ -18,7 +18,9 @@ use serde_json::json;
 use tauri::plugin::{Builder, PluginHandle, TauriPlugin};
 use tauri::{AppHandle, Manager};
 
-use crate::tools::ToolOutput;/// Default working directory under shared storage, per ANDROID_SHELL.md
+use crate::tools::ToolOutput;
+
+/// Default working directory under shared storage, per ANDROID_SHELL.md
 /// (overridable via `config.shell_workspace_dir`).
 pub const DEFAULT_WORKSPACE: &str = "/storage/emulated/0/PiChat";
 
@@ -34,12 +36,12 @@ pub struct TermuxOutput {
 pub struct RunCommandHandle(pub PluginHandle<tauri::Wry>);
 
 /// Register the Kotlin plugin and store the handle so `run_termux_command` can
-/// reach it. (Android bridge; the iOS shell path is out of scope for this app.)
+/// reach it. `register_android_plugin` builds `package/SimpleClass`, so the
+/// first arg is the dotted package and the second the simple Kotlin class name.
 pub fn plugin() -> TauriPlugin<tauri::Wry> {
     Builder::new("run_command")
         .setup(move |app, api| {
-            let handle =
-                api.register_android_plugin("run_command", "com.rp.chat.RunCommandPlugin")?;
+            let handle = api.register_android_plugin("com.rp.chat", "RunCommandPlugin")?;
             app.manage(RunCommandHandle(handle));
             Ok(())
         })
@@ -62,10 +64,20 @@ fn workspace(app: &AppHandle) -> String {
 pub async fn run_termux_command(app: &AppHandle, command: &str) -> ToolOutput {
     let handle = app.state::<RunCommandHandle>();
     let payload = json!({ "command": command, "workdir": workspace(app) });
-    let result: Result<TermuxOutput, _> = handle
-        .0
-        .run_mobile_plugin_async::<TermuxOutput>("run", payload)
-        .await;
+    // Match the desktop executor's per-call timeout: if Termux never delivers a
+    // result (e.g. `allow-external-apps` is off, or the command hangs), the
+    // chat's tool loop must not block forever.
+    let result = tokio::time::timeout(
+        crate::shell::DEFAULT_TIMEOUT,
+        handle
+            .0
+            .run_mobile_plugin_async::<TermuxOutput>("run", payload),
+    )
+    .await;
+    let result: Result<TermuxOutput, _> = match result {
+        Err(_) => return ToolOutput::err("termux: timed out".into()),
+        Ok(inner) => inner,
+    };
     match result {
         Ok(out) => {
             let mut text = out.stdout;

@@ -1,5 +1,5 @@
 mod attachments;
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 mod android;
 mod chat;
 mod config;
@@ -21,7 +21,7 @@ use tauri::Manager;
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
     // Android-only host-shell bridge (Termux RUN_COMMAND).
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
     let builder = builder.plugin(crate::android::plugin());
     builder
         .setup(|app| {
@@ -44,9 +44,9 @@ pub fn run() {
             app.manage(tools::ApprovalRegistry::default());
             // One-shot host shell; on Android it carries the app handle to reach
             // the Termux bridge (see shell.rs / android.rs).
-            #[cfg(mobile)]
+            #[cfg(target_os = "android")]
             let shell_state = shell::ShellExecutor::new_mobile(app.handle().clone());
-            #[cfg(not(mobile))]
+            #[cfg(not(target_os = "android"))]
             let shell_state = shell::ShellExecutor::new();
             app.manage(shell_state);
             app.manage(reflection::Backfill::default());

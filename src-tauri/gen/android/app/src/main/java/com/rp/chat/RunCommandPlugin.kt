@@ -40,11 +40,20 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
     private const val EXTRA_ARGUMENTS = "com.termux.RUN_COMMAND_ARGUMENTS"
     private const val EXTRA_WORKDIR = "com.termux.RUN_COMMAND_WORKDIR"
     private const val EXTRA_PENDING_INTENT = "com.termux.RUN_COMMAND_PENDING_INTENT"
+    private const val EXTRA_RUNNER = "com.termux.RUN_COMMAND_RUNNER"
 
-    // Result extras Termux delivers to the result pending intent.
-    private const val RESULT_STDOUT = "com.termux.RUN_COMMAND_STDOUT"
-    private const val RESULT_STDERR = "com.termux.RUN_COMMAND_STDERR"
-    private const val RESULT_EXIT_CODE = "com.termux.RUN_COMMAND_EXIT_CODE"
+    // Run the command as a detached background process so output is clean
+    // (stdout/stderr separate) and no terminal session is opened per call.
+    private const val RUNNER_APP_SHELL = "app-shell"
+
+    // Result extras Termux delivers to the result pending intent, nested under a
+    // single "result" Bundle (TermuxConstants.EXTRA_PLUGIN_RESULT_BUNDLE).
+    private const val EXTRA_RESULT_BUNDLE = "result"
+    private const val RESULT_STDOUT = "stdout"
+    private const val RESULT_STDERR = "stderr"
+    private const val RESULT_EXIT_CODE = "exitCode"
+    private const val RESULT_ERR = "err"
+    private const val RESULT_ERR_MSG = "errmsg"
 
     // A result bundle is bounded; cap what we forward so a runaway command
     // cannot blow past the pending-intent result size (see ANDROID_SHELL.md).
@@ -78,6 +87,7 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
       putExtra(EXTRA_PATH, termuxBash)
       putExtra(EXTRA_ARGUMENTS, arrayOf("-c", command))
       if (!workdir.isNullOrBlank()) putExtra(EXTRA_WORKDIR, workdir)
+      putExtra(EXTRA_RUNNER, RUNNER_APP_SHELL)
       putExtra(EXTRA_PENDING_INTENT, pending)
     }
 
@@ -114,13 +124,21 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
   ): BroadcastReceiver {
     val receiver = object : BroadcastReceiver() {
       override fun onReceive(context: Context, intent: Intent) {
-        val stdout = intent.getStringExtra(RESULT_STDOUT).orEmpty()
-        val stderr = intent.getStringExtra(RESULT_STDERR).orEmpty()
-        val code = resultCode
-        Log.d(TAG, "run($workdir) finished exit=$code")
+        // Termux packs the result into a Bundle under the intent key "result".
+        // `err == -1` (Activity.RESULT_OK) means no internal error; otherwise the
+        // command never ran (e.g. permission/service issue) and `errmsg` explains.
+        val bundle = intent.getBundleExtra(EXTRA_RESULT_BUNDLE)
+        val err = bundle?.getInt(RESULT_ERR, -1) ?: -1
+        val errmsg = bundle?.getString(RESULT_ERR_MSG).orEmpty()
+        val stdout = bundle?.getString(RESULT_STDOUT).orEmpty()
+        val stderr = bundle?.getString(RESULT_STDERR).orEmpty()
+        val exitCode = bundle?.getInt(RESULT_EXIT_CODE, 0) ?: 0
+        val code = if (err == -1) exitCode else 1
+        val stderrOut = if (err == -1) stderr else stderr.ifEmpty { errmsg }
+        Log.d(TAG, "run($workdir) finished exit=$code err=$err")
         val ret = JSObject()
         ret.put("stdout", stdout.take(MAX_OUTPUT_CHARS))
-        ret.put("stderr", stderr.take(MAX_OUTPUT_CHARS))
+        ret.put("stderr", stderrOut.take(MAX_OUTPUT_CHARS))
         ret.put("exit_code", code)
         invoke.resolve(ret)
       }

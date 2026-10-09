@@ -143,9 +143,15 @@ Because execution runs in Termux, the broad shared-storage grant lives with
 3. **Android bridge:** Rust `crate::android` (`run_command` Tauri plugin →
    `run_termux_command`) + Kotlin `RunCommandPlugin` in `gen/android` + the
    `com.termux.permission.RUN_COMMAND` manifest permission, with feature-detect
-   (Termux presence) and result routing. 🔶 — Rust path compiles for Android;
-   Kotlin is written to the documented Termux/RUN_COMMAND API but the real
-   Termux round-trip needs on-device validation.
+   (Termux presence) and result routing. The command runs as a detached
+   **background** runner (`com.termux.RUN_COMMAND_RUNNER=app-shell`) and Termux
+   returns its result in a nested Bundle under the `"result"` key (`stdout` /
+   `stderr` / `exitCode` / `err`), which the receiver maps to the Rust
+   `TermuxOutput`. Calls time out after `shell::DEFAULT_TIMEOUT` so a dropped
+   intent (e.g. `allow-external-apps` off) can't hang the tool loop. 🔶 — Rust
+   path compiles for Android; Kotlin is written to the documented
+   Termux/RUN_COMMAND API but the real Termux round-trip needs on-device
+   validation.
 4. **File tools:** `read_file`/`write_file` route through the executor — native
    filesystem on desktop, Termux one-liners on Android. ✅
 5. **Permission & onboarding UI:** settings entry for the working directory and
