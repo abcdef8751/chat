@@ -1997,14 +1997,14 @@ export default function App() {
 
             <div class="mt-4 flex min-h-0 flex-1 gap-4">
               <div class="flex w-44 shrink-0 flex-col gap-1 overflow-y-auto">
-                <p class="px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                <p class="shrink-0 px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
                   Core
                 </p>
                 <For each={memoryFiles().filter((f) => f.core)}>
                   {(f) => (
                     <button
                       onClick={() => selectMemoryFile(f)}
-                      class={`truncate rounded-md px-2 py-1.5 text-left text-xs transition ${
+                      class={`truncate shrink-0 rounded-md px-2 py-1.5 text-left text-xs transition ${
                         memorySelected() === f.name
                           ? "bg-neutral-200 font-medium dark:bg-neutral-800"
                           : "text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
@@ -2015,14 +2015,14 @@ export default function App() {
                   )}
                 </For>
                 <Show when={memoryFiles().some((f) => !f.core)}>
-                  <p class="mt-3 px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                  <p class="mt-3 shrink-0 px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
                     Other
                   </p>
                   <For each={memoryFiles().filter((f) => !f.core)}>
                     {(f) => (
                       <button
                         onClick={() => selectMemoryFile(f)}
-                        class={`truncate rounded-md px-2 py-1.5 text-left text-xs transition ${
+                        class={`truncate shrink-0 rounded-md px-2 py-1.5 text-left text-xs transition ${
                           memorySelected() === f.name
                             ? "bg-neutral-200 font-medium dark:bg-neutral-800"
                             : "text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
