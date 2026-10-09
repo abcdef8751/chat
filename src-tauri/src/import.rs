@@ -137,13 +137,17 @@ fn import_inner(app: &tauri::AppHandle, path: &str) -> Result<ImportReport, Stri
         ..Default::default()
     };
 
+    // One import run = one batch. Stamping every conversation with the same id
+    // lets the backfill scope itself to the newest run instead of the archive.
+    let import_batch = db::next_import_batch(&db)?;
+
     for file in files {
         let text = std::fs::read_to_string(&file)
             .map_err(|e| format!("read {}: {e}", file.display()))?;
         let conversations =
             parse_conversations(&text).map_err(|e| format!("parse {}: {e}", file.display()))?;
         for conversation in conversations {
-            import_one(&db, &conversation, &mut report)?;
+            import_one(&db, &conversation, import_batch, &mut report)?;
         }
     }
 
@@ -190,6 +194,7 @@ fn parse_conversations(text: &str) -> Result<Vec<RawConversation>, String> {
 fn import_one(
     db: &db::Db,
     conversation: &RawConversation,
+    import_batch: i64,
     report: &mut ImportReport,
 ) -> Result<(), String> {
     let Some(id) = conversation.uuid.clone().filter(|s| !s.is_empty()) else {
@@ -271,6 +276,7 @@ fn import_one(
         conversation.model.as_deref(),
         created,
         updated,
+        import_batch,
         &rows,
     )? {
         report.skipped += 1;
@@ -652,7 +658,7 @@ mod tests {
         .unwrap();
 
         let mut report = ImportReport::default();
-        import_one(&db, &conversation, &mut report).unwrap();
+        import_one(&db, &conversation, 1, &mut report).unwrap();
         assert_eq!(report.conversations, 1);
         assert_eq!(report.messages, 2);
 
@@ -681,7 +687,7 @@ mod tests {
 
         // Re-importing skips it entirely — no duplicate rows.
         let mut again = ImportReport::default();
-        import_one(&db, &conversation, &mut again).unwrap();
+        import_one(&db, &conversation, 1, &mut again).unwrap();
         assert_eq!(again.conversations, 0);
         assert_eq!(again.messages, 0);
         assert_eq!(again.skipped, 1);
@@ -726,10 +732,11 @@ mod tests {
         };
         let db = db::Db(std::sync::Mutex::new(db::open(&db_path).unwrap()));
 
+        let import_batch = db::next_import_batch(&db).unwrap();
         let before = counts(&db);
         let mut report = ImportReport::default();
         for conversation in &conversations {
-            import_one(&db, conversation, &mut report).unwrap();
+            import_one(&db, conversation, import_batch, &mut report).unwrap();
         }
         db::mark_imported_reflected(&db).unwrap();
         let after = counts(&db);
@@ -761,7 +768,7 @@ mod tests {
         // Re-importing is a no-op, not a clobber.
         let mut again = ImportReport::default();
         for conversation in &conversations {
-            import_one(&db, conversation, &mut again).unwrap();
+            import_one(&db, conversation, import_batch, &mut again).unwrap();
         }
         assert_eq!(again.conversations, 0);
         assert_eq!(again.messages, 0);

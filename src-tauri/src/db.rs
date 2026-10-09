@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   compaction_summary TEXT,
   last_reflected_index INTEGER,
   imported INTEGER NOT NULL DEFAULT 0,
+  import_batch INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -121,6 +122,11 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     // Older databases predate imported-conversation tracking.
     let _ = conn.execute(
         "ALTER TABLE conversations ADD COLUMN imported INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // Older databases predate import-batch scoping.
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN import_batch INTEGER NOT NULL DEFAULT 0",
         [],
     );
     // Older databases predate resumable consolidation.
@@ -778,6 +784,9 @@ pub fn conversations_pending_extraction(db: &Db, min_chars: i64) -> Result<Vec<S
         .prepare(
             "SELECT c.id FROM conversations c
              WHERE c.imported = 1
+               AND c.import_batch = (
+                   SELECT COALESCE(MAX(import_batch), 0) FROM conversations WHERE imported = 1
+               )
                AND COALESCE((SELECT MAX(m.\"index\") FROM messages m
                              WHERE m.conversation_id = c.id AND m.role != 'memory'), -1) >= 0
                AND (SELECT COALESCE(SUM(LENGTH(m.content)), 0) FROM messages m
@@ -900,6 +909,18 @@ pub struct ImportedMessage {
     pub created_at: i64,
 }
 
+/// The batch id to stamp on the conversations of the next import run. One import
+/// run = one batch, so the backfill can scope itself to the newest one.
+pub fn next_import_batch(db: &Db) -> Result<i64, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT COALESCE(MAX(import_batch), 0) + 1 FROM conversations",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Insert an imported conversation and all of its rows in a single transaction.
 ///
 /// The caller supplies the timestamps, so imported chats sort into the sidebar
@@ -913,8 +934,12 @@ pub struct ImportedMessage {
 /// half-written forever. It is also far faster than a statement per row, since
 /// each of those would otherwise be its own WAL commit.
 ///
+/// `import_batch` stamps the run that wrote the conversation, so the memory
+/// backfill can scope itself to the newest import.
+///
 /// Returns `false` when the conversation already exists, which makes re-importing
 /// a no-op rather than a clobber.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_imported_conversation(
     db: &Db,
     id: &str,
@@ -922,6 +947,7 @@ pub fn insert_imported_conversation(
     model: Option<&str>,
     created_at: i64,
     updated_at: i64,
+    import_batch: i64,
     messages: &[ImportedMessage],
 ) -> Result<bool, String> {
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -931,9 +957,9 @@ pub fn insert_imported_conversation(
         .execute(
             "INSERT OR IGNORE INTO conversations
                (id, title, model, system_prompt, compaction_summary, last_reflected_index,
-                imported, created_at, updated_at)
-             VALUES (?1, ?2, ?3, NULL, NULL, NULL, 1, ?4, ?5)",
-            params![id, title, model, created_at, updated_at],
+                imported, import_batch, created_at, updated_at)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL, 1, ?6, ?4, ?5)",
+            params![id, title, model, created_at, updated_at, import_batch],
         )
         .map_err(|e| e.to_string())?
         > 0;
@@ -1207,6 +1233,49 @@ mod tests {
 
         assert_eq!(discard_staged_extractions(&db).unwrap(), 1);
         assert!(list_extractions(&db).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The backfill is scoped to the newest import batch: importing a second
+    /// archive must not re-sweep the first one, even though its conversations
+    /// are still `imported = 1` with no extraction watermark.
+    #[test]
+    fn pending_extraction_is_scoped_to_the_newest_import_batch() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-batch-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Mutex::new(open(&p).unwrap()));
+        let now = now_ms();
+
+        let mk = |id: &str, batch: i64| {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations
+                   (id, title, imported, import_batch, created_at, updated_at)
+                 VALUES (?1, ?1, 1, ?2, ?3, ?3)",
+                params![id, batch, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at)
+                 VALUES (?1, ?2, 'user', 0, ?3, ?4)",
+                params![format!("{id}-m"), id, "x".repeat(3000), now],
+            )
+            .unwrap();
+        };
+
+        mk("older", 1);
+        mk("newest", 2);
+
+        // Both are pending by content, but only the newest batch is in scope.
+        assert_eq!(
+            conversations_pending_extraction(&db, 2000).unwrap(),
+            vec!["newest".to_string()]
+        );
+
+        // The next import run gets a fresh, higher batch id.
+        assert_eq!(next_import_batch(&db).unwrap(), 3);
 
         let _ = std::fs::remove_file(&p);
     }
