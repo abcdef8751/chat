@@ -696,6 +696,14 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
     Ok(total)
 }
 
+/// Rows sent per upsert request. The first full-history seed often marks
+/// thousands of rows dirty at once, and a single giant POST body makes the
+/// Supabase proxy abort with an HTTP 520 ("origin returned unknown error").
+/// We split each entity's dirty rows into bounded batches to stay under the
+/// request-size/time budget. Merge-duplicate upserts are idempotent, so a
+/// mid-batch failure just retries the whole set next tick.
+const UPSERT_BATCH_SIZE: usize = 400;
+
 async fn post_upsert(
     ctx: &SyncCtx<'_>,
     table: &str,
@@ -703,25 +711,33 @@ async fn post_upsert(
     rows: &[Value],
 ) -> Result<(), String> {
     let url = format!("{}/rest/v1/{}", ctx.base_url, table);
-    let resp = ctx
-        .client
-        .post(&url)
-        .header("apikey", ctx.anon)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .header("Prefer", "resolution=merge-duplicates")
-        .header(CONTENT_TYPE, "application/json")
-        .json(rows)
-        .send()
-        .await
-        .map_err(|e| format!("push {table}: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "push {table} failed (HTTP {}): {}",
-            status.as_u16(),
-            body.chars().take(300).collect::<String>()
-        ));
+    for chunk in rows.chunks(UPSERT_BATCH_SIZE) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let resp = ctx
+            .client
+            .post(&url)
+            .header("apikey", ctx.anon)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("Prefer", "resolution=merge-duplicates")
+            .header(CONTENT_TYPE, "application/json")
+            .json(chunk)
+            .send()
+            .await
+            .map_err(|e| format!("push {table}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "push {table} failed (HTTP {}): {}",
+                status.as_u16(),
+                body.chars().take(300).collect::<String>()
+            ));
+        }
+        // Give PostgREST a beat between batches — a fresh burst of large
+        // upserts can still trip the proxy even under the size limit.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     Ok(())
 }
