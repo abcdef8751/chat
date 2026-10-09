@@ -420,25 +420,23 @@ and the app is byte-identical to before. Never blocks the UI.
   before upload and decrypted on pull, so Supabase only ever holds ciphertext.
   Structural columns (`id`, `revision`, `conversation_id`, `created_at`,
   `deleted_at`, `path`) stay plaintext so LWW/tombstones/ordering still work.
-  The 256-bit data key is derived deterministically from the passphrase + a
-  stable per-account salt (the Supabase user id) via Argon2id
-  (`crypt::derive_key`/`account_salt`) and cached in the OS keychain
-  (`secrets::enc_key_*`, "remember on this device" so background auto-sync works
-  without re-typing). Deterministic derivation is what makes **multi-device** work
-  with no key transfer and no server state: the same passphrase on any device
-  yields the same key. `sync_set_encryption` verifies the passphrase against the
-  existing remote ciphertext before caching (wrong passphrase is rejected), marks
-  every row dirty so the plaintext mirror is re-uploaded as ciphertext;
-  `sync_remove_encryption` does the reverse. A device without the key that finds
-  an encrypted mirror is **locked**: `do_sync` probes the server
-  (`fetch_encrypted_sample`), refuses to push (so it can never overwrite
-  ciphertext with plaintext), and surfaces `SyncStatus.locked` so the UI asks for
-  the passphrase. **The local SQLite DB is deliberately NOT encrypted** — it lives
-  on the user's own machine (OS disk encryption covers idle-at-rest), and keeping
-  it plaintext avoids "forgot passphrase = locked out of everything". Key loss
-  only costs the cloud backup, never local data.
+  The 256-bit data key is a **random key generated on the device** and stored in
+  the OS keychain (`secrets::enc_key_*`), never in `config.json`. It can be shown
+  as a portable **recovery code** (`sync_recovery_code`, base64) and pasted on
+  another device (`sync_import_key`) to unlock the same mirror — so multi-device
+  works with no server state and no passphrase. `sync_set_encryption` generates
+  the key (if absent), and marks every row dirty so the plaintext mirror is
+  re-uploaded as ciphertext; `sync_remove_encryption` does the reverse. A device
+  without the key that finds an encrypted mirror is **locked**: `do_sync` probes
+  the server (`fetch_encrypted_sample`), refuses to push (so it can never
+  overwrite ciphertext with plaintext), and surfaces `SyncStatus.locked` so the
+  UI asks for the recovery code. **The local SQLite DB is deliberately NOT
+  encrypted** — it lives on the user's own machine (OS disk encryption covers
+  idle-at-rest), and keeping it plaintext avoids "lost key = locked out of
+  everything". Losing the key only costs the cloud backup, never local data.
 - **Commands:** `sync_sign_in`, `sync_sign_out`, `sync_status`, `sync_toggle`,
-  `sync_now`, `sync_set_encryption`, `sync_remove_encryption` (see `api.ts`).
+  `sync_now`, `sync_set_encryption`, `sync_remove_encryption`, `sync_import_key`,
+  `sync_recovery_code` (see `api.ts`).
   Background scheduler (60s tick) runs push+pull only
   when enabled + signed in; a `syncing` swap-guard prevents overlapping runs.
 - **Schema:** `supabase/schema.sql` (run in the Supabase SQL editor) creates

@@ -50,6 +50,8 @@ import {
   syncSignUp,
   syncSetEncryption,
   syncRemoveEncryption,
+  syncImportKey,
+  syncRecoveryCode,
   syncStatus,
   syncToggle,
   thinkingOptions,
@@ -599,9 +601,9 @@ export default function App() {
   // "signin" | "signup" — which mode the auth form is in; a confirmation notice.
   const [syncAuthMode, setSyncAuthMode] = createSignal<"signin" | "signup">("signin");
   const [syncNotice, setSyncNotice] = createSignal<string | null>(null);
-  // Client-side encryption passphrase entry (enable/disable).
-  const [syncPassphrase, setSyncPassphrase] = createSignal("");
-  const [syncPassphraseConfirm, setSyncPassphraseConfirm] = createSignal("");
+  // Client-side encryption: recovery-code entry (unlock) + revealed code.
+  const [syncRecoveryInput, setSyncRecoveryInput] = createSignal("");
+  const [syncRecoveryShown, setSyncRecoveryShown] = createSignal<string | null>(null);
   const [syncEncBusy, setSyncEncBusy] = createSignal(false);
 
   // Theme: dark by default, persisted across launches, toggled from the header.
@@ -982,22 +984,11 @@ export default function App() {
   }
 
   async function enableEncryption() {
-    const pass = syncPassphrase();
-    if (pass !== syncPassphraseConfirm()) {
-      setSyncError("Passphrases don't match.");
-      return;
-    }
-    if (!pass) {
-      setSyncError("Enter a passphrase.");
-      return;
-    }
     setSyncEncBusy(true);
     setSyncError(null);
     try {
-      const status = await syncSetEncryption(pass);
+      const status = await syncSetEncryption();
       setSyncStatusData(status);
-      setSyncPassphrase("");
-      setSyncPassphraseConfirm("");
       setSyncNotice("Encryption on — your data is now sent to Supabase as ciphertext.");
     } catch (e) {
       setSyncError(String(e));
@@ -1007,22 +998,30 @@ export default function App() {
   }
 
   async function unlockEncryption() {
-    const pass = syncPassphrase();
-    if (!pass) {
-      setSyncError("Enter your passphrase.");
+    const code = syncRecoveryInput().trim();
+    if (!code) {
+      setSyncError("Paste your recovery code.");
       return;
     }
     setSyncEncBusy(true);
     setSyncError(null);
     try {
-      const status = await syncSetEncryption(pass);
+      const status = await syncImportKey(code);
       setSyncStatusData(status);
-      setSyncPassphrase("");
+      setSyncRecoveryInput("");
       setSyncNotice("Unlocked — this device can now decrypt your backup.");
     } catch (e) {
       setSyncError(String(e));
     } finally {
       setSyncEncBusy(false);
+    }
+  }
+
+  async function showRecoveryCode() {
+    try {
+      setSyncRecoveryShown(await syncRecoveryCode());
+    } catch (e) {
+      setSyncError(String(e));
     }
   }
 
@@ -2399,7 +2398,7 @@ export default function App() {
                         {syncStatusData()?.encryption
                           ? "Data sent to Supabase is ciphertext — only this device can read it."
                           : syncStatusData()?.locked
-                            ? "This backup is encrypted. Enter your passphrase to unlock it on this device."
+                            ? "This backup is encrypted. Paste its recovery code to unlock it on this device."
                             : "Optional: encrypt the sync mirror so Supabase only ever sees ciphertext."}
                       </p>
                       <Show
@@ -2408,21 +2407,7 @@ export default function App() {
                           <Show
                             when={syncStatusData()?.locked}
                             fallback={
-                              <div class="mt-2 space-y-2">
-                                <input
-                                  type="password"
-                                  placeholder="Passphrase (min 6 chars)"
-                                  value={syncPassphrase()}
-                                  onInput={(e) => setSyncPassphrase(e.currentTarget.value)}
-                                  class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                                />
-                                <input
-                                  type="password"
-                                  placeholder="Confirm passphrase"
-                                  value={syncPassphraseConfirm()}
-                                  onInput={(e) => setSyncPassphraseConfirm(e.currentTarget.value)}
-                                  class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                                />
+                              <div class="mt-2">
                                 <button
                                   onClick={() => void enableEncryption()}
                                   disabled={syncEncBusy()}
@@ -2430,19 +2415,23 @@ export default function App() {
                                 >
                                   {syncEncBusy() ? "Encrypting…" : "Enable encryption"}
                                 </button>
-                                <p class="text-[10px] leading-snug text-neutral-400 dark:text-neutral-500">
-                                  Remember this passphrase — it's the only way to read the
-                                  backup on another device. Local data is unaffected if lost.
+                                <p class="mt-1 text-[10px] leading-snug text-neutral-400 dark:text-neutral-500">
+                                  A key is generated and kept in your OS keychain. You'll get a
+                                  recovery code to use on other devices.
                                 </p>
                               </div>
                             }
                           >
                             <div class="mt-2 space-y-2">
+                              <p class="text-[10px] leading-snug text-neutral-400 dark:text-neutral-500">
+                                This backup is encrypted by another device. Paste its recovery
+                                code to read it here.
+                              </p>
                               <input
                                 type="password"
-                                placeholder="Passphrase"
-                                value={syncPassphrase()}
-                                onInput={(e) => setSyncPassphrase(e.currentTarget.value)}
+                                placeholder="Recovery code"
+                                value={syncRecoveryInput()}
+                                onInput={(e) => setSyncRecoveryInput(e.currentTarget.value)}
                                 class="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
                               />
                               <button
@@ -2456,13 +2445,33 @@ export default function App() {
                           </Show>
                         }
                       >
-                        <button
-                          onClick={() => void disableEncryption()}
-                          disabled={syncEncBusy()}
-                          class="mt-2 text-[11px] font-normal text-neutral-500 underline-offset-2 transition hover:text-red-600 disabled:opacity-50 dark:text-neutral-400 dark:hover:text-red-400"
-                        >
-                          Disable
-                        </button>
+                        <div class="mt-2 space-y-2">
+                          <Show
+                            when={syncRecoveryShown()}
+                            fallback={
+                              <button
+                                onClick={() => void showRecoveryCode()}
+                                class="text-[11px] font-normal text-neutral-500 underline-offset-2 transition hover:text-neutral-800 disabled:opacity-50 dark:text-neutral-400 dark:hover:text-neutral-200"
+                              >
+                                Show recovery code
+                              </button>
+                            }
+                          >
+                            <p class="text-[10px] leading-snug text-neutral-400 dark:text-neutral-500">
+                              Save this to unlock the backup on another device:
+                            </p>
+                            <code class="block select-all break-all rounded-lg bg-neutral-100 px-2 py-1.5 font-mono text-[10px] text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300">
+                              {syncRecoveryShown()}
+                            </code>
+                          </Show>
+                          <button
+                            onClick={() => void disableEncryption()}
+                            disabled={syncEncBusy()}
+                            class="block text-[11px] font-normal text-neutral-500 underline-offset-2 transition hover:text-red-600 disabled:opacity-50 dark:text-neutral-400 dark:hover:text-red-400"
+                          >
+                            Disable
+                          </button>
+                        </div>
                       </Show>
                     </div>
                   </Show>

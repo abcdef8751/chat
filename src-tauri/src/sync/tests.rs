@@ -629,7 +629,7 @@ async fn encryption_roundtrips_through_push_and_pull() {
     .unwrap();
     memstate.append("secret memory", "profile.md").unwrap();
 
-    let key = crypt::derive_key("test passphrase", &crypt::account_salt("user-42"));
+    let key = crypt::new_key();
     let client = reqwest::Client::new();
     let base = srv.addr.clone();
     let ctx = SyncCtx {
@@ -703,7 +703,7 @@ async fn probe_detects_encrypted_remote() {
     let mem = temp_memory("probe", &db);
     let client = reqwest::Client::new();
     let base = srv.addr.clone();
-    let key = crypt::derive_key("pw", &crypt::account_salt("u"));
+    let key = crypt::new_key();
     let ctx = SyncCtx {
         client: &client,
         base_url: &base,

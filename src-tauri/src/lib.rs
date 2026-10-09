@@ -113,6 +113,8 @@ pub fn run() {
             sync::sync_now,
             sync::sync_set_encryption,
             sync::sync_remove_encryption,
+            sync::sync_import_key,
+            sync::sync_recovery_code,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

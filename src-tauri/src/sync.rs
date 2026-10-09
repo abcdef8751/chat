@@ -242,25 +242,37 @@ fn status(app: &AppHandle) -> SyncStatus {
     }
 }
 
-/// Enable/unlock client-side encryption with a passphrase. The data key is
-/// derived deterministically from the passphrase + the account's stable salt,
-/// so the same passphrase on any device yields the same key — no key transfer.
-/// If the remote backup is already encrypted, the passphrase is verified
-/// against it first (wrong passphrase is rejected, never overwriting data).
-/// Every row is marked dirty so the mirror is (re-)uploaded encrypted.
+/// Enable client-side encryption: generate a random 256-bit key, store it in the
+/// OS keychain, and mark every row dirty so the mirror is (re-)uploaded as
+/// ciphertext. No passphrase. The key can be shown as a recovery code and pasted
+/// on another device (`sync_import_key`).
 #[tauri::command]
-pub async fn sync_set_encryption(app: AppHandle, passphrase: String) -> Result<SyncStatus, String> {
-    let pass = passphrase.trim();
-    if pass.len() < 6 {
-        return Err("Passphrase too short — use at least 6 characters.".into());
+pub async fn sync_set_encryption(app: AppHandle) -> Result<SyncStatus, String> {
+    // Reuse an existing key if present; only generate when there isn't one.
+    if secrets::enc_key_get()?.and_then(|k| crypt::decode_key(&k)).is_none() {
+        let k = crypt::new_key();
+        secrets::enc_key_set(&crypt::encode_key(&k))?;
     }
-    let Some(session) = load_session()? else {
-        return Err("Sign in before setting up encryption.".into());
-    };
-    let key = crypt::derive_key(pass, &crypt::account_salt(&session.user_id));
+    db::mark_all_dirty_for_resync(dbref(&app))?;
+    app.state::<SyncState>().set_locked(false);
+    // Kick off a re-upload (now encrypted) shortly after.
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = do_sync(&app2).await;
+    });
+    Ok(status(&app))
+}
 
-    // If the server already holds ciphertext, this is an unlock (e.g. a second
-    // device): verify the passphrase can decrypt it before we cache anything.
+/// Import a recovery code (the base64 key from another device) to unlock this
+/// device. Verifies it against the existing remote ciphertext before caching, so
+/// a wrong code is rejected rather than corrupting the mirror.
+#[tauri::command]
+pub async fn sync_import_key(app: AppHandle, code: String) -> Result<SyncStatus, String> {
+    let key = crypt::decode_key(&code)
+        .ok_or("That doesn't look like a valid recovery code.")?;
+    let Some(session) = load_session()? else {
+        return Err("Sign in before unlocking.".into());
+    };
     let sync = app.state::<SyncState>();
     let token = valid_access_token(&sync, &session).await?;
     let ctx = SyncCtx {
@@ -273,19 +285,26 @@ pub async fn sync_set_encryption(app: AppHandle, passphrase: String) -> Result<S
     };
     if let Some(sample) = fetch_encrypted_sample(&ctx, &token).await? {
         if crypt::decrypt(&key, &sample).is_none() {
-            return Err("Wrong passphrase — it doesn't decrypt the existing backup.".into());
+            return Err("Wrong recovery code — it doesn't decrypt this backup.".into());
         }
     }
-
     secrets::enc_key_set(&crypt::encode_key(&key))?;
     db::mark_all_dirty_for_resync(dbref(&app))?;
     sync.set_locked(false);
-    // Kick off a re-upload (now encrypted) shortly after.
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let _ = do_sync(&app2).await;
     });
     Ok(status(&app))
+}
+
+/// Return the current key as a portable recovery code (base64). Intended for the
+/// user to record it and use on another device. Empty string when encryption is
+/// off.
+#[tauri::command]
+pub fn sync_recovery_code(app: AppHandle) -> Result<String, String> {
+    let _ = app;
+    Ok(secrets::enc_key_get()?.unwrap_or_default())
 }
 
 /// Disable client-side encryption: forgets the data key and re-marks every row

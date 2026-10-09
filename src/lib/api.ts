@@ -355,12 +355,22 @@ export function syncNow(): Promise<SyncStatus> {
 }
 
 /**
- * Set the client-side-encryption passphrase. Generates/recovers the data key,
- * caches it in the OS keychain, and re-uploads all rows encrypted.
- * The data sent to Supabase is ciphertext from then on.
+ * Enable client-side encryption: generates a random key in the OS keychain and
+ * re-uploads all rows encrypted. No passphrase. The data sent to Supabase is
+ * ciphertext from then on.
  */
-export function syncSetEncryption(passphrase: string): Promise<SyncStatus> {
-  return invoke<SyncStatus>("sync_set_encryption", { passphrase });
+export function syncSetEncryption(): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_set_encryption");
+}
+
+/** Import a recovery code (base64 key) to unlock this device. */
+export function syncImportKey(code: string): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_import_key", { code });
+}
+
+/** The current key as a portable recovery code ("" when encryption is off). */
+export function syncRecoveryCode(): Promise<string> {
+  return invoke<string>("sync_recovery_code");
 }
 
 /** Disable client-side encryption and re-upload rows as plaintext. */
