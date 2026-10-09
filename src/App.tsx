@@ -1008,6 +1008,34 @@ export default function App() {
     return new Date(ms).toLocaleString();
   }
 
+  function syncLabel(d: SyncStatus | null): string {
+    if (d?.phase === "pull") return "Pulling changes…";
+    if (d?.phase === "push") return "Pushing changes…";
+    return "Syncing…";
+  }
+
+  // During the push phase we know how much is left, so the bar is real progress
+  // (pushed / pushed+pending). Pull has no total, so it stays full + pulsing.
+  function syncBarWidth(d: SyncStatus | null): number {
+    if (!d || d.phase !== "push" || d.pushed + d.pending === 0) return 100;
+    return Math.max(6, Math.min(100, Math.round((d.pushed / (d.pushed + d.pending)) * 100)));
+  }
+
+  // Keep the Cloud sync + memory backfill panels live while Settings is open,
+  // instead of a one-shot snapshot that only refreshes on open/action.
+  createEffect(() => {
+    if (!settingsOpen()) return;
+    const tick = () => {
+      syncStatus().then(setSyncStatusData).catch(() => {});
+      if (backfill()?.running) {
+        backfillStatus().then(setBackfill).catch(() => {});
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 1000);
+    onCleanup(() => window.clearInterval(id));
+  });
+
   // Pull the model catalog (models.dev when the endpoint matches, else the
   // endpoint's own `/models`). Prices ride along in the same cache. Cached
   // values render first; a forced refresh replaces them once it resolves.
@@ -2279,10 +2307,24 @@ export default function App() {
                     </button>
                   </Show>
 
-                  <Show when={syncStatusData()?.syncing}>
-                    <p class="mt-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
-                      Syncing…
-                    </p>
+                  <Show when={syncStatusData()?.syncing || syncStatusData()?.phase}>
+                    <div class="mt-2">
+                      <div class="flex items-baseline justify-between gap-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                        <span>{syncLabel(syncStatusData())}</span>
+                        <span class="tabular-nums">
+                          ↑{syncStatusData()?.pushed ?? 0} · ↓{syncStatusData()?.pulled ?? 0}{" "}
+                          · {syncStatusData()?.pending ?? 0} pending
+                        </span>
+                      </div>
+                      <div class="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+                        <div
+                          class={`h-full rounded-full bg-neutral-500 transition-all duration-500 dark:bg-neutral-400 ${
+                            syncStatusData()?.phase === "pull" ? "animate-pulse" : ""
+                          }`}
+                          style={{ width: `${syncBarWidth(syncStatusData())}%` }}
+                        />
+                      </div>
+                    </div>
                   </Show>
 
                   <p class="mt-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">

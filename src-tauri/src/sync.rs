@@ -61,12 +61,19 @@ pub struct SyncStatus {
     pub pending: u64,
     pub last_sync_at: Option<i64>,
     pub last_error: Option<String>,
+    // Live per-run progress ("push" | "pull" | "" when idle).
+    pub phase: String,
+    pub pushed: u64,
+    pub pulled: u64,
 }
 
 #[derive(Default)]
 struct SyncStats {
     last_sync_at: Option<i64>,
     last_error: Option<String>,
+    phase: String,
+    pushed: u64,
+    pulled: u64,
 }
 
 /// Shared sync state installed into Tauri: HTTP client, endpoints, and the
@@ -110,6 +117,7 @@ impl SyncState {
     fn set_error(&self, err: String) {
         if let Ok(mut s) = self.stats.lock() {
             s.last_error = Some(err);
+            s.phase = String::new();
         }
     }
 
@@ -117,16 +125,50 @@ impl SyncState {
         if let Ok(mut s) = self.stats.lock() {
             s.last_sync_at = Some(at);
             s.last_error = None;
+            s.phase = String::new();
         }
     }
 
-    fn snapshot(&self) -> (bool, Option<i64>, Option<String>) {
+    /// Reset the live counters for a fresh run. Phase starts at "push".
+    fn begin_run(&self) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.phase = "push".into();
+            s.pushed = 0;
+            s.pulled = 0;
+        }
+    }
+
+    fn set_phase(&self, phase: &str) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.phase = phase.into();
+        }
+    }
+
+    fn add_pushed(&self, n: u64) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.pushed += n;
+        }
+    }
+
+    fn add_pulled(&self, n: u64) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.pulled += n;
+        }
+    }
+
+    fn snapshot(&self) -> (bool, Option<i64>, Option<String>, String, u64, u64) {
         let syncing = self.syncing.load(Ordering::SeqCst);
-        let (last_sync_at, last_error) = match self.stats.lock() {
-            Ok(s) => (s.last_sync_at, s.last_error.clone()),
-            Err(_) => (None, None),
-        };
-        (syncing, last_sync_at, last_error)
+        match self.stats.lock() {
+            Ok(s) => (
+                syncing,
+                s.last_sync_at,
+                s.last_error.clone(),
+                s.phase.clone(),
+                s.pushed,
+                s.pulled,
+            ),
+            Err(_) => (syncing, None, None, String::new(), 0, 0),
+        }
     }
 }
 
@@ -165,7 +207,7 @@ fn status(app: &AppHandle) -> SyncStatus {
     let cfg = app.state::<ConfigState>().get();
     let session = load_session().ok().flatten();
     let sync = app.state::<SyncState>();
-    let (syncing, last_sync_at, last_error) = sync.snapshot();
+    let (syncing, last_sync_at, last_error, phase, pushed, pulled) = sync.snapshot();
     let pending = db::pending_rows(app.state::<Db>().inner()).unwrap_or(0);
     SyncStatus {
         enabled: cfg.sync_enabled,
@@ -175,6 +217,9 @@ fn status(app: &AppHandle) -> SyncStatus {
         pending,
         last_sync_at,
         last_error,
+        phase,
+        pushed,
+        pulled,
     }
 }
 
@@ -448,13 +493,21 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     // account's first run).
     let mem_names = ctx.memory.file_names();
     db::seed_initial_sync(ctx.db, &session.user_id, &mem_names)?;
-    if let Err(e) = push(&ctx, &token).await {
-        sync.set_error(e.clone());
-        return Err(e);
+    sync.begin_run();
+    match push(&ctx, &token).await {
+        Ok(n) => sync.add_pushed(n),
+        Err(e) => {
+            sync.set_error(e.clone());
+            return Err(e);
+        }
     }
-    if let Err(e) = pull(&ctx, &session.user_id, &token).await {
-        sync.set_error(e.clone());
-        return Err(e);
+    sync.set_phase("pull");
+    match pull(&ctx, &session.user_id, &token).await {
+        Ok(n) => sync.add_pulled(n),
+        Err(e) => {
+            sync.set_error(e.clone());
+            return Err(e);
+        }
     }
     sync.set_success(now_ms());
     Ok(())
@@ -793,8 +846,9 @@ struct RemoteMemory {
     deleted_at: Option<i64>,
 }
 
-/// Pull rows newer than the per-entity high-water mark and apply them.
-async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<(), String> {
+/// Pull rows newer than the per-entity high-water mark and apply them. Returns
+/// the number of rows fetched (so callers can surface live progress).
+async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<u64, String> {
     let last_conv = last_seen(ctx.db, "conversations");
     let convs = get_table(ctx, "conversations", me, token, last_conv).await?;
     apply_conversations(ctx.db, &convs).await?;
@@ -807,7 +861,7 @@ async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<(), String> {
     let mems = get_table(ctx, "memory_files", me, token, last_mem).await?;
     apply_memory(ctx.db, ctx.memory, &mems)?;
 
-    Ok(())
+    Ok((convs.len() + msgs.len() + mems.len()) as u64)
 }
 
 fn last_seen(db: &Db, entity: &str) -> i64 {

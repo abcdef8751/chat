@@ -141,6 +141,9 @@ export interface SyncStatus {
   pending: number;
   lastSyncAt: number | null; // ms epoch or null
   lastError: string | null;
+  phase: string; // "push" | "pull" | "" when idle
+  pushed: number;
+  pulled: number;
 }
 
 export type StreamEvent =
