@@ -376,9 +376,10 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         memory: app.state::<MemoryState>().inner(),
     };
     // First sync: mark all pre-existing rows + memory files dirty so the initial
-    // push backs up full history (a guarded no-op after the first run).
+    // push backs up full history. Scoped per account (a guarded no-op after each
+    // account's first run).
     let mem_names = ctx.memory.file_names();
-    db::seed_initial_sync(ctx.db, &mem_names)?;
+    db::seed_initial_sync(ctx.db, &session.user_id, &mem_names)?;
     if let Err(e) = push(&ctx, &token).await {
         sync.set_error(e.clone());
         return Err(e);

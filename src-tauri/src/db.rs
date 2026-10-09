@@ -668,17 +668,19 @@ pub fn mark_memory_dirty(conn: &Connection, path: &str) -> Result<(), String> {
 /// 0 / dirty 0) would never be pushed and enabling sync on an existing user
 /// would back up nothing.
 ///
-/// Guarded by a sentinel row in `sync_state` (entity `\0seeded`), so it runs once
-/// and re-enabling sync never re-marks everything dirty. `memory_files` is the
-/// list of on-disk memory file names (the caller collects them from `MemoryState`
-/// so this module stays free of a dependency on `memory`).
-pub fn seed_initial_sync(db: &Db, memory_files: &[String]) -> Result<(), String> {
+/// Guarded by a sentinel row in `sync_state`, scoped **per account** by
+/// `user_id` (entity `\0seeded:<user_id>`), so it runs once per Supabase user
+/// and re-enabling sync — or signing into a *different* account — never skips a
+/// needed full backup. `memory_files` is the list of on-disk memory file names
+/// (the caller collects them from `MemoryState` so this module stays free of a
+/// dependency on `memory`).
+pub fn seed_initial_sync(db: &Db, user_id: &str, memory_files: &[String]) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    const SEEDED: &str = "\u{0}seeded";
+    let seeded_entity = format!("\u{0}seeded:{}", user_id);
     let already: Option<i64> = conn
         .query_row(
             "SELECT last_seen_revision FROM sync_state WHERE entity = ?1",
-            [SEEDED],
+            [&seeded_entity],
             |r| r.get(0),
         )
         .optional()
@@ -698,7 +700,7 @@ pub fn seed_initial_sync(db: &Db, memory_files: &[String]) -> Result<(), String>
     conn.execute(
         "INSERT INTO sync_state(entity, last_seen_revision) VALUES (?1, 1)
          ON CONFLICT(entity) DO NOTHING",
-        [SEEDED],
+        [&seeded_entity],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

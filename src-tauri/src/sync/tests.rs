@@ -659,7 +659,7 @@ fn seed_initial_sync_marks_full_history_dirty_once() {
         )
         .unwrap();
     }
-    db::seed_initial_sync(&db, &["profile.md".to_string()]).unwrap();
+    db::seed_initial_sync(&db, "user-a", &["profile.md".to_string()]).unwrap();
     assert_eq!(
         dirty_of(&db, &format!("SELECT dirty FROM conversations WHERE id = '{cid}'")),
         1
@@ -669,14 +669,15 @@ fn seed_initial_sync_marks_full_history_dirty_once() {
         1
     );
 
-    // Idempotent: after clearing everything, a second seed must be a no-op.
+    // Idempotent: after clearing everything, a second seed for the SAME account
+    // must be a no-op.
     {
         let conn = db.0.lock().unwrap();
         conn.execute("UPDATE conversations SET dirty = 0", []).unwrap();
         conn.execute("UPDATE messages SET dirty = 0", []).unwrap();
         conn.execute("UPDATE memory_sync SET dirty = 0", []).unwrap();
     }
-    db::seed_initial_sync(&db, &["profile.md".to_string()]).unwrap();
+    db::seed_initial_sync(&db, "user-a", &["profile.md".to_string()]).unwrap();
     assert_eq!(
         dirty_of(&db, &format!("SELECT dirty FROM conversations WHERE id = '{cid}'")),
         0
@@ -684,6 +685,13 @@ fn seed_initial_sync_marks_full_history_dirty_once() {
     assert_eq!(
         dirty_of(&db, "SELECT dirty FROM memory_sync WHERE path = 'profile.md'"),
         0
+    );
+
+    // A DIFFERENT account has its own sentinel, so it gets a fresh full seed.
+    db::seed_initial_sync(&db, "user-b", &["profile.md".to_string()]).unwrap();
+    assert_eq!(
+        dirty_of(&db, &format!("SELECT dirty FROM conversations WHERE id = '{cid}'")),
+        1
     );
 }
 

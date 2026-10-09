@@ -411,7 +411,8 @@ and the app is byte-identical to before. Never blocks the UI.
   hard-delete), and re-orders a conversation's local `index` by `(created_at,
   id)` for consistent cross-device ordering. The reflection watermark
   (`last_reflected_index`) rides on the conversation row and is preserved across
-  re-index. The first sync (guarded by a sentinel) seeds all pre-existing rows +
+  re-index. The first sync per account (guarded by a per-`user_id` sentinel)
+  seeds all pre-existing rows +
   memory files dirty so enabling backs up full history once.
 - **Memory files** sync whole-file (identity by path), tracking metadata in the
   `memory_sync` table; a failed apply is left dirty and retried.
