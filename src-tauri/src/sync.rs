@@ -673,8 +673,11 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
                 "created_at": last_local_at, "updated_at": now_ms(),
             })
         } else {
+            // Tombstone: the remote `content` column is NOT NULL, so send an empty
+            // placeholder rather than null. Consumers delete on `deleted_at` alone
+            // (`apply_memory` never reads a tombstone's content), so "" is safe.
             json!({
-                "path": path, "content": Value::Null, "revision": revision,
+                "path": path, "content": "", "revision": revision,
                 "deleted_at": now_ms(), "created_at": last_local_at, "updated_at": now_ms(),
             })
         };
