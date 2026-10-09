@@ -46,7 +46,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **103 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **127 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, `npm run build`, and `npm run e2e` are clean.
 
@@ -58,7 +58,7 @@ check, the real-export import, and the real models.dev catalog parse). Clippy,
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline                                 |
 | Tools             | ✅    | `bash` (one-shot shell), `read_file`/`write_file` (gated), native Brave search tools (ungated)          |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
-| Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files |
+| Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
 | Context + price   | ◑     | Context counter + frozen per-turn cost done; **near-limit banner + compaction (M7) remain**                |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
 
@@ -414,8 +414,25 @@ and the app is byte-identical to before. Never blocks the UI.
   memory files dirty so enabling backs up full history once.
 - **Memory files** sync whole-file (identity by path), tracking metadata in the
   `memory_sync` table; a failed apply is left dirty and retried.
+- **Client-side encryption** (`crypt.rs`, opt-in): content fields (conversation
+  title/system_prompt/summary, message content/thinking/usage/attachments, memory
+  content) are encrypted with AES-256-GCM (`enc:v1:<base64 nonce||ct||tag>`)
+  before upload and decrypted on pull, so Supabase only ever holds ciphertext.
+  Structural columns (`id`, `revision`, `conversation_id`, `created_at`,
+  `deleted_at`, `path`) stay plaintext so LWW/tombstones/ordering still work.
+  The random 256-bit data key is cached in the OS keychain
+  (`secrets::enc_key_*`, "remember on this device" so background auto-sync works
+  without re-typing) and wrapped with an Argon2id-derived key from the user's
+  passphrase (`secrets::enc_wrap_*`) for verification/recovery. Enabling
+  encryption (`sync_set_encryption`) marks every row dirty so the existing
+  plaintext mirror is re-uploaded as ciphertext; `sync_remove_encryption` does
+  the reverse. **The local SQLite DB is deliberately NOT encrypted** — it lives
+  on the user's own machine (OS disk encryption covers idle-at-rest), and keeping
+  it plaintext avoids "forgot passphrase = locked out of everything". Key loss
+  only costs the cloud backup, never local data.
 - **Commands:** `sync_sign_in`, `sync_sign_out`, `sync_status`, `sync_toggle`,
-  `sync_now` (see `api.ts`). Background scheduler (60s tick) runs push+pull only
+  `sync_now`, `sync_set_encryption`, `sync_remove_encryption` (see `api.ts`).
+  Background scheduler (60s tick) runs push+pull only
   when enabled + signed in; a `syncing` swap-guard prevents overlapping runs.
 - **Schema:** `supabase/schema.sql` (run in the Supabase SQL editor) creates
   `conversations`, `messages`, `memory_files` with revision/deleted_at, enables
@@ -464,6 +481,7 @@ and the app is byte-identical to before. Never blocks the UI.
       ├─ db.rs         # Db state, schema/migration, conversation/message commands + helpers
       ├─ config.rs     # AppConfig, config.json persistence, legacy key migration
       ├─ secrets.rs    # OS-keychain API key storage (keyring crate) + has/set_api_key
+      ├─ crypt.rs      # client-side AES-256-GCM + Argon2id key wrapping (cloud sync)
       ├─ models.rs     # list_models (models.dev catalog, /models fallback), chat filter, per-baseUrl cache
       ├─ tools.rs      # tool specs, host executor, approval registry, native BraveSearch
       ├─ shell.rs      # one-shot host shell executor (fresh `bash -c` per call);
