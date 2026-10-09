@@ -58,6 +58,7 @@ check, the real-export import, and the real models.dev catalog parse). Clippy,
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline                                 |
 | Tools             | ✅    | `bash` (one-shot shell), `read_file`/`write_file` (gated), native Brave search tools (ungated)          |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
+| Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files |
 | Context + price   | ◑     | Context counter + frozen per-turn cost done; **near-limit banner + compaction (M7) remain**                |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
 
@@ -389,6 +390,38 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
 
 ---
 
+## Cloud sync (Supabase)
+
+Opt-in, local-first mirror, off by default. **SQLite stays the source of truth**;
+with no network, sync enabled ≠ logged in, or the toggle off, the module is idle
+and the app is byte-identical to before. Never blocks the UI.
+
+- **Auth:** email + password against GoTrue (`/auth/v1/token?grant_type=password`)
+  with the publishable (anon) key; the "Confirm email" flag is ON, so
+  `email_not_confirmed` is surfaced as a friendly "check your inbox" error. The
+  session (access/refresh token + user id + email) is stored in the OS keychain
+  under a separate `sync_session` account and never crosses IPC. The service-role
+  key is never compiled in — `build.rs` embeds only `SUPABASE_URL` +
+  `SUPABASE_PUBLISHABLE_KEY` from `.env` (gitignored). RLS (`auth.uid() =
+  user_id`) is the authorization boundary.
+- **Sync engine** (`sync.rs`): push upserts `dirty` rows to PostgREST
+  (`Prefer: resolution=merge-duplicates`, scoped clear by `(id, revision)` so a
+  row written mid-flight isn't dropped); pull fetches `revision > last_seen` and
+  applies with last-writer-wins by revision, tombstones (`deleted_at` → local
+  hard-delete), and re-orders a conversation's local `index` by `(created_at,
+  id)` for consistent cross-device ordering. The reflection watermark
+  (`last_reflected_index`) rides on the conversation row and is preserved across
+  re-index. The first sync (guarded by a sentinel) seeds all pre-existing rows +
+  memory files dirty so enabling backs up full history once.
+- **Memory files** sync whole-file (identity by path), tracking metadata in the
+  `memory_sync` table; a failed apply is left dirty and retried.
+- **Commands:** `sync_sign_in`, `sync_sign_out`, `sync_status`, `sync_toggle`,
+  `sync_now` (see `api.ts`). Background scheduler (60s tick) runs push+pull only
+  when enabled + signed in; a `syncing` swap-guard prevents overlapping runs.
+- **Schema:** `supabase/schema.sql` (run in the Supabase SQL editor) creates
+  `conversations`, `messages`, `memory_files` with revision/deleted_at, enables
+  RLS, and stores the client revision via a trigger.
+
 ## File layout
 
 ```
@@ -428,6 +461,9 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
       ├─ memory.rs     # Plain-Markdown memory: core files, listing, save/read/write, migration
       ├─ import.rs     # Anthropic-export importer (timestamp-preserving, backfill-only)
       ├─ reflection.rs # Idle memory-consolidation scheduler + per-conversation pass
+      ├─ sync.rs       # Supabase sync engine + auth commands + 60s scheduler
+      └─ sync/
+         └─ tests.rs   # sync tests (revision, LWW, tombstones, re-index, mock PostgREST)
       ├─ attachments.rs # read paths -> Attachment (image data URL / text / metadata)
       ├─ pricing.rs    # pricing + models.dev metadata cache; overrides -> cache -> bundled
       ├─ chat.rs       # stream_chat/stop_chat, raw SSE, run_tool_loop, StreamRegistry, StreamEvent
