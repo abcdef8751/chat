@@ -40,7 +40,7 @@ pub fn run() {
             app.manage(config);
             app.manage(chat::StreamRegistry::default());
             app.manage(models::ModelCache::default());
-            app.manage(tools::McpClient::new());
+            app.manage(tools::BraveSearch::default());
             app.manage(tools::ApprovalRegistry::default());
             // One-shot host shell; on Android it carries the app handle to reach
             // the Termux bridge (see shell.rs / android.rs).
@@ -74,6 +74,8 @@ pub fn run() {
             config::set_config,
             secrets::has_api_key,
             secrets::set_api_key,
+            secrets::has_brave_key_cmd,
+            secrets::set_brave_key,
             models::list_models,
             chat::stream_chat,
             chat::stop_chat,

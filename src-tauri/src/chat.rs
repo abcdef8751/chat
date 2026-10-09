@@ -767,18 +767,12 @@ pub(crate) struct ToolLoopResult {
 /// tools run with per-call approval (gating is handled by the caller).
 async fn dispatch_tool(
     call: &ToolCall,
-    mcp: &tools::McpClient,
+    brave: &tools::BraveSearch,
     shell: &ShellExecutor,
     memory: &crate::memory::MemoryState,
 ) -> ToolOutput {
-    if call.name == "web_search" {
-        let query = call
-            .arguments
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let count = call.arguments.get("count").and_then(Value::as_u64);
-        mcp.web_search(query, count).await
+    if call.name.starts_with("brave_") {
+        brave.call_tool(&call.name, &call.arguments).await
     } else if matches!(
         call.name.as_str(),
         "save_memory" | "read_memory" | "write_memory"
@@ -815,7 +809,7 @@ pub(crate) enum ToolMode {
 pub(crate) async fn run_tool_loop(
     cfg: &AppConfig,
     api_key: &str,
-    mcp: &tools::McpClient,
+    brave: &tools::BraveSearch,
     shell: &ShellExecutor,
     memory: &crate::memory::MemoryState,
     approvals: &tools::ApprovalRegistry,
@@ -999,7 +993,7 @@ pub(crate) async fn run_tool_loop(
                         }
                     }
                     if approved {
-                        dispatch_tool(call, mcp, shell, memory).await
+                        dispatch_tool(call, brave, shell, memory).await
                     } else {
                         ToolOutput {
                             content: "The user denied this tool call.".into(),
@@ -1076,7 +1070,7 @@ pub(crate) async fn run_chat_turn(
     db: &db::Db,
     cfg: &AppConfig,
     api_key: &str,
-    mcp: &tools::McpClient,
+    brave: &tools::BraveSearch,
     shell: &ShellExecutor,
     memory: &crate::memory::MemoryState,
     approvals: &tools::ApprovalRegistry,
@@ -1118,12 +1112,12 @@ pub(crate) async fn run_chat_turn(
         .unwrap_or_else(|| cfg.model.clone());
     let system_prompt = build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
     let messages = build_messages(&system_prompt, &history, &content, &attachments)?;
-    let tools_list = tools::tool_specs(tools::web_search_available());
+    let tools_list = tools::tool_specs(tools::brave_available());
 
     let mut result = run_tool_loop(
         cfg,
         api_key,
-        mcp,
+        brave,
         shell,
         memory,
         approvals,
@@ -1188,7 +1182,7 @@ pub async fn stream_chat(
 
     let db = app.state::<db::Db>();
     let approvals = app.state::<tools::ApprovalRegistry>();
-    let mcp = app.state::<tools::McpClient>();
+    let brave = app.state::<tools::BraveSearch>();
     let shell = app.state::<ShellExecutor>();
     let memory = app.state::<crate::memory::MemoryState>();
 
@@ -1201,7 +1195,7 @@ pub async fn stream_chat(
         &db,
         &config,
         &api_key,
-        &mcp,
+        &brave,
         &shell,
         &memory,
         &approvals,

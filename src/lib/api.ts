@@ -192,6 +192,16 @@ export function setApiKey(apiKey: string | null): Promise<void> {
   return invoke<void>("set_api_key", { apiKey: apiKey ?? null });
 }
 
+/** Whether a Brave Search API key is stored (enables the native web tools). */
+export function hasBraveKey(): Promise<boolean> {
+  return invoke<boolean>("has_brave_key");
+}
+
+/** Set (or clear, with null) the Brave Search API key in the OS keychain. */
+export function setBraveKey(braveKey: string | null): Promise<void> {
+  return invoke<void>("set_brave_key", { braveKey: braveKey ?? null });
+}
+
 export function listModels(refresh?: boolean): Promise<ModelInfo[]> {
   return invoke<ModelInfo[]>("list_models", { refresh: refresh ?? null });
 }

@@ -27,6 +27,7 @@ import {
   getConfig,
   getPricing,
   hasApiKey,
+  hasBraveKey,
   importConversations,
   listConversations,
   listMemoryFiles,
@@ -39,6 +40,7 @@ import {
   renameConversation,
   searchConversations,
   setApiKey,
+  setBraveKey,
   setConfig,
   stopChat,
   streamChat,
@@ -570,6 +572,8 @@ export default function App() {
   const [settingsError, setSettingsError] = createSignal<string | null>(null);
   const [keyDraft, setKeyDraft] = createSignal("");
   const [hasKey, setHasKey] = createSignal(false);
+  const [braveKeyDraft, setBraveKeyDraft] = createSignal("");
+  const [hasBraveKeySaved, setHasBraveKeySaved] = createSignal(false);
   const [reflectionEnabled, setReflectionEnabled] = createSignal(true);
   const [reflectionIdleMinutes, setReflectionIdleMinutes] = createSignal(30);
   const [shellWorkspaceDir, setShellWorkspaceDir] = createSignal("");
@@ -809,6 +813,8 @@ export default function App() {
     setModelOverrides(cfg.modelOverrides ?? {});
     setHasKey(await hasApiKey());
     setKeyDraft("");
+    setHasBraveKeySaved(await hasBraveKey());
+    setBraveKeyDraft("");
     setSettingsError(null);
     setSettingsOpen(true);
   }
@@ -837,6 +843,12 @@ export default function App() {
       await setApiKey(keyDraft().trim());
       setHasKey(true);
       setKeyDraft("");
+      keyChanged = true;
+    }
+    if (braveKeyDraft().trim()) {
+      await setBraveKey(braveKeyDraft().trim());
+      setHasBraveKeySaved(true);
+      setBraveKeyDraft("");
       keyChanged = true;
     }
     return endpointChanged || keyChanged;
@@ -1891,6 +1903,42 @@ export default function App() {
                         await setApiKey(null);
                         setHasKey(false);
                         setKeyDraft("");
+                      } catch (e) {
+                        setSettingsError(String(e));
+                      }
+                    }}
+                    class="mt-1 text-[11px] font-normal text-red-600 transition hover:underline dark:text-red-400"
+                  >
+                    Remove saved key
+                  </button>
+                </Show>
+              </label>
+
+              <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                Brave Search API key
+                <input
+                  type="password"
+                  class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                  placeholder={
+                    hasBraveKeySaved()
+                      ? "••••••  saved in keychain — type to replace"
+                      : "BSA… (optional — enables web search tools)"
+                  }
+                  value={braveKeyDraft()}
+                  onInput={(e) => setBraveKeyDraft(e.currentTarget.value)}
+                />
+                <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                  Enables Brave's native search tools (web / news / images / videos / local /
+                  summarizer) — handled directly, no external server, so it works on Android too.
+                  Stored in the OS keychain.
+                </span>
+                <Show when={hasBraveKeySaved()}>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await setBraveKey(null);
+                        setHasBraveKeySaved(false);
+                        setBraveKeyDraft("");
                       } catch (e) {
                         setSettingsError(String(e));
                       }

@@ -10,9 +10,16 @@ use keyring::Entry;
 const SERVICE: &str = "com.rp.chat";
 /// Keychain user/account name for the API key entry.
 const USER: &str = "api_key";
+/// Keychain account name for the Brave Search API key (separate from the LLM
+/// key so the two never collide).
+const BRAVE_USER: &str = "brave_key";
 
 fn entry() -> Result<Entry, String> {
     Entry::new(SERVICE, USER).map_err(|e| format!("open keychain entry: {e}"))
+}
+
+fn brave_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, BRAVE_USER).map_err(|e| format!("open keychain entry: {e}"))
 }
 
 /// Read the stored API key. `Ok(None)` when no key has been saved yet.
@@ -52,6 +59,57 @@ pub fn set_api_key(api_key: Option<String>) -> Result<(), String> {
     match api_key.as_deref() {
         Some(k) if !k.trim().is_empty() => set(k.trim()),
         _ => delete(),
+    }
+}
+
+fn brave_get() -> Result<Option<String>, String> {
+    match brave_entry()?.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keychain read: {e}")),
+    }
+}
+
+fn brave_set(key: &str) -> Result<(), String> {
+    brave_entry()?
+        .set_password(key)
+        .map_err(|e| format!("keychain write: {e}"))
+}
+
+fn brave_delete() -> Result<(), String> {
+    match brave_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete: {e}")),
+    }
+}
+
+/// Whether a Brave Search API key is stored. Used by `tools::brave_available`
+/// to decide whether the ungated Brave web tools are offered at all.
+pub fn has_brave_key() -> bool {
+    match brave_get() {
+        Ok(Some(k)) => !k.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether a Brave Search API key is stored (frontend status check).
+#[tauri::command]
+pub fn has_brave_key_cmd() -> bool {
+    has_brave_key()
+}
+
+/// The stored Brave key, for native Brave REST calls (`tools::BraveSearch`).
+pub fn get_brave_key() -> Result<Option<String>, String> {
+    brave_get()
+}
+
+/// Update the stored Brave key. `None`/empty removes it.
+#[tauri::command]
+pub fn set_brave_key(brave_key: Option<String>) -> Result<(), String> {
+    match brave_key.as_deref() {
+        Some(k) if !k.trim().is_empty() => brave_set(k.trim()),
+        _ => brave_delete(),
     }
 }
 

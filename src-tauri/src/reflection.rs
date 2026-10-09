@@ -87,7 +87,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
 
     let db = app.state::<db::Db>();
     let memory = app.state::<MemoryState>();
-    let mcp = app.state::<tools::McpClient>();
+    let brave = app.state::<tools::BraveSearch>();
     let shell = app.state::<crate::shell::ShellExecutor>();
     let approvals = app.state::<tools::ApprovalRegistry>();
 
@@ -137,7 +137,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
             .into(),
     );
 
-    let tools_list = tools::tool_specs(tools::web_search_available());
+    let tools_list = tools::tool_specs(tools::brave_available());
     let flag = Arc::new(AtomicBool::new(false));
 
     // Abort the pass if a real chat turn starts on this conversation.
@@ -166,7 +166,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     let result = chat::run_tool_loop(
         &cfg,
         &api_key,
-        &mcp,
+        &brave,
         &shell,
         &memory,
         &approvals,
@@ -786,7 +786,7 @@ async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<
 
     let db = app.state::<db::Db>();
     let memory = app.state::<MemoryState>();
-    let mcp = app.state::<tools::McpClient>();
+    let brave = app.state::<tools::BraveSearch>();
     let shell = app.state::<crate::shell::ShellExecutor>();
     let approvals = app.state::<tools::ApprovalRegistry>();
 
@@ -810,7 +810,7 @@ async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<
     let result = chat::run_tool_loop(
         &cfg,
         &api_key,
-        &mcp,
+        &brave,
         &shell,
         &memory,
         &approvals,
@@ -993,7 +993,7 @@ async fn run_reduce_pass(
 
     let db = app.state::<db::Db>();
     let memory = app.state::<MemoryState>();
-    let mcp = app.state::<tools::McpClient>();
+    let brave = app.state::<tools::BraveSearch>();
     let shell = app.state::<crate::shell::ShellExecutor>();
     let approvals = app.state::<tools::ApprovalRegistry>();
 
@@ -1023,13 +1023,13 @@ async fn run_reduce_pass(
         system_message(consolidate_instruction(memory_through))?,
     ];
 
-    let tools_list = tools::tool_specs(tools::web_search_available());
+    let tools_list = tools::tool_specs(tools::brave_available());
     let flag = Arc::new(AtomicBool::new(false));
     let sink = NullSink;
     let result = chat::run_tool_loop(
         &cfg,
         &api_key,
-        &mcp,
+        &brave,
         &shell,
         &memory,
         &approvals,

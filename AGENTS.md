@@ -14,7 +14,8 @@ A general-purpose AI chat app (not a coding agent) with:
 - An expandable sidebar listing past conversations (search, rename, delete)
 - Streaming assistant replies over any OpenAI-compatible endpoint
 - Optional tools — `bash` (a **one-shot per-call shell**), `read_file`,
-  `write_file` (all approval-gated), and `web_search` (Brave via MCP, ungated)
+  `write_file` (all approval-gated), and Brave's native search tools
+  (`brave_web_search`/`local`/`image`/`video`/`news`/`summarizer`, ungated)
 - Reasoning traces from thinking models (inline "Thought" bar → popup)
 - Per-turn **activity timeline** grouping reasoning, preamble text, and tool calls
 - Plain-Markdown long-term **memory** curated by an idle reflection pass
@@ -32,7 +33,7 @@ in `src-tauri`; the UI is a Solid SPA.
   Markdown files for memory. No microservices.
 - **No agent framework.** The core loop is simple and implemented directly in
   Rust. pi is a *pattern reference only* — we don't import or vendor it. We reuse
-  `async-openai` for LLM types and `rmcp` for the Brave MCP server.
+  `async-openai` for LLM types and call Brave Search natively over `reqwest`.
 - **The model decides; the user controls.** Tools and memory writes are surfaced,
   gateable, and auditable.
 - **Separate storage size from injected context size.** We can store a lot; we
@@ -55,7 +56,7 @@ check, the real-export import, and the real models.dev catalog parse). Clippy,
 | Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, capped tool loop                        |
 | Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; price overrides                  |
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline                                 |
-| Tools             | ✅    | `bash` (one-shot shell), `read_file`/`write_file` (gated), `web_search` (MCP, ungated)                   |
+| Tools             | ✅    | `bash` (one-shot shell), `read_file`/`write_file` (gated), native Brave search tools (ungated)          |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
 | Context + price   | ◑     | Context counter + frozen per-turn cost done; **near-limit banner + compaction (M7) remain**                |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
@@ -312,23 +313,26 @@ save_memory(content, path)        // append; path required
 read_memory(path)
 write_memory(path, content)       // replace (curation)
 
-// Web search — reused Brave MCP server, read-only (ungated)
-web_search(query, count?)
+// Web search — native Brave Search API, read-only (ungated)
+brave_web_search(query, count?)
+brave_local_search(query, count?)
+brave_image_search(query, count?)
+brave_video_search(query, count?)
+brave_news_search(query, count?)
+brave_summarizer(query, count?)
 ```
 
 The tool list is byte-identical for live and reflection turns so the prompt-cache
 prefix matches; `run_tool_loop` refuses disallowed calls by mode instead of
 splitting the list (live: no `write_memory`; reflection: no host/web tools).
 
-**MCP integration:** `tools.rs` `McpClient` spawns the official
-`@brave/brave-search-mcp-server` (`node .../dist/index.js --transport stdio`,
-installed under `~/.config/opencode/node_modules`) once and keeps a long-lived
-`rmcp` stdio client (the `RunningService`, not just its `Peer` — dropping the
-service closes the transport). Re-spawned once on failure. The app advertises a
-stable `web_search` tool that proxies to the server's `brave_web_search`.
-`BRAVE_API_KEY` is read from the process environment or the sibling
-`~/.config/opencode/mcp/.env` and passed to the child; `web_search` is offered
-only when the server entry and a key are both present.
+**Brave integration (native, no node/MCP process):** `tools.rs` `BraveSearch`
+calls `api.search.brave.com` directly over `reqwest` (the same six-tool surface
+the official `brave-search-mcp-server` exposes), with the key from the OS
+keychain (`secrets::brave_key`). Because there's no child process, config file,
+or node runtime, it works identically on desktop and Android. The Brave tools
+are offered only when a key is stored (`brave_available()`). Setup: add a Brave
+Search API key in Settings → keychain.
 
 ---
 
@@ -407,17 +411,17 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
 │     └─ Markdown.tsx  # marked + DOMPurify renderer (prose + dark:prose-invert)
 └─ src-tauri/
    ├─ tauri.conf.json  # v2 config (productName, window, devUrl, frontendDist)
-   ├─ Cargo.toml       # tauri, serde, rusqlite [bundled], uuid, async-openai, keyring, rmcp, reqwest, tokio, tokio-stream
+   ├─ Cargo.toml       # tauri, serde, rusqlite [bundled], uuid, async-openai, keyring, reqwest, tokio, tokio-stream
    ├─ capabilities/default.json
    ├─ build.rs
    └─ src/
       ├─ main.rs       # thin entry -> chat_app_lib::run()
-      ├─ lib.rs        # Builder, setup (SQLite + config + MCP + registries + reflection), invoke_handler
+      ├─ lib.rs        # Builder, setup (SQLite + config + Brave + registries + reflection), invoke_handler
       ├─ db.rs         # Db state, schema/migration, conversation/message commands + helpers
       ├─ config.rs     # AppConfig, config.json persistence, legacy key migration
       ├─ secrets.rs    # OS-keychain API key storage (keyring crate) + has/set_api_key
       ├─ models.rs     # list_models (models.dev catalog, /models fallback), chat filter, per-baseUrl cache
-      ├─ tools.rs      # tool specs, host executor, approval registry, MCP web_search
+      ├─ tools.rs      # tool specs, host executor, approval registry, native BraveSearch
       ├─ shell.rs      # one-shot host shell executor (fresh `bash -c` per call);
       │                 #   Android routes to the Termux bridge (android.rs)
       ├─ android.rs    # Android: Termux RUN_COMMAND bridge (`run_command` plugin) [mobile]
@@ -461,12 +465,12 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
 
 ## Environment gotchas
 
-- **Brave MCP:** the official `@brave/brave-search-mcp-server` (npm), spawned via
-  `rmcp` from `~/.config/opencode/node_modules/@brave/brave-search-mcp-server/dist/index.js`.
-  `BRAVE_API_KEY` is read from the environment or `~/.config/opencode/mcp/.env`
-  and passed to the child process. Needs a separate `BRAVE_API_KEY` from the LLM
-  provider key.
-- **Fireworks is the default endpoint** (`https://api.fireworks.ai/inference/v1`) but the client is generic; the user enters `baseUrl` + `apiKey` in Settings. Fireworks needs a `fw_` key; Brave needs a separate `BRAVE_API_KEY`.
+- **Brave Search (native):** the app calls `api.search.brave.com` directly over
+  `reqwest` — no node, no MCP process, no `~/.config/opencode` path, so it works
+  on desktop and Android alike. The key lives in the OS keychain (separate
+  `brave_key` entry from the LLM key) and is entered in Settings. Web tools are
+  offered only when a key is stored.
+- **Fireworks is the default endpoint** (`https://api.fireworks.ai/inference/v1`) but the client is generic; the user enters `baseUrl` + `apiKey` in Settings. Fireworks needs a `fw_` key; Brave needs a separate Brave Search API key.
 - **Rust builds are slow** on first run (Wry + bundled SQLite). `cargo check` is faster for iteration.
 - **GUI needs a display:** use `npm run tauri dev` from the desktop session; scripted checks use `npm run e2e` (same requirement).
 - **One-shot shell:** `bash` runs a fresh `bash -c` per call — no persistent session, so `cd`/`export` do not survive (the agent already assumes non-persistence; see `ANDROID_SHELL.md`). 60s per-call timeout kills the child. On Android, execution happens inside the user's Termux (`crate::android` + `RunCommandPlugin`).

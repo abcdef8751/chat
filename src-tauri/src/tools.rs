@@ -1,6 +1,8 @@
 //! Tool surface: OpenAI-style tool specs, a host executor (bash/read/write,
-//! approval-gated), and `web_search` via a long-lived `rmcp` MCP stdio client
-//! (the official `@brave/brave-search-mcp-server`, read-only → ungated).
+//! approval-gated), and native Brave Search (web/local/image/video/news/
+//! summarizer) called directly over the Brave REST API. The native client needs
+//! only a keychain-stored key + network — no node/`~/.config/opencode` path, so
+//! it works on Android too. Read-only → ungated.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -8,7 +10,6 @@ use std::sync::Mutex;
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 use serde_json::{json, Value};
 use tauri::Manager;
-use tokio::sync::Mutex as AsyncMutex;
 
 /// Tool names needing per-call user approval (local side effects / local data).
 pub const GATED_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
@@ -120,11 +121,13 @@ fn memory_write_tool() -> ChatCompletionTools {
     )
 }
 
-/// OpenAI `tools` array for a request. `web_search` is included only when the
-/// MCP server is available. The list is **identical for live and reflection
-/// turns** (so the prompt-cache prefix matches); `write_memory` is present in
-/// both but refused during live turns by `run_tool_loop`'s `memory_only` mode.
-pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
+/// OpenAI `tools` array for a request. When `brave` is true the full native
+/// Brave tool surface is appended (`brave_web_search`, `brave_local_search`,
+/// `brave_image_search`, `brave_video_search`, `brave_news_search`,
+/// `brave_summarizer`). The list is **identical for live and reflection turns**
+/// (so the prompt-cache prefix matches); `write_memory` is present in both but
+/// refused during live turns by `run_tool_loop`'s `memory_only` mode.
+pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
     let mut tools = vec![
         fn_tool(
             "bash",
@@ -160,22 +163,101 @@ pub fn tool_specs(web_search: bool) -> Vec<ChatCompletionTools> {
         memory_read_tool(),
         memory_write_tool(),
     ];
-    if web_search {
-        tools.push(fn_tool(
-            "web_search",
-            "Search the web for current information via the Brave Search API. Returns results with \
-             title, URL, and snippet.",
+    if brave {
+        tools.extend(brave_tools());
+    }
+    tools
+}
+
+/// Brave's native tool surface (mirrors the official `brave-search-mcp-server`
+/// tool catalog). Each maps to one `api.search.brave.com` endpoint; the agent
+/// calls them by name and `BraveSearch::call_tool` routes them.
+fn brave_tools() -> Vec<ChatCompletionTools> {
+    let count = |desc: &str| -> Value {
+        json!({ "type": "number", "description": desc })
+    };
+    vec![
+        fn_tool(
+            "brave_web_search",
+            "General web search returning web pages, news, discussions, FAQs and video \
+             results, with pagination and freshness controls.",
             json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search query (max 400 chars, 50 words)" },
-                    "count": { "type": "number", "description": "Number of results (1-20, default 10)" }
+                    "query": { "type": "string", "description": "Search query" },
+                    "count": count("Number of results (1-20, default 10)"),
+                    "offset": count("Pagination offset (max 9)"),
+                    "freshness": { "type": "string", "description": "Time filter, e.g. pd, pw, pm, py" },
+                    "safesearch": { "type": "string", "description": "off|moderate|strict" }
                 },
                 "required": ["query"]
             }),
-        ));
-    }
-    tools
+        ),
+        fn_tool(
+            "brave_local_search",
+            "Find local businesses, restaurants, and services with address, phone and rating.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Local search terms, e.g. 'coffee near me'" },
+                    "count": count("Number of results (1-20, default 10)")
+                },
+                "required": ["query"]
+            }),
+        ),
+        fn_tool(
+            "brave_image_search",
+            "Search for images with thumbnails and metadata.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "count": count("Number of results (1-20, default 10)"),
+                    "safesearch": { "type": "string", "description": "off|moderate|strict" }
+                },
+                "required": ["query"]
+            }),
+        ),
+        fn_tool(
+            "brave_video_search",
+            "Search for videos with thumbnails and metadata.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "count": count("Number of results (1-20, default 10)"),
+                    "freshness": { "type": "string", "description": "Time filter, e.g. pd, pw, pm, py" }
+                },
+                "required": ["query"]
+            }),
+        ),
+        fn_tool(
+            "brave_news_search",
+            "Search for recent news articles with freshness filters.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "count": count("Number of results (1-20, default 10)"),
+                    "freshness": { "type": "string", "description": "Time filter, e.g. pd, pw, pm, py" }
+                },
+                "required": ["query"]
+            }),
+        ),
+        fn_tool(
+            "brave_summarizer",
+            "Search and summarize results into a short answer (Pro plan).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query to summarize" },
+                    "count": count("Number of results to summarize"),
+                    "extra_snippets": { "type": "boolean", "description": "Include extra snippets" }
+                },
+                "required": ["query"]
+            }),
+        ),
+    ]
 }
 
 /// Execute a host tool (bash/read_file/write_file). Errors are returned as
@@ -210,164 +292,207 @@ pub async fn execute_host_tool(call: &ToolCall, shell: &crate::shell::ShellExecu
     }
 }
 
-/// Long-lived `rmcp` client for the official Brave Search MCP server (stdio).
-/// Spawned lazily on first `web_search`; invalidated and re-spawned if the
-/// child process dies (a failed call is retried once on a fresh server).
-/// The `RunningService` (not just its `Peer`) is kept alive — dropping it
-/// closes the transport.
-pub struct McpClient {
-    entry: std::path::PathBuf,
-    service: AsyncMutex<Option<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>>,
+/// Whether the Brave Search API key is stored, i.e. the native Brave tools can
+/// be offered to the model. Reads the OS keychain — no filesystem/env needed,
+/// so it works identically on desktop and Android.
+pub fn brave_available() -> bool {
+    crate::secrets::has_brave_key()
 }
 
-fn home_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/rp".to_string()))
+/// Native Brave Search client. Calls `api.search.brave.com` directly over
+/// `reqwest` (no node/`~/.config/opencode` dependency), so it works on any
+/// platform that can reach the network and holds a keychain-stored key.
+pub struct BraveSearch {
+    http: reqwest::Client,
 }
 
-/// Entry point of the official Brave Search MCP server
-/// (`@brave/brave-search-mcp-server`, npm). Installed next to the OpenCode
-/// config so it resolves without a network install.
-fn brave_server_entry() -> std::path::PathBuf {
-    let mut p = home_dir();
-    p.push(".config/opencode/node_modules/@brave/brave-search-mcp-server/dist/index.js");
-    p
-}
-
-/// dotenv file beside the OpenCode MCP config that holds `BRAVE_API_KEY`.
-fn brave_env_file() -> std::path::PathBuf {
-    let mut p = home_dir();
-    p.push(".config/opencode/mcp/.env");
-    p
-}
-
-/// Extract `KEY=value` from dotenv-style text (quotes and a leading `export`
-/// stripped). Pure so it can be unit-tested.
-fn parse_env_value(text: &str, key: &str) -> Option<String> {
-    for raw in text.lines() {
-        let line = raw.trim();
-        let line = line.strip_prefix("export").map(str::trim_start).unwrap_or(line);
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        if k.trim() != key {
-            continue;
-        }
-        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
-        if !v.is_empty() {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
-
-/// Resolve the Brave API key: the process environment first, then the OpenCode
-/// MCP `.env` (the same file the former hand-rolled script read).
-fn read_brave_api_key() -> Option<String> {
-    if let Ok(key) = std::env::var("BRAVE_API_KEY") {
-        let key = key.trim();
-        if !key.is_empty() {
-            return Some(key.to_string());
-        }
-    }
-    let text = std::fs::read_to_string(brave_env_file()).ok()?;
-    parse_env_value(&text, "BRAVE_API_KEY")
-        .or_else(|| parse_env_value(&text, "BRAVE_SEARCH_API_KEY"))
-}
-
-/// Whether the official Brave MCP server and an API key are both present, i.e.
-/// `web_search` can be offered to the model.
-pub fn web_search_available() -> bool {
-    brave_server_entry().exists() && read_brave_api_key().is_some()
-}
-
-impl McpClient {
-    pub fn new() -> Self {
+impl Default for BraveSearch {
+    fn default() -> Self {
         Self {
-            entry: brave_server_entry(),
-            service: AsyncMutex::new(None),
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+const BRAVE_BASE: &str = "https://api.search.brave.com/res/v1";
+
+impl BraveSearch {
+    /// Route a model-requested `brave_*` tool to its REST endpoint.
+    pub async fn call_tool(&self, name: &str, args: &Value) -> ToolOutput {
+        match name {
+            "brave_web_search" => self.page_search("web/search", args, false).await,
+            "brave_local_search" => self.page_search("web/search", args, true).await,
+            "brave_image_search" => self.page_search("images/search", args, false).await,
+            "brave_video_search" => self.page_search("videos/search", args, false).await,
+            "brave_news_search" => self.page_search("news/search", args, false).await,
+            "brave_summarizer" => self.summarizer(args).await,
+            other => ToolOutput::err(format!("unknown brave tool: {other}")),
         }
     }
 
-    async fn spawn(
+    /// GET a paginated Brave endpoint with the given query string params.
+    async fn get(
         &self,
-    ) -> Result<rmcp::service::RunningService<rmcp::service::RoleClient, ()>, String> {
-        use tokio::process::Command;
-        let key = read_brave_api_key().ok_or_else(|| {
-            "Brave API key not found (set BRAVE_API_KEY or ~/.config/opencode/mcp/.env)".to_string()
-        })?;
-        let mut cmd = Command::new("node");
-        cmd.arg(&self.entry);
-        cmd.arg("--transport").arg("stdio");
-        cmd.env("BRAVE_API_KEY", key);
-        let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)
-            .map_err(|e| format!("spawn MCP server: {e}"))?;
-        // `()` is the no-callback client handler.
-        rmcp::service::serve_client((), transport)
+        endpoint: &str,
+        args: &Value,
+        extra: &[(&str, String)],
+    ) -> Result<Value, String> {
+        let key = crate::secrets::get_brave_key()?.ok_or("Brave API key not set")?;
+        let mut params: Vec<(String, String)> = Vec::new();
+        if let Some(q) = args.get("query").and_then(Value::as_str) {
+            params.push(("q".into(), q.to_string()));
+        }
+        if let Some(c) = args.get("count").and_then(Value::as_u64) {
+            params.push(("count".into(), c.to_string()));
+        }
+        for (k, v) in extra {
+            params.push(((*k).into(), v.clone()));
+        }
+        if let Some(f) = args.get("freshness").and_then(Value::as_str) {
+            params.push(("freshness".into(), f.to_string()));
+        }
+        if let Some(s) = args.get("safesearch").and_then(Value::as_str) {
+            params.push(("safesearch".into(), s.to_string()));
+        }
+        let url = format!("{BRAVE_BASE}/{endpoint}");
+        let mut req = self
+            .http
+            .get(&url)
+            .header("X-Subscription-Token", key)
+            .header("Accept", "application/json");
+        for (k, v) in &params {
+            req = req.query(&[(k.as_str(), v.as_str())]);
+        }
+        let resp = req.send().await.map_err(|e| format!("brave: {e}"))?;
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
             .await
-            .map_err(|e| format!("serve MCP client: {e}"))
-    }
-
-    /// Ensure a live service exists, returning a cheap-to-clone handle to it.
-    async fn get_or_spawn(
-        &self,
-    ) -> Result<rmcp::service::Peer<rmcp::service::RoleClient>, String> {
-        let mut guard = self.service.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.spawn().await?);
+            .map_err(|e| format!("brave: {e}"))?;
+        if !status.is_success() {
+            let body: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
+            // A missing/expired key is the most common non-2xx; keep the message
+            // short so the model can self-correct with a clear hint.
+            return Err(format!("brave: HTTP {status}: {body}"));
         }
-        Ok(guard.as_ref().unwrap().peer().clone())
+        serde_json::from_slice(&bytes).map_err(|e| format!("brave: bad response: {e}"))
     }
 
-    async fn invalidate(&self) {
-        *self.service.lock().await = None;
-    }
-
-    /// Run `web_search` through the MCP server, retrying once on a fresh
-    /// server if the cached one has died.
-    pub async fn web_search(&self, query: &str, count: Option<u64>) -> ToolOutput {
-        if !self.entry.exists() {
-            return ToolOutput::err(
-                "web_search: Brave MCP server not found (~/.config/opencode/node_modules/@brave/brave-search-mcp-server)"
-                    .into(),
-            );
+    /// A paginated results endpoint (web/local share `web/search`; local asks
+    /// Brave to prefer local results via `q_local`).
+    async fn page_search(&self, endpoint: &str, args: &Value, local: bool) -> ToolOutput {
+        let Some(query) = args.get("query").and_then(Value::as_str) else {
+            return ToolOutput::err("missing 'query' argument".into());
+        };
+        if query.trim().is_empty() {
+            return ToolOutput::err("'query' must not be empty".into());
         }
-        for attempt in 0..2 {
-            let peer = match self.get_or_spawn().await {
-                Ok(p) => p,
-                Err(e) => return ToolOutput::err(format!("web_search: {e}")),
-            };
-            let mut arguments = serde_json::Map::new();
-            arguments.insert("query".into(), json!(query));
-            if let Some(count) = count {
-                arguments.insert("count".into(), json!(count));
-            }
-            // The app advertises a stable `web_search` tool; the official
-            // server names its web tool `brave_web_search`.
-            let mut params = rmcp::model::CallToolRequestParams::new("brave_web_search");
-            params.arguments = Some(arguments);
-            match peer.call_tool(params).await {
-                Ok(res) => {
-                    let mut text = String::new();
-                    for content in &res.content {
-                        if let rmcp::model::ContentBlock::Text(t) = content {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(&t.text);
-                        }
+        let extra: &[(&str, String)] = if local {
+            &[("q_local", "1".into())]
+        } else {
+            &[]
+        };
+        match self.get(endpoint, args, extra).await {
+            Ok(json) => ToolOutput::ok(truncate(format_results(endpoint, &json))),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+
+    /// `brave_summarizer` — Brave returns a synthesized answer plus sources.
+    async fn summarizer(&self, args: &Value) -> ToolOutput {
+        let Some(query) = args.get("query").and_then(Value::as_str) else {
+            return ToolOutput::err("missing 'query' argument".into());
+        };
+        if query.trim().is_empty() {
+            return ToolOutput::err("'query' must not be empty".into());
+        }
+        let extra: &[(&str, String)] = &[
+            ("summary", "1".into()),
+            (
+                "extra_snippets",
+                if args.get("extra_snippets").and_then(Value::as_bool).unwrap_or(false) {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            ),
+        ];
+        match self.get("summarizer/search", args, extra).await {
+            Ok(json) => {
+                let prefix = "summarizer/search";
+                let answer = json
+                    .get("answer")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mut text = answer.to_string();
+                let sources = format_results(prefix, &json);
+                if !sources.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str("\n\nSources:\n");
                     }
-                    return ToolOutput {
-                        is_error: res.is_error.unwrap_or(false),
-                        content: truncate(text),
-                    };
+                    text.push_str(&sources);
                 }
-                Err(_e) if attempt == 0 => {
-                    self.invalidate().await;
+                if text.trim().is_empty() {
+                    text = "No summary returned.".to_string();
                 }
-                Err(e) => return ToolOutput::err(format!("web_search: {e}")),
+                ToolOutput::ok(truncate(text))
+            }
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+}
+
+/// Render a Brave endpoint's result arrays as readable text (title — url,
+/// then description). Tolerant of varied response shapes per endpoint.
+fn format_results(endpoint: &str, json: &Value) -> String {
+    let mut out = String::new();
+    let arrays: &[&str] = match endpoint {
+        "web/search" => &["web.results", "local.results", "news.results", "videos.results"],
+        // news/images/videos/summarizer surface their items under "results".
+        _ => &["results", "web.results", "local.results"],
+    };
+    for path in arrays {
+        let mut items: &Value = json;
+        let mut missing = false;
+        for part in path.split('.') {
+            match items.get(part) {
+                Some(v) => items = v,
+                None => {
+                    missing = true;
+                    break;
+                }
             }
         }
-        ToolOutput::err("web_search: unreached".into())
+        if missing || !items.is_array() {
+            continue;
+        }
+        for item in items.as_array().unwrap_or(&vec![]) {
+            let title = item.get("title").and_then(Value::as_str).unwrap_or("");
+            let url = item.get("url").and_then(Value::as_str).unwrap_or("");
+            let desc = item
+                .get("description")
+                .or_else(|| item.get("snippet"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            if !title.is_empty() {
+                out.push_str(title);
+            }
+            if !url.is_empty() {
+                out.push_str(&format!("\n  {url}"));
+            }
+            if !desc.is_empty() {
+                out.push_str(&format!("\n  {desc}"));
+            }
+        }
+    }
+    if out.trim().is_empty() {
+        "No results.".to_string()
+    } else {
+        out
     }
 }
 
@@ -513,17 +638,30 @@ mod tests {
     #[test]
     fn tool_specs_shape() {
         let with = tool_specs(true);
-        assert_eq!(with.len(), 7);
+        // 6 host/memory tools + 6 native Brave tools.
+        assert_eq!(with.len(), 12);
         let without = tool_specs(false);
         assert_eq!(without.len(), 6);
         // The list is identical for live and reflection (cache alignment);
         // `write_memory` is present but gated by mode at execution time.
         assert!(without.iter().any(|t| tool_name(t) == "write_memory"));
         assert!(is_gated("bash"));
-        assert!(!is_gated("web_search"));
+        assert!(!is_gated("brave_web_search"));
         assert!(!is_gated("save_memory"));
         assert!(!is_gated("read_memory"));
         assert!(!is_gated("write_memory"));
+        // Brave's full tool surface is exposed when a key is configured.
+        for name in [
+            "brave_web_search",
+            "brave_local_search",
+            "brave_image_search",
+            "brave_video_search",
+            "brave_news_search",
+            "brave_summarizer",
+        ] {
+            assert!(with.iter().any(|t| tool_name(t) == name), "missing {name}");
+            assert!(!is_gated(name), "{name} should be ungated");
+        }
     }
 
     fn tool_name(t: &ChatCompletionTools) -> &str {
@@ -533,35 +671,55 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mcp_server_handshake_lists_brave_web_search() {
-        if !web_search_available() {
-            return; // machine without the official Brave MCP server/key — skip
-        }
-        let client = McpClient::new();
-        let peer = client.get_or_spawn().await.expect("spawn MCP server");
-        let tools = peer
-            .list_tools(Default::default())
-            .await
-            .expect("list tools");
-        assert!(tools.tools.iter().any(|t| t.name == "brave_web_search"));
+    #[test]
+    fn format_results_is_tolerant_and_handles_empty() {
+        // Nested web results render as title — url — description.
+        let json = json!({
+            "web": { "results": [{ "title": "T", "url": "https://x", "description": "D" }] },
+            "query": { "original": "q" }
+        });
+        let text = format_results("web/search", &json);
+        assert!(text.contains("T"));
+        assert!(text.contains("https://x"));
+        assert!(text.contains("D"));
+
+        // News-style responses put items under top-level "results".
+        let news = json!({ "results": [{ "title": "N", "url": "https://n" }] });
+        assert!(format_results("news/search", &news).contains("https://n"));
+
+        // No results → friendly message, not an error.
+        assert_eq!(format_results("web/search", &json!({})), "No results.");
     }
 
     #[test]
-    fn parse_env_value_handles_export_quotes_and_comments() {
-        let text = "# comment\nexport BRAVE_API_KEY=\"abc-123\"\nOTHER=1\n";
-        assert_eq!(
-            parse_env_value(text, "BRAVE_API_KEY").as_deref(),
-            Some("abc-123")
-        );
-        assert_eq!(
-            parse_env_value("BRAVE_API_KEY=plain\n", "BRAVE_API_KEY").as_deref(),
-            Some("plain")
-        );
-        assert_eq!(
-            parse_env_value("BRAVE_API_KEY='q'\n", "BRAVE_API_KEY").as_deref(),
-            Some("q")
-        );
-        assert_eq!(parse_env_value("OTHER=1\n", "BRAVE_API_KEY"), None);
+    fn tool_routing_unknown_brave_tool_is_error() {
+        let blk = tokio::runtime::Runtime::new().unwrap();
+        blk.block_on(async {
+            let brave = crate::tools::BraveSearch::default();
+            let out = brave
+                .call_tool("brave_nonexistent", &json!({}))
+                .await;
+            assert!(out.is_error);
+            assert!(out.content.contains("unknown brave tool"));
+        });
+    }
+
+    #[test]
+    fn brave_available_reflects_keychain() {
+        // Without a key the flag is false; the native client is still
+        // constructible and degrades to a clear key-not-set error.
+        let blk = tokio::runtime::Runtime::new().unwrap();
+        blk.block_on(async {
+            let brave = crate::tools::BraveSearch::default();
+            let out = brave.call_tool("brave_web_search", &json!({"query": "x"})).await;
+            if crate::secrets::has_brave_key() {
+                // Key present: real network call — assert it doesn't panic and is
+                // a ToolOutput (no crash on either an OK or an HTTP error).
+                assert!(out.content.contains("No results") || out.is_error || !out.content.is_empty());
+            } else {
+                assert!(out.is_error);
+                assert!(out.content.contains("Brave API key not set"));
+            }
+        });
     }
 }
