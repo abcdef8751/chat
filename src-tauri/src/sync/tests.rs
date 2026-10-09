@@ -542,7 +542,8 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
     };
 
     // --- Push ---
-    let n = push(&ctx, "fake-token").await.unwrap();
+    let progress = SyncState::new();
+    let n = push(&ctx, "fake-token", &progress).await.unwrap();
     assert!(n > 0);
     // Server received our conversation + message + memory rows.
     let conv_posts = srv.posted("conversations");

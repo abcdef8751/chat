@@ -494,8 +494,9 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     let mem_names = ctx.memory.file_names();
     db::seed_initial_sync(ctx.db, &session.user_id, &mem_names)?;
     sync.begin_run();
-    match push(&ctx, &token).await {
-        Ok(n) => sync.add_pushed(n),
+    // Progress (pushed/pending) is updated per batch inside `push`.
+    match push(&ctx, &token, &sync).await {
+        Ok(_) => {}
         Err(e) => {
             sync.set_error(e.clone());
             return Err(e);
@@ -524,7 +525,7 @@ fn dbref(app: &AppHandle) -> &Db {
 /// conversation tombstones, as PostgREST `merge-duplicates` upserts. Returns the
 /// number of rows pushed. Dirty flags are cleared only for entities whose POST
 /// succeeded, so a partial failure is retried next tick.
-async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
+async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u64, String> {
     let mut total: u64 = 0;
 
     // Conversations (dirty rows + tombstones).
@@ -589,52 +590,12 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
 
     let row_count = conv_rows.len() + conv_tombstones.len();
     if !conv_rows.is_empty() || !conv_tombstones.is_empty() {
-        let tomb_keys: Vec<(String, i64)> = conv_tombstones
-            .iter()
-            .filter_map(|v| {
-                Some((
-                    v.get("id")?.as_str()?.to_string(),
-                    v.get("revision")?.as_i64()?,
-                ))
-            })
-            .collect();
         let mut body = conv_rows;
         body.extend(conv_tombstones);
-        post_upsert(ctx, "conversations", token, &body).await?;
-        // Clear dirty/tombstone only for the exact rows we pushed. A row that was
-        // mutated during the in-flight POST (a new message bumped its revision)
-        // fails the `revision = ?2` guard and stays dirty for the next tick.
-        let keys: Vec<(String, i64)> = body
-            .iter()
-            .filter_map(|v| {
-                Some((
-                    v.get("id")?.as_str()?.to_string(),
-                    v.get("revision")?.as_i64()?,
-                ))
-            })
-            .collect();
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        {
-            let mut stmt = conn
-                .prepare("UPDATE conversations SET dirty = 0 WHERE id = ?1 AND revision = ?2")
-                .map_err(|e| e.to_string())?;
-            for (id, rev) in &keys {
-                stmt.execute(rusqlite::params![id, rev])
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        {
-            let mut stmt = conn
-                .prepare(
-                    "DELETE FROM sync_tombstones
-                     WHERE entity = 'conversations' AND id = ?1 AND revision = ?2",
-                )
-                .map_err(|e| e.to_string())?;
-            for (id, rev) in &tomb_keys {
-                stmt.execute(rusqlite::params![id, rev])
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        post_upsert(ctx, "conversations", token, &body, progress, |chunk| {
+            clear_conversation_keys(ctx.db, chunk)
+        })
+        .await?;
         total += row_count as u64;
     }
 
@@ -675,24 +636,10 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
         rows?
     };
     if !msg_rows.is_empty() {
-        post_upsert(ctx, "messages", token, &msg_rows).await?;
-        let keys: Vec<(String, i64)> = msg_rows
-            .iter()
-            .filter_map(|v| {
-                Some((
-                    v.get("id")?.as_str()?.to_string(),
-                    v.get("revision")?.as_i64()?,
-                ))
-            })
-            .collect();
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare("UPDATE messages SET dirty = 0 WHERE id = ?1 AND revision = ?2")
-            .map_err(|e| e.to_string())?;
-        for (id, rev) in &keys {
-            stmt.execute(rusqlite::params![id, rev])
-                .map_err(|e| e.to_string())?;
-        }
+        post_upsert(ctx, "messages", token, &msg_rows, progress, |chunk| {
+            clear_message_keys(ctx.db, chunk)
+        })
+        .await?;
         total += msg_rows.len() as u64;
     }
 
@@ -737,19 +684,106 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
         mem_body.push(row);
     }
     if !mem_body.is_empty() {
-        post_upsert(ctx, "memory_files", token, &mem_body).await?;
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare("UPDATE memory_sync SET dirty = 0 WHERE path = ?1 AND revision = ?2")
-            .map_err(|e| e.to_string())?;
-        for (path, revision, _) in &mem_rows {
-            stmt.execute(rusqlite::params![path, revision])
-                .map_err(|e| e.to_string())?;
-        }
+        post_upsert(ctx, "memory_files", token, &mem_body, progress, |chunk| {
+            clear_memory_keys(ctx.db, chunk)
+        })
+        .await?;
         total += mem_body.len() as u64;
     }
 
     Ok(total)
+}
+
+/// Clear the dirty flag (guarded by revision) for the message rows in a batch
+/// that just pushed successfully. Rows mutated mid-flight fail the guard and
+/// stay dirty for the next tick. This runs per batch so `pending` shrinks live.
+fn clear_message_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    for v in chunk {
+        if let (Some(id), Some(rev)) = (
+            v.get("id").and_then(|x| x.as_str()),
+            v.get("revision").and_then(|x| x.as_i64()),
+        ) {
+            keys.push((id.to_string(), rev));
+        }
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("UPDATE messages SET dirty = 0 WHERE id = ?1 AND revision = ?2")
+        .map_err(|e| e.to_string())?;
+    for (id, rev) in &keys {
+        stmt.execute(rusqlite::params![id, rev]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Clear dirty flags / tombstones for the conversation rows in a batch. Live
+/// rows clear `conversations.dirty`; tombstoned rows are removed from
+/// `sync_tombstones` (distinguished by a non-null `deleted_at`).
+fn clear_conversation_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
+    let mut live: Vec<(String, i64)> = Vec::new();
+    let mut tombs: Vec<(String, i64)> = Vec::new();
+    for v in chunk {
+        if let (Some(id), Some(rev)) = (
+            v.get("id").and_then(|x| x.as_str()),
+            v.get("revision").and_then(|x| x.as_i64()),
+        ) {
+            if v.get("deleted_at").and_then(|x| x.as_i64()).is_some() {
+                tombs.push((id.to_string(), rev));
+            } else {
+                live.push((id.to_string(), rev));
+            }
+        }
+    }
+    if live.is_empty() && tombs.is_empty() {
+        return Ok(());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    if !live.is_empty() {
+        let mut stmt = conn
+            .prepare("UPDATE conversations SET dirty = 0 WHERE id = ?1 AND revision = ?2")
+            .map_err(|e| e.to_string())?;
+        for (id, rev) in &live {
+            stmt.execute(rusqlite::params![id, rev]).map_err(|e| e.to_string())?;
+        }
+    }
+    if !tombs.is_empty() {
+        let mut stmt = conn
+            .prepare(
+                "DELETE FROM sync_tombstones
+                 WHERE entity = 'conversations' AND id = ?1 AND revision = ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        for (id, rev) in &tombs {
+            stmt.execute(rusqlite::params![id, rev]).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Clear the dirty flag for the memory-file rows in a batch.
+fn clear_memory_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    for v in chunk {
+        if let Some(p) = v.get("path").and_then(|x| x.as_str()) {
+            let rev = v.get("revision").and_then(|x| x.as_i64()).unwrap_or(0);
+            keys.push((p.to_string(), rev));
+        }
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("UPDATE memory_sync SET dirty = 0 WHERE path = ?1 AND revision = ?2")
+        .map_err(|e| e.to_string())?;
+    for (path, rev) in &keys {
+        stmt.execute(rusqlite::params![path, rev]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Rows sent per upsert request. The first full-history seed often marks
@@ -760,12 +794,17 @@ async fn push(ctx: &SyncCtx<'_>, token: &str) -> Result<u64, String> {
 /// mid-batch failure just retries the whole set next tick.
 const UPSERT_BATCH_SIZE: usize = 400;
 
-async fn post_upsert(
+async fn post_upsert<F>(
     ctx: &SyncCtx<'_>,
     table: &str,
     token: &str,
     rows: &[Value],
-) -> Result<(), String> {
+    progress: &SyncState,
+    mut on_chunk: F,
+) -> Result<(), String>
+where
+    F: FnMut(&[Value]) -> Result<(), String> + Send,
+{
     let url = format!("{}/rest/v1/{}", ctx.base_url, table);
     for chunk in rows.chunks(UPSERT_BATCH_SIZE) {
         if chunk.is_empty() {
@@ -791,6 +830,11 @@ async fn post_upsert(
                 body.chars().take(300).collect::<String>()
             ));
         }
+        // This batch landed: bump the live `pushed` counter and clear the dirty
+        // flags for exactly these rows, so progress updates as we go (not once
+        // the whole entity finishes).
+        progress.add_pushed(chunk.len() as u64);
+        on_chunk(chunk)?;
         // Give PostgREST a beat between batches — a fresh burst of large
         // upserts can still trip the proxy even under the size limit.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
