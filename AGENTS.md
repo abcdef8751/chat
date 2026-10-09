@@ -414,7 +414,8 @@ and the app is byte-identical to before. Never blocks the UI.
   memory files dirty so enabling backs up full history once.
 - **Memory files** sync whole-file (identity by path), tracking metadata in the
   `memory_sync` table; a failed apply is left dirty and retried.
-- **Client-side encryption** (`crypt.rs`, opt-in): content fields (conversation
+- **Client-side encryption** (`crypt.rs`, opt-in, **off by default** — see
+  "Next / open items" for the multi-device caveat): content fields (conversation
   title/system_prompt/summary, message content/thinking/usage/attachments, memory
   content) are encrypted with AES-256-GCM (`enc:v1:<base64 nonce||ct||tag>`)
   before upload and decrypted on pull, so Supabase only ever holds ciphertext.
@@ -564,6 +565,17 @@ memory conflict resolution.
 **Also deferred:** the `CompatConfig` layer for provider quirks (thinking field,
 `max_tokens`, developer-vs-system role). Default OpenAI-shaped behavior is fine
 until a provider breaks it; the first knob (`echo_reasoning_content`) has landed.
+
+**Client-side encryption — implemented but OFF by default (revisit later).** The
+`crypt.rs` / `sync_set_encryption` feature works (AES-256-GCM, random key in the
+OS keychain, optional recovery code), but the **multi-device workflow is awkward**:
+unlocking a second device means copying a base64 recovery code over by hand
+because the key never leaves the device. That's why it stays off for now — the
+plaintext mirror is fine for a personal, single-device setup given Supabase's
+no-train/no-sell policy. Revisit if a smoother key-transfer story is wanted
+(e.g. wrapping the key with a user passphrase and syncing the wrapped blob, or an
+OS-level cross-device key sync) before recommending it. Note: the key/commands
+are inert unless the user enables it (`sync_enabled` + a stored key).
 
 **Known gaps:** the per-conversation scratch workspace for `read_file`/`write_file`
 is not implemented — host tools operate on real paths with per-call approval.
