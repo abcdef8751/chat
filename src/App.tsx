@@ -1673,6 +1673,7 @@ export default function App() {
       name: p.name,
       baseUrl: p.baseUrl,
       defaultModel: p.defaultModel ?? null,
+      catalogId: p.catalogId ?? null,
     }));
 
   // The header's provider selector. A non-empty list is the real provider set;
@@ -1686,6 +1687,7 @@ export default function App() {
         name: "Default",
         baseUrl: baseUrl(),
         defaultModel: model(),
+        catalogId: null,
         hasKey: hasKey(),
         active: true,
       },
@@ -1724,7 +1726,10 @@ export default function App() {
     }
     setProviderError(null);
     try {
-      await addProvider(name, url, addKey().trim() || null);
+      // catalogId is the models.dev provider id only when the user picked one
+      // from the catalog (enables models.dev listing/pricing); a manual add
+      // (pick "") keeps it null so models.dev is never used for it.
+      await addProvider(name, url, addKey().trim() || null, pick || null);
       await refreshProviders();
       setAddOpen(false);
       setAddName("");

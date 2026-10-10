@@ -151,14 +151,25 @@ pub async fn list_models(
         }
     }
 
-    // Pull/refresh the models.dev catalog for this endpoint, then list from it.
-    let _ = crate::pricing::ensure_cached(&db, &base_url, force).await;
-    let mut ids: Vec<String> = crate::pricing::provider_model_ids(&db, &base_url)
-        .into_iter()
-        .filter(|id| is_likely_chat(id))
-        .collect();
+    // models.dev is used ONLY when the user explicitly picked this provider from
+    // the catalog (catalog_id is set). Manual/custom providers always list via
+    // the provider's own GET /models — models.dev is never auto-matched by host.
+    let use_catalog = provider
+        .catalog_id
+        .as_deref()
+        .map(|c| !c.trim().is_empty())
+        .unwrap_or(false);
+    let mut ids: Vec<String> = Vec::new();
+    if use_catalog {
+        let _ = crate::pricing::ensure_cached(&db, &base_url, force).await;
+        ids = crate::pricing::provider_model_ids(&db, &base_url)
+            .into_iter()
+            .filter(|id| is_likely_chat(id))
+            .collect();
+    }
 
-    // Endpoint isn't in models.dev: ask the endpoint itself (needs a key).
+    // No catalog list (manual provider, or the catalog had no chat models): ask
+    // the endpoint itself (needs a key).
     if ids.is_empty() {
         let api_key = crate::providers::resolve(&provider.id)?.ok_or_else(|| {
             "API key not set for this provider — set it in Settings.".to_string()

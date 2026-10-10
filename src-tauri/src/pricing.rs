@@ -520,9 +520,24 @@ pub fn get_pricing(
 #[tauri::command]
 pub async fn refresh_pricing(app: tauri::AppHandle) -> Result<RefreshResult, String> {
     let config = app.state::<ConfigState>().get();
+    let active = config.active_provider();
+    // models.dev prices only apply to providers the user explicitly picked from
+    // the catalog; manual/custom providers keep bundled/default rates.
+    let use_catalog = active
+        .catalog_id
+        .as_deref()
+        .map(|c| !c.trim().is_empty())
+        .unwrap_or(false);
+    if !use_catalog {
+        return Ok(RefreshResult {
+            count: 0,
+            provider: active.name,
+            fetched_at: now_millis(),
+        });
+    }
     let root = fetch_models_dev().await?;
     let db = app.state::<Db>();
-    let (provider_id, count, fetched_at) = cache_provider(&db, &config.base_url, &root)?;
+    let (provider_id, count, fetched_at) = cache_provider(&db, &active.base_url, &root)?;
     Ok(RefreshResult {
         count,
         provider: provider_id,

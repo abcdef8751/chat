@@ -50,6 +50,8 @@ export interface Provider {
   name: string;
   baseUrl: string;
   defaultModel?: string | null;
+  /** Set only when added via the catalog picker (models.dev is then used). */
+  catalogId?: string | null;
 }
 
 /** A provider plus its live key status and active flag (for pickers/manager). */
@@ -58,6 +60,8 @@ export interface ProviderInfo {
   name: string;
   baseUrl: string;
   defaultModel: string | null;
+  /** The models.dev provider id, set only when added via the catalog picker. */
+  catalogId: string | null;
   hasKey: boolean;
   active: boolean;
 }
@@ -239,11 +243,13 @@ export function addProvider(
   name: string,
   baseUrl: string,
   apiKey?: string | null,
+  catalogId?: string | null,
 ): Promise<ProviderInfo> {
   return invoke<ProviderInfo>("add_provider", {
     name,
     baseUrl,
     apiKey: apiKey ?? null,
+    catalogId: catalogId ?? null,
   });
 }
 

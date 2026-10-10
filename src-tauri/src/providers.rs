@@ -24,6 +24,9 @@ pub struct ProviderInfo {
     pub name: String,
     pub base_url: String,
     pub default_model: Option<String>,
+    /// The models.dev provider id this was populated from, if the user picked
+    /// it from the catalog (which enables models.dev listing/pricing).
+    pub catalog_id: Option<String>,
     /// Whether a per-provider (or legacy) API key is stored.
     pub has_key: bool,
     /// Whether this is the active provider for new chats.
@@ -41,6 +44,7 @@ fn info_for(config: &AppConfig, provider: &Provider) -> ProviderInfo {
         name: provider.name.clone(),
         base_url: provider.base_url.clone(),
         default_model: provider.default_model.clone(),
+        catalog_id: provider.catalog_id.clone(),
         has_key,
         active: config.active_provider_id() == provider.id,
     }
@@ -74,14 +78,29 @@ pub fn list_providers(config: tauri::State<'_, ConfigState>) -> Vec<ProviderInfo
     cfg.providers.iter().map(|p| info_for(&cfg, p)).collect()
 }
 
+/// Normalize a user-supplied `catalog_id` from the "Add provider" dialog: trim
+/// and treat empty as `None`. `None`/empty means the provider is manual and
+/// models.dev must never be used for it.
+fn normalize_catalog_id(catalog_id: &Option<String>) -> Option<String> {
+    catalog_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
 /// Add a provider. Returns the new provider's info (with key status). When
 /// `api_key` is given it is stored in the keychain; otherwise left empty.
+/// `catalog_id` is the models.dev provider id when the user picked this from
+/// the catalog (enables models.dev listing/pricing); `None` for a manual
+/// endpoint (models.dev is never auto-used — models come from `GET /models`).
 #[tauri::command]
 pub fn add_provider(
     config: tauri::State<'_, ConfigState>,
     name: String,
     base_url: String,
     api_key: Option<String>,
+    catalog_id: Option<String>,
 ) -> Result<ProviderInfo, String> {
     let mut cfg = config.get();
     let name = name.trim().to_string();
@@ -103,6 +122,9 @@ pub fn add_provider(
         name,
         base_url,
         default_model: None,
+        // Populated only when the user picked this provider from the models.dev
+        // catalog; a manual add keeps this None so models.dev is never auto-used.
+        catalog_id: normalize_catalog_id(&catalog_id),
     };
     cfg.providers.push(provider.clone());
     // First provider becomes the active one.
@@ -279,6 +301,7 @@ mod tests {
             name: "My Provider".into(),
             base_url: "https://x.io/v1".into(),
             default_model: None,
+            catalog_id: None,
         };
         cfg.providers.push(provider.clone());
         // First provider becomes active (mirrors add_provider's condition).
@@ -298,9 +321,22 @@ mod tests {
             name: "P".into(),
             base_url: "https://p/v1".into(),
             default_model: Some("m1".into()),
+            catalog_id: None,
         }];
         sync_active(&mut cfg, "p");
         assert_eq!(cfg.base_url, "https://p/v1");
         assert_eq!(cfg.model, "m1");
+    }
+
+    #[test]
+    fn catalog_id_is_set_only_when_picked_from_catalog() {
+        // Manual/custom add → None (models.dev must not be used).
+        assert_eq!(normalize_catalog_id(&None), None);
+        assert_eq!(normalize_catalog_id(&Some("  ".into())), None);
+        // Picked from the catalog → the models.dev provider id, trimmed.
+        assert_eq!(
+            normalize_catalog_id(&Some(" fireworks-ai ".into())),
+            Some("fireworks-ai".to_string())
+        );
     }
 }

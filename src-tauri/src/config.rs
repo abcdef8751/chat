@@ -38,6 +38,12 @@ pub struct Provider {
     pub base_url: String,
     /// Optional per-provider favorite model shown first in the model picker.
     pub default_model: Option<String>,
+    /// The models.dev provider id (`catalog_id`) this provider was populated
+    /// from, set ONLY when the user explicitly picked it from the "Add provider"
+    /// catalog. `None` (manual/custom endpoint) means models.dev must not be
+    /// used for this provider — its models are listed via `GET {base_url}/models`
+    /// and pricing falls back to bundled/default values.
+    pub catalog_id: Option<String>,
 }
 
 impl Default for Provider {
@@ -47,6 +53,7 @@ impl Default for Provider {
             name: String::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             default_model: None,
+            catalog_id: None,
         }
     }
 }
@@ -166,6 +173,7 @@ impl AppConfig {
             name: host,
             base_url: normalize_base_url(&self.base_url),
             default_model: None,
+            catalog_id: None,
         }
     }
 
@@ -355,12 +363,14 @@ mod tests {
                 name: "A".into(),
                 base_url: "https://a/v1/".into(),
                 default_model: None,
+                catalog_id: None,
             },
             Provider {
                 id: "b".into(),
                 name: "B".into(),
                 base_url: "https://b/v1/".into(),
                 default_model: Some("m-b".into()),
+                catalog_id: None,
             },
         ];
         // No active id → first provider.
