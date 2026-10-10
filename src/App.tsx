@@ -2217,7 +2217,7 @@ export default function App() {
             </button>
             <h1 class="truncate text-sm font-semibold">{activeTitle()}</h1>
           </div>
-          <div class="flex shrink-0 items-center gap-2 sm:gap-3">
+          <div class="flex shrink-0 flex-wrap items-center justify-end gap-2 sm:gap-3">
             <Show when={activeId()}>
               <div
                 class="hidden items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-neutral-500 sm:flex dark:text-neutral-400"
