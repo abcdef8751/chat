@@ -609,7 +609,10 @@ pub struct ThinkingOptions {
     pub supports_reasoning: bool,
 }
 
-const OPENAI_THINKING_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
+// The full range the OpenAI/DeepSeek-style APIs accept for the reasoning-effort
+// field, used as the fallback for custom models with no models.dev metadata.
+const OPENAI_THINKING_LEVELS: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub fn thinking_options_for(meta: Option<ModelMeta>) -> ThinkingOptions {
     if let Some(meta) = meta {
@@ -893,7 +896,10 @@ mod tests {
         };
         let opts = thinking_options_for(Some(toggle));
         assert_eq!(opts.source, "openai");
-        assert_eq!(opts.options, vec!["minimal", "low", "medium", "high"]);
+        assert_eq!(
+            opts.options,
+            vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
 
         // Unknown model → OpenAI set.
         let unknown = thinking_options_for(None);
