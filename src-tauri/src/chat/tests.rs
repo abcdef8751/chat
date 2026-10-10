@@ -201,6 +201,20 @@
         )
     }
 
+    /// Reasoning aliased as a plain `thinking` string delta field (some proxies).
+    fn thinking_alias_chunk(reasoning: &str) -> String {
+        format!(
+            r#"{{"id":"1","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{{"index":0,"delta":{{"thinking":"{reasoning}"}},"finish_reason":null}}]}}"#
+        )
+    }
+
+    /// A content-array reasoning part carrying `content` (Responses style).
+    fn content_part_reasoning_chunk(reasoning: &str) -> String {
+        format!(
+            r#"{{"id":"1","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{{"index":0,"delta":{{"content":[{{"type":"reasoning","content":["{reasoning}"]}}]}},"finish_reason":null}}]}}"#
+        )
+    }
+
     fn finish_chunk(reason: &str) -> String {
         format!(
             r#"{{"id":"1","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{{"index":0,"delta":{{}},"finish_reason":"{reason}"}}]}}"#
@@ -332,6 +346,36 @@
         let _ = handle.join();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_captures_reasoning_aliases() {
+        // A provider that streams reasoning as a plain `thinking` delta field.
+        let (port, handle) = start_mock(
+            vec![vec![
+                thinking_alias_chunk("Let me think. "),
+                delta_chunk("Hello"),
+                finish_chunk("stop"),
+            ]],
+            0,
+        );
+        let acc = complete_once(port).await;
+        assert_eq!(acc.text, "Hello");
+        assert_eq!(acc.thinking, "Let me think. ");
+        let _ = handle.join();
+
+        // A Responses-style content-array reasoning part carrying `content`.
+        let (port, handle) = start_mock(
+            vec![vec![
+                content_part_reasoning_chunk("Surely. "),
+                delta_chunk("Hi"),
+                finish_chunk("stop"),
+            ]],
+            0,
+        );
+        let acc = complete_once(port).await;
+        assert_eq!(acc.text, "Hi");
+        assert_eq!(acc.thinking, "Surely. ");
+        let _ = handle.join();
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_completion_accumulates_tool_call_fragments() {
         let (port, handle) = start_mock(

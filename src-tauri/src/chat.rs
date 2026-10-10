@@ -171,6 +171,33 @@ fn error_message(err: &Value) -> String {
     err.to_string()
 }
 
+/// Extract reasoning text from a content-array part. Different providers put the
+/// reasoning in different fields: `text` (some OpenAI-compatible), `thinking`
+/// (Claude/thinking-style), or `content` (Responses-style reasoning parts, which
+/// is a string or an array of strings). Returns `None` when the part carries no
+/// readable reasoning, so it's skipped rather than emitted as an empty trace.
+fn reasoning_part_text(part: &Value) -> Option<String> {
+    for key in ["text", "thinking", "content"] {
+        if let Some(s) = part.get(key).and_then(Value::as_str) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    if let Some(arr) = part.get("content").and_then(Value::as_array) {
+        let joined: String = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        if !joined.trim().is_empty() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
 /// Apply one parsed stream chunk to the running accumulation, emitting events.
 /// Reads both the classic OpenAI shape (`content` string) and the shapes
 /// providers use for thinking models: a `reasoning_content` string on the
@@ -239,16 +266,9 @@ fn apply_chunk(
                         }
                     }
                     "thinking" | "reasoning" | "reasoning_content" => {
-                        let t = item
-                            .get("text")
-                            .or_else(|| item.get("thinking"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if !t.is_empty() {
-                            out.thinking.push_str(t);
-                            sink.emit(StreamEvent::ThinkingDelta {
-                                text: t.to_string(),
-                            });
+                        if let Some(t) = reasoning_part_text(item) {
+                            out.thinking.push_str(&t);
+                            sink.emit(StreamEvent::ThinkingDelta { text: t });
                         }
                     }
                     _ => {}
@@ -257,13 +277,17 @@ fn apply_chunk(
         }
         _ => {}
     }
-    // DeepSeek/Qwen-style reasoning, streamed in its own delta field.
-    if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
-        if !r.is_empty() {
-            out.thinking.push_str(r);
-            sink.emit(StreamEvent::ThinkingDelta {
-                text: r.to_string(),
-            });
+    // DeepSeek/Qwen-style reasoning, streamed in its own delta field. Some
+    // providers alias it as `thinking` or `reasoning` (a plain string) rather
+    // than `reasoning_content`; accept any of those, deepest-match, but only
+    // once (so a provider that sends multiple aliases isn't double-counted).
+    for key in ["reasoning_content", "thinking", "reasoning"] {
+        if let Some(r) = delta.get(key).and_then(Value::as_str) {
+            if !r.is_empty() {
+                out.thinking.push_str(r);
+                sink.emit(StreamEvent::ThinkingDelta { text: r.to_string() });
+                break;
+            }
         }
     }
     // Streamed tool-call fragments, accumulated by index.
