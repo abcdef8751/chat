@@ -22,7 +22,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::chat::{self, EventSink, StreamEvent};
-use crate::config::ConfigState;
+use crate::config::{AppConfig, ConfigState};
 use crate::db;
 use crate::memory::MemoryState;
 use crate::tools;
@@ -790,12 +790,34 @@ async fn backfill_inner(app: &AppHandle, min_chars: i64, concurrency: usize) -> 
     consolidate_extractions(app).await
 }
 
+/// Build the turn-local config for a background pass that runs on the active
+/// provider (the backfill map + reduce phases). These have no conversation to
+/// pin, so they resolve the *active provider's* base URL (and its default model,
+/// falling back to the global default) rather than trusting the top-level
+/// `base_url`/`model` mirrors. Those mirrors can drift stale against the active
+/// provider (e.g. when the frontend writes a config whose mirror still points at
+/// an old endpoint), which would send the wrong model to the wrong endpoint and
+/// surface as a provider-side "model not found" 404.
+fn active_turn_cfg(cfg: &AppConfig) -> AppConfig {
+    let provider = cfg.active_provider();
+    let mut turn_cfg = cfg.clone();
+    turn_cfg.base_url = provider.base_url.clone();
+    let model = provider
+        .default_model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| cfg.model.clone());
+    turn_cfg.model = model;
+    turn_cfg
+}
+
 /// One extraction pass: transcript in, staged summary out. Read-only with
 /// respect to the memory files, which is what makes the map phase safe to run
 /// concurrently.
 async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<(), String> {
     let cfg = app.state::<ConfigState>().get();
-    if cfg.model.trim().is_empty() {
+    let turn_cfg = active_turn_cfg(&cfg);
+    if turn_cfg.model.trim().is_empty() {
         return Ok(());
     }
     let Some(api_key) = crate::providers::resolve(&cfg.active_provider_id())? else {
@@ -826,7 +848,7 @@ async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<
     let flag = Arc::new(AtomicBool::new(false));
     let sink = NullSink;
     let result = chat::run_tool_loop(
-        &cfg,
+        &turn_cfg,
         &api_key,
         &brave,
         &shell,
@@ -852,7 +874,7 @@ async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<
     }
 
     let cost = {
-        let pricing = crate::pricing::resolve_for(&db, &cfg, &cfg.model);
+        let pricing = crate::pricing::resolve_for(&db, &turn_cfg, &turn_cfg.model);
         crate::pricing::cost_of_usage(&result.usage, &pricing)
     };
     // Record even an empty payload: the watermark is what stops this
@@ -863,7 +885,7 @@ async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<
         &db,
         conversation_id,
         snapshot_max,
-        &cfg.model,
+        &turn_cfg.model,
         Some(&result.usage.to_string()),
         cost,
         payload,
@@ -1002,7 +1024,8 @@ async fn run_reduce_pass(
     memory_through: Option<i64>,
 ) -> Result<(), String> {
     let cfg = app.state::<ConfigState>().get();
-    if cfg.model.trim().is_empty() {
+    let turn_cfg = active_turn_cfg(&cfg);
+    if turn_cfg.model.trim().is_empty() {
         return Ok(());
     }
     let Some(api_key) = crate::providers::resolve(&cfg.active_provider_id())? else {
@@ -1016,8 +1039,8 @@ async fn run_reduce_pass(
     let approvals = app.state::<tools::ApprovalRegistry>();
 
     let before = snapshot_files(&memory);
-    let model_label = crate::pricing::cached_model_name(&db, &cfg.base_url, &cfg.model)
-        .unwrap_or_else(|| cfg.model.clone());
+    let model_label = crate::pricing::cached_model_name(&db, &turn_cfg.base_url, &turn_cfg.model)
+        .unwrap_or_else(|| turn_cfg.model.clone());
     let system_prompt = chat::build_system_prompt(
         chat::DEFAULT_SYSTEM_PROMPT,
         &model_label,
@@ -1045,7 +1068,7 @@ async fn run_reduce_pass(
     let flag = Arc::new(AtomicBool::new(false));
     let sink = NullSink;
     let result = chat::run_tool_loop(
-        &cfg,
+        &turn_cfg,
         &api_key,
         &brave,
         &shell,
@@ -1073,7 +1096,7 @@ async fn run_reduce_pass(
     let after = snapshot_files(&memory);
     let changed = diff_files(&before, &after);
     let cost = {
-        let pricing = crate::pricing::resolve_for(&db, &cfg, &cfg.model);
+        let pricing = crate::pricing::resolve_for(&db, &turn_cfg, &turn_cfg.model);
         crate::pricing::cost_of_usage(&result.usage, &pricing)
     };
     let note = if changed.is_empty() {
@@ -1083,7 +1106,7 @@ async fn run_reduce_pass(
     };
     db::insert_backfill_run(
         &db,
-        &cfg.model,
+        &turn_cfg.model,
         Some(&result.usage.to_string()),
         cost,
         &changed,
@@ -1183,6 +1206,39 @@ mod tests {
             payload: "x".repeat(chars),
             created_at: at,
         }
+    }
+
+    /// Backfill passes must run on the active provider's base URL, not the
+    /// top-level `base_url`/`model` mirrors (which can drift stale and point at
+    /// the wrong endpoint, causing provider-side "model not found" 404s).
+    #[test]
+    fn active_turn_cfg_resolves_the_active_provider() {
+        let mut cfg = AppConfig::default();
+        cfg.active_provider_id = "inferx".into();
+        cfg.base_url = "https://stale.example/v1".into(); // stale mirror
+        cfg.model = "deepseek-v4-flash-0731".into();
+        cfg.providers = vec![
+            crate::config::Provider {
+                id: "inferx".into(),
+                name: "InferX".into(),
+                base_url: "https://model.inferx.net/endpoints/v1".into(),
+                default_model: None,
+                catalog_id: None,
+            },
+            crate::config::Provider {
+                id: "other".into(),
+                name: "Other".into(),
+                base_url: "https://other.example/v1".into(),
+                default_model: Some("other-model".into()),
+                catalog_id: None,
+            },
+        ];
+
+        let turn_cfg = active_turn_cfg(&cfg);
+        // Uses the active provider's real endpoint and the global default model
+        // (provider has no default_model to override it), not the stale mirror.
+        assert_eq!(turn_cfg.base_url, "https://model.inferx.net/endpoints/v1");
+        assert_eq!(turn_cfg.model, "deepseek-v4-flash-0731");
     }
 
     /// One pass is the default: it sees every summary at once, which resolves
