@@ -4,7 +4,7 @@ export interface Conversation {
   id: string;
   title: string;
   model: string | null;
-  providerId: string | null;
+  provider_id: string | null;
   system_prompt: string | null;
   compaction_summary: string | null;
   created_at: number;

@@ -1808,7 +1808,7 @@ export default function App() {
       await setActiveProvider(id);
       await refreshProviders();
       const conv = activeConversation();
-      if (conv && !conv.providerId) {
+      if (conv && !conv.provider_id) {
         // New chats/current defaulted chat now resolves to the new active one.
         setHeaderProviderId(id);
       }
@@ -1839,9 +1839,9 @@ export default function App() {
     // header + conversation if the new provider's model list fails to load.
     const target = !conv
       ? null
-      : conv.providerId === null || conv.providerId === ""
+      : conv.provider_id === null || conv.provider_id === ""
         ? null
-        : conv.providerId;
+        : conv.provider_id;
     const prevEff = target ?? activeProviderId();
     setHeaderProviderId(id);
     if (conv) {
@@ -1893,7 +1893,7 @@ export default function App() {
     const convId = activeId();
     const ap = activeProviderId();
     const conv = convId ? activeConversation() : null;
-    const prov = conv?.providerId ?? ap;
+    const prov = conv?.provider_id ?? ap;
     if (convId === lastSyncId && ap === lastSyncAp) return;
     lastSyncId = convId;
     lastSyncAp = ap;
