@@ -10,6 +10,7 @@ import {
   Switch,
 } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
+import { DropdownMenu } from "@kobalte/core/dropdown-menu";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -209,6 +210,58 @@ function PaperclipIcon() {
     </svg>
   );
 }
+
+function MenuIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      class="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.7"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M4 6h16" />
+      <path d="M4 12h16" />
+      <path d="M4 18h16" />
+    </svg>
+  );
+}
+
+function MoreIcon() {
+  return (
+    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor" aria-hidden="true">
+      <circle cx="5" cy="12" r="1.7" />
+      <circle cx="12" cy="12" r="1.7" />
+      <circle cx="19" cy="12" r="1.7" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      class="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.7"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M18 6 6 18" />
+      <path d="m6 6 12 12" />
+    </svg>
+  );
+}
+
+// Shared styling for dropdown-menu items (header overflow menu). Kept as a
+// literal here so Tailwind's scanner picks up the `data-[highlighted]` variant.
+const MENU_ITEM_CLASS =
+  "flex cursor-pointer select-none items-center rounded-md px-3 py-2 text-neutral-700 outline-none data-[highlighted]:bg-neutral-100 dark:text-neutral-200 dark:data-[highlighted]:bg-neutral-800";
 
 function formatTokens(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "0";
@@ -560,6 +613,9 @@ export default function App() {
   // Files staged for the next message (picked or dropped).
   const [pendingAttachments, setPendingAttachments] = createSignal<Attachment[]>([]);
   const [dragOver, setDragOver] = createSignal(false);
+  // Narrow-viewport drawer state. At >=lg the sidebar is always in flow, so
+  // this only matters below the breakpoint (see the `lg:` overrides on <aside>).
+  const [sidebarOpen, setSidebarOpen] = createSignal(false);
 
   const [draftTitle, setDraftTitle] = createSignal("");
   const [newOpen, setNewOpen] = createSignal(false);
@@ -648,6 +704,14 @@ export default function App() {
     } catch {
       // ignore
     }
+
+    // Narrow-viewport drawer: Escape closes it (no-op on wide viewports where
+    // the sidebar is always in flow).
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSidebarOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => window.removeEventListener("keydown", onKey));
 
     // Native OS drag-and-drop (HTML5 drops are intercepted by Tauri).
     const unlistenDrop = await getCurrentWebview().onDragDropEvent((event) => {
@@ -1639,10 +1703,22 @@ export default function App() {
           </div>
         </div>
       </Show>
-      {/* Sidebar */}
-      <aside class="flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-900">
-        <div class="flex items-center justify-between gap-2 border-b border-neutral-200 p-3 dark:border-neutral-800">
-          <span class="pl-1 text-sm font-semibold tracking-tight">Pi Chat</span>
+      {/* Sidebar backdrop — narrow viewports only, closes the drawer on tap */}
+      <Show when={sidebarOpen()}>
+        <div
+          class="fixed inset-0 z-30 bg-black/40 lg:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      </Show>
+      {/* Sidebar — a slide-in drawer below `lg`, always in flow at `lg` and up */}
+      <aside
+        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform lg:static lg:z-auto lg:translate-x-0 dark:border-neutral-800 dark:bg-neutral-900 ${
+          sidebarOpen() ? "translate-x-0" : "-translate-x-full"
+        }`}
+      >
+        <div class="flex items-center gap-2 border-b border-neutral-200 p-3 dark:border-neutral-800">
+          <span class="mr-auto pl-1 text-sm font-semibold tracking-tight">Pi Chat</span>
 
           <Dialog open={newOpen()} onOpenChange={setNewOpen}>
             <Dialog.Trigger class="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300">
@@ -1678,6 +1754,14 @@ export default function App() {
               </Dialog.Content>
             </Dialog.Portal>
           </Dialog>
+          <button
+            onClick={() => setSidebarOpen(false)}
+            title="Close chats"
+            aria-label="Close conversations"
+            class="rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-200 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
+          >
+            <CloseIcon />
+          </button>
         </div>
 
         <div class="border-b border-neutral-200 px-3 py-2 dark:border-neutral-800">
@@ -1713,6 +1797,7 @@ export default function App() {
                       onClick={() => {
                         setActiveId(c.id);
                         setConfirmDeleteId(null);
+                        setSidebarOpen(false);
                       }}
                       class={`w-full truncate rounded-lg px-3 py-2 pr-14 text-left text-sm transition ${
                         activeId() === c.id
@@ -1769,9 +1854,20 @@ export default function App() {
 
       {/* Main */}
       <main class="flex min-w-0 flex-1 flex-col">
-        <header class="flex items-center justify-between gap-3 border-b border-neutral-200 px-6 py-3 dark:border-neutral-800">
-          <h1 class="truncate text-sm font-semibold">{activeTitle()}</h1>
-          <div class="flex shrink-0 items-center gap-3">
+        <header class="flex items-center justify-between gap-3 border-b border-neutral-200 px-4 py-3 sm:px-6 dark:border-neutral-800">
+          <div class="flex min-w-0 items-center gap-2">
+            <button
+              onClick={() => setSidebarOpen(true)}
+              title="Show chats"
+              aria-label="Show conversations"
+              aria-expanded={sidebarOpen()}
+              class="shrink-0 rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
+            >
+              <MenuIcon />
+            </button>
+            <h1 class="truncate text-sm font-semibold">{activeTitle()}</h1>
+          </div>
+          <div class="flex shrink-0 items-center gap-2 sm:gap-3">
             <Show when={activeId()}>
               <div
                 class="hidden items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-neutral-500 sm:flex dark:text-neutral-400"
@@ -1795,12 +1891,12 @@ export default function App() {
               onClick={() => setDark(!dark())}
               title="Toggle light/dark theme"
               aria-pressed={dark()}
-              class="rounded-md px-3 py-1.5 text-xs text-neutral-500 transition hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+              class="hidden rounded-md px-3 py-1.5 text-xs text-neutral-500 transition hover:bg-neutral-100 lg:inline-block dark:text-neutral-400 dark:hover:bg-neutral-800"
             >
               {dark() ? "Light" : "Dark"}
             </button>
             <select
-              class="max-w-56 truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
+              class="max-w-[9rem] truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-50 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
               title="Model"
               aria-busy={modelsLoading()}
               ref={(el) => (modelSelectEl = el)}
@@ -1820,7 +1916,7 @@ export default function App() {
               when={thinkingOpts()?.supportsReasoning && thinkingOpts()!.options.length > 0}
             >
               <select
-                class="rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
+                class="hidden rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 lg:block dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
                 title={
                   thinkingOpts()!.source === "models.dev"
                     ? "Thinking level (from models.dev)"
@@ -1837,16 +1933,87 @@ export default function App() {
             </Show>
             <button
               onClick={openMemory}
-              class="rounded-md px-3 py-1.5 text-xs text-neutral-500 transition hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+              class="hidden rounded-md px-3 py-1.5 text-xs text-neutral-500 transition hover:bg-neutral-100 lg:inline-block dark:text-neutral-400 dark:hover:bg-neutral-800"
             >
               Memory
             </button>
             <button
               onClick={openSettings}
-              class="rounded-md px-3 py-1.5 text-xs text-neutral-500 transition hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+              class="hidden rounded-md px-3 py-1.5 text-xs text-neutral-500 transition hover:bg-neutral-100 lg:inline-block dark:text-neutral-400 dark:hover:bg-neutral-800"
             >
               Settings
             </button>
+            {/* Overflow menu: the header controls above collapse into this below
+                `lg`, so nothing becomes unreachable when the window is narrow. */}
+            <DropdownMenu>
+              <DropdownMenu.Trigger
+                title="More actions"
+                aria-label="More actions"
+                class="rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 data-[expanded]:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800 dark:data-[expanded]:bg-neutral-800"
+              >
+                <MoreIcon />
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal>
+                <DropdownMenu.Content
+                  class="z-50 min-w-44 rounded-lg border border-neutral-200 bg-white p-1 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900"
+                >
+                  <DropdownMenu.Item class={MENU_ITEM_CLASS} onSelect={openMemory}>
+                    Memory
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item class={MENU_ITEM_CLASS} onSelect={openSettings}>
+                    Settings
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item
+                    class={MENU_ITEM_CLASS}
+                    onSelect={() => setDark(!dark())}
+                  >
+                    {dark() ? "Switch to light" : "Switch to dark"}
+                  </DropdownMenu.Item>
+                  <Show
+                    when={
+                      thinkingOpts()?.supportsReasoning && thinkingOpts()!.options.length > 0
+                    }
+                  >
+                    <DropdownMenu.Separator class="my-1 h-px bg-neutral-200 dark:bg-neutral-800" />
+                    <DropdownMenu.Sub>
+                      <DropdownMenu.SubTrigger
+                        class={`${MENU_ITEM_CLASS} justify-between gap-3`}
+                      >
+                        <span>Thinking: {thinkingLevel() || "default"}</span>
+                        <span class="text-neutral-400">›</span>
+                      </DropdownMenu.SubTrigger>
+                      <DropdownMenu.Portal>
+                        <DropdownMenu.SubContent
+                          class="z-50 min-w-40 rounded-lg border border-neutral-200 bg-white p-1 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900"
+                        >
+                          <DropdownMenu.RadioGroup
+                            value={thinkingLevel()}
+                            onChange={(value) => changeThinking(value)}
+                          >
+                            <DropdownMenu.RadioItem value="" class={MENU_ITEM_CLASS}>
+                              <span class="inline-block w-4">
+                                {thinkingLevel() === "" ? "✓" : ""}
+                              </span>
+                              Default
+                            </DropdownMenu.RadioItem>
+                            <For each={thinkingOpts()!.options}>
+                              {(o) => (
+                                <DropdownMenu.RadioItem value={o} class={MENU_ITEM_CLASS}>
+                                  <span class="inline-block w-4">
+                                    {thinkingLevel() === o ? "✓" : ""}
+                                  </span>
+                                  Thinking: {o}
+                                </DropdownMenu.RadioItem>
+                              )}
+                            </For>
+                          </DropdownMenu.RadioGroup>
+                        </DropdownMenu.SubContent>
+                      </DropdownMenu.Portal>
+                    </DropdownMenu.Sub>
+                  </Show>
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu>
           </div>
         </header>
 
