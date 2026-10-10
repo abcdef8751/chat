@@ -9,6 +9,7 @@ mod import;
 mod memory;
 mod models;
 mod pricing;
+mod providers;
 mod reflection;
 mod secrets;
 mod shell;
@@ -77,10 +78,19 @@ pub fn run() {
             db::list_messages,
             db::add_message,
             db::rename_conversation,
+            db::set_conversation_provider,
+            db::set_conversation_model,
             db::delete_conversation,
             db::search_conversations,
             config::get_config,
             config::set_config,
+            providers::list_providers,
+            providers::add_provider,
+            providers::update_provider,
+            providers::remove_provider,
+            providers::set_active_provider,
+            providers::list_models_dev_providers,
+            providers::resolve_provider_key,
             secrets::has_api_key,
             secrets::set_api_key,
             secrets::has_brave_key_cmd,

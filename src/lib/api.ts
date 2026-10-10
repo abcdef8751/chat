@@ -4,6 +4,7 @@ export interface Conversation {
   id: string;
   title: string;
   model: string | null;
+  providerId: string | null;
   system_prompt: string | null;
   compaction_summary: string | null;
   created_at: number;
@@ -44,9 +45,37 @@ export interface ModelOverride {
   cacheWritePerMillion: number | null;
 }
 
+export interface Provider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  defaultModel?: string | null;
+}
+
+/** A provider plus its live key status and active flag (for pickers/manager). */
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  baseUrl: string;
+  defaultModel: string | null;
+  hasKey: boolean;
+  active: boolean;
+}
+
+/** A provider entry from the models.dev catalog shown in "Add provider". */
+export interface ModelsDevProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+}
+
 export interface Config {
   baseUrl: string;
   model: string;
+  /** All configured providers. Empty on legacy configs (single provider). */
+  providers: Provider[];
+  /** The provider new chats default to. */
+  activeProviderId: string;
   preferences: string;
   thinkingLevel: string;
   echoReasoningContent: boolean;
@@ -186,6 +215,65 @@ export function renameConversation(conversationId: string, title: string): Promi
   return invoke<void>("rename_conversation", { conversationId, title });
 }
 
+export function setConversationProvider(
+  conversationId: string,
+  providerId: string | null,
+): Promise<void> {
+  return invoke<void>("set_conversation_provider", {
+    conversationId,
+    providerId: providerId ?? null,
+  });
+}
+
+export function setConversationModel(conversationId: string, model: string): Promise<void> {
+  return invoke<void>("set_conversation_model", { conversationId, model });
+}
+
+// --- Multi-provider management ---
+
+export function listProviders(): Promise<ProviderInfo[]> {
+  return invoke<ProviderInfo[]>("list_providers");
+}
+
+export function addProvider(
+  name: string,
+  baseUrl: string,
+  apiKey?: string | null,
+): Promise<ProviderInfo> {
+  return invoke<ProviderInfo>("add_provider", {
+    name,
+    baseUrl,
+    apiKey: apiKey ?? null,
+  });
+}
+
+export function updateProvider(
+  id: string,
+  name?: string | null,
+  baseUrl?: string | null,
+  apiKey?: string | null,
+): Promise<ProviderInfo> {
+  return invoke<ProviderInfo>("update_provider", {
+    id,
+    name: name ?? null,
+    baseUrl: baseUrl ?? null,
+    apiKey: apiKey === undefined ? null : apiKey,
+  });
+}
+
+export function removeProvider(id: string): Promise<ProviderInfo[]> {
+  return invoke<ProviderInfo[]>("remove_provider", { id });
+}
+
+export function setActiveProvider(id: string): Promise<ProviderInfo> {
+  return invoke<ProviderInfo>("set_active_provider", { id });
+}
+
+/** Providers offered in the "Add provider" picker, from the models.dev catalog. */
+export function listModelsDevProviders(): Promise<ModelsDevProvider[]> {
+  return invoke<ModelsDevProvider[]>("list_models_dev_providers");
+}
+
 export function deleteConversation(conversationId: string): Promise<void> {
   return invoke<void>("delete_conversation", { conversationId });
 }
@@ -220,8 +308,11 @@ export function setBraveKey(braveKey: string | null): Promise<void> {
   return invoke<void>("set_brave_key", { braveKey: braveKey ?? null });
 }
 
-export function listModels(refresh?: boolean): Promise<ModelInfo[]> {
-  return invoke<ModelInfo[]>("list_models", { refresh: refresh ?? null });
+export function listModels(refresh?: boolean, providerId?: string | null): Promise<ModelInfo[]> {
+  return invoke<ModelInfo[]>("list_models", {
+    refresh: refresh ?? null,
+    providerId: providerId ?? null,
+  });
 }
 
 export function getPricing(modelId: string): Promise<Pricing> {

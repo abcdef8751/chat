@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
   model TEXT,
+  provider_id TEXT,
   system_prompt TEXT,
   compaction_summary TEXT,
   last_reflected_index INTEGER,
@@ -157,6 +158,11 @@ pub fn open(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE conversations ADD COLUMN import_batch INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Older databases predate per-conversation provider selection.
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN provider_id TEXT",
+        [],
+    );
     // Older databases predate resumable consolidation.
     let _ = conn.execute(
         "ALTER TABLE memory_extractions ADD COLUMN folded INTEGER NOT NULL DEFAULT 0",
@@ -215,6 +221,7 @@ pub struct Conversation {
     pub id: String,
     pub title: String,
     pub model: Option<String>,
+    pub provider_id: Option<String>,
     pub system_prompt: Option<String>,
     pub compaction_summary: Option<String>,
     pub created_at: i64,
@@ -271,7 +278,7 @@ pub fn get_conversation(
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, model, system_prompt, compaction_summary, created_at, updated_at
+            "SELECT id, title, model, provider_id, system_prompt, compaction_summary, created_at, updated_at
              FROM conversations WHERE id = ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -281,10 +288,11 @@ pub fn get_conversation(
                 id: r.get(0)?,
                 title: r.get(1)?,
                 model: r.get(2)?,
-                system_prompt: r.get(3)?,
-                compaction_summary: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
+                provider_id: r.get(3)?,
+                system_prompt: r.get(4)?,
+                compaction_summary: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -457,7 +465,7 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, model, system_prompt, compaction_summary, created_at, updated_at
+            "SELECT id, title, model, provider_id, system_prompt, compaction_summary, created_at, updated_at
              FROM conversations ORDER BY updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -467,10 +475,11 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
                 id: r.get(0)?,
                 title: r.get(1)?,
                 model: r.get(2)?,
-                system_prompt: r.get(3)?,
-                compaction_summary: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
+                provider_id: r.get(3)?,
+                system_prompt: r.get(4)?,
+                compaction_summary: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -501,6 +510,7 @@ pub fn create_conversation(
         id,
         title: t,
         model: None,
+        provider_id: None,
         system_prompt: None,
         compaction_summary: None,
         created_at: now,
@@ -552,6 +562,42 @@ pub fn rename_conversation(
     Ok(())
 }
 
+/// Set (or clear) a conversation's provider. `provider_id: None` clears it back
+/// to the active provider's default. Marks the row dirty for sync.
+#[tauri::command]
+pub fn set_conversation_provider(
+    db: tauri::State<'_, Db>,
+    conversation_id: String,
+    provider_id: Option<String>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let rev = bump_revision_c(&conn)?;
+    let pid = provider_id.filter(|p| !p.is_empty());
+    conn.execute(
+        "UPDATE conversations SET provider_id = ?2, updated_at = ?3, revision = ?4, dirty = 1 WHERE id = ?1",
+        params![conversation_id, pid, now(), rev],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Set a conversation's model (used by the per-chat model picker).
+#[tauri::command]
+pub fn set_conversation_model(
+    db: tauri::State<'_, Db>,
+    conversation_id: String,
+    model: String,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let rev = bump_revision_c(&conn)?;
+    conn.execute(
+        "UPDATE conversations SET model = ?2, updated_at = ?3, revision = ?4, dirty = 1 WHERE id = ?1",
+        params![conversation_id, model, now(), rev],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn delete_conversation(
     db: tauri::State<'_, Db>,
@@ -584,7 +630,7 @@ pub fn search_conversations(
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT c.id, c.title, c.model, c.system_prompt, c.compaction_summary, c.created_at, c.updated_at
+            "SELECT DISTINCT c.id, c.title, c.model, c.provider_id, c.system_prompt, c.compaction_summary, c.created_at, c.updated_at
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              WHERE lower(c.title) LIKE ?1 OR lower(m.content) LIKE ?1
@@ -597,10 +643,11 @@ pub fn search_conversations(
                 id: r.get(0)?,
                 title: r.get(1)?,
                 model: r.get(2)?,
-                system_prompt: r.get(3)?,
-                compaction_summary: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
+                provider_id: r.get(3)?,
+                system_prompt: r.get(4)?,
+                compaction_summary: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?;

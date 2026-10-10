@@ -10,6 +10,9 @@ use keyring::Entry;
 const SERVICE: &str = "com.rp.chat";
 /// Keychain user/account name for the API key entry.
 const USER: &str = "api_key";
+/// Keychain account prefix for per-provider API keys: the account is
+/// `provider:<id>`, one per configured provider (see `providers`).
+const PROVIDER_KEY_PREFIX: &str = "provider:";
 /// Keychain account name for the Brave Search API key (separate from the LLM
 /// key so the two never collide).
 const BRAVE_USER: &str = "brave_key";
@@ -27,6 +30,11 @@ fn entry() -> Result<Entry, String> {
 
 fn brave_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, BRAVE_USER).map_err(|e| format!("open keychain entry: {e}"))
+}
+
+fn provider_entry(id: &str) -> Result<Entry, String> {
+    Entry::new(SERVICE, &format!("{PROVIDER_KEY_PREFIX}{id}"))
+        .map_err(|e| format!("open keychain entry: {e}"))
 }
 
 fn session_entry() -> Result<Entry, String> {
@@ -58,10 +66,49 @@ pub fn delete() -> Result<(), String> {
     }
 }
 
+// --- Per-provider API keys --------------------------------------------------
+// Each configured provider stores its own key under the account `provider:<id>`.
+// This keeps one key per provider so switching providers swaps credentials too.
+
+/// Read a provider's stored API key. `Ok(None)` when none is saved yet.
+pub fn get_provider_key(provider_id: &str) -> Result<Option<String>, String> {
+    match provider_entry(provider_id)?.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keychain read: {e}")),
+    }
+}
+
+/// Store (or replace) a provider's API key.
+pub fn set_provider_key(provider_id: &str, key: &str) -> Result<(), String> {
+    provider_entry(provider_id)?
+        .set_password(key)
+        .map_err(|e| format!("keychain write: {e}"))
+}
+
+/// Remove a provider's API key. Removing a missing entry is a no-op.
+pub fn delete_provider_key(provider_id: &str) -> Result<(), String> {
+    match provider_entry(provider_id)?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete: {e}")),
+    }
+}
+
+/// Whether a specific provider has a stored key.
+pub fn has_provider_key(provider_id: &str) -> bool {
+    matches!(get_provider_key(provider_id), Ok(Some(k)) if !k.is_empty())
+}
+
 /// Whether an API key is stored in the keychain.
 #[tauri::command]
 pub fn has_api_key() -> Result<bool, String> {
     Ok(get()?.is_some())
+}
+
+/// Keychain-presence check that never errors (used by provider listing).
+pub fn has_api_key_quiet() -> bool {
+    get().map(|k| k.is_some()).unwrap_or(false)
 }
 
 /// Update the stored API key. `None`/empty removes it.
