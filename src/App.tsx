@@ -2562,58 +2562,63 @@ export default function App() {
             </Dialog.Description>
 
             <div class="mt-4 space-y-3">
-              <Show
-                when={providers().length > 0}
-                fallback={
-                  <>
-                    <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
-                      Base URL
-                      <input
-                        class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                        value={baseUrl()}
-                        onInput={(e) => setBaseUrl(e.currentTarget.value)}
-                      />
-                    </label>
+              <Show when={providers().length === 0}>
+                <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+                  <span class="block text-xs font-semibold text-neutral-600 dark:text-neutral-300">
+                    Default provider
+                  </span>
+                  <p class="mt-0.5 mb-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                    No providers configured yet. Edit the built-in default below, or add a
+                    provider with the button above.
+                  </p>
+                  <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                    Base URL
+                    <input
+                      class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                      value={baseUrl()}
+                      onInput={(e) => setBaseUrl(e.currentTarget.value)}
+                    />
+                  </label>
 
-                    <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
-                      API key
-                      <input
-                        type="password"
-                        class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                        placeholder={
-                          hasKey()
-                            ? "••••••  saved in keychain — type to replace"
-                            : "sk-… / fw_…"
-                        }
-                        value={keyDraft()}
-                        onInput={(e) => {
-                          setKeyDraft(e.currentTarget.value);
+                  <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                    API key
+                    <input
+                      type="password"
+                      class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                      placeholder={
+                        hasKey()
+                          ? "••••••  saved in keychain — type to replace"
+                          : "sk-… / fw_…"
+                      }
+                      value={keyDraft()}
+                      onInput={(e) => {
+                        setKeyDraft(e.currentTarget.value);
+                      }}
+                    />
+                    <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                      Stored in the OS keychain, never on disk or in the app config.
+                    </span>
+                    <Show when={hasKey()}>
+                      <button
+                        onClick={async () => {
+                          try {
+                            await setApiKey(null);
+                            setHasKey(false);
+                            setKeyDraft("");
+                          } catch (e) {
+                            setSettingsError(String(e));
+                          }
                         }}
-                      />
-                      <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
-                        Stored in the OS keychain, never on disk or in the app config.
-                      </span>
-                      <Show when={hasKey()}>
-                        <button
-                          onClick={async () => {
-                            try {
-                              await setApiKey(null);
-                              setHasKey(false);
-                              setKeyDraft("");
-                            } catch (e) {
-                              setSettingsError(String(e));
-                            }
-                          }}
-                          class="mt-1 text-[11px] font-normal text-red-600 transition hover:underline dark:text-red-400"
-                        >
-                          Remove saved key
-                        </button>
-                      </Show>
-                    </label>
-                  </>
-                }
-              >
-                <div>
+                        class="mt-1 text-[11px] font-normal text-red-600 transition hover:underline dark:text-red-400"
+                      >
+                        Remove saved key
+                      </button>
+                    </Show>
+                  </label>
+                </div>
+              </Show>
+
+              <div>
                   <div class="mb-2 flex items-center justify-between">
                     <span class="text-xs font-semibold text-neutral-600 dark:text-neutral-300">
                       Providers
@@ -2835,7 +2840,6 @@ export default function App() {
                     is used for new chats.
                   </p>
                 </div>
-              </Show>
 
               <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
                 Brave Search API key
