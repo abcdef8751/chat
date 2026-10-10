@@ -1084,6 +1084,21 @@ pub(crate) async fn run_chat_turn(
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
     let history = db::read_messages(db, &conversation_id)?;
 
+    // Resolve this conversation's provider and model once, falling back to the
+    // active provider and the app's configured model when unset. The override is
+    // applied by cloning the config and overriding base_url/model, so
+    // `run_tool_loop` (which reads `cfg.base_url`/`cfg.model`) stays unchanged
+    // and the reflection pass is untouched.
+    let provider = cfg.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
+    let model = conversation
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| cfg.model.clone());
+    let mut turn_cfg = cfg.clone();
+    turn_cfg.base_url = provider.base_url.clone();
+    turn_cfg.model = model.clone();
+
     // Persist the incoming user turn before streaming so it survives an abort/error.
     let attachments_json = if attachments.is_empty() {
         None
@@ -1095,8 +1110,8 @@ pub(crate) async fn run_chat_turn(
         conversation_id.clone(),
         "user".into(),
         content.clone(),
-        Some(cfg.model.clone()),
-        Some(cfg.base_url.clone()),
+        Some(turn_cfg.model.clone()),
+        Some(turn_cfg.base_url.clone()),
         None,
         None,
         None,
@@ -1108,14 +1123,15 @@ pub(crate) async fn run_chat_turn(
         .system_prompt
         .clone()
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    let model_label = crate::pricing::cached_model_name(db, &cfg.base_url, &cfg.model)
-        .unwrap_or_else(|| cfg.model.clone());
+    let model_label =
+        crate::pricing::cached_model_name(db, &turn_cfg.base_url, &turn_cfg.model)
+            .unwrap_or_else(|| turn_cfg.model.clone());
     let system_prompt = build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
     let messages = build_messages(&system_prompt, &history, &content, &attachments)?;
     let tools_list = tools::tool_specs(tools::brave_available());
 
     let mut result = run_tool_loop(
-        cfg,
+        &turn_cfg,
         api_key,
         brave,
         shell,
@@ -1138,7 +1154,12 @@ pub(crate) async fn run_chat_turn(
     if result.usage.get("prompt_tokens").is_some()
         || result.usage.get("completion_tokens").is_some()
     {
-        let pricing = crate::pricing::resolve_for(db, cfg, &cfg.model);
+        let pricing = crate::pricing::resolve_for_base(
+            db,
+            &turn_cfg.base_url,
+            &turn_cfg.model_overrides,
+            &turn_cfg.model,
+        );
         if let Some(cost) = crate::pricing::cost_of_usage(&result.usage, &pricing) {
             result.usage["cost"] = json!(cost);
         }
@@ -1149,8 +1170,8 @@ pub(crate) async fn run_chat_turn(
         conversation_id.clone(),
         "assistant".into(),
         result.text.clone(),
-        Some(cfg.model.clone()),
-        Some(cfg.base_url.clone()),
+        Some(turn_cfg.model.clone()),
+        Some(turn_cfg.base_url.clone()),
         None,
         result.thinking,
         Some(result.usage.to_string()),
@@ -1174,13 +1195,17 @@ pub async fn stream_chat(
     channel: Channel<StreamEvent>,
 ) -> Result<(), String> {
     let config = app.state::<ConfigState>().get();
-    let api_key = crate::secrets::get()?
-        .ok_or_else(|| "API key not set — open Settings and add your key.".to_string())?;
+    let db = app.state::<db::Db>();
+
+    let conversation = db::get_conversation(&db, &conversation_id)?
+        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
+    let provider = config.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
+    let api_key = crate::providers::resolve(&provider.id)?
+        .ok_or_else(|| "API key not set for this provider — set it in Settings.".to_string())?;
     if config.model.trim().is_empty() {
         return Err("No model selected — set a model in Settings.".into());
     }
 
-    let db = app.state::<db::Db>();
     let approvals = app.state::<tools::ApprovalRegistry>();
     let brave = app.state::<tools::BraveSearch>();
     let shell = app.state::<ShellExecutor>();
