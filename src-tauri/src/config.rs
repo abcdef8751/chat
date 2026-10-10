@@ -185,8 +185,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_api_key_field_is_ignored_on_load() {
-        let path = temp_path("legacy");
+    fn sync_last_sync_at_roundtrips_and_defaults_for_old_config() {
+        let path = temp_path("sync-last");
+        // An old config file without the new field must load with None (backwards
+        // compat), so "last sync" simply shows "never" rather than erroring.
+        std::fs::write(&path, r#"{"baseUrl":"http://x/v1","model":"m"}"#).unwrap();
+        let state = ConfigState::load(path.clone()).unwrap();
+        assert_eq!(state.get().sync_last_sync_at, None);
+        // And a value we set must survive a write -> reload round-trip.
+        let mut cfg = state.get();
+        cfg.sync_last_sync_at = Some(1_700_000_000_000);
+        state.set(cfg).unwrap();
+        let reloaded = ConfigState::load(path.clone()).unwrap();
+        assert_eq!(reloaded.get().sync_last_sync_at, Some(1_700_000_000_000));
+        assert_eq!(reloaded.get().model, "m"); // other fields preserved
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_api_key_field_is_ignored_on_load() {        let path = temp_path("legacy");
         std::fs::write(
             &path,
             r#"{"baseUrl":"http://x/v1","apiKey":"fw_legacy","model":"m"}"#,
