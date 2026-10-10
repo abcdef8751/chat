@@ -2263,32 +2263,37 @@ export default function App() {
                 </For>
               </select>
             </Show>
-            <select
-              class="max-w-[9rem] truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-60 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
-              title="Model"
-              aria-busy={modelsLoading()}
-              disabled={modelsLoading()}
-              ref={(el) => (modelSelectEl = el)}
-              value={model()}
-              onChange={(e) => {
-                const next = e.currentTarget.value;
-                // Ignore spurious events from the list refreshing, only
-                // persist a real user selection.
-                if (next && next !== model()) void changeModel(next);
-              }}
-            >
-              <For each={modelOptions()}>
-                {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
-              </For>
-            </select>
-            <Show when={modelsLoading()}>
-              <span
-                role="status"
-                aria-label="Loading models"
-                title="Loading models…"
-                class="ml-1 inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-neutral-400 border-t-transparent align-middle dark:border-neutral-500 dark:border-t-transparent"
-              />
-            </Show>
+            <div class="relative">
+              <select
+                class="max-w-[9rem] pr-7 truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-60 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
+                title="Model"
+                aria-busy={modelsLoading()}
+                disabled={modelsLoading()}
+                ref={(el) => (modelSelectEl = el)}
+                value={model()}
+                onChange={(e) => {
+                  const next = e.currentTarget.value;
+                  // Ignore spurious events from the list refreshing, only
+                  // persist a real user selection.
+                  if (next && next !== model()) void changeModel(next);
+                }}
+              >
+                <For each={modelOptions()}>
+                  {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
+                </For>
+              </select>
+              {/* Overlay the spinner on the select so it doesn't take layout
+                  width — an inline sibling here pushes the neighbor controls
+                  out and makes them clip on narrower windows. */}
+              <Show when={modelsLoading()}>
+                <span
+                  role="status"
+                  aria-label="Loading models"
+                  title="Loading models…"
+                  class="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 animate-spin rounded-full border-2 border-neutral-400 border-t-transparent"
+                />
+              </Show>
+            </div>
             <Show
               when={thinkingOpts()?.supportsReasoning && thinkingOpts()!.options.length > 0}
             >
