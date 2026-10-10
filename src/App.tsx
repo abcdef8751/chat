@@ -2770,8 +2770,11 @@ export default function App() {
                               setAddPick(pick);
                               const chosen = modelsDevProviders().find((p) => p.id === pick);
                               if (chosen) {
-                                if (!addName().trim()) setAddName(chosen.name);
-                                if (!addUrl().trim()) setAddUrl(chosen.baseUrl);
+                                // The pick is the source of truth: always overwrite the
+                                // name/URL so switching catalog entries updates them.
+                                // (Use "— custom —" to type a manual endpoint instead.)
+                                setAddName(chosen.name);
+                                setAddUrl(chosen.baseUrl);
                               }
                             }}
                           >
