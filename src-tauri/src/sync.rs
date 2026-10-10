@@ -708,7 +708,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
         let mut rows = Vec::new();
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, model, system_prompt, compaction_summary,
+                "SELECT id, title, model, provider_id, system_prompt, compaction_summary,
                         last_reflected_index, imported, import_batch, created_at, updated_at, revision
                  FROM conversations WHERE dirty = 1",
             )
@@ -720,14 +720,15 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                     "id": r.get::<_, String>(0)?,
                     "title": enc_str(key, r.get::<_, String>(1)?),
                     "model": r.get::<_, Option<String>>(2)?,
-                    "system_prompt": enc_opt(key, r.get::<_, Option<String>>(3)?),
-                    "compaction_summary": enc_opt(key, r.get::<_, Option<String>>(4)?),
-                    "last_reflected_index": r.get::<_, Option<i64>>(5)?,
-                    "imported": r.get::<_, i64>(6)? != 0,
-                    "import_batch": r.get::<_, i64>(7)?,
-                    "created_at": r.get::<_, i64>(8)?,
-                    "updated_at": r.get::<_, i64>(9)?,
-                    "revision": r.get::<_, i64>(10)?,
+                    "provider_id": r.get::<_, Option<String>>(3)?,
+                    "system_prompt": enc_opt(key, r.get::<_, Option<String>>(4)?),
+                    "compaction_summary": enc_opt(key, r.get::<_, Option<String>>(5)?),
+                    "last_reflected_index": r.get::<_, Option<i64>>(6)?,
+                    "imported": r.get::<_, i64>(7)? != 0,
+                    "import_batch": r.get::<_, i64>(8)?,
+                    "created_at": r.get::<_, i64>(9)?,
+                    "updated_at": r.get::<_, i64>(10)?,
+                    "revision": r.get::<_, i64>(11)?,
                     "deleted_at": Value::Null,
                 }))
             })
@@ -754,7 +755,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
         for t in trows {
             let (id, rev) = t.map_err(|e| e.to_string())?;
             tombstones.push(json!({
-                "id": id, "title": "", "model": Value::Null,
+                "id": id, "title": "", "model": Value::Null, "provider_id": Value::Null,
                 "system_prompt": Value::Null, "compaction_summary": Value::Null,
                 "last_reflected_index": Value::Null, "imported": false, "import_batch": 0,
                 "created_at": now, "updated_at": now, "revision": rev, "deleted_at": now,
@@ -1068,6 +1069,8 @@ struct RemoteConversation {
     id: String,
     title: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    provider_id: Option<String>,
     system_prompt: Option<String>,
     compaction_summary: Option<String>,
     last_reflected_index: Option<i64>,
@@ -1263,11 +1266,11 @@ async fn apply_conversations(db: &Db, rows: &[Value]) -> Result<(), String> {
         if local_rev.is_none() {
             tx.execute(
                 "INSERT INTO conversations
-                   (id, title, model, system_prompt, compaction_summary, last_reflected_index,
+                   (id, title, model, provider_id, system_prompt, compaction_summary, last_reflected_index,
                     imported, import_batch, created_at, updated_at, revision, dirty)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
                 rusqlite::params![
-                    r.id, title, r.model, r.system_prompt, r.compaction_summary,
+                    r.id, title, r.model, r.provider_id, r.system_prompt, r.compaction_summary,
                     r.last_reflected_index, imported, import_batch, created_at, updated_at,
                     r.revision
                 ],
@@ -1275,13 +1278,13 @@ async fn apply_conversations(db: &Db, rows: &[Value]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         } else {
             tx.execute(
-                "UPDATE conversations SET title = ?2, model = ?3, system_prompt = ?4,
-                        compaction_summary = ?5, last_reflected_index = ?6, imported = ?7,
-                        import_batch = ?8, created_at = ?9, updated_at = ?10,
-                        revision = ?11, dirty = 0
+                "UPDATE conversations SET title = ?2, model = ?3, provider_id = ?4,
+                        system_prompt = ?5, compaction_summary = ?6, last_reflected_index = ?7,
+                        imported = ?8, import_batch = ?9, created_at = ?10, updated_at = ?11,
+                        revision = ?12, dirty = 0
                  WHERE id = ?1",
                 rusqlite::params![
-                    r.id, title, r.model, r.system_prompt, r.compaction_summary,
+                    r.id, title, r.model, r.provider_id, r.system_prompt, r.compaction_summary,
                     r.last_reflected_index, imported, import_batch, created_at, updated_at,
                     r.revision
                 ],

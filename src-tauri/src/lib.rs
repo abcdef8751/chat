@@ -90,7 +90,6 @@ pub fn run() {
             providers::remove_provider,
             providers::set_active_provider,
             providers::list_models_dev_providers,
-            providers::resolve_provider_key,
             secrets::has_api_key,
             secrets::set_api_key,
             secrets::has_brave_key_cmd,

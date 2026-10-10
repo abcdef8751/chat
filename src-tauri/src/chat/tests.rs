@@ -515,6 +515,71 @@
         assert!(matches!(guard.last(), Some(StreamEvent::Done { stop_reason }) if stop_reason == "stop"));
     }
 
+    /// A conversation pinned to a non-active provider + its own model must run the
+    /// turn against THAT provider (base URL) and model, not the active one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_uses_conversation_provider_and_model() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![vec![
+                delta_chunk("Pinned"),
+                finish_chunk("stop"),
+                usage_chunk(),
+            ]],
+            0,
+        );
+        let db = Arc::new(open_db("prov-turn"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = uuid::Uuid::new_v4().to_string();
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, provider_id, model, created_at, updated_at)
+                 VALUES (?1, 'pinned', 'p-b', 'conv-model', 0, 0)",
+                [&cid],
+            )
+            .unwrap();
+        }
+        // Active provider points elsewhere; provider "p-b" is the mock endpoint.
+        let mock_url = format!("http://127.0.0.1:{port}/v1");
+        let cfg = AppConfig {
+            base_url: "http://active.invalid/v1".into(),
+            model: "mock".into(),
+            providers: vec![crate::config::Provider {
+                id: "p-b".into(),
+                name: "B".into(),
+                base_url: mock_url.clone(),
+                default_model: None,
+            }],
+            active_provider_id: "".into(),
+            ..Default::default()
+        };
+        let mcp = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        let memory = temp_memory("prov-turn");
+
+        let (db2, approvals2) = (db.clone(), approvals.clone());
+        let cid_task = cid.clone();
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink, cid_task, "ping".into(), Vec::new(),
+            )
+            .await
+        });
+        task.await.unwrap().unwrap();
+        let _ = handle.join();
+
+        // The request must have gone to the pinned provider's endpoint...
+        assert!(!bodies.lock().unwrap().is_empty(), "no request hit the mock");
+        // ...and be stamped with the pinned provider's base URL + model.
+        let rows = msgs(&db, &cid);
+        let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
+        assert_eq!(assistant.model.as_deref(), Some("conv-model"));
+        assert_eq!(assistant.provider.as_deref(), Some(mock_url.as_str()));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loop_sends_preferences_and_model_in_system_prompt() {
         let (port, bodies, handle) = start_mock_capture(

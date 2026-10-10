@@ -22,6 +22,7 @@ create table if not exists conversations (
   id uuid primary key,
   title text not null,
   model text,
+  provider_id text,
   system_prompt text,
   compaction_summary text,
   last_reflected_index bigint,

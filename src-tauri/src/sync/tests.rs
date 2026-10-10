@@ -515,6 +515,14 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
 
     // --- Local state destined for push ---
     let cid = insert_conv(&db);
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET provider_id = 'p-x' WHERE id = ?1",
+            [&cid],
+        )
+        .unwrap();
+    }
     db::insert_message(
         &db,
         cid.clone(),
@@ -549,6 +557,13 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
     // Server received our conversation + message + memory rows.
     let conv_posts = srv.posted("conversations");
     assert!(conv_posts.iter().any(|v| v["id"] == cid));
+    // provider_id is a structural (plaintext) column and must round-trip on push.
+    assert!(
+        conv_posts
+            .iter()
+            .any(|v| v["id"] == cid && v["provider_id"] == "p-x"),
+        "provider_id not pushed for conversation"
+    );
     assert!(srv.posted("messages").iter().any(|v| v["content"] == "push me"));
     assert!(srv.posted("memory_files").iter().any(|v| v["path"] == "profile.md"));
     // Local dirty flags cleared after a successful push.
@@ -559,7 +574,7 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
     srv.set_get(
         "conversations",
         vec![json!({
-            "id": remote_conv_id, "title": "From device B", "revision": 100,
+            "id": remote_conv_id, "title": "From device B", "provider_id": "p-remote", "revision": 100,
             "created_at": 1, "updated_at": 2, "deleted_at": Value::Null
         })],
     );
@@ -586,6 +601,11 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
         conn.query_row("SELECT title FROM conversations WHERE id = ?1", [&remote_conv_id], |r| r.get(0)).unwrap()
     };
     assert_eq!(conv_title, "From device B");
+    let conv_prov: Option<String> = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT provider_id FROM conversations WHERE id = ?1", [&remote_conv_id], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(conv_prov.as_deref(), Some("p-remote"), "provider_id not applied on pull");
     let msg: String = {
         let conn = db.0.lock().unwrap();
         conn.query_row("SELECT content FROM messages WHERE id = 'remote-msg'", [], |r| r.get(0)).unwrap()

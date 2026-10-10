@@ -64,27 +64,14 @@ pub fn resolve(provider_id: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Command-form of [`resolve`], exposed for the frontend to check/display a
-/// provider's key state.
-#[tauri::command]
-pub fn resolve_provider_key(provider_id: String) -> Result<Option<String>, String> {
-    resolve(&provider_id)
-}
-
 #[tauri::command]
 pub fn list_providers(config: tauri::State<'_, ConfigState>) -> Vec<ProviderInfo> {
     let cfg = config.get();
-    // Always include the legacy synthesized provider first so a pre-multi config
-    // (which has no `providers` entries) still shows something to manage.
-    let legacy = cfg.active_provider();
-    let mut out = vec![info_for(&cfg, &legacy)];
-    for p in &cfg.providers {
-        if p.id == legacy.id {
-            continue;
-        }
-        out.push(info_for(&cfg, p));
-    }
-    out
+    // Only the real configured providers. A legacy config (empty `providers`)
+    // returns an empty list; the frontend renders it as a single implicit
+    // "Default" provider. This keeps `providers` in config.json empty for legacy
+    // configs so the first real provider added is auto-activated.
+    cfg.providers.iter().map(|p| info_for(&cfg, p)).collect()
 }
 
 /// Add a provider. Returns the new provider's info (with key status). When

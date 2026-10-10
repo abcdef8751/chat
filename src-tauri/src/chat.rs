@@ -1202,7 +1202,14 @@ pub async fn stream_chat(
     let provider = config.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
     let api_key = crate::providers::resolve(&provider.id)?
         .ok_or_else(|| "API key not set for this provider — set it in Settings.".to_string())?;
-    if config.model.trim().is_empty() {
+    // A conversation may pin its own model; fall back to the global one. Guard on
+    // the actual model the turn will use, not just the global `config.model`.
+    let model = conversation
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| config.model.clone());
+    if model.trim().is_empty() {
         return Err("No model selected — set a model in Settings.".into());
     }
 

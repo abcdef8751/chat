@@ -81,11 +81,27 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     if cfg.model.trim().is_empty() {
         return Ok(());
     }
-    let Some(api_key) = crate::secrets::get()? else {
+    let db = app.state::<db::Db>();
+
+    // The conversation's own provider drives reflection (which endpoint/model a
+    // chat actually runs on), falling back to the active provider.
+    let conversation = db::get_conversation(&db, conversation_id)?
+        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
+    let provider = cfg.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
+    let model = conversation
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| cfg.model.clone());
+    let Some(api_key) = crate::providers::resolve(&provider.id)? else {
         return Ok(());
     };
+    // Override the turn-local config so run_tool_loop (which reads cfg.base_url
+    // / cfg.model) targets this conversation's provider + model.
+    let mut turn_cfg = cfg.clone();
+    turn_cfg.base_url = provider.base_url.clone();
+    turn_cfg.model = model.clone();
 
-    let db = app.state::<db::Db>();
     let memory = app.state::<MemoryState>();
     let brave = app.state::<tools::BraveSearch>();
     let shell = app.state::<crate::shell::ShellExecutor>();
@@ -101,8 +117,6 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
         return Ok(());
     }
 
-    let conversation = db::get_conversation(&db, conversation_id)?
-        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
     let history = db::read_messages(&db, conversation_id)?;
     let before = snapshot_files(&memory);
     // Recent consolidation notes (across chats) so the model doesn't repeat work.
@@ -115,8 +129,9 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
         .system_prompt
         .clone()
         .unwrap_or_else(|| chat::DEFAULT_SYSTEM_PROMPT.to_string());
-    let model_label = crate::pricing::cached_model_name(&db, &cfg.base_url, &cfg.model)
-        .unwrap_or_else(|| cfg.model.clone());
+    let model_label =
+        crate::pricing::cached_model_name(&db, &turn_cfg.base_url, &turn_cfg.model)
+            .unwrap_or_else(|| turn_cfg.model.clone());
     let system_prompt =
         chat::build_system_prompt(&base_prompt, &model_label, &cfg.preferences, &memory);
 
@@ -164,7 +179,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
 
     let sink = NullSink;
     let result = chat::run_tool_loop(
-        &cfg,
+        &turn_cfg,
         &api_key,
         &brave,
         &shell,
@@ -191,7 +206,8 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     let changed = diff_files(&before, &after);
 
     let cost = {
-        let pricing = crate::pricing::resolve_for(&db, &cfg, &cfg.model);
+        let pricing =
+            crate::pricing::resolve_for(&db, &turn_cfg, &turn_cfg.model);
         crate::pricing::cost_of_usage(&result.usage, &pricing)
     };
     let note = if changed.is_empty() {
@@ -203,7 +219,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     db::insert_reflection(
         &db,
         conversation_id,
-        &cfg.model,
+        &turn_cfg.model,
         Some(&result.usage.to_string()),
         cost,
         &changed,
@@ -217,8 +233,8 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
             conversation_id.to_string(),
             "memory".into(),
             note,
-            Some(cfg.model.clone()),
-            Some(cfg.base_url.clone()),
+            Some(turn_cfg.model.clone()),
+            Some(turn_cfg.base_url.clone()),
             None,
             None,
             None,
@@ -780,7 +796,7 @@ async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<
     if cfg.model.trim().is_empty() {
         return Ok(());
     }
-    let Some(api_key) = crate::secrets::get()? else {
+    let Some(api_key) = crate::providers::resolve(&cfg.active_provider_id())? else {
         return Ok(());
     };
 
@@ -987,7 +1003,7 @@ async fn run_reduce_pass(
     if cfg.model.trim().is_empty() {
         return Ok(());
     }
-    let Some(api_key) = crate::secrets::get()? else {
+    let Some(api_key) = crate::providers::resolve(&cfg.active_provider_id())? else {
         return Ok(());
     };
 
