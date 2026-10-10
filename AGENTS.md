@@ -272,7 +272,15 @@ default**; it only chunks when the payload exceeds `CONTEXT_BUDGET` (80%) of the
   a concurrency cap, and its docs are explicit that ramping up too quickly draws
   429s, so a cold burst of extraction passes must back off rather than record
   permanent failures. `is_transient` retries 429/503/timeouts and lets a 400 or
-  an abort fail immediately.
+  an abort fail immediately. **Both phases run on the active provider, not the
+  top-level `base_url`/`model` mirrors.** A backfill has no conversation to pin,
+  so `active_turn_cfg` resolves the *active* provider's base URL and its default
+  model (falling back to `cfg.model`), rather than trusting the `AppConfig`
+  `base_url`/`model` fields — those mirrors are persisted separately from
+  `providers[]` and can drift stale against the active provider, which would send
+  the default model to an old endpoint and surface as a provider-side "model not
+  found" 404. The ordinary per-conversation reflection pass already resolves each
+  chat's own provider; backfill just does the same for the active one.
 - **Interruption is resumable in both phases.** The map phase is watermark-based
   (`memory_extractions.watermark` vs the newest message), so a cancel, crash, or
   failure leaves it consistent and a re-run skips exactly what is already staged.
