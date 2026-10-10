@@ -713,7 +713,6 @@ export default function App() {
   const [activeProviderId, setActiveProviderId] = createSignal("");
   const [providersLoading, setProvidersLoading] = createSignal(false);
   const [modelsDevProviders, setModelsDevProviders] = createSignal<ModelsDevProvider[]>([]);
-  const [modelsProviderId, setModelsProviderId] = createSignal("");
   // Provider shown in the header for the active conversation (or active default).
   const [headerProviderId, setHeaderProviderId] = createSignal("");
   // Provider manager form state.
@@ -1244,6 +1243,12 @@ export default function App() {
   // against that: only the request that was issued last is allowed to apply its
   // result, so the model list always reflects the most recent selection.
   let modelsReqSeq = 0;
+  // Non-reactive bookkeeping for the header-sync effect (below). Tracked via
+  // these plain variables instead of signals so the effect doesn't retrigger on
+  // changes it itself causes (setModel / loadModels) — see the effect comment.
+  let lastSyncId: string | null = null;
+  let lastSyncAp = "";
+  let lastModelsProv: string | null = null;
   async function loadModels(refresh: boolean, providerId?: string | null) {
     const prov = providerId ?? headerProviderId() ?? activeProviderId() ?? null;
     const seq = ++modelsReqSeq;
@@ -1253,7 +1258,7 @@ export default function App() {
       // A newer request superseded this one — drop the stale result.
       if (seq !== modelsReqSeq) return;
       setModels(rows);
-      setModelsProviderId(prov ?? "");
+      lastModelsProv = prov;
       setCatalogVersion((v) => v + 1);
     } finally {
       if (seq === modelsReqSeq) setModelsLoading(false);
@@ -1851,13 +1856,28 @@ export default function App() {
   // conversation's provider + model in the header and load that provider's
   // model list. New chats carry no explicit provider/model, so they resolve to
   // the active provider + its default model.
+  //
+  // This effect previously also read `model()` and `modelsProviderId()` to
+  // compare, which made it re-run the moment changeModel/changeHeaderProvider
+  // updated them — and it would then snap the pickers back to a stale
+  // conversation record (the "can't change the model / provider snaps back"
+  // bug). It must key ONLY on the active conversation id and the active
+  // provider id, neither of which changes from a manual selection, and use the
+  // plain `lastModelsProv` variable (not a signal) for its load bookkeeping.
   createEffect(() => {
-    const conv = activeConversation();
+    const convId = activeId();
     const ap = activeProviderId();
+    const conv = convId ? activeConversation() : null;
     const prov = conv?.providerId ?? ap;
+    if (convId === lastSyncId && ap === lastSyncAp) return;
+    lastSyncId = convId;
+    lastSyncAp = ap;
     setHeaderProviderId(prov);
-    if (conv && conv.model && conv.model !== model()) setModel(conv.model);
-    if (prov !== modelsProviderId()) void loadModels(false, prov || null);
+    if (conv?.model) setModel(conv.model);
+    if (prov !== lastModelsProv) {
+      lastModelsProv = prov;
+      void loadModels(false, prov || null);
+    }
   });
 
 
