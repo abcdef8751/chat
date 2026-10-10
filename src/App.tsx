@@ -269,6 +269,24 @@ function CloseIcon() {
   );
 }
 
+function BackArrowIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      class="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.7"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M19 12H5" />
+      <path d="m12 19-7-7 7-7" />
+    </svg>
+  );
+}
+
 // Shared styling for dropdown-menu items (header overflow menu). Kept as a
 // literal here so Tailwind's scanner picks up the `data-[highlighted]` variant.
 const MENU_ITEM_CLASS =
@@ -2649,8 +2667,28 @@ export default function App() {
       >
         <Dialog.Portal>
           <Dialog.Overlay class="fixed inset-0 z-50 bg-black/40" />
-          <Dialog.Content class="fixed left-1/2 top-1/2 z-50 max-h-[85vh] w-full max-w-md -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900">
-            <Dialog.Title class="text-base font-semibold">Settings</Dialog.Title>
+          <Dialog.Content
+            class={
+              // On narrow (mobile) viewports — the same `lg` threshold that turns
+              // the chat list into a drawer — expand to cover the whole viewport
+              // so these pages don't render as a cramped centered card.
+              wideViewport()
+                ? "fixed left-1/2 top-1/2 z-50 max-h-[85vh] w-full max-w-md -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900"
+                : "fixed inset-0 z-50 h-full w-full overflow-y-auto bg-white p-5 focus:outline-none dark:bg-neutral-900"
+            }
+          >
+            <div class="flex items-center gap-2">
+              {/* Mobile (full-screen) exit arrow — hidden on wide viewports, where
+                  the centered card keeps its Done button. */}
+              <Dialog.CloseButton
+                title="Close settings"
+                aria-label="Close settings"
+                class="shrink-0 rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
+              >
+                <BackArrowIcon />
+              </Dialog.CloseButton>
+              <Dialog.Title class="text-base font-semibold">Settings</Dialog.Title>
+            </div>
             <Dialog.Description class="mt-1 text-sm text-neutral-500 dark:text-neutral-400">
               OpenAI-compatible endpoint. Fireworks is prefilled.
             </Dialog.Description>
@@ -3323,8 +3361,28 @@ export default function App() {
       <Dialog open={memoryOpen()} onOpenChange={setMemoryOpen}>
         <Dialog.Portal>
           <Dialog.Overlay class="fixed inset-0 z-50 bg-black/40" />
-          <Dialog.Content class="fixed left-1/2 top-1/2 z-50 flex h-[70vh] w-full max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900">
-            <Dialog.Title class="text-base font-semibold">Memory</Dialog.Title>
+          <Dialog.Content
+            class={
+              // On narrow (mobile) viewports — the same `lg` threshold that turns
+              // the chat list into a drawer — expand to cover the whole viewport
+              // so these pages don't render as a cramped centered card.
+              wideViewport()
+                ? "fixed left-1/2 top-1/2 z-50 flex h-[70vh] w-full max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900"
+                : "fixed inset-0 z-50 flex h-full w-full flex-col overflow-y-auto bg-white p-5 focus:outline-none dark:bg-neutral-900"
+            }
+          >
+            <div class="flex items-center gap-2">
+              {/* Mobile (full-screen) exit arrow — hidden on wide viewports, where
+                  the centered card keeps its Close button. */}
+              <Dialog.CloseButton
+                title="Close memory"
+                aria-label="Close memory"
+                class="shrink-0 rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
+              >
+                <BackArrowIcon />
+              </Dialog.CloseButton>
+              <Dialog.Title class="text-base font-semibold">Memory</Dialog.Title>
+            </div>
             <Dialog.Description class="mt-1 text-sm text-neutral-500 dark:text-neutral-400">
               Long-term memory is plain Markdown files. Core files (profile, preferences,
               goals) are always shown to the assistant; other files are listed and read on
