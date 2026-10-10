@@ -1236,16 +1236,27 @@ export default function App() {
   // values render first; a forced refresh replaces them once it resolves.
   // `providerId` scopes the call to a specific provider; when omitted it falls
   // back to the header/active provider.
+  //
+  // Because the backend caches model lists per base URL, concurrent `listModels`
+  // calls can resolve out of order — a fast cached response for a *previous*
+  // provider can land after a slow network fetch for the *current* one and
+  // overwrite it, so the list "falls behind" to the old provider. `seq` guards
+  // against that: only the request that was issued last is allowed to apply its
+  // result, so the model list always reflects the most recent selection.
+  let modelsReqSeq = 0;
   async function loadModels(refresh: boolean, providerId?: string | null) {
     const prov = providerId ?? headerProviderId() ?? activeProviderId() ?? null;
+    const seq = ++modelsReqSeq;
     setModelsLoading(true);
     try {
       const rows = await listModels(refresh, prov);
+      // A newer request superseded this one — drop the stale result.
+      if (seq !== modelsReqSeq) return;
       setModels(rows);
       setModelsProviderId(prov ?? "");
       setCatalogVersion((v) => v + 1);
     } finally {
-      setModelsLoading(false);
+      if (seq === modelsReqSeq) setModelsLoading(false);
     }
   }
 
