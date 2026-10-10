@@ -1833,10 +1833,18 @@ export default function App() {
   // active we persist the choice (null reverts it to the active provider),
   // reload that provider's model list and adopt a default model for it.
   async function changeHeaderProvider(id: string) {
-    setHeaderProviderId(id);
     const conv = activeConversation();
+    // The provider in effect before this switch (the conversation's explicit
+    // override, or failing that the active provider) — used to roll back the
+    // header + conversation if the new provider's model list fails to load.
+    const target = !conv
+      ? null
+      : conv.providerId === null || conv.providerId === ""
+        ? null
+        : conv.providerId;
+    const prevEff = target ?? activeProviderId();
+    setHeaderProviderId(id);
     if (conv) {
-      const target = conv.providerId === null || conv.providerId === "" ? null : conv.providerId;
       const next = target === id ? null : id;
       try {
         await setConversationProvider(conv.id, next);
@@ -1844,9 +1852,26 @@ export default function App() {
         setProviderError(null);
       } catch (e) {
         setProviderError(String(e));
+        return;
       }
     }
-    await loadModels(true, id || null);
+    try {
+      await loadModels(true, id || null);
+    } catch (e) {
+      // The new provider couldn't list models (bad key, unreachable endpoint,
+      // ...): snap back to the previous provider and conversation state.
+      setProviderError(String(e));
+      setHeaderProviderId(prevEff);
+      if (conv) {
+        try {
+          await setConversationProvider(conv.id, target);
+          await refreshConversations();
+        } catch {
+          // best-effort rollback
+        }
+      }
+      return;
+    }
     const prov = providers().find((p) => p.id === id);
     const fallback = prov?.defaultModel ?? models()[0]?.id ?? "";
     if (fallback && fallback !== model()) void changeModel(fallback);
@@ -1900,6 +1925,24 @@ export default function App() {
     models();
     if (modelSelectEl && modelSelectEl.value !== value) {
       modelSelectEl.value = value;
+    }
+  });
+
+  // Same WebKit quirk for the provider select: when the neighbor model select
+  // rebuilds its options (e.g. the new provider's model list lands), WebKit
+  // resets this select to its first option — which is the active/old provider —
+  // and the `value` binding won't restore it because `headerProviderId()` is
+  // unchanged. Force the DOM value back to the selected provider whenever the
+  // provider selection, the option list, or the model-list (neighbor) rebuild
+  // changes.
+  let providerSelectEl: HTMLSelectElement | undefined;
+  createEffect(() => {
+    const value = headerProviderId();
+    providers();
+    models();
+    modelsLoading();
+    if (providerSelectEl && providerSelectEl.value !== value) {
+      providerSelectEl.value = value;
     }
   });
 
@@ -2204,6 +2247,7 @@ export default function App() {
             </button>
             <Show when={providers().length > 0 && activeId()}>
               <select
+                ref={(el) => (providerSelectEl = el)}
                 class="hidden max-w-28 truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-50 sm:block md:max-w-36 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
                 title="Provider"
                 value={headerProviderId()}
@@ -2220,9 +2264,10 @@ export default function App() {
               </select>
             </Show>
             <select
-              class="max-w-[9rem] truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-50 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
+              class="max-w-[9rem] truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-60 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
               title="Model"
               aria-busy={modelsLoading()}
+              disabled={modelsLoading()}
               ref={(el) => (modelSelectEl = el)}
               value={model()}
               onChange={(e) => {
@@ -2236,6 +2281,14 @@ export default function App() {
                 {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
               </For>
             </select>
+            <Show when={modelsLoading()}>
+              <span
+                role="status"
+                aria-label="Loading models"
+                title="Loading models…"
+                class="ml-1 inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-neutral-400 border-t-transparent align-middle dark:border-neutral-500 dark:border-t-transparent"
+              />
+            </Show>
             <Show
               when={thinkingOpts()?.supportsReasoning && thinkingOpts()!.options.length > 0}
             >
