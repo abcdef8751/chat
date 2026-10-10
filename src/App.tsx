@@ -616,6 +616,19 @@ export default function App() {
   // Narrow-viewport drawer state. At >=lg the sidebar is always in flow, so
   // this only matters below the breakpoint (see the `lg:` overrides on <aside>).
   const [sidebarOpen, setSidebarOpen] = createSignal(false);
+  // Mirrors Tailwind's `lg` (64rem) so the off-screen drawer can be made inert
+  // below it — a merely translated drawer stays focusable and in the a11y tree.
+  const [wideViewport, setWideViewport] = createSignal(
+    typeof window === "undefined" ? true : window.matchMedia("(min-width: 64rem)").matches,
+  );
+  const drawerHidden = () => !wideViewport() && !sidebarOpen();
+  let hamburgerEl: HTMLButtonElement | undefined;
+  let sidebarSearchEl: HTMLInputElement | undefined;
+
+  // Move focus into the drawer when it opens (it is only openable below `lg`).
+  createEffect(() => {
+    if (sidebarOpen()) sidebarSearchEl?.focus();
+  });
 
   const [draftTitle, setDraftTitle] = createSignal("");
   const [newOpen, setNewOpen] = createSignal(false);
@@ -705,13 +718,22 @@ export default function App() {
       // ignore
     }
 
-    // Narrow-viewport drawer: Escape closes it (no-op on wide viewports where
-    // the sidebar is always in flow).
+    // Narrow-viewport drawer: Escape closes it and returns focus to the
+    // hamburger (no-op on wide viewports where the sidebar is always in flow).
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setSidebarOpen(false);
+      if (e.key === "Escape" && sidebarOpen()) {
+        setSidebarOpen(false);
+        hamburgerEl?.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
     onCleanup(() => window.removeEventListener("keydown", onKey));
+
+    const mq = window.matchMedia("(min-width: 64rem)");
+    const onMq = (e: MediaQueryListEvent) => setWideViewport(e.matches);
+    setWideViewport(mq.matches);
+    mq.addEventListener("change", onMq);
+    onCleanup(() => mq.removeEventListener("change", onMq));
 
     // Native OS drag-and-drop (HTML5 drops are intercepted by Tauri).
     const unlistenDrop = await getCurrentWebview().onDragDropEvent((event) => {
@@ -1713,7 +1735,10 @@ export default function App() {
       </Show>
       {/* Sidebar — a slide-in drawer below `lg`, always in flow at `lg` and up */}
       <aside
-        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform lg:static lg:z-auto lg:translate-x-0 dark:border-neutral-800 dark:bg-neutral-900 ${
+        id="app-sidebar"
+        inert={drawerHidden()}
+        aria-hidden={drawerHidden() ? "true" : undefined}
+        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform lg:static lg:z-auto lg:translate-x-0 lg:transition-none dark:border-neutral-800 dark:bg-neutral-900 ${
           sidebarOpen() ? "translate-x-0" : "-translate-x-full"
         }`}
       >
@@ -1755,9 +1780,12 @@ export default function App() {
             </Dialog.Portal>
           </Dialog>
           <button
-            onClick={() => setSidebarOpen(false)}
+            onClick={() => {
+              setSidebarOpen(false);
+              hamburgerEl?.focus();
+            }}
             title="Close chats"
-            aria-label="Close conversations"
+            aria-label="Close chats"
             class="rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-200 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
           >
             <CloseIcon />
@@ -1766,6 +1794,7 @@ export default function App() {
 
         <div class="border-b border-neutral-200 px-3 py-2 dark:border-neutral-800">
           <input
+            ref={(el) => (sidebarSearchEl = el)}
             class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
             placeholder="Search chats…"
             value={searchQuery()}
@@ -1857,9 +1886,11 @@ export default function App() {
         <header class="flex items-center justify-between gap-3 border-b border-neutral-200 px-4 py-3 sm:px-6 dark:border-neutral-800">
           <div class="flex min-w-0 items-center gap-2">
             <button
+              ref={(el) => (hamburgerEl = el)}
               onClick={() => setSidebarOpen(true)}
               title="Show chats"
-              aria-label="Show conversations"
+              aria-label="Show chats"
+              aria-controls="app-sidebar"
               aria-expanded={sidebarOpen()}
               class="shrink-0 rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
             >
