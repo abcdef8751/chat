@@ -124,20 +124,23 @@ async fn fetch_provider_models(base_url: &str, api_key: &str) -> Result<Vec<Stri
     Ok(models.data.into_iter().map(|m| m.id).collect())
 }
 
-/// List chat-capable models for the configured endpoint.
+/// List chat-capable models for a provider's endpoint.
 ///
 /// models.dev is the source of truth when the endpoint matches one of its
 /// providers (which also supplies display names, context windows, and
 /// reasoning metadata). Self-hosted/unmatched endpoints fall back to their own
 /// `GET /models`. The resolved list is cached in memory per base URL; pass
-/// `refresh: true` to re-fetch the catalog.
+/// `refresh: true` to re-fetch the catalog. `provider_id` selects a specific
+/// provider (base URL + key); when `None`/unknown the active provider is used.
 #[tauri::command]
 pub async fn list_models(
     app: tauri::AppHandle,
     refresh: Option<bool>,
+    provider_id: Option<String>,
 ) -> Result<Vec<ModelInfo>, String> {
     let config = app.state::<crate::config::ConfigState>().get();
-    let base_url = config.base_url.trim_end_matches('/').to_string();
+    let provider = config.provider_for(provider_id.as_deref().unwrap_or(""));
+    let base_url = provider.base_url.trim_end_matches('/').to_string();
     let db = app.state::<crate::db::Db>();
     let force = refresh.unwrap_or(false);
 
@@ -157,8 +160,9 @@ pub async fn list_models(
 
     // Endpoint isn't in models.dev: ask the endpoint itself (needs a key).
     if ids.is_empty() {
-        let api_key = crate::secrets::get()?
-            .ok_or_else(|| "API key not set — open Settings and add your key.".to_string())?;
+        let api_key = crate::providers::resolve(&provider.id)?.ok_or_else(|| {
+            "API key not set for this provider — set it in Settings.".to_string()
+        })?;
         ids = fetch_provider_models(&base_url, &api_key)
             .await?
             .into_iter()

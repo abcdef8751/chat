@@ -214,8 +214,30 @@ pub fn resolve_with_cache(
 /// then user overrides, then the bundled table. Shared by the `get_pricing`
 /// command and the chat loop (which freezes a turn's cost with it).
 pub fn resolve_for(db: &Db, config: &crate::config::AppConfig, model_id: &str) -> Pricing {
-    let cached = get_cached(db, &provider_key(&config.base_url), model_id);
-    resolve_with_cache(model_id, config, cached)
+    resolve_for_base(
+        db,
+        &config.active_provider().base_url,
+        &config.model_overrides,
+        model_id,
+    )
+}
+
+/// Provider-aware [`resolve_for`]: resolve pricing for an explicit base URL and
+/// an explicit override map, without reading them from `config`. Used by the
+/// chat loop to price a turn against a specific conversation's provider, which
+/// may differ from the active provider. Identical logic to [`resolve_for`].
+pub fn resolve_for_base(
+    db: &Db,
+    base_url: &str,
+    model_overrides: &HashMap<String, crate::config::ModelOverride>,
+    model_id: &str,
+) -> Pricing {
+    let cached = get_cached(db, &provider_key(base_url), model_id);
+    let config = crate::config::AppConfig {
+        model_overrides: model_overrides.clone(),
+        ..Default::default()
+    };
+    resolve_with_cache(model_id, &config, cached)
 }
 
 /// Dollar cost of one turn's summed `usage` at the given rates. Returns `None`
@@ -969,5 +991,41 @@ mod tests {
             cached_model_name(&db, base, "accounts/fireworks/routers/kimi-k3-fast").as_deref(),
             Some("Kimi K3 Fast")
         );
+    }
+
+    #[test]
+    fn resolve_for_base_uses_explicit_base_url_and_overrides() {
+        let db = temp_db("resolve-for-base");
+        let root: Value = serde_json::from_str(SAMPLE).unwrap();
+        let base = "https://api.fireworks.ai/inference/v1";
+        cache_provider(&db, base, &root).unwrap();
+
+        // An override wins on the fields it sets; the rest falls through to the
+        // models.dev row cached under this base URL.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "accounts/fireworks/models/deepseek-v4-pro-0813".into(),
+            ModelOverride {
+                input_per_million: Some(0.99),
+                ..Default::default()
+            },
+        );
+        let p = resolve_for_base(
+            &db,
+            base,
+            &overrides,
+            "accounts/fireworks/models/deepseek-v4-pro-0813",
+        );
+        assert_eq!(p.source, "override");
+        assert_eq!(p.input_per_million, Some(0.99));
+        // Output comes from the cached models.dev row (3.96), not the bundled table.
+        assert_eq!(p.output_per_million, Some(3.96));
+
+        // The explicit base URL keys the cache: an unknown base finds no row and
+        // no bundled match, so it falls to defaults.
+        let p2 = resolve_for_base(&db, "https://other.example/v1", &HashMap::new(), "some-local/unknown-model");
+        assert_eq!(p2.source, "default");
+        assert_eq!(p2.context_window, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(p2.input_per_million, None);
     }
 }
