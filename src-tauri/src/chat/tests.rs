@@ -542,17 +542,26 @@
             .unwrap();
         }
         // Active provider points elsewhere; provider "p-b" is the mock endpoint.
+        // Two providers so the active one genuinely differs from the pinned one.
         let mock_url = format!("http://127.0.0.1:{port}/v1");
         let cfg = AppConfig {
             base_url: "http://active.invalid/v1".into(),
             model: "mock".into(),
-            providers: vec![crate::config::Provider {
-                id: "p-b".into(),
-                name: "B".into(),
-                base_url: mock_url.clone(),
-                default_model: None,
-            }],
-            active_provider_id: "".into(),
+            providers: vec![
+                crate::config::Provider {
+                    id: "p-a".into(),
+                    name: "A".into(),
+                    base_url: "http://active.invalid/v1".into(),
+                    default_model: None,
+                },
+                crate::config::Provider {
+                    id: "p-b".into(),
+                    name: "B".into(),
+                    base_url: mock_url.clone(),
+                    default_model: None,
+                },
+            ],
+            active_provider_id: "p-a".into(),
             ..Default::default()
         };
         let mcp = tools::BraveSearch::default();

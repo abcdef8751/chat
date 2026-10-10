@@ -78,9 +78,6 @@ async fn tick(app: &AppHandle) -> Result<(), String> {
 /// button / a test can trigger it directly.
 pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Result<(), String> {
     let cfg = app.state::<ConfigState>().get();
-    if cfg.model.trim().is_empty() {
-        return Ok(());
-    }
     let db = app.state::<db::Db>();
 
     // The conversation's own provider drives reflection (which endpoint/model a
@@ -93,6 +90,11 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
         .clone()
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| cfg.model.clone());
+    // Guard on the actual model the conversation would run on (it may pin one
+    // even when the global default is unset).
+    if model.trim().is_empty() {
+        return Ok(());
+    }
     let Some(api_key) = crate::providers::resolve(&provider.id)? else {
         return Ok(());
     };
