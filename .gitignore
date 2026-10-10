@@ -8,3 +8,4 @@ src-tauri/gen/schemas/
 
 # never commit Supabase credentials (contains the service-role secret)
 .env
+/dist-android/
