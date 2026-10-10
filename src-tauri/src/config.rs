@@ -52,6 +52,10 @@ pub struct AppConfig {
     /// Opt-in Supabase backup + sync. Off by default; when off (or logged out)
     /// the whole sync module is idle and never touches the network.
     pub sync_enabled: bool,
+    /// ms epoch of the last successful sync, persisted so the "last sync"
+    /// readout survives restarts (the live value in `SyncState` is in-memory
+    /// only and otherwise resets to "never" on each launch).
+    pub sync_last_sync_at: Option<i64>,
 }
 
 impl Default for AppConfig {
@@ -67,6 +71,7 @@ impl Default for AppConfig {
             model_overrides: HashMap::new(),
             shell_workspace_dir: String::new(),
             sync_enabled: false,
+            sync_last_sync_at: None,
         }
     }
 }

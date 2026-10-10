@@ -226,6 +226,9 @@ fn status(app: &AppHandle) -> SyncStatus {
     let sync = app.state::<SyncState>();
     let (syncing, last_sync_at, last_error, phase, pushed, pulled, locked) = sync.snapshot();
     let pending = db::pending_rows(app.state::<Db>().inner()).unwrap_or(0);
+    // Prefer the live in-memory value while it is set; otherwise fall back to the
+    // timestamp persisted in config so a fresh process does not forget past syncs.
+    let last_sync_at = last_sync_at.or(cfg.sync_last_sync_at);
     SyncStatus {
         enabled: cfg.sync_enabled,
         logged_in: session.is_some(),
@@ -661,7 +664,14 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
             return Err(e);
         }
     }
-    sync.set_success(now_ms());
+    // Persist the success timestamp so it survives restarts (the live value in
+    // SyncState is in-memory only; without this the page would show "never"
+    // after a relaunch even though syncs ran in earlier sessions).
+    let at = now_ms();
+    sync.set_success(at);
+    let mut cfg = app.state::<ConfigState>().get();
+    cfg.sync_last_sync_at = Some(at);
+    let _ = app.state::<ConfigState>().set(cfg);
     Ok(())
 }
 
