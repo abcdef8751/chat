@@ -16,6 +16,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  addProvider,
   approveTool,
   backfillMemories,
   backfillStatus,
@@ -34,17 +35,24 @@ import {
   listMemoryFiles,
   listMessages,
   listModels,
+  listModelsDevProviders,
+  listProviders,
   memoryExtractionStats,
   memoryReflectionStats,
   readAttachments,
   reflectNow,
+  removeProvider,
   renameConversation,
   searchConversations,
+  setActiveProvider,
   setApiKey,
   setBraveKey,
   setConfig,
+  setConversationModel,
+  setConversationProvider,
   stopChat,
   streamChat,
+  updateProvider,
   syncNow,
   syncSignIn,
   syncSignOut,
@@ -66,7 +74,10 @@ import {
   type Message,
   type ModelInfo,
   type ModelOverride,
+  type ModelsDevProvider,
   type Pricing,
+  type Provider,
+  type ProviderInfo,
   type ReflectionStats,
   type StreamEvent,
   type SyncStatus,
@@ -697,6 +708,26 @@ export default function App() {
   // Bumped after a catalog refresh so pricing/thinking re-resolve.
   const [catalogVersion, setCatalogVersion] = createSignal(0);
 
+  // --- Multi-provider state ---
+  const [providers, setProviders] = createSignal<ProviderInfo[]>([]);
+  const [activeProviderId, setActiveProviderId] = createSignal("");
+  const [providersLoading, setProvidersLoading] = createSignal(false);
+  const [modelsDevProviders, setModelsDevProviders] = createSignal<ModelsDevProvider[]>([]);
+  const [modelsProviderId, setModelsProviderId] = createSignal("");
+  // Provider shown in the header for the active conversation (or active default).
+  const [headerProviderId, setHeaderProviderId] = createSignal("");
+  // Provider manager form state.
+  const [addOpen, setAddOpen] = createSignal(false);
+  const [addName, setAddName] = createSignal("");
+  const [addUrl, setAddUrl] = createSignal("");
+  const [addKey, setAddKey] = createSignal("");
+  const [addPick, setAddPick] = createSignal("");
+  const [editId, setEditId] = createSignal<string | null>(null);
+  const [editName, setEditName] = createSignal("");
+  const [editUrl, setEditUrl] = createSignal("");
+  const [editKey, setEditKey] = createSignal("");
+  const [providerError, setProviderError] = createSignal<string | null>(null);
+
   createEffect(() => {
     const el = document.documentElement;
     const isDark = dark();
@@ -798,13 +829,17 @@ export default function App() {
     setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
     setSyncEnabled(cfg.syncEnabled ?? false);
     setModelOverrides(cfg.modelOverrides ?? {});
+    setActiveProviderId(cfg.activeProviderId ?? "");
+    void refreshProviders();
     setHasKey(await hasApiKey());
     void refreshReflectionStats();    // Fast path: cached catalog/prices so the picker and meter render at once.
-    // Without a key the picker falls back to the configured model.
-    await loadModels(false).catch(() => {});
+    // Without a key the picker falls back to the configured model. The list is
+    // scoped to the active/header provider after refreshProviders() resolves;
+    // load the legacy default immediately so the picker renders.
+    await loadModels(false, cfg.activeProviderId ?? "").catch(() => {});
     // Background: pull fresh data from models.dev and replace values if they
     // changed, without blocking startup.
-    loadModels(true).catch(() => {});
+    loadModels(true, cfg.activeProviderId ?? "").catch(() => {});
   });
 
   // Re-resolve pricing whenever the selected model or the catalog changes.
@@ -923,8 +958,13 @@ export default function App() {
     setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
     setSyncEnabled(cfg.syncEnabled ?? false);
     setModelOverrides(cfg.modelOverrides ?? {});
+    setActiveProviderId(cfg.activeProviderId ?? "");
     setHasKey(await hasApiKey());
     setKeyDraft("");
+    void refreshProviders();
+    setAddOpen(false);
+    setEditId(null);
+    setProviderError(null);
     hasBraveKey()
       .then(setHasBraveKeySaved)
       .catch(() => setHasBraveKeySaved(false)); // never block opening Settings
@@ -954,6 +994,8 @@ export default function App() {
       modelOverrides: current.modelOverrides ?? {},
       shellWorkspaceDir: shellWorkspaceDir(),
       syncEnabled: syncEnabled(),
+      providers: providerConfig(),
+      activeProviderId: activeProviderId(),
     });
     let keyChanged = false;
     if (keyDraft().trim()) {
@@ -978,7 +1020,7 @@ export default function App() {
       const changed = await persistSettings();
       // Only re-pull the catalog when the endpoint or key changed (or on app
       // start); otherwise keep the list the user is working with.
-      if (changed) loadModels(true).catch(() => {});
+      if (changed) loadModels(true, headerProviderId() ?? null).catch(() => {});
     } catch (e) {
       setSettingsError(String(e));
     }
@@ -1192,11 +1234,15 @@ export default function App() {
   // Pull the model catalog (models.dev when the endpoint matches, else the
   // endpoint's own `/models`). Prices ride along in the same cache. Cached
   // values render first; a forced refresh replaces them once it resolves.
-  async function loadModels(refresh: boolean) {
+  // `providerId` scopes the call to a specific provider; when omitted it falls
+  // back to the header/active provider.
+  async function loadModels(refresh: boolean, providerId?: string | null) {
+    const prov = providerId ?? headerProviderId() ?? activeProviderId() ?? null;
     setModelsLoading(true);
     try {
-      const rows = await listModels(refresh);
+      const rows = await listModels(refresh, prov);
       setModels(rows);
+      setModelsProviderId(prov ?? "");
       setCatalogVersion((v) => v + 1);
     } finally {
       setModelsLoading(false);
@@ -1228,7 +1274,14 @@ export default function App() {
         modelOverrides: modelOverrides(),
         shellWorkspaceDir: shellWorkspaceDir(),
         syncEnabled: syncEnabled(),
+        providers: providerConfig(),
+        activeProviderId: activeProviderId(),
       });
+      // With a conversation active, persist the per-conversation model so the
+      // stream uses it (the backend defaults to the active provider's model
+      // otherwise).
+      const conv = activeConversation();
+      if (conv) await setConversationModel(conv.id, id);
     } catch (e) {
       setSettingsError(String(e));
     }
@@ -1248,6 +1301,8 @@ export default function App() {
         modelOverrides: modelOverrides(),
         shellWorkspaceDir: shellWorkspaceDir(),
         syncEnabled: syncEnabled(),
+        providers: providerConfig(),
+        activeProviderId: activeProviderId(),
       });
     } catch (e) {
       setSettingsError(String(e));
@@ -1605,6 +1660,191 @@ export default function App() {
     return conversations().find((c) => c.id === id)?.title ?? "New chat";
   };
 
+  const activeConversation = () => {
+    const id = activeId();
+    return id ? conversations().find((c) => c.id === id) ?? null : null;
+  };
+
+  // Config's `providers` field is the slimmer Provider[] shape; map the rich
+  // ProviderInfo list (with live key/active flags) down to what setConfig needs.
+  const providerConfig = (): Provider[] =>
+    providers().map((p) => ({
+      id: p.id,
+      name: p.name,
+      baseUrl: p.baseUrl,
+      defaultModel: p.defaultModel ?? null,
+    }));
+
+  // The header's provider selector. A non-empty list is the real provider set;
+  // an empty list is a legacy single-provider config, exposed as one implicit
+  // entry so the existing header/settings behavior is preserved.
+  const providerOptions = (): ProviderInfo[] => {
+    if (providers().length > 0) return providers();
+    return [
+      {
+        id: "",
+        name: "Default",
+        baseUrl: baseUrl(),
+        defaultModel: model(),
+        hasKey: hasKey(),
+        active: true,
+      },
+    ];
+  };
+
+  async function refreshProviders() {
+    setProvidersLoading(true);
+    try {
+      const rows = await listProviders();
+      setProviders(rows);
+      const active = rows.find((p) => p.active);
+      if (active) setActiveProviderId(active.id);
+      setModelsDevProviders(await listModelsDevProviders().catch(() => []));
+    } catch (e) {
+      setProviderError(String(e));
+    } finally {
+      setProvidersLoading(false);
+    }
+  }
+
+  async function doAddProvider() {
+    let name = addName().trim();
+    let url = addUrl().trim();
+    const pick = addPick();
+    if (pick) {
+      const chosen = modelsDevProviders().find((p) => p.id === pick);
+      if (chosen) {
+        if (!name) name = chosen.name;
+        if (!url) url = chosen.baseUrl;
+      }
+    }
+    if (!name || !url) {
+      setProviderError("Enter a name and a base URL.");
+      return;
+    }
+    setProviderError(null);
+    try {
+      await addProvider(name, url, addKey().trim() || null);
+      await refreshProviders();
+      setAddOpen(false);
+      setAddName("");
+      setAddUrl("");
+      setAddKey("");
+      setAddPick("");
+    } catch (e) {
+      setProviderError(String(e));
+    }
+  }
+
+  function startEdit(p: ProviderInfo) {
+    setEditId(p.id);
+    setEditName(p.name);
+    setEditUrl(p.baseUrl);
+    setEditKey("");
+    setProviderError(null);
+  }
+
+  function cancelEdit() {
+    setEditId(null);
+    setProviderError(null);
+  }
+
+  async function doUpdateProvider() {
+    const id = editId();
+    if (!id) return;
+    const name = editName().trim();
+    const url = editUrl().trim();
+    if (!name || !url) {
+      setProviderError("Enter a name and a base URL.");
+      return;
+    }
+    setProviderError(null);
+    try {
+      // A non-empty edit sets the key; an empty edit leaves it unchanged.
+      // A separate "Clear key" action removes it.
+      const key = editKey().trim();
+      await updateProvider(id, name, url, key ? key : undefined);
+      await refreshProviders();
+      setEditId(null);
+    } catch (e) {
+      setProviderError(String(e));
+    }
+  }
+
+  async function doClearProviderKey(id: string) {
+    setProviderError(null);
+    try {
+      await updateProvider(id, undefined, undefined, "");
+      await refreshProviders();
+    } catch (e) {
+      setProviderError(String(e));
+    }
+  }
+
+  async function doSetActive(id: string) {
+    setProviderError(null);
+    try {
+      await setActiveProvider(id);
+      await refreshProviders();
+      const conv = activeConversation();
+      if (conv && !conv.providerId) {
+        // New chats/current defaulted chat now resolves to the new active one.
+        setHeaderProviderId(id);
+      }
+    } catch (e) {
+      setProviderError(String(e));
+    }
+  }
+
+  async function doRemoveProvider(id: string) {
+    setProviderError(null);
+    try {
+      const rows = await removeProvider(id);
+      setProviders(rows);
+      const active = rows.find((p) => p.active);
+      if (active) setActiveProviderId(active.id);
+    } catch (e) {
+      setProviderError(String(e));
+    }
+  }
+
+  // Header: switching the active conversation's provider. With a conversation
+  // active we persist the choice (null reverts it to the active provider),
+  // reload that provider's model list and adopt a default model for it.
+  async function changeHeaderProvider(id: string) {
+    setHeaderProviderId(id);
+    const conv = activeConversation();
+    if (conv) {
+      const target = conv.providerId === null || conv.providerId === "" ? null : conv.providerId;
+      const next = target === id ? null : id;
+      try {
+        await setConversationProvider(conv.id, next);
+        await refreshConversations();
+        setProviderError(null);
+      } catch (e) {
+        setProviderError(String(e));
+      }
+    }
+    await loadModels(true, id || null);
+    const prov = providers().find((p) => p.id === id);
+    const fallback = prov?.defaultModel ?? models()[0]?.id ?? "";
+    if (fallback && fallback !== model()) void changeModel(fallback);
+  }
+
+  // When the active conversation (or the active provider) changes, reflect the
+  // conversation's provider + model in the header and load that provider's
+  // model list. New chats carry no explicit provider/model, so they resolve to
+  // the active provider + its default model.
+  createEffect(() => {
+    const conv = activeConversation();
+    const ap = activeProviderId();
+    const prov = conv?.providerId ?? ap;
+    setHeaderProviderId(prov);
+    if (conv && conv.model && conv.model !== model()) setModel(conv.model);
+    if (prov !== modelsProviderId()) void loadModels(false, prov || null);
+  });
+
+
   // The active model is always the first option, so the picker can never lose
   // its selection when the catalog is replaced. Option values are plain
   // strings (not reactive) to avoid a select/value update race.
@@ -1926,6 +2166,23 @@ export default function App() {
             >
               {dark() ? "Light" : "Dark"}
             </button>
+            <Show when={providers().length > 0 && activeId()}>
+              <select
+                class="hidden max-w-28 truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-50 sm:block md:max-w-36 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
+                title="Provider"
+                value={headerProviderId()}
+                onChange={(e) => void changeHeaderProvider(e.currentTarget.value)}
+              >
+                <For each={providerOptions()}>
+                  {(p) => (
+                    <option value={p.id}>
+                      {p.name}
+                      {!p.hasKey ? " (no key)" : ""}
+                    </option>
+                  )}
+                </For>
+              </select>
+            </Show>
             <select
               class="max-w-[9rem] truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-50 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
               title="Model"
@@ -2305,50 +2562,280 @@ export default function App() {
             </Dialog.Description>
 
             <div class="mt-4 space-y-3">
-              <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
-                Base URL
-                <input
-                  class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                  value={baseUrl()}
-                  onInput={(e) => setBaseUrl(e.currentTarget.value)}
-                />
-              </label>
+              <Show
+                when={providers().length > 0}
+                fallback={
+                  <>
+                    <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                      Base URL
+                      <input
+                        class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        value={baseUrl()}
+                        onInput={(e) => setBaseUrl(e.currentTarget.value)}
+                      />
+                    </label>
 
-              <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
-                API key
-                <input
-                  type="password"
-                  class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                  placeholder={
-                    hasKey()
-                      ? "••••••  saved in keychain — type to replace"
-                      : "sk-… / fw_…"
-                  }
-                  value={keyDraft()}
-                  onInput={(e) => {
-                    setKeyDraft(e.currentTarget.value);
-                  }}
-                />
-                <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
-                  Stored in the OS keychain, never on disk or in the app config.
-                </span>
-                <Show when={hasKey()}>
-                  <button
-                    onClick={async () => {
-                      try {
-                        await setApiKey(null);
-                        setHasKey(false);
-                        setKeyDraft("");
-                      } catch (e) {
-                        setSettingsError(String(e));
-                      }
-                    }}
-                    class="mt-1 text-[11px] font-normal text-red-600 transition hover:underline dark:text-red-400"
-                  >
-                    Remove saved key
-                  </button>
-                </Show>
-              </label>
+                    <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                      API key
+                      <input
+                        type="password"
+                        class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        placeholder={
+                          hasKey()
+                            ? "••••••  saved in keychain — type to replace"
+                            : "sk-… / fw_…"
+                        }
+                        value={keyDraft()}
+                        onInput={(e) => {
+                          setKeyDraft(e.currentTarget.value);
+                        }}
+                      />
+                      <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                        Stored in the OS keychain, never on disk or in the app config.
+                      </span>
+                      <Show when={hasKey()}>
+                        <button
+                          onClick={async () => {
+                            try {
+                              await setApiKey(null);
+                              setHasKey(false);
+                              setKeyDraft("");
+                            } catch (e) {
+                              setSettingsError(String(e));
+                            }
+                          }}
+                          class="mt-1 text-[11px] font-normal text-red-600 transition hover:underline dark:text-red-400"
+                        >
+                          Remove saved key
+                        </button>
+                      </Show>
+                    </label>
+                  </>
+                }
+              >
+                <div>
+                  <div class="mb-2 flex items-center justify-between">
+                    <span class="text-xs font-semibold text-neutral-600 dark:text-neutral-300">
+                      Providers
+                    </span>
+                    <button
+                      onClick={() => {
+                        setAddOpen(!addOpen());
+                        setEditId(null);
+                        setProviderError(null);
+                      }}
+                      class="rounded-md bg-neutral-900 px-2 py-1 text-[11px] font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                    >
+                      {addOpen() ? "Cancel" : "+ Add provider"}
+                    </button>
+                  </div>
+
+                  <div class="space-y-2">
+                    <Show when={providersLoading()}>
+                      <p class="text-xs text-neutral-400 dark:text-neutral-500">
+                        Loading providers…
+                      </p>
+                    </Show>
+                    <For each={providers()}>
+                      {(p) => (
+                        <div class="rounded-lg border border-neutral-200 p-2 dark:border-neutral-700">
+                          <Show
+                            when={editId() === p.id}
+                            fallback={
+                              <div class="flex items-start gap-2">
+                                <div class="min-w-0 flex-1">
+                                  <div class="flex items-center gap-2">
+                                    <span class="truncate text-xs font-medium text-neutral-700 dark:text-neutral-200">
+                                      {p.name}
+                                    </span>
+                                    {p.active && (
+                                      <span class="shrink-0 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400">
+                                        Active
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div class="truncate text-[11px] text-neutral-400 dark:text-neutral-500">
+                                    {p.baseUrl}
+                                  </div>
+                                  <div class="text-[11px] text-neutral-400 dark:text-neutral-500">
+                                    {p.hasKey ? "Key saved" : "No key"}
+                                    {p.defaultModel ? ` · ${p.defaultModel}` : ""}
+                                  </div>
+                                </div>
+                                <div class="flex shrink-0 flex-col gap-1 text-right">
+                                  {!p.active && (
+                                    <button
+                                      onClick={() => void doSetActive(p.id)}
+                                      class="text-[11px] font-normal text-neutral-500 transition hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200"
+                                    >
+                                      Set active
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={() => startEdit(p)}
+                                    class="text-[11px] font-normal text-neutral-500 transition hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200"
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    onClick={() => void doRemoveProvider(p.id)}
+                                    class="text-[11px] font-normal text-red-600 transition hover:underline disabled:opacity-50 dark:text-red-400"
+                                    disabled={p.active}
+                                    title={p.active ? "Remove the active provider first" : undefined}
+                                  >
+                                    Remove
+                                  </button>
+                                </div>
+                              </div>
+                            }
+                          >
+                            <div class="space-y-2">
+                              <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                                Name
+                                <input
+                                  class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                                  value={editName()}
+                                  onInput={(e) => setEditName(e.currentTarget.value)}
+                                />
+                              </label>
+                              <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                                Base URL
+                                <input
+                                  class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                                  value={editUrl()}
+                                  onInput={(e) => setEditUrl(e.currentTarget.value)}
+                                />
+                              </label>
+                              <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                                API key
+                                <input
+                                  type="password"
+                                  class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                                  placeholder={
+                                    p.hasKey
+                                      ? "saved — blank keeps it, type to replace"
+                                      : "sk-… / fw_…"
+                                  }
+                                  value={editKey()}
+                                  onInput={(e) => setEditKey(e.currentTarget.value)}
+                                />
+                                <span class="mt-1 block text-[10px] font-normal text-neutral-400 dark:text-neutral-500">
+                                  Stored in the OS keychain.
+                                </span>
+                              </label>
+                              <Show when={p.hasKey}>
+                                <button
+                                  onClick={() => void doClearProviderKey(p.id)}
+                                  class="text-[11px] font-normal text-red-600 transition hover:underline dark:text-red-400"
+                                >
+                                  Clear saved key
+                                </button>
+                              </Show>
+                              <div class="flex gap-2">
+                                <button
+                                  onClick={() => void doUpdateProvider()}
+                                  class="rounded-md bg-neutral-900 px-3 py-1 text-[11px] font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  onClick={cancelEdit}
+                                  class="rounded-md border border-neutral-300 px-3 py-1 text-[11px] font-medium text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          </Show>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+
+                  <Show when={addOpen()}>
+                    <div class="mt-2 space-y-2 rounded-lg border border-neutral-200 p-2 dark:border-neutral-700">
+                      <Show when={modelsDevProviders().length > 0}>
+                        <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                          Pick from catalog (optional)
+                          <select
+                            class="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200"
+                            value={addPick()}
+                            onChange={(e) => {
+                              const pick = e.currentTarget.value;
+                              setAddPick(pick);
+                              const chosen = modelsDevProviders().find((p) => p.id === pick);
+                              if (chosen) {
+                                if (!addName().trim()) setAddName(chosen.name);
+                                if (!addUrl().trim()) setAddUrl(chosen.baseUrl);
+                              }
+                            }}
+                          >
+                            <option value="">— custom —</option>
+                            <For each={modelsDevProviders()}>
+                              {(p) => <option value={p.id}>{p.name}</option>}
+                            </For>
+                          </select>
+                        </label>
+                      </Show>
+                      <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                        Name
+                        <input
+                          class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                          placeholder="My provider"
+                          value={addName()}
+                          onInput={(e) => setAddName(e.currentTarget.value)}
+                        />
+                      </label>
+                      <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                        Base URL
+                        <input
+                          class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                          placeholder="https://api.example.com/inference/v1"
+                          value={addUrl()}
+                          onInput={(e) => setAddUrl(e.currentTarget.value)}
+                        />
+                      </label>
+                      <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                        API key (optional)
+                        <input
+                          type="password"
+                          class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                          placeholder="sk-… / fw_…"
+                          value={addKey()}
+                          onInput={(e) => setAddKey(e.currentTarget.value)}
+                        />
+                      </label>
+                      <div class="flex gap-2">
+                        <button
+                          onClick={() => void doAddProvider()}
+                          class="rounded-md bg-neutral-900 px-3 py-1 text-[11px] font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                        >
+                          Add
+                        </button>
+                        <button
+                          onClick={() => {
+                            setAddOpen(false);
+                            setAddPick("");
+                          }}
+                          class="rounded-md border border-neutral-300 px-3 py-1 text-[11px] font-medium text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  </Show>
+
+                  <Show when={providerError()}>
+                    <p class="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-400">
+                      {providerError()}
+                    </p>
+                  </Show>
+                  <p class="mt-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                    Each provider has its own base URL, API key, and model list. The active one
+                    is used for new chats.
+                  </p>
+                </div>
+              </Show>
 
               <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
                 Brave Search API key
