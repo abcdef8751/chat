@@ -6,9 +6,12 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import app.tauri.annotation.Command
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
@@ -36,6 +39,27 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
   companion object {
     private const val TAG = "RunCommandPlugin"
     private const val TERMUX = "com.termux"
+
+    // Termux's RUN_COMMAND is a custom runtime permission owned by the Termux
+    // package. Declaring `<uses-permission>` in our manifest is not enough: on
+    // device it must be GRANTED at runtime (via a dialog Termux shows), or
+    // `startService` throws "Not allowed to start service ... without permission
+    // com.termux.permission.RUN_COMMAND". We request it on first use and resume
+    // the pending call once granted.
+    private const val RUN_COMMAND_PERMISSION = "com.termux.permission.RUN_COMMAND"
+    const val REQUEST_CODE_RUN_COMMAND = 4001
+
+    // Holds the in-flight call while the runtime grant dialog is up.
+    @Volatile var instance: RunCommandPlugin? = null
+    @Volatile var pending: PendingCall? = null
+
+    /** Entry point from [MainActivity.onRequestPermissionsResult]. */
+    @JvmStatic
+    fun onPermissionResult(requestCode: Int, grantResults: IntArray) {
+      if (requestCode != REQUEST_CODE_RUN_COMMAND) return
+      val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+      instance?.onRunCommandPermissionResult(granted)
+    }
 
     // Termux RunCommandService intent extras (public API).
     private const val EXTRA_PATH = "com.termux.RUN_COMMAND_PATH"
@@ -80,9 +104,27 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
       return
     }
 
+    // Termux must grant us RUN_COMMAND at runtime before we may start its
+    // service. If not yet granted, stash the call and pop Termux's grant dialog;
+    // onPermissionResult resumes it. (The Rust side has its own timeout, so if
+    // the user is slow the invoke is dropped and resumed work is a no-op.)
+    if (ContextCompat.checkSelfPermission(activity, RUN_COMMAND_PERMISSION)
+        != PackageManager.PERMISSION_GRANTED) {
+      pending = PendingCall(command, workdir, invoke)
+      instance = this
+      ActivityCompat.requestPermissions(
+        activity, arrayOf(RUN_COMMAND_PERMISSION), REQUEST_CODE_RUN_COMMAND
+      )
+      return
+    }
+
+    execute(command, workdir, invoke)
+  }
+
+  private fun execute(command: String?, workdir: String?, invoke: Invoke) {
     val id = System.nanoTime()
     val callback = registerResultReceiver(id, workdir, invoke)
-    val pending = buildResultPendingIntent(id)
+    val pendingIntent = buildResultPendingIntent(id)
 
     val intent = Intent(TERMUX + ".RUN_COMMAND").apply {
       setPackage(TERMUX)
@@ -90,7 +132,7 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
       putExtra(EXTRA_ARGUMENTS, arrayOf("-c", command))
       if (!workdir.isNullOrBlank()) putExtra(EXTRA_WORKDIR, workdir)
       putExtra(EXTRA_RUNNER, RUNNER_APP_SHELL)
-      putExtra(EXTRA_PENDING_INTENT, pending)
+      putExtra(EXTRA_PENDING_INTENT, pendingIntent)
     }
 
     try {
@@ -99,6 +141,20 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
       runCatching { activity.unregisterReceiver(callback) }
       invoke.reject("termux: failed to start RUN_COMMAND: ${e.message}")
     }
+  }
+
+  /** Called from [MainActivity.onRequestPermissionsResult] via the companion. */
+  private fun onRunCommandPermissionResult(granted: Boolean) {
+    val p = pending
+    pending = null
+    if (p == null) return
+    if (!granted) {
+      p.invoke.reject(
+        "termux: RUN_COMMAND permission denied — allow it on the Termux dialog, then retry."
+      )
+      return
+    }
+    execute(p.command, p.workdir, p.invoke)
   }
 
   private fun isTermuxInstalled(): Boolean = try {
@@ -173,3 +229,14 @@ class RunArgs {
   var command: String? = null
   var workdir: String? = null
 }
+
+/**
+ * A `run()` call parked while we ask the user to grant the Termux RUN_COMMAND
+ * permission. We keep the original [Invoke] so the command can resume (rather
+ * than failing) once the dialog returns.
+ */
+class PendingCall(
+  val command: String?,
+  val workdir: String?,
+  val invoke: Invoke,
+)

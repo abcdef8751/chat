@@ -55,6 +55,18 @@ class MainActivity : TauriActivity() {
     initRustls()
   }
 
+  // The Termux RUN_COMMAND permission is a runtime grant owned by Termux; our
+  // RunCommandPlugin requests it and parks the pending command. Route the result
+  // back so it can resume (or report a denial) instead of silently hanging.
+  override fun onRequestPermissionsResult(
+    requestCode: Int,
+    permissions: Array<out String>,
+    grantResults: IntArray,
+  ) {
+    super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+    RunCommandPlugin.onPermissionResult(requestCode, grantResults)
+  }
+
   // WryActivity calls this once the WebView is created. We expose the system-bar
   // insets to the web content via `window.PiInsets` + a `pi-insets` event, and let
   // the app's own flex layout reserve the space (top padding for the header,
