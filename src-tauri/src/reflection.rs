@@ -673,9 +673,10 @@ pub fn clear_extractions(db: tauri::State<'_, db::Db>) -> Result<usize, String> 
 /// `model` / `thinking_level` optionally override which model (and reasoning
 /// level) the map + reduce phases run on; when `None` they fall back to the
 /// active provider's default (see [`active_turn_cfg`]). `all_history` switches
-/// the map phase from the newest import batch to every pending conversation, and
-/// `force` re-extracts even conversations already marked extracted (it re-stages
-/// and re-folds them).
+/// the map phase from the newest import batch to every pending conversation.
+/// `force` skips extraction entirely and re-folds the staged summaries that
+/// already exist (see [`unfold_all_extractions`]) — "redo memory" without
+/// re-mining.
 #[tauri::command]
 pub async fn backfill_memories(
     app: AppHandle,
@@ -733,12 +734,28 @@ async fn backfill_inner(
     all_history: bool,
     force: bool,
 ) -> Result<(), String> {
+    // Force = re-consolidate the staged summaries that already exist, without
+    // re-extracting (no map phase). This is what "re-do memory" means without
+    // paying for a full re-mining pass, and it cannot clobber a good summary
+    // with a NOTHING re-extract. Nothing staged -> nothing to re-fold.
+    if force {
+        {
+            let db = app.state::<db::Db>();
+            if db::count_extractions(&db)? == 0 {
+                app.state::<Backfill>().set_phase("nothing to backfill");
+                let _ = app.emit("memory-backfill", app.state::<Backfill>().snapshot());
+                return Ok(());
+            }
+            db::unfold_all_extractions(&db)?;
+        }
+        app.state::<Backfill>().set_phase("consolidating");
+        let _ = app.emit("memory-backfill", app.state::<Backfill>().snapshot());
+        return consolidate_extractions(app, model, thinking).await;
+    }
+
     let pending = {
         let db = app.state::<db::Db>();
-        if force {
-            // Re-backfill everything, ignoring the extraction watermark.
-            db::conversations_all_force_extraction(&db, min_chars)?
-        } else if all_history {
+        if all_history {
             db::conversations_pending_extraction_all(&db, min_chars)?
         } else {
             db::conversations_pending_extraction(&db, min_chars)?

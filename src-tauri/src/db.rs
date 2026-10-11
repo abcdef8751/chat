@@ -1262,35 +1262,26 @@ pub fn conversations_pending_extraction_all(
     Ok(out)
 }
 
-/// Every conversation with enough content, imported or not and regardless of the
-/// extraction watermark — the "force" re-backfill scope. Used by the explicit
-/// "re-backfill everything" control, which deliberately ignores which chats were
-/// already extracted (`upsert_extraction` re-stages and marks them unfolded, so
-/// the reduce re-folds them). Same as [`conversations_pending_extraction_all`]
-/// but WITHOUT the `watermark < newest message` guard. Ordered newest first.
-pub fn conversations_all_force_extraction(
-    db: &Db,
-    min_chars: i64,
-) -> Result<Vec<String>, String> {
+/// How many staged extraction rows exist (folded or not). The force
+/// re-consolidation reports "nothing to backfill" when nothing has ever been
+/// extracted, since it has no staged summaries to re-fold.
+pub fn count_extractions(db: &Db) -> Result<usize, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.id FROM conversations c
-             WHERE COALESCE((SELECT MAX(m.\"index\") FROM messages m
-                             WHERE m.conversation_id = c.id AND m.role != 'memory'), -1) >= 0
-               AND (SELECT COALESCE(SUM(LENGTH(m.content)), 0) FROM messages m
-                    WHERE m.conversation_id = c.id AND m.role != 'memory') >= ?1
-             ORDER BY c.updated_at DESC",
-        )
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_extractions", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([min_chars], |r| r.get::<_, String>(0))
+    Ok(n as usize)
+}
+
+/// Flip every staged extraction back to pending (`folded = 0`). Used by the
+/// force re-consolidation, which re-folds the summaries that already exist
+/// instead of re-extracting them. Retiring/`folded=1` rows are re-queued too;
+/// the reduce re-partitions empty ones out.
+pub fn unfold_all_extractions(db: &Db) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute("UPDATE memory_extractions SET folded = 0", [])
         .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|e| e.to_string())?);
-    }
-    Ok(out)
+    Ok(())
 }
 
 ///
@@ -1870,10 +1861,11 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// The force scope deliberately ignores the extraction watermark: a chat that
-    /// was already extracted (has a folded extraction row) still gets re-picked.
+    /// Force re-consolidation: `count_extractions` sees staged rows regardless of
+    /// the `folded` flag, and `unfold_all_extractions` re-queues them (sets
+    /// `folded = 0`) so the reduce will re-fold them.
     #[test]
-    fn force_extraction_ignores_the_extraction_watermark() {
+    fn force_refold_unfolds_staged_extractions() {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-batch-force-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
@@ -1893,7 +1885,7 @@ mod tests {
             params!["x".repeat(3000), now],
         )
         .unwrap();
-        // The chat is already extracted (watermark == max index AND folded).
+        // The chat was already folded into memory (folded = 1).
         conn.execute(
             "INSERT INTO memory_extractions (conversation_id, watermark, payload, folded, created_at)
              VALUES ('done', 0, ?1, 1, ?2)",
@@ -1902,13 +1894,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        // Not pending under the normal/all scopes (watermark is up to date)...
-        assert!(conversations_pending_extraction_all(&db, 2000).unwrap().is_empty());
-        // ...but the force scope still re-picks it.
-        assert_eq!(
-            conversations_all_force_extraction(&db, 2000).unwrap(),
-            vec!["done".to_string()]
-        );
+        // count_extractions sees the row even though it is folded...
+        assert_eq!(count_extractions(&db).unwrap(), 1);
+        // ...and list_extractions (folded = 0 only) does not yet.
+        assert!(list_extractions(&db).unwrap().is_empty());
+
+        // A force re-consolidation re-queues it for the reduce.
+        unfold_all_extractions(&db).unwrap();
+        let rows = list_extractions(&db).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_id, "done");
 
         let _ = std::fs::remove_file(&p);
     }

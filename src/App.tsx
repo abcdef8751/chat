@@ -4149,10 +4149,10 @@ export default function App() {
                       })
                     }
                     disabled={backfill()?.running}
-                    title="Re-extract every conversation regardless of whether it was already backfilled, then consolidate again. Costs a full re-run."
+                    title="Re-run consolidation over the summaries already staged (no re-extraction, so it's fast and can't lose a good summary). Re-writes memory from what was previously extracted."
                     class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
                   >
-                    Force backfill all
+                    Force re-consolidate
                   </button>
                 </div>
               </div>
