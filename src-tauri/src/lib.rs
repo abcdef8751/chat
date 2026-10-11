@@ -24,6 +24,17 @@ pub fn run() {
     // Android-only host-shell bridge (Termux RUN_COMMAND).
     #[cfg(target_os = "android")]
     let builder = builder.plugin(crate::android::plugin());
+    // Linux: "close to tray". Clicking the X hides the window instead of quitting,
+    // so the process (and its background sync/reflection schedulers) keep running.
+    // The tray menu is the only reliable reopen path on Linux (tray click events
+    // often don't fire), so it doubles as the "hidden app is still alive" affordance.
+    #[cfg(target_os = "linux")]
+    let builder = builder.on_window_event(|window, event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            let _ = window.hide();
+            api.prevent_close();
+        }
+    });
     builder
         .setup(|app| {
             let dir = app
@@ -73,6 +84,32 @@ pub fn run() {
 
             // Background sync scheduler (only active when enabled + logged in).
             sync::spawn(app.handle().clone());
+
+            // Linux: system-tray icon with Open/Quit. Required for close-to-tray:
+            // once the window is hidden there's no other way back in. The menu
+            // (not the icon click) is the supported interaction on Linux.
+            #[cfg(target_os = "linux")]
+            if let Some(icon) = app.default_window_icon().cloned() {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::TrayIconBuilder;
+                let open = MenuItem::with_id(app, "open", "Open Pi Chat", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&open, &quit])?;
+                TrayIconBuilder::with_id("main-tray")
+                    .icon(icon)
+                    .menu(&menu)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "open" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .build(app)?;
+            }
 
             Ok(())
         })
@@ -130,6 +167,41 @@ pub fn run() {
             sync::sync_import_key,
             sync::sync_recovery_code,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| match event {
+            #[cfg(target_os = "android")]
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                // tao maps each Android activity to a window; when the user swipes
+                // the app away the last window is destroyed and Tauri's default
+                // exit-on-last-window-close calls std::process::exit(0), killing
+                // the process (and the Rust sync/reflection schedulers) along with
+                // it. Block that so the foreground service keeps them alive.
+                api.prevent_exit();
+            }
+            #[cfg(target_os = "android")]
+            tauri::RunEvent::Resumed => {
+                // Known Tauri gap (tauri#15671): after swipe-away the process
+                // survives, but a relaunched activity gets no WebView → blank
+                // screen. Recreate the main window when resumed with none open.
+                if _app.webview_windows().is_empty() {
+                    let _ = tauri::WebviewWindowBuilder::new(
+                        _app,
+                        "main",
+                        tauri::WebviewUrl::default(),
+                    )
+                    .title("Pi Chat")
+                    .build();
+                }
+            }
+            #[cfg(target_os = "linux")]
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => {
+                // Linux close-to-tray: a window closing (code None) must not quit
+                // the app; it stays hidden in the background. The tray's explicit
+                // "Quit" calls app.exit(0) → code Some(0), which is not matched
+                // here and so is allowed through.
+                api.prevent_exit();
+            }
+            _ => {}
+        });
 }

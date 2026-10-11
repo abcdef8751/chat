@@ -1,8 +1,10 @@
 package com.rp.chat
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowInsets
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
@@ -53,6 +55,15 @@ class MainActivity : TauriActivity() {
     // first HTTPS request SIGABRTs the process:
     // "Expect rustls-platform-verifier to be initialized".
     initRustls()
+    // Keep the app (and its Rust sync/reflection schedulers) alive after the user
+    // swipes it away. Started from onCreate so we're reliably in the foreground
+    // (Android 12+ forbids starting foreground services from the background),
+    // then START_STICKY keeps it running; best-effort, wrapped in a guard anyway.
+    try {
+      startForegroundService(Intent(this, KeepAliveService::class.java))
+    } catch (e: Exception) {
+      Log.w("MainActivity", "could not start keep-alive service", e)
+    }
   }
 
   // The Termux RUN_COMMAND permission is a runtime grant owned by Termux; our
