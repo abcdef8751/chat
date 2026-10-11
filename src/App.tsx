@@ -1028,6 +1028,15 @@ export default function App() {
     );
     onCleanup(() => unlistenBackfill());
 
+    // Background/manual sync pull finished: local data may have changed. Refresh
+    // the conversation list and the open conversation's messages.
+    const unlistenSync = await listen("sync-changed", () => {
+      refreshConversations().catch(() => {});
+      const id = activeId();
+      if (id && !streaming()) listMessages(id).then(setMessages);
+    });
+    onCleanup(() => unlistenSync);
+
     const rows = await listConversations();
     setConversations(rows);
     setVisibleConversations(rows);

@@ -18,7 +18,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -699,13 +699,16 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         let _ = app.state::<ConfigState>().set(cfg);
     }
     sync.set_phase("pull");
-    match pull(&ctx, &session.user_id, &token).await {
-        Ok(n) => sync.add_pulled(n),
+    let n = match pull(&ctx, &session.user_id, &token).await {
+        Ok(n) => {
+            sync.add_pulled(n);
+            n
+        }
         Err(e) => {
             sync.set_error(e.clone());
             return Err(e);
         }
-    }
+    };
     // Mirror the user config AFTER the pull, never before. Because `user_config`
     // is a single global 'main' row, a device that mirrors+pushes its own config
     // ahead of the pull would push its (default) row over the authoritative
@@ -728,6 +731,10 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     let mut cfg = app.state::<ConfigState>().get();
     cfg.sync_last_sync_at = Some(at);
     let _ = app.state::<ConfigState>().set(cfg);
+    // Broadcast that local data may have changed (a successful pull applied
+    // remote rows). Refresh is cheap, so emit unconditionally after a pull —
+    // the frontend refreshes the chat list and open conversation on receipt.
+    let _ = app.emit("sync-changed", json!({ "changed": n > 0, "pulled": n }));
     Ok(())
 }
 
