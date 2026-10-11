@@ -151,5 +151,15 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
   }
 }
 
-/** Args for `RunCommandPlugin.run`. */
-data class RunArgs(val command: String?, val workdir: String?)
+/**
+ * Args for `RunCommandPlugin.run`. A plain POJO (no-arg constructor + mutable
+ * properties), NOT a Kotlin `data class`: Tauri's Android plugin deserializes the
+ * JSON payload into this with Jackson, and Jackson can only build a class that
+ * exposes a no-arg constructor plus property setters. A `data class` has neither,
+ * so every Termux call failed with "Cannot construct instance of RunArgs (no
+ * Creators, like default constructor, exist)".
+ */
+class RunArgs {
+  var command: String? = null
+  var workdir: String? = null
+}
