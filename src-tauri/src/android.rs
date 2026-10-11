@@ -18,6 +18,40 @@ use serde_json::json;
 use tauri::plugin::{Builder, PluginHandle, TauriPlugin};
 use tauri::{AppHandle, Manager};
 
+/// Initialize `rustls-platform-verifier` with Android's system trust store
+/// before the first TLS handshake.
+///
+/// reqwest 0.13 routes every HTTPS request through `rustls-platform-verifier`.
+/// On Android that verifier cannot reach the OS trust store on its own — it
+/// needs a JNI env + a `Context`, and without them the *first* handshake (the
+/// models.dev catalog fetch, a stream, Brave, or sync — whatever runs first on
+/// a `tokio-rt-worker`) hard-aborts the whole process with
+/// `Expect rustls-platform-verifier to be initialized` (SIGABRT). Desktop is
+/// unaffected because the verifier reads the OS store directly there; only
+/// Android needs this explicit init.
+///
+/// This is the JNI export for the Kotlin `MainActivity.initRustls` external
+/// method. It is invoked once from `MainActivity.onCreate` (see
+/// `gen/android/.../MainActivity.kt`), where the Android `Activity` (itself a
+/// `Context`) is passed as the `this` receiver.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_rp_chat_MainActivity_initRustls(
+    mut env: jni::EnvUnowned,
+    activity: jni::objects::JObject,
+) {
+    // `init_with_env` wants a full `Env`; `with_env` upgrades the FFI-safe
+    // unowned env and runs the closure inside its local JNI frame.
+    let _ = env.with_env(|env| {
+        let result = rustls_platform_verifier::android::init_with_env(env, activity);
+        match &result {
+            Ok(()) => eprintln!("rustls-platform-verifier initialized"),
+            Err(e) => eprintln!("rustls-platform-verifier init failed: {e:?}"),
+        }
+        result
+    });
+}
+
 use crate::tools::ToolOutput;
 
 /// Default working directory under shared storage, per ANDROID_SHELL.md

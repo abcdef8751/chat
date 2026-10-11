@@ -34,6 +34,14 @@ argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
 
+# Android-only: rustls-platform-verifier needs a JNI env + Context to reach the
+# OS trust store (see crate::android::init_rustls). `jni` 0.22 matches the
+# version rustls-platform-verifier 0.7 uses so our export can feed it the Env
+# directly.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22", default-features = false }
+rustls-platform-verifier = "0.7"
+
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

@@ -28,7 +28,6 @@ import {
   denyTool,
   getConfig,
   getPricing,
-  hasApiKey,
   hasBraveKey,
   importConversations,
   listConversations,
@@ -45,7 +44,6 @@ import {
   renameConversation,
   searchConversations,
   setActiveProvider,
-  setApiKey,
   setBraveKey,
   setConfig,
   setConversationModel,
@@ -688,8 +686,6 @@ export default function App() {
   const [attachmentWarning, setAttachmentWarning] = createSignal<string | null>(null);
   const [modelsLoading, setModelsLoading] = createSignal(false);
   const [settingsError, setSettingsError] = createSignal<string | null>(null);
-  const [keyDraft, setKeyDraft] = createSignal("");
-  const [hasKey, setHasKey] = createSignal(false);
   const [braveKeyDraft, setBraveKeyDraft] = createSignal("");
   const [hasBraveKeySaved, setHasBraveKeySaved] = createSignal(false);
   const [reflectionEnabled, setReflectionEnabled] = createSignal(true);
@@ -716,6 +712,62 @@ export default function App() {
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
   const [thinkingOpenId, setThinkingOpenId] = createSignal<string | null>(null);
+
+  // Android system-bar insets (px), exposed by the native side via
+  // `window.PiInsets` + the `pi-insets` event (see MainActivity.kt). Absent on
+  // desktop, where these stay 0. The app reserves the space itself in its flex
+  // layout so content never hides under the status / navigation bars.
+  const [insets, setInsets] = createSignal({ top: 0, left: 0, right: 0, bottom: 0 });
+  createEffect(() => {
+    const w = window as unknown as {
+      PiInsets?: {
+        getTop(): number;
+        getBottom(): number;
+        getLeft(): number;
+        getRight(): number;
+      };
+    };
+    const apply = () => {
+      if (w.PiInsets) {
+        setInsets({
+          top: w.PiInsets.getTop(),
+          bottom: w.PiInsets.getBottom(),
+          left: w.PiInsets.getLeft(),
+          right: w.PiInsets.getRight(),
+        });
+      }
+    };
+    apply();
+    const onInsets = (e: Event) => {
+      const d = (e as CustomEvent<{ top?: number; bottom?: number; left?: number; right?: number }>).detail;
+      if (d) {
+        setInsets((p) => ({
+          top: d.top ?? p.top,
+          bottom: d.bottom ?? p.bottom,
+          left: d.left ?? p.left,
+          right: d.right ?? p.right,
+        }));
+      }
+    };
+    window.addEventListener("pi-insets", onInsets);
+    window.addEventListener("resize", apply);
+    onCleanup(() => {
+      window.removeEventListener("pi-insets", onInsets);
+      window.removeEventListener("resize", apply);
+    });
+  });
+  // Full-screen (mobile) dialogs render in their own `fixed inset-0` viewport,
+  // outside the padded app root, so they must apply the same system-bar insets
+  // to their padding themselves. On desktop `insets()` are all 0, making this
+  // exactly the base `p-5` (1.25rem) the classes already use.
+  const fullscreenInsetStyle = () =>
+    ({
+      "padding-top": `calc(1.25rem + ${insets().top}px)`,
+      "padding-bottom": `calc(1.25rem + ${insets().bottom}px)`,
+      "padding-left": `calc(1.25rem + ${insets().left}px)`,
+      "padding-right": `calc(1.25rem + ${insets().right}px)`,
+    }) as const;
+
 
   // Memory tab: reads/edits the Markdown memory files.
   const [memoryOpen, setMemoryOpen] = createSignal(false);
@@ -913,7 +965,6 @@ export default function App() {
     setModelOverrides(cfg.modelOverrides ?? {});
     setActiveProviderId(cfg.activeProviderId ?? "");
     void refreshProviders();
-    setHasKey(await hasApiKey());
     void refreshReflectionStats();    // Fast path: cached catalog/prices so the picker and meter render at once.
     // Without a key the picker falls back to the configured model. The list is
     // scoped to the active/header provider after refreshProviders() resolves;
@@ -1075,33 +1126,42 @@ export default function App() {
   }
 
   async function openSettings() {
-    const cfg = await getConfig();
-    setBaseUrl(cfg.baseUrl);
-    setModel(cfg.model);
-    setPreferences(cfg.preferences ?? "");
-    setThinkingLevel(cfg.thinkingLevel ?? "");
-    setEchoReasoning(cfg.echoReasoningContent ?? true);
-    setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
-    setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
-    setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
-    setSyncEnabled(cfg.syncEnabled ?? false);
-    setModelOverrides(cfg.modelOverrides ?? {});
-    setOverrideModel(model());
-    setActiveProviderId(cfg.activeProviderId ?? "");
-    setHasKey(await hasApiKey());
-    setKeyDraft("");
-    void refreshProviders();
+    // Open the dialog first: none of the async setup below may block it. Some
+    // of those round-trips can fail (e.g. the OS keychain is unavailable on
+    // Android), and previously the awaited `hasApiKey()` rejecting early meant
+    // `setSettingsOpen(true)` never ran, so Settings silently failed to open.
+    // Mirror `openMemory()`, which opens its dialog before loading anything.
     setAddOpen(false);
     setEditId(null);
     setProviderError(null);
+    setSettingsError(null);
+    setSyncError(null);
+    setBraveKeyDraft("");
+    setSettingsOpen(true);
+
+    try {
+      const cfg = await getConfig();
+      setBaseUrl(cfg.baseUrl);
+      setModel(cfg.model);
+      setPreferences(cfg.preferences ?? "");
+      setThinkingLevel(cfg.thinkingLevel ?? "");
+      setEchoReasoning(cfg.echoReasoningContent ?? true);
+      setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
+      setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
+      setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
+      setSyncEnabled(cfg.syncEnabled ?? false);
+      setModelOverrides(cfg.modelOverrides ?? {});
+      setOverrideModel(model());
+      setActiveProviderId(cfg.activeProviderId ?? "");
+    } catch (e) {
+      // Never block opening Settings; surface the failure as a banner instead.
+      setSettingsError(String(e));
+    }
+    void refreshProviders();
     hasBraveKey()
       .then(setHasBraveKeySaved)
       .catch(() => setHasBraveKeySaved(false)); // never block opening Settings
-    setBraveKeyDraft("");
-    setSettingsError(null);
-    setSyncError(null);
     void refreshSync();
-    setSettingsOpen(true);
   }
 
   // Persist the endpoint + preferences (and a typed key, if any). The active
@@ -1127,12 +1187,6 @@ export default function App() {
       activeProviderId: activeProviderId(),
     });
     let keyChanged = false;
-    if (keyDraft().trim()) {
-      await setApiKey(keyDraft().trim());
-      setHasKey(true);
-      setKeyDraft("");
-      keyChanged = true;
-    }
     if (braveKeyDraft().trim()) {
       await setBraveKey(braveKeyDraft().trim());
       setHasBraveKeySaved(true);
@@ -1830,24 +1884,6 @@ export default function App() {
       catalogId: p.catalogId ?? null,
     }));
 
-  // The header's provider selector. A non-empty list is the real provider set;
-  // an empty list is a legacy single-provider config, exposed as one implicit
-  // entry so the existing header/settings behavior is preserved.
-  const providerOptions = (): ProviderInfo[] => {
-    if (providers().length > 0) return providers();
-    return [
-      {
-        id: "",
-        name: "Default",
-        baseUrl: baseUrl(),
-        defaultModel: model(),
-        catalogId: null,
-        hasKey: hasKey(),
-        active: true,
-      },
-    ];
-  };
-
   async function refreshProviders() {
     setProvidersLoading(true);
     try {
@@ -2046,8 +2082,10 @@ export default function App() {
 
   // The active model is always the first option, so the picker can never lose
   // its selection when the catalog is replaced. Option values are plain
-  // strings (not reactive) to avoid a select/value update race.
+  // strings (not reactive) to avoid a select/value update race. With no provider
+  // configured there are no models, so the selector renders blank.
   const modelOptions = (): ModelInfo[] => {
+    if (providers().length === 0) return [];
     const id = model();
     const rest = models().filter((m) => m.id !== id);
     const current = models().find((m) => m.id === id);
@@ -2059,7 +2097,9 @@ export default function App() {
   // `value` binding alone won't restore it because `model()` is unchanged.
   let modelSelectEl: HTMLSelectElement | undefined;
   createEffect(() => {
-    const value = model();
+    // With no provider the model selector is blank, so the value is "" (the
+    // "No provider" placeholder) regardless of whatever `model()` still holds.
+    const value = providers().length === 0 ? "" : model();
     models();
     if (modelSelectEl && modelSelectEl.value !== value) {
       modelSelectEl.value = value;
@@ -2189,7 +2229,15 @@ export default function App() {
   };
 
   return (
-    <div class="flex h-screen w-screen overflow-hidden bg-white text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+    <div
+      class="flex h-screen w-screen overflow-hidden bg-white text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100"
+      style={{
+        "padding-top": `${insets().top}px`,
+        "padding-bottom": `${insets().bottom}px`,
+        "padding-left": `${insets().left}px`,
+        "padding-right": `${insets().right}px`,
+      }}
+    >
       <Show when={dragOver()}>
         <div class="pointer-events-none fixed inset-0 z-[60] flex items-center justify-center bg-black/40">
           <div class="rounded-xl border-2 border-dashed border-white/70 px-6 py-4 text-sm font-medium text-white">
@@ -2213,6 +2261,10 @@ export default function App() {
         class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform lg:static lg:z-auto lg:translate-x-0 lg:transition-none dark:border-neutral-800 dark:bg-neutral-900 ${
           sidebarOpen() ? "translate-x-0" : "-translate-x-full"
         }`}
+        style={{
+          "padding-top": `${insets().top}px`,
+          "padding-bottom": `${insets().bottom}px`,
+        }}
       >
         <div class="flex items-center gap-2 border-b border-neutral-200 p-3 dark:border-neutral-800">
           <span class="mr-auto flex items-center gap-2 pl-1">
@@ -2416,7 +2468,7 @@ export default function App() {
                 value={headerProviderId()}
                 onChange={(e) => void changeHeaderProvider(e.currentTarget.value)}
               >
-                <For each={providerOptions()}>
+                <For each={providers()}>
                   {(p) => (
                     <option value={p.id}>
                       {p.name}
@@ -2431,9 +2483,9 @@ export default function App() {
                 class="max-w-[9rem] pr-7 truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-60 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
                 title="Model"
                 aria-busy={modelsLoading()}
-                disabled={modelsLoading()}
+                disabled={modelsLoading() || providers().length === 0}
                 ref={(el) => (modelSelectEl = el)}
-                value={model()}
+                value={providers().length === 0 ? "" : model()}
                 onChange={(e) => {
                   const next = e.currentTarget.value;
                   // Ignore spurious events from the list refreshing, only
@@ -2441,6 +2493,11 @@ export default function App() {
                   if (next && next !== model()) void changeModel(next);
                 }}
               >
+                <Show when={providers().length === 0}>
+                  <option value="" disabled>
+                    No provider
+                  </option>
+                </Show>
                 <For each={modelOptions()}>
                   {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
                 </For>
@@ -2829,6 +2886,7 @@ export default function App() {
                 ? "fixed left-1/2 top-1/2 z-50 max-h-[85vh] w-full max-w-md -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900"
                 : "fixed inset-0 z-50 h-full w-full overflow-y-auto bg-white p-5 focus:outline-none dark:bg-neutral-900"
             }
+            style={fullscreenInsetStyle()}
           >
             <div class="flex items-center gap-2">
               {/* Mobile (full-screen) exit arrow — hidden on wide viewports, where
@@ -2843,66 +2901,10 @@ export default function App() {
               <Dialog.Title class="text-base font-semibold">Settings</Dialog.Title>
             </div>
             <Dialog.Description class="mt-1 text-sm text-neutral-500 dark:text-neutral-400">
-              OpenAI-compatible endpoint. Fireworks is prefilled.
+              Add an OpenAI-compatible endpoint to start chatting.
             </Dialog.Description>
 
             <div class="mt-4 space-y-3">
-              <Show when={providers().length === 0}>
-                <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
-                  <span class="block text-xs font-semibold text-neutral-600 dark:text-neutral-300">
-                    Default provider
-                  </span>
-                  <p class="mt-0.5 mb-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
-                    No providers configured yet. Edit the built-in default below, or add a
-                    provider with the button above.
-                  </p>
-                  <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
-                    Base URL
-                    <input
-                      class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                      value={baseUrl()}
-                      onInput={(e) => setBaseUrl(e.currentTarget.value)}
-                    />
-                  </label>
-
-                  <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
-                    API key
-                    <input
-                      type="password"
-                      class="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                      placeholder={
-                        hasKey()
-                          ? "••••••  saved in keychain — type to replace"
-                          : "sk-… / fw_…"
-                      }
-                      value={keyDraft()}
-                      onInput={(e) => {
-                        setKeyDraft(e.currentTarget.value);
-                      }}
-                    />
-                    <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
-                      Stored in the OS keychain, never on disk or in the app config.
-                    </span>
-                    <Show when={hasKey()}>
-                      <button
-                        onClick={async () => {
-                          try {
-                            await setApiKey(null);
-                            setHasKey(false);
-                            setKeyDraft("");
-                          } catch (e) {
-                            setSettingsError(String(e));
-                          }
-                        }}
-                        class="mt-1 text-[11px] font-normal text-red-600 transition hover:underline dark:text-red-400"
-                      >
-                        Remove saved key
-                      </button>
-                    </Show>
-                  </label>
-                </div>
-              </Show>
-
               <div>
                   <div class="mb-2 flex items-center justify-between">
                     <span class="text-xs font-semibold text-neutral-600 dark:text-neutral-300">
@@ -2924,6 +2926,11 @@ export default function App() {
                     <Show when={providersLoading()}>
                       <p class="text-xs text-neutral-400 dark:text-neutral-500">
                         Loading providers…
+                      </p>
+                    </Show>
+                    <Show when={!providersLoading() && providers().length === 0}>
+                      <p class="text-xs text-neutral-400 dark:text-neutral-500">
+                        No providers yet — add one to start chatting.
                       </p>
                     </Show>
                     <For each={providers()}>
@@ -3139,10 +3146,16 @@ export default function App() {
                   built-in defaults. Leave a field blank to fall back.
                 </span>
                 <select
-                  class="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                  value={overrideModel()}
+                  class="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-800"
+                  value={providers().length === 0 ? "" : overrideModel()}
                   onChange={(e) => setOverrideModel(e.currentTarget.value)}
+                  disabled={providers().length === 0}
                 >
+                  <Show when={providers().length === 0}>
+                    <option value="" disabled>
+                      No provider
+                    </option>
+                  </Show>
                   <For each={modelOptions()}>
                     {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
                   </For>
@@ -3661,6 +3674,7 @@ export default function App() {
                 ? "fixed left-1/2 top-1/2 z-50 flex h-[70vh] w-full max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900"
                 : "fixed inset-0 z-50 flex h-full w-full flex-col overflow-y-auto bg-white p-5 focus:outline-none dark:bg-neutral-900"
             }
+            style={fullscreenInsetStyle()}
           >
             <div class="flex items-center gap-2">
               {/* Mobile (full-screen) exit arrow — hidden on wide viewports, where

@@ -1,9 +1,41 @@
+import groovy.json.JsonSlurper
+import java.io.File
 import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("rust")
+}
+
+// Locate the `rustls-platform-verifier-android` AAR that cargo downloaded for
+// the Android target and register it as a local Maven repo. reqwest 0.13
+// routes TLS through rustls-platform-verifier, which needs its Kotlin
+// component (`org.rustls.platformverifier.CertificateVerifier`) packaged into
+// the APK or the trust store cannot be reached from Java.
+fun rustlsPlatformVerifierMaven(): String {
+    val cargoToml = project.rootDir.parentFile.parentFile.resolve("Cargo.toml")
+    val metadata = providers.exec {
+        commandLine(
+            "cargo", "metadata", "--format-version", "1",
+            "--filter-platform", "aarch64-linux-android",
+            "--manifest-path", cargoToml.absolutePath,
+        )
+    }.standardOutput.asText.get()
+    val json = JsonSlurper().parseText(metadata) as Map<*, *>
+    val pkg = (json["packages"] as List<*>).first { p ->
+        (p as Map<*, *>)["name"] == "rustls-platform-verifier-android"
+    } as Map<*, *>
+    return File(File(pkg["manifest_path"] as String).parentFile, "maven").path
+}
+
+repositories {
+    google()
+    mavenCentral()
+    maven {
+        url = uri(rustlsPlatformVerifierMaven())
+        metadataSources.artifact()
+    }
 }
 
 val tauriProperties = Properties().apply {
@@ -85,6 +117,10 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.lifecycle:lifecycle-process:2.10.0")
+    // Kotlin/jni component of rustls-platform-verifier (provided by the local
+    // maven repo above). Kept in sync with the crate via `latest.release`-style
+    // resolution; the exposed version here must match the crate's.
+    implementation("rustls:rustls-platform-verifier:0.1.1")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
