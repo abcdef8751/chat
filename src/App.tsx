@@ -3897,7 +3897,7 @@ export default function App() {
                       onInput={(e) => setMemoryDraft(e.currentTarget.value)}
                     />
                   </Show>
-                  <div class="mt-3 flex items-center justify-between gap-3">
+                  <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
                     <Show
                       when={memoryConfirmDelete() === selectedMemoryFile()?.name}
                       fallback={
@@ -3959,7 +3959,7 @@ export default function App() {
             {/* Import an archive, then backfill it: map (parallel extraction)
                 then reduce (one writer). */}
             <div class="mt-4 rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
-              <div class="flex items-start justify-between gap-3">
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div class="min-w-0">
                   <p class="text-xs font-medium">Imported chats</p>
                   <p class="mt-0.5 text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">
