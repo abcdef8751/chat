@@ -1003,15 +1003,18 @@ fn syncable_payload_is_empty(payload: &str) -> bool {
     match serde_json::from_str::<SyncableConfig>(payload) {
         Ok(sc) => {
             // A config is "empty" (nothing user-owned to back up) when every field
-            // the user configures is defaulted. base_url/model are intentionally
-            // NOT considered: `syncable_payload()` always fills them with the
-            // DEFAULT_BASE_URL/DEFAULT_MODEL, so a blank device's default row has
-            // non-empty mirrors — guarding on them would make this dead for real
-            // configs and let a blank device clobber the canonical on the mirror.
+            // the user configures is defaulted. base_url/model only count as
+            // empty when they are STILL the factory defaults: `syncable_payload()`
+            // always fills them, so a blank device's defaults would otherwise
+            // defeat the guard; but a legacy (pre-multi-provider) user whose only
+            // content is a custom base_url/model must still be recognized as
+            // non-empty or their config would never sync.
             sc.providers.is_empty()
                 && sc.active_provider_id.is_empty()
                 && sc.preferences.trim().is_empty()
                 && sc.model_overrides.is_empty()
+                && sc.base_url == crate::config::DEFAULT_BASE_URL
+                && sc.model == crate::config::DEFAULT_MODEL
         }
         // Unparseable — assume non-empty so it is pushed as-is rather than dropped.
         Err(_) => false,

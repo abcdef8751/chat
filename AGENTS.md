@@ -684,6 +684,20 @@ memory conflict resolution.
 `max_tokens`, developer-vs-system role). Default OpenAI-shaped behavior is fine
 until a provider breaks it; the first knob (`echo_reasoning_content`) has landed.
 
+**TO FIX (legacy provider layer, low priority — not currently causing problems):**
+the pre-multi-provider compatibility shim is load-bearing and should eventually be
+migrated away. It includes: synthesis of an implicit `legacy` provider when
+`providers[]` is empty, the `base_url`/`model` mirrors kept in sync with the active
+provider (`sync_active` in `providers.rs`), and `providers::resolve()` falling back
+to the legacy `api_key` keychain entry. It exists so old installs / saved
+`config.json`s keep working after the provider refactor, and several code paths
+(settings, chat, pricing, model resolution, and the `user_config` sync via
+`syncable_payload`/the empty-guard) go through it. Retiring it means making every
+config a real provider (a UX/schema decision), so treat it as its own migration
+project — do NOT rip it out as a drive-by edit. The sync empty-guard already works
+*with* it: factory-default mirrors count as "empty/not configured" while a
+legacy custom `base_url`/`model` is treated as real content and still syncs.
+
 **Client-side encryption — implemented but OFF by default (revisit later).** The
 `crypt.rs` / `sync_set_encryption` feature works (AES-256-GCM, random key in the
 OS keychain, optional recovery code), but the **multi-device workflow is awkward**:

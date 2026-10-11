@@ -837,9 +837,9 @@ async fn empty_user_config_row_is_never_pushed() {
     let cfg = temp_config("emptycfg");
 
     // Plant a dirty user_config row as a real blank device has one: an EMPTY
-    // user-owned config but with the DEFAULT_BASE_URL / DEFAULT_MODEL mirrors
-    // filled in (exactly what `syncable_payload()` emits for a default config).
-    // The guard must still recognize this as "nothing to back up" and NOT push it.
+    // user-owned config with the factory-default base_url/model mirrors filled in
+    // (exactly what `syncable_payload()` emits for a default config). The guard
+    // must recognize this as "nothing to back up" and NOT push it.
     {
         let conn = db.0.lock().unwrap();
         conn.execute(
@@ -847,8 +847,8 @@ async fn empty_user_config_row_is_never_pushed() {
              ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, revision = excluded.revision, dirty = 1",
             rusqlite::params![json!({
                 "preferences": "", "providers": [], "activeProviderId": "",
-                "baseUrl": "https://api.fireworks.ai/inference/v1",
-                "model": "deepseek-v4-flash-0731",
+                "baseUrl": crate::config::DEFAULT_BASE_URL,
+                "model": crate::config::DEFAULT_MODEL,
                 "modelOverrides": {}
             }).to_string()],
         )
@@ -875,6 +875,53 @@ async fn empty_user_config_row_is_never_pushed() {
             .unwrap()
     };
     assert_eq!(dirty, 0);
+}
+
+/// A legacy (pre-multi-provider) config whose ONLY content is a custom base_url
+/// and model must still be recognized as NON-empty and pushed — the empty-guard
+/// must not swallow a meaningful custom endpoint (only factory-defaults are empty).
+#[tokio::test]
+async fn legacy_custom_config_is_still_pushed() {
+    let srv = MockRest::spawn();
+    let db = temp_db("legcfg");
+    let mem = temp_memory("legcfg", &db);
+    let cfg = temp_config("legcfg");
+
+    // A legacy config: empty providers/active/prefs/overrides, but a custom
+    // self-hosted base_url/model (the only thing this user owns).
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 1, 1)
+             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, revision = excluded.revision, dirty = 1",
+            rusqlite::params![json!({
+                "preferences": "", "providers": [], "activeProviderId": "",
+                "baseUrl": "https://my.selfhosted.example/v1",
+                "model": "my-custom-model",
+                "modelOverrides": {}
+            }).to_string()],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    // The legacy custom config MUST be pushed (it is real content).
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "legacy custom config must be pushed");
+    let payload: Value =
+        serde_json::from_str(posts[0]["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["baseUrl"], "https://my.selfhosted.example/v1");
+    assert_eq!(payload["model"], "my-custom-model");
 }
 
 /// Regression for the reviewer's critical finding: a fresh/second device that

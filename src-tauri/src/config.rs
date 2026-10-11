@@ -5,9 +5,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// Default OpenAI-compatible endpoint (Fireworks) pre-filled for convenience.
-const DEFAULT_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
+pub const DEFAULT_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
 /// A common, broadly-available Fireworks model id. Users change this in Settings.
-const DEFAULT_MODEL: &str = "accounts/fireworks/models/llama-v3p1-8b-instruct";
+pub const DEFAULT_MODEL: &str = "accounts/fireworks/models/llama-v3p1-8b-instruct";
 /// Stable id used for the single provider synthesized from a legacy config that
 /// predates multiple-provider support. Its API key resolves via the legacy
 /// `api_key` keychain entry (see `secrets` / `providers::resolve`).
