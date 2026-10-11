@@ -776,6 +776,14 @@ export default function App() {
   const [backfill, setBackfill] = createSignal<BackfillStatus | null>(null);
   const [extractionStats, setExtractionStats] = createSignal<ExtractionStats | null>(null);
   const [importReport, setImportReport] = createSignal<ImportReport | null>(null);
+  // Backfill overrides: empty model/thinking = the active provider's default;
+  // `backfillThinkingOpts` mirrors the header select's reasoning options but for
+  // the chosen backfill model (or the active default when none is chosen).
+  const [backfillModel, setBackfillModel] = createSignal("");
+  const [backfillThinking, setBackfillThinking] = createSignal("");
+  const [backfillThinkingOpts, setBackfillThinkingOpts] = createSignal<ThinkingOptions | null>(
+    null,
+  );
   const [syncEnabled, setSyncEnabled] = createSignal(false);
   const [syncStatusData, setSyncStatusData] = createSignal<SyncStatus | null>(null);
   const [syncEmail, setSyncEmail] = createSignal("");
@@ -1632,11 +1640,17 @@ export default function App() {
 
   // Backfill: extract from every conversation in parallel, then consolidate the
   // staged summaries into memory in one serial pass. The command returns
-  // immediately; progress arrives on the `memory-backfill` event.
-  async function startBackfill() {
+  // immediately; progress arrives on the `memory-backfill` event. An optional
+  // options object carries the chosen backfill model / thinking level and the
+  // "all history" flag.
+  async function startBackfill(opts?: {
+    model?: string | null;
+    thinkingLevel?: string | null;
+    allHistory?: boolean;
+  }) {
     setMemoryError(null);
     try {
-      setBackfill(await backfillMemories());
+      setBackfill(await backfillMemories(opts ?? {}));
     } catch (e) {
       setMemoryError(String(e));
     }
@@ -1649,6 +1663,29 @@ export default function App() {
       // non-fatal
     }
   }
+
+  // Resolve the backfill thinking-level options for the chosen backfill model.
+  // Empty `backfillModel` means "active provider default", so fall back to the
+  // header-selected model. Mirrors the header select's reasoning support gating.
+  let backfillThinkingReqSeq = 0;
+  createEffect(() => {
+    const id = backfillModel() === "" ? model() : backfillModel();
+    const prov = headerProviderId();
+    catalogVersion();
+    if (!id) {
+      setBackfillThinkingOpts(null);
+      return;
+    }
+    const seq = ++backfillThinkingReqSeq;
+    thinkingOptions(id, prov)
+      .then((opts) => {
+        if (seq !== backfillThinkingReqSeq) return;
+        setBackfillThinkingOpts(opts);
+      })
+      .catch(() => {
+        if (seq === backfillThinkingReqSeq) setBackfillThinkingOpts(null);
+      });
+  });
 
   async function discardExtractions() {
     try {
@@ -3929,8 +3966,58 @@ export default function App() {
                     idle reflection sweep. Backfill then extracts durable facts from
                     them in parallel and consolidates the summaries into memory in one
                     pass; extraction never writes to memory, only the final pass does.
-                    Backfill covers only your most recent import.
+                    Backfill covers only your most recent import — or all of
+                    history when you choose "Backfill all history". The run uses
+                    the active provider's default model unless you pick one
+                    below.
                   </p>
+                  <div class="mt-2 flex flex-wrap items-center gap-3">
+                    <label class="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">
+                      Backfill model
+                      <select
+                        class="rounded-md border border-neutral-300 bg-white px-2 py-1 text-[11px] text-neutral-700 outline-none focus:border-neutral-500 dark:border-neutral-600 dark:bg-neutral-800 dark:text-neutral-200"
+                        value={backfillModel()}
+                        disabled={backfill()?.running}
+                        onChange={(e) => {
+                          setBackfillModel(e.currentTarget.value);
+                          // Drop a thinking level the new model doesn't accept.
+                          if (
+                            backfillThinking() &&
+                            backfillThinkingOpts() &&
+                            !backfillThinkingOpts()!.options.includes(backfillThinking())
+                          ) {
+                            setBackfillThinking("");
+                          }
+                        }}
+                      >
+                        <option value="">Active default</option>
+                        <For each={modelOptions()}>
+                          {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
+                        </For>
+                      </select>
+                    </label>
+                    <Show
+                      when={
+                        backfillThinkingOpts()?.supportsReasoning &&
+                        backfillThinkingOpts()!.options.length > 0
+                      }
+                    >
+                      <label class="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">
+                        Thinking
+                        <select
+                          class="rounded-md border border-neutral-300 bg-white px-2 py-1 text-[11px] text-neutral-700 outline-none focus:border-neutral-500 dark:border-neutral-600 dark:bg-neutral-800 dark:text-neutral-200"
+                          value={backfillThinking()}
+                          disabled={backfill()?.running}
+                          onChange={(e) => setBackfillThinking(e.currentTarget.value)}
+                        >
+                          <option value="">Provider default</option>
+                          <For each={backfillThinkingOpts()!.options}>
+                            {(o) => <option value={o}>Thinking: {o}</option>}
+                          </For>
+                        </select>
+                      </label>
+                    </Show>
+                  </div>
                   <Show when={importReport()}>
                     <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
                       Imported {importReport()!.conversations} chats ·{' '}
@@ -3969,7 +4056,12 @@ export default function App() {
                     when={backfill()?.running}
                     fallback={
                       <button
-                        onClick={() => void startBackfill()}
+                        onClick={() =>
+                          void startBackfill({
+                            model: backfillModel() || null,
+                            thinkingLevel: backfillThinking() || null,
+                          })
+                        }
                         class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
                       >
                         Backfill
@@ -3983,6 +4075,13 @@ export default function App() {
                       Cancel
                     </button>
                   </Show>
+                  <button
+                    onClick={() => void startBackfill({ allHistory: true })}
+                    disabled={backfill()?.running}
+                    class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                  >
+                    Backfill all history
+                  </button>
                 </div>
               </div>
 

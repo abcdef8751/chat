@@ -669,11 +669,19 @@ pub fn clear_extractions(db: tauri::State<'_, db::Db>) -> Result<usize, String> 
 
 /// Start a backfill in the background and return immediately. Progress is
 /// reported through the `memory-backfill` event and [`backfill_status`].
+///
+/// `model` / `thinking_level` optionally override which model (and reasoning
+/// level) the map + reduce phases run on; when `None` they fall back to the
+/// active provider's default (see [`active_turn_cfg`]). `all_history` switches
+/// the map phase from the newest import batch to every pending conversation.
 #[tauri::command]
 pub async fn backfill_memories(
     app: AppHandle,
     min_chars: Option<i64>,
     concurrency: Option<usize>,
+    model: Option<String>,
+    thinking_level: Option<String>,
+    all_history: Option<bool>,
 ) -> Result<BackfillStatus, String> {
     {
         let state = app.state::<Backfill>();
@@ -695,7 +703,8 @@ pub async fn backfill_memories(
     tauri::async_runtime::spawn(async move {
         let min = min_chars.unwrap_or(DEFAULT_MIN_CHARS);
         let conc = concurrency.unwrap_or(DEFAULT_CONCURRENCY).max(1);
-        let outcome = backfill_inner(&handle, min, conc).await;
+        let all = all_history.unwrap_or(false);
+        let outcome = backfill_inner(&handle, min, conc, model, thinking_level, all).await;
         let state = handle.state::<Backfill>();
         match outcome {
             Ok(()) => state.set_phase(if state.cancelled() { "cancelled" } else { "done" }),
@@ -711,10 +720,21 @@ pub async fn backfill_memories(
     Ok(initial)
 }
 
-async fn backfill_inner(app: &AppHandle, min_chars: i64, concurrency: usize) -> Result<(), String> {
+async fn backfill_inner(
+    app: &AppHandle,
+    min_chars: i64,
+    concurrency: usize,
+    model: Option<String>,
+    thinking: Option<String>,
+    all_history: bool,
+) -> Result<(), String> {
     let pending = {
         let db = app.state::<db::Db>();
-        db::conversations_pending_extraction(&db, min_chars)?
+        if all_history {
+            db::conversations_pending_extraction_all(&db, min_chars)?
+        } else {
+            db::conversations_pending_extraction(&db, min_chars)?
+        }
     };
     {
         let state = app.state::<Backfill>();
@@ -732,6 +752,8 @@ async fn backfill_inner(app: &AppHandle, min_chars: i64, concurrency: usize) -> 
     for cid in pending {
         let handle = app.clone();
         let aimd = aimd.clone();
+        let model = model.clone();
+        let thinking = thinking.clone();
         set.spawn(async move {
             if handle.state::<Backfill>().cancelled() {
                 return (cid, Ok(()));
@@ -744,7 +766,7 @@ async fn backfill_inner(app: &AppHandle, min_chars: i64, concurrency: usize) -> 
                 return (cid, Ok(()));
             }
             let r = with_retry(
-                || extract_conversation(&handle, &cid),
+                || extract_conversation(&handle, &cid, model.as_deref(), thinking.as_deref()),
                 PASS_ATTEMPTS,
                 || aimd.on_throttle(),
             )
@@ -786,7 +808,7 @@ async fn backfill_inner(app: &AppHandle, min_chars: i64, concurrency: usize) -> 
 
     app.state::<Backfill>().set_phase("consolidating");
     let _ = app.emit("memory-backfill", app.state::<Backfill>().snapshot());
-    consolidate_extractions(app).await
+    consolidate_extractions(app, model, thinking).await
 }
 
 /// Build the turn-local config for a background pass that runs on the active
@@ -797,25 +819,41 @@ async fn backfill_inner(app: &AppHandle, min_chars: i64, concurrency: usize) -> 
 /// provider (e.g. when the frontend writes a config whose mirror still points at
 /// an old endpoint), which would send the wrong model to the wrong endpoint and
 /// surface as a provider-side "model not found" 404.
-fn active_turn_cfg(cfg: &AppConfig) -> AppConfig {
+///
+/// `model`/`thinking`, when `Some`, override the active provider's default model
+/// and reasoning level respectively (an empty string still means "default", so
+/// callers can pass through a blank picker choice). The API key still resolves
+/// from the active provider, because the picker only offers its models.
+fn active_turn_cfg(cfg: &AppConfig, model: Option<&str>, thinking: Option<&str>) -> AppConfig {
     let provider = cfg.active_provider();
     let mut turn_cfg = cfg.clone();
     turn_cfg.base_url = provider.base_url.clone();
-    let model = provider
-        .default_model
-        .clone()
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| cfg.model.clone());
-    turn_cfg.model = model;
+    let resolved = match model.filter(|m| !m.trim().is_empty()) {
+        Some(m) => m.to_string(),
+        None => provider
+            .default_model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| cfg.model.clone()),
+    };
+    turn_cfg.model = resolved;
+    if thinking.map(|t| !t.trim().is_empty()).unwrap_or(false) {
+        turn_cfg.thinking_level = thinking.unwrap().to_string();
+    }
     turn_cfg
 }
 
 /// One extraction pass: transcript in, staged summary out. Read-only with
 /// respect to the memory files, which is what makes the map phase safe to run
 /// concurrently.
-async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<(), String> {
+async fn extract_conversation(
+    app: &AppHandle,
+    conversation_id: &str,
+    model: Option<&str>,
+    thinking: Option<&str>,
+) -> Result<(), String> {
     let cfg = app.state::<ConfigState>().get();
-    let turn_cfg = active_turn_cfg(&cfg);
+    let turn_cfg = active_turn_cfg(&cfg, model, thinking);
     if turn_cfg.model.trim().is_empty() {
         return Ok(());
     }
@@ -894,7 +932,11 @@ async fn extract_conversation(app: &AppHandle, conversation_id: &str) -> Result<
 
 /// Reduce phase: fold staged extractions into memory, oldest first, in batches.
 /// Serial by construction — this is the only writer.
-async fn consolidate_extractions(app: &AppHandle) -> Result<(), String> {
+async fn consolidate_extractions(
+    app: &AppHandle,
+    model: Option<String>,
+    thinking: Option<String>,
+) -> Result<(), String> {
     let extractions = {
         let db = app.state::<db::Db>();
         db::list_extractions(&db)?
@@ -917,7 +959,7 @@ async fn consolidate_extractions(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let batches = plan_batches(app, &usable);
+    let batches = plan_batches(app, &usable, model.as_deref());
     let total = batches.len();
     let mut failures = 0usize;
     // Resume where a previous run stopped. `list_extractions` already excludes
@@ -937,7 +979,7 @@ async fn consolidate_extractions(app: &AppHandle) -> Result<(), String> {
             .set_phase(&format!("consolidating {}/{total}", i + 1));
         let _ = app.emit("memory-backfill", app.state::<Backfill>().snapshot());
         match with_retry(
-            || run_reduce_pass(app, batch, memory_through),
+            || run_reduce_pass(app, batch, memory_through, model.as_deref(), thinking.as_deref()),
             PASS_ATTEMPTS,
             || {},
         )
@@ -972,11 +1014,18 @@ async fn consolidate_extractions(app: &AppHandle) -> Result<(), String> {
 /// Split the staged summaries into reduce passes. One pass unless the payload
 /// would exceed [`CONTEXT_BUDGET`] of the selected model's context window, in
 /// which case it is chunked in chronological order.
-fn plan_batches(app: &AppHandle, usable: &[db::ExtractionRow]) -> Vec<Vec<db::ExtractionRow>> {
+fn plan_batches(
+    app: &AppHandle,
+    usable: &[db::ExtractionRow],
+    model: Option<&str>,
+) -> Vec<Vec<db::ExtractionRow>> {
     let budget = {
         let db = app.state::<db::Db>();
         let cfg = app.state::<ConfigState>().get();
-        let pricing = crate::pricing::resolve_for(&db, &cfg, &cfg.model);
+        // Size the budget against the model this run actually consolidates on, so
+        // a chosen (larger/smaller) model's context window drives the chunking.
+        let turn_cfg = active_turn_cfg(&cfg, model, None);
+        let pricing = crate::pricing::resolve_for(&db, &turn_cfg, &turn_cfg.model);
         // The remaining 20% covers the system prompt, the tool rounds, and the
         // reply.
         (pricing.context_window as f64 * CONTEXT_BUDGET * CHARS_PER_TOKEN) as usize
@@ -1021,9 +1070,11 @@ async fn run_reduce_pass(
     app: &AppHandle,
     batch: &[db::ExtractionRow],
     memory_through: Option<i64>,
+    model: Option<&str>,
+    thinking: Option<&str>,
 ) -> Result<(), String> {
     let cfg = app.state::<ConfigState>().get();
-    let turn_cfg = active_turn_cfg(&cfg);
+    let turn_cfg = active_turn_cfg(&cfg, model, thinking);
     if turn_cfg.model.trim().is_empty() {
         return Ok(());
     }
@@ -1233,11 +1284,50 @@ mod tests {
             },
         ];
 
-        let turn_cfg = active_turn_cfg(&cfg);
+        let turn_cfg = active_turn_cfg(&cfg, None, None);
         // Uses the active provider's real endpoint and the global default model
         // (provider has no default_model to override it), not the stale mirror.
         assert_eq!(turn_cfg.base_url, "https://model.inferx.net/endpoints/v1");
         assert_eq!(turn_cfg.model, "deepseek-v4-flash-0731");
+        assert_eq!(turn_cfg.thinking_level, "");
+    }
+
+    /// The active turn config applies a caller-chosen model and thinking level,
+    /// still on the active provider's endpoint.
+    #[test]
+    fn active_turn_cfg_applies_chosen_model_and_thinking() {
+        let mut cfg = AppConfig::default();
+        cfg.active_provider_id = "other".into();
+        cfg.base_url = "https://stale.example/v1".into();
+        cfg.model = "deepseek-v4-flash-0731".into();
+        cfg.providers = vec![
+            crate::config::Provider {
+                id: "inferx".into(),
+                name: "InferX".into(),
+                base_url: "https://model.inferx.net/endpoints/v1".into(),
+                default_model: None,
+                catalog_id: None,
+            },
+            crate::config::Provider {
+                id: "other".into(),
+                name: "Other".into(),
+                base_url: "https://other.example/v1".into(),
+                default_model: Some("other-model".into()),
+                catalog_id: None,
+            },
+        ];
+
+        // Chosen model + thinking override the provider default (and the global
+        // default). Endpoint stays the active provider's.
+        let turn_cfg = active_turn_cfg(&cfg, Some("picked-model"), Some("high"));
+        assert_eq!(turn_cfg.base_url, "https://other.example/v1");
+        assert_eq!(turn_cfg.model, "picked-model");
+        assert_eq!(turn_cfg.thinking_level, "high");
+
+        // An empty-string model/thinking still means "use the default".
+        let blank = active_turn_cfg(&cfg, Some(""), Some(""));
+        assert_eq!(blank.model, "other-model");
+        assert_eq!(blank.thinking_level, "");
     }
 
     /// One pass is the default: it sees every summary at once, which resolves

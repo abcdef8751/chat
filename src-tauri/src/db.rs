@@ -1228,6 +1228,40 @@ pub fn conversations_pending_extraction(db: &Db, min_chars: i64) -> Result<Vec<S
     Ok(out)
 }
 
+/// Every conversation — imported or not, regardless of import batch — that still
+/// needs a staged extraction (same filters as
+/// [`conversations_pending_extraction`], minus the newest-import-batch scoping).
+/// Used by the opt-in "backfill all history" control, which wants to mine chats
+/// the user actually had too, ordered newest first.
+pub fn conversations_pending_extraction_all(
+    db: &Db,
+    min_chars: i64,
+) -> Result<Vec<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id FROM conversations c
+             WHERE COALESCE((SELECT MAX(m.\"index\") FROM messages m
+                             WHERE m.conversation_id = c.id AND m.role != 'memory'), -1) >= 0
+               AND (SELECT COALESCE(SUM(LENGTH(m.content)), 0) FROM messages m
+                    WHERE m.conversation_id = c.id AND m.role != 'memory') >= ?1
+               AND COALESCE((SELECT e.watermark FROM memory_extractions e
+                             WHERE e.conversation_id = c.id), -1)
+                   < COALESCE((SELECT MAX(m.\"index\") FROM messages m
+                               WHERE m.conversation_id = c.id AND m.role != 'memory'), -1)
+             ORDER BY c.updated_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([min_chars], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
 /// Staged extractions that have not yet been folded into memory, in
 /// chronological order so the reduce folds history forward and later facts
 /// naturally win over earlier ones.
@@ -1753,6 +1787,57 @@ mod tests {
 
         // The next import run gets a fresh, higher batch id.
         assert_eq!(next_import_batch(&db).unwrap(), 3);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The all-history scope drops the newest-import-batch filter, so it also
+    /// picks up chats the user actually had (non-imported) plus older import
+    /// batches.
+    #[test]
+    fn pending_extraction_all_ignores_import_scoping() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-batch-all-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+        let now = now_ms();
+
+        let mk = |id: &str, imported: bool, batch: i64| {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations
+                   (id, title, imported, import_batch, created_at, updated_at)
+                 VALUES (?1, ?1, ?2, ?3, ?4, ?4)",
+                params![id, imported as i64, batch, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at)
+                 VALUES (?1, ?2, 'user', 0, ?3, ?4)",
+                params![format!("{id}-m"), id, "x".repeat(3000), now],
+            )
+            .unwrap();
+        };
+
+        mk("older-import", true, 1);
+        mk("older-import-2", true, 2);
+        mk("my-own-chat", false, 0);
+
+        // The default scope only sees the newest import batch (batch 2).
+        assert_eq!(
+            conversations_pending_extraction(&db, 2000).unwrap(),
+            vec!["older-import-2".to_string()]
+        );
+
+        // The all-history scope sees every import batch AND the user's own
+        // (non-imported) chat.
+        let pending = conversations_pending_extraction_all(&db, 2000).unwrap();
+        for id in ["older-import", "older-import-2", "my-own-chat"] {
+            assert!(
+                pending.contains(&id.to_string()),
+                "all-scope should include {id}, got {pending:?}"
+            );
+        }
 
         let _ = std::fs::remove_file(&p);
     }
