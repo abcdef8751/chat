@@ -84,7 +84,9 @@ class MainActivity : TauriActivity() {
       // root already reserves `bottomInset` as CSS px, so growing this value is
       // all that is needed — the web layer re-lays out the flex column for us.
       val ime = insets.getInsets(WindowInsets.Type.ime())
-      if (ime.isVisible) {
+      // `isVisible(t)` is a method on the root insets (API 30+); the WindowInsets
+      // returned by getInsets has no no-arg `isVisible` property.
+      if (insets.isVisible(WindowInsets.Type.ime())) {
         // Keyboard is showing — reserve its full height (which includes the nav
         // bar beneath it, so there's no need to add bars.bottom as well).
         bottomInset = dp(ime.bottom)
