@@ -70,10 +70,25 @@ create table if not exists memory_files (
   primary key (user_id, path)
 );
 
+-- The syncable user config (explicit preferences, provider list, per-model
+-- price/context overrides) as a single 'main' row. `payload` is a JSON string;
+-- API keys are NEVER stored here (they live in the OS keychain on each device),
+-- so this entity carries no secret.
+create table if not exists user_config (
+  id text primary key,           -- 'main'
+  payload text not null,
+  created_at bigint not null,
+  updated_at bigint not null default 0,
+  revision bigint not null,
+  deleted_at bigint,
+  user_id uuid not null default auth.uid()
+);
+
 -- Row level security: a client (anon key) may only ever touch its own rows.
 alter table conversations enable row level security;
 alter table messages enable row level security;
 alter table memory_files enable row level security;
+alter table user_config enable row level security;
 
 drop policy if exists "owner rw" on conversations;
 create policy "owner rw" on conversations
@@ -85,6 +100,10 @@ create policy "owner rw" on messages
 
 drop policy if exists "owner rw" on memory_files;
 create policy "owner rw" on memory_files
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+drop policy if exists "owner rw" on user_config;
+create policy "owner rw" on user_config
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
 -- Store the client-provided revision verbatim on every insert/update, and only
@@ -126,8 +145,14 @@ create trigger trg_memory_files_revision
   before insert or update on memory_files
   for each row execute function enforce_revision();
 
+drop trigger if exists trg_user_config_revision on user_config;
+create trigger trg_user_config_revision
+  before insert or update on user_config
+  for each row execute function enforce_revision();
+
 -- Convenience indexes for the pull query shapes.
 create index if not exists messages_conv_idx on messages(conversation_id);
 create index if not exists messages_revision_idx on messages(revision);
 create index if not exists conversations_revision_idx on conversations(revision);
 create index if not exists memory_files_revision_idx on memory_files(revision);
+create index if not exists user_config_revision_idx on user_config(revision);

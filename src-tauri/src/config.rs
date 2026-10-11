@@ -198,6 +198,26 @@ impl AppConfig {
             .cloned()
             .unwrap_or_else(|| self.active_provider())
     }
+
+    /// The JSON subset of this config that is syncable across devices:
+    /// explicit user preferences, the provider list (ids/names/base URLs only —
+    /// API keys live in the keychain and are never included), the active
+    /// provider id, the per-model price/context overrides, plus the legacy
+    /// `base_url` / `model` mirrors that still define the effective provider on
+    /// pre-multi-provider configs (where `providers` is empty and
+    /// `active_provider()` synthesizes one from `base_url`). LWW by revision
+    /// treats this whole blob as one unit, so the payload must not drift from
+    /// what [`db::sync_user_config`] writes.
+    pub fn syncable_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "preferences": self.preferences,
+            "providers": self.providers,
+            "activeProviderId": self.active_provider_id,
+            "baseUrl": self.base_url,
+            "model": self.model,
+            "modelOverrides": self.model_overrides,
+        })
+    }
 }
 
 /// Global config state installed into Tauri. Holds the config file path and an
@@ -269,8 +289,17 @@ pub fn get_config(state: tauri::State<'_, ConfigState>) -> AppConfig {
 }
 
 #[tauri::command]
-pub fn set_config(state: tauri::State<'_, ConfigState>, config: AppConfig) -> Result<(), String> {
-    state.set(config)
+pub fn set_config(
+    state: tauri::State<'_, ConfigState>,
+    db: tauri::State<'_, crate::db::Db>,
+    config: AppConfig,
+) -> Result<(), String> {
+    let cfg = config.clone();
+    state.set(config)?;
+    // Mirror the syncable subset (preferences/providers/overrides) into the sync
+    // row so the next push backs it up; a no-op when nothing syncable changed.
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::db::sync_user_config(&conn, &cfg)
 }
 
 /// Replace just the per-model pricing/context overrides, leaving every other
@@ -281,11 +310,15 @@ pub fn set_config(state: tauri::State<'_, ConfigState>, config: AppConfig) -> Re
 #[tauri::command]
 pub fn set_model_overrides(
     state: tauri::State<'_, ConfigState>,
+    db: tauri::State<'_, crate::db::Db>,
     model_overrides: HashMap<String, ModelOverride>,
 ) -> Result<(), String> {
     let mut cfg = state.get();
     cfg.model_overrides = model_overrides;
-    state.set(cfg)
+    let cfg2 = cfg.clone();
+    state.set(cfg)?;
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::db::sync_user_config(&conn, &cfg2)
 }
 
 #[cfg(test)]

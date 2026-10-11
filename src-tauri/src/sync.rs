@@ -10,10 +10,10 @@
 //! `supabase-js`. Only the publishable (anon) key is embedded at build time.
 //! Session tokens live in the OS keychain and never cross IPC.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -284,6 +284,7 @@ pub async fn sync_import_key(app: AppHandle, code: String) -> Result<SyncStatus,
         anon: &sync.anon,
         db: dbref(&app),
         memory: app.state::<MemoryState>().inner(),
+        config: &app.state::<ConfigState>(),
         key: Some(key),
     };
     if let Some(sample) = fetch_encrypted_sample(&ctx, &token).await? {
@@ -585,6 +586,9 @@ struct SyncCtx<'a> {
     anon: &'a str,
     db: &'a Db,
     memory: &'a MemoryState,
+    /// Syncable user config (preferences/providers/overrides) state, written
+    /// through on pull so a remote provider/preference change lands in Settings.
+    config: &'a ConfigState,
     /// Client-side encryption key, if configured. When `Some`, sync encrypts
     /// content on the way out and decrypts on the way in.
     key: Option<[u8; 32]>,
@@ -625,6 +629,7 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         anon: &sync.anon,
         db: dbref(app),
         memory: app.state::<MemoryState>().inner(),
+        config: &app.state::<ConfigState>(),
         key: secrets::enc_key_get()
             .ok()
             .flatten()
@@ -700,6 +705,20 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
             sync.set_error(e.clone());
             return Err(e);
         }
+    }
+    // Mirror the user config AFTER the pull, never before. Because `user_config`
+    // is a single global 'main' row, a device that mirrors+pushes its own config
+    // ahead of the pull would push its (default) row over the authoritative
+    // remote config under a clock-based revision — clobbering it on the server
+    // and then seeing local-wins on its own pull (nothing appears). Pulling first
+    // lets a fresh/second device adopt the canonical config, at which point the
+    // mirror is a no-op (its config equals what it just applied); a genuine local
+    // edit still wins because `sync_user_config` bumps the revision above the
+    // latest applied/pulled one. It is pushed on the next tick.
+    let cfg_after = app.state::<ConfigState>().get();
+    {
+        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        db::sync_user_config(&conn, &cfg_after)?;
     }
     // Persist the success timestamp so it survives restarts (the live value in
     // SyncState is in-memory only; without this the page would show "never"
@@ -921,10 +940,79 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
         total += mem_body.len() as u64;
     }
 
+    // User config (preferences + providers + price/context overrides): a single
+    // 'main' row. Small, so fetched + pushed in one go.
+    let cfg_rows = {
+        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, payload, revision FROM user_config WHERE dirty = 1",
+            )
+            .map_err(|e| e.to_string())?;
+        let key = ctx.key;
+        let mut out = Vec::new();
+        for row in stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })
+            .map_err(|e| e.to_string())?
+        {
+            let (id, payload, revision) = row.map_err(|e| e.to_string())?;
+            // Never push an EMPTY config — it must not clobber the canonical row
+            // (see `syncable_payload_is_empty`). Nothing to back up, so just clear
+            // the dirty flag locally and move on.
+            if syncable_payload_is_empty(&payload) {
+                conn.execute(
+                    "UPDATE user_config SET dirty = 0 WHERE id = ?1 AND revision = ?2",
+                    rusqlite::params![id, revision],
+                )
+                .map_err(|e| e.to_string())?;
+                continue;
+            }
+            out.push(json!({
+                "id": id,
+                "payload": enc_str(key, payload),
+                "revision": revision,
+                "deleted_at": Value::Null,
+                "created_at": now_ms(),
+                "updated_at": now_ms(),
+            }));
+        }
+        drop(stmt);
+        out
+    };
+    if !cfg_rows.is_empty() {
+        post_upsert(ctx, "user_config", token, &cfg_rows, progress, |chunk| {
+            clear_user_config_keys(ctx.db, chunk)
+        })
+        .await?;
+        total += cfg_rows.len() as u64;
+    }
+
     Ok(total)
 }
 
-/// Clear the dirty flag (guarded by revision) for the message rows in a batch
+/// True when a `user_config` payload carries nothing that could back anything up.
+/// An EMPTY config must never be pushed: `user_config` is a single global row and
+/// a blank device's default (empty) payload would clobber the server's canonical
+/// config under a clock-based revision (any clock skew makes it "newer"). A device
+/// with nothing to sync instead just clears its dirty flag, so the row is not
+/// re-pushed every tick. Once a device pulls and adopts a non-empty config, that
+/// (non-empty) config is what gets pushed.
+fn syncable_payload_is_empty(payload: &str) -> bool {
+    match serde_json::from_str::<SyncableConfig>(payload) {
+        Ok(sc) => {
+            sc.providers.is_empty()
+                && sc.active_provider_id.is_empty()
+                && sc.preferences.trim().is_empty()
+                && sc.base_url.is_empty()
+                && sc.model.is_empty()
+                && sc.model_overrides.is_empty()
+        }
+        // Unparseable — assume non-empty so it is pushed as-is rather than dropped.
+        Err(_) => false,
+    }
+}
 /// that just pushed successfully. Rows mutated mid-flight fail the guard and
 /// stay dirty for the next tick. This runs per batch so `pending` shrinks live.
 fn clear_message_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
@@ -995,8 +1083,7 @@ fn clear_conversation_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
 }
 
 /// Clear the dirty flag for the memory-file rows in a batch.
-fn clear_memory_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
-    let mut keys: Vec<(String, i64)> = Vec::new();
+fn clear_memory_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {    let mut keys: Vec<(String, i64)> = Vec::new();
     for v in chunk {
         if let Some(p) = v.get("path").and_then(|x| x.as_str()) {
             let rev = v.get("revision").and_then(|x| x.as_i64()).unwrap_or(0);
@@ -1012,6 +1099,31 @@ fn clear_memory_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     for (path, rev) in &keys {
         stmt.execute(rusqlite::params![path, rev]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Clear the dirty flag (guarded by revision) for the user-config row(s) in a
+/// batch that just pushed successfully. Rows mutated mid-flight stay dirty.
+fn clear_user_config_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    for v in chunk {
+        if let (Some(id), Some(rev)) = (
+            v.get("id").and_then(|x| x.as_str()),
+            v.get("revision").and_then(|x| x.as_i64()),
+        ) {
+            keys.push((id.to_string(), rev));
+        }
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("UPDATE user_config SET dirty = 0 WHERE id = ?1 AND revision = ?2")
+        .map_err(|e| e.to_string())?;
+    for (id, rev) in &keys {
+        stmt.execute(rusqlite::params![id, rev]).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1234,6 +1346,23 @@ async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<u64, String> {
         apply_memory(ctx.db, ctx.memory, &rows)?;
         total += rows.len() as u64;
         if rows.len() < 1000 || last_seen(ctx.db, "memory") <= since {
+            break;
+        }
+    }
+
+    // Syncable user config (preferences/providers/overrides).
+    loop {
+        let since = last_seen(ctx.db, "user_config");
+        let mut rows = get_table(ctx, "user_config", me, token, since).await?;
+        if rows.is_empty() {
+            break;
+        }
+        if let Some(key) = ctx.key {
+            rows = decrypt_rows(&key, rows, &["payload"]);
+        }
+        apply_user_config(ctx, &rows)?;
+        total += rows.len() as u64;
+        if rows.len() < 1000 || last_seen(ctx.db, "user_config") <= since {
             break;
         }
     }
@@ -1544,6 +1673,163 @@ fn reindex_messages(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Re
 /// Apply remote memory files (whole-file replace) honoring LWW by revision.
 /// File I/O happens outside the DB lock; the lock is only taken (twice) to
 /// decide the apply set and to record the resulting revisions + high-water.
+/// A row of the `user_config` mirror table as pulled from Supabase.
+#[derive(Deserialize)]
+struct RemoteUserConfig {
+    id: String,
+    payload: String,
+    revision: i64,
+    #[serde(default)]
+    deleted_at: Option<i64>,
+}
+
+/// The syncable config subset, deserialized from `user_config.payload`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncableConfig {
+    #[serde(default)]
+    preferences: String,
+    #[serde(default)]
+    providers: Vec<crate::config::Provider>,
+    #[serde(default)]
+    active_provider_id: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    model_overrides: HashMap<String, crate::config::ModelOverride>,
+}
+
+/// Apply pulled user-config rows. This is deliberately NON-DESTRUCTIVE: a pulled
+/// config may only FILL IN fields this device has left empty. A device that
+/// already has its own providers / preferences / overrides configured is never
+/// wiped by a remote — in particular an EMPTY remote (e.g. a blank device's
+/// default row pushed at a faster-clock revision) must never erase a configured
+/// device's providers, which is exactly the clobber we hit. Non-syncable fields
+/// (shell workspace, thinking level, sync flags, etc.) are always left untouched,
+/// and API keys are never in the payload. The local `user_config` row records
+/// the applied revision so the pull high-water advances without re-fetching.
+fn apply_user_config(ctx: &SyncCtx, rows: &[Value]) -> Result<(), String> {
+    let parsed: Vec<RemoteUserConfig> = rows
+        .iter()
+        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+        .collect();
+    if parsed.is_empty() {
+        return Ok(());
+    }
+    // Phase 1 (lock held): decide each row's fate — is the remote newer, and if
+    // so can we parse it? No config/file I/O here.
+    struct Plan {
+        remote_newer: bool,
+        /// The parsed remote config to adopt (only when newer and parseable).
+        adopt: Option<SyncableConfig>,
+        id: String,
+        revision: i64,
+    }
+    let mut plans: Vec<Plan> = Vec::with_capacity(parsed.len());
+    let mut parse_failed = false;
+    {
+        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        for r in &parsed {
+            let local_rev: i64 = conn
+                .query_row(
+                    "SELECT revision FROM user_config WHERE id = ?1",
+                    [&r.id],
+                    |x| x.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .unwrap_or(-1);
+            let remote_newer = local_rev < r.revision;
+            let adopt = if remote_newer && r.deleted_at.is_none() {
+                match serde_json::from_str::<SyncableConfig>(&r.payload) {
+                    Ok(sc) => Some(sc),
+                    Err(_) => {
+                        parse_failed = true;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            plans.push(Plan {
+                remote_newer,
+                adopt,
+                id: r.id.clone(),
+                revision: r.revision,
+            });
+        }
+    }
+    // Phase 2 (no lock): non-destructive, empty-aware adoption. A remote value is
+    // written through only where the local field is empty, so a blank device
+    // adopts the canonical config and a configured device is never clobbered.
+    let mut wrote_ok = true;
+    for p in plans.iter().filter(|p| p.remote_newer) {
+        let Some(sc) = &p.adopt else { continue };
+        let mut cfg = ctx.config.get();
+        let mut changed = false;
+        if cfg.preferences.trim().is_empty() && !sc.preferences.is_empty() {
+            cfg.preferences = sc.preferences.clone();
+            changed = true;
+        }
+        if cfg.providers.is_empty() {
+            if !sc.providers.is_empty() {
+                cfg.providers = sc.providers.clone();
+                if !sc.active_provider_id.is_empty() {
+                    cfg.active_provider_id = sc.active_provider_id.clone();
+                }
+                changed = true;
+            }
+            // Legacy effective provider: only adopt on a device that has no real
+            // providers of its own, so a legacy-only remote can seed a blank one.
+            if cfg.providers.is_empty() && !sc.base_url.is_empty() && cfg.base_url.is_empty() {
+                cfg.base_url = sc.base_url.clone();
+                changed = true;
+            }
+            if cfg.providers.is_empty() && !sc.model.is_empty() && cfg.model.is_empty() {
+                cfg.model = sc.model.clone();
+                changed = true;
+            }
+        }
+        if cfg.model_overrides.is_empty() && !sc.model_overrides.is_empty() {
+            cfg.model_overrides = sc.model_overrides.clone();
+            changed = true;
+        }
+        if changed && ctx.config.set(cfg).is_err() {
+            wrote_ok = false;
+        }
+    }
+    // Phase 3 (lock): record applied revisions + advance the high-water in one
+    // transaction. Only when every newer row parsed cleanly and every write
+    // landed; a bad payload or failed write leaves the row at its old revision so
+    // the next pull re-fetches and retries it instead of eclipsing it.
+    let mut conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let clean = !parse_failed && wrote_ok;
+    let mut max_rev = 0;
+    if clean {
+        for p in &plans {
+            max_rev = max_rev.max(p.revision);
+            if !p.remote_newer {
+                continue; // local already at/above this revision — keep it
+            }
+            let merged = ctx.config.get().syncable_payload().to_string();
+            tx.execute(
+                "INSERT INTO user_config(id, payload, revision, dirty)
+                 VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(id) DO UPDATE SET
+                   payload = excluded.payload, revision = excluded.revision, dirty = 0",
+                rusqlite::params![p.id, merged, p.revision],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        advance_watermark(&tx, "user_config", max_rev)?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn apply_memory(db: &Db, memory: &MemoryState, rows: &[Value]) -> Result<(), String> {
     let parsed: Vec<RemoteMemory> = rows
         .iter()

@@ -121,6 +121,17 @@ CREATE TABLE IF NOT EXISTS sync_tombstones (
   PRIMARY KEY (entity, id)
 );
 
+-- Syncable copy of the user-edited config (explicit preferences, the provider
+-- list, and per-model price/context overrides). One 'main' row holds the whole
+-- subset as JSON; API keys are never stored here (they live in the OS
+-- keychain), so syncing this entity never leaks a secret. LWW by `revision`.
+CREATE TABLE IF NOT EXISTS user_config (
+  id TEXT PRIMARY KEY,
+  payload TEXT NOT NULL,
+  revision BIGINT NOT NULL DEFAULT 0,
+  dirty INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, "index");
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reflections_conv ON memory_reflections(conversation_id);
@@ -219,6 +230,16 @@ pub fn open(path: &Path) -> Result<Connection, String> {
            id TEXT NOT NULL,
            revision BIGINT NOT NULL,
            PRIMARY KEY (entity, id)
+         )",
+        [],
+    );
+    // Older databases predate the syncable user-config entity.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_config (
+           id TEXT PRIMARY KEY,
+           payload TEXT NOT NULL,
+           revision BIGINT NOT NULL DEFAULT 0,
+           dirty INTEGER NOT NULL DEFAULT 0
          )",
         [],
     );
@@ -724,6 +745,54 @@ pub fn mark_memory_dirty(conn: &Connection, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Mirror the syncable subset of `AppConfig` (explicit preferences + provider
+/// list + per-model price/context overrides) into the `user_config` row so the
+/// next push backs it up. No-op when nothing changed, so calling this on every
+/// sync run or Settings save stays cheap and never churns the revision. API keys
+/// are not part of the payload (they live in the keychain), so this cannot leak
+/// a secret.
+///
+/// The new revision is bumped above BOTH the global monotonic counter and the
+/// newest revision this device has applied/pulled for the row, so a genuine
+/// local edit always beats anything previously synced: a pulled config from a
+/// faster-clock (or higher-revision test) device must never cause a real newer
+/// local edit to be judged "local wins, nothing to push".
+pub fn sync_user_config(conn: &Connection, cfg: &crate::config::AppConfig) -> Result<(), String> {
+    let payload = cfg.syncable_payload();
+    let existing: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT payload, revision FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    // Semantic (not byte) comparison: `model_overrides` is a HashMap whose JSON
+    // key order can differ across restarts, so string equality would spuriously
+    // mark an unchanged config dirty and bump/re-push it.
+    if let Some((existing_payload, _)) = &existing {
+        if serde_json::from_str::<serde_json::Value>(existing_payload).ok()
+            == Some(payload.clone())
+        {
+            return Ok(()); // unchanged — keep the stored revision and clean state
+        }
+    }
+    let base = existing.as_ref().map(|(_, r)| *r).unwrap_or(0);
+    let global = bump_revision_c(conn)?;
+    let rev = if global > base { global } else { base + 1 };
+    conn.execute(
+        "INSERT INTO user_config(id, payload, revision, dirty)
+         VALUES ('main', ?1, ?2, 1)
+         ON CONFLICT(id) DO UPDATE SET
+           payload = excluded.payload,
+           revision = excluded.revision,
+           dirty = 1",
+        params![payload.to_string(), rev],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Ensure dirty rows carry a non-zero revision before a push. Rows that were
 /// inserted without a revision — imported archives or legacy rows that predate
 /// the sync columns — sit at `revision = 0`. Pushed as-is they upload with
@@ -828,8 +897,9 @@ pub fn pending_rows(db: &Db) -> Result<u64, String> {
     );
     let msg = count("SELECT COUNT(*) FROM messages WHERE dirty = 1");
     let mem = count("SELECT COUNT(*) FROM memory_sync WHERE dirty = 1");
+    let cfg = count("SELECT COUNT(*) FROM user_config WHERE dirty = 1");
     let tomb = count("SELECT COUNT(*) FROM sync_tombstones");
-    Ok((conv + msg + mem + tomb) as u64)
+    Ok((conv + msg + mem + cfg + tomb) as u64)
 }
 
 /// Mark every syncable row dirty so the next push re-uploads it. Used when
@@ -843,6 +913,8 @@ pub fn mark_all_dirty_for_resync(db: &Db) -> Result<(), String> {
     conn.execute("UPDATE messages SET dirty = 1 WHERE role != 'memory'", [])
         .map_err(|e| e.to_string())?;
     conn.execute("UPDATE memory_sync SET dirty = 1", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("UPDATE user_config SET dirty = 1", [])
         .map_err(|e| e.to_string())?;
     Ok(())
 }

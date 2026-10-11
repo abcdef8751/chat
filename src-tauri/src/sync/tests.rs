@@ -35,6 +35,13 @@ fn temp_memory(name: &str, db: &Db) -> MemoryState {
     m
 }
 
+fn temp_config(name: &str) -> crate::config::ConfigState {
+    let mut p = std::env::temp_dir();
+    p.push(format!("pi-chat-sync-cfg-{name}-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    crate::config::ConfigState::load(p).unwrap()
+}
+
 fn rev_of(db: &Db, sql: &str) -> i64 {
     let conn = db.0.lock().unwrap();
     conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
@@ -541,12 +548,14 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
 
     let client = reqwest::Client::new();
     let base = srv.addr.clone();
+    let cfg = temp_config("integ");
     let ctx = SyncCtx {
         client: &client,
         base_url: &base,
         anon: "anon",
         db: &db,
         memory: &mem,
+        config: &cfg,
         key: None,
     };
 
@@ -652,12 +661,14 @@ async fn encryption_roundtrips_through_push_and_pull() {
     let key = crypt::new_key();
     let client = reqwest::Client::new();
     let base = srv.addr.clone();
+    let cfg = temp_config("enc");
     let ctx = SyncCtx {
         client: &client,
         base_url: &base,
         anon: "anon",
         db: &db,
         memory: &memstate,
+        config: &cfg,
         key: Some(key),
     };
     let progress = SyncState::new();
@@ -712,6 +723,282 @@ async fn encryption_roundtrips_through_push_and_pull() {
     assert!(memstate.read("goals.md").unwrap().contains("Encrypted goal"));
 }
 
+/// Push and pull the syncable user config (preferences/providers/overrides) as
+/// a single LWW 'main' row. API keys are never part of the payload.
+#[tokio::test]
+async fn config_syncs_preferences_providers_and_overrides() {
+    use crate::config::{ModelOverride, Provider};
+
+    let srv = MockRest::spawn();
+    let db = temp_db("cfg");
+    let mem = temp_memory("cfg", &db);
+    let cfg = temp_config("cfg");
+
+    // Give the local config syncable content (plus a non-syncable field we must
+    // keep) and mirror it into the sync row.
+    let mut c = cfg.get();
+    c.preferences = "Always answer in Spanish.".into();
+    c.providers = vec![Provider {
+        id: "prov-1".into(),
+        name: "My Provider".into(),
+        base_url: "https://example.com/v1".into(),
+        default_model: Some("model-a".into()),
+        catalog_id: Some("example-ai".into()),
+    }];
+    let mut ov = HashMap::new();
+    ov.insert(
+        "model-a".into(),
+        ModelOverride {
+            context_window: Some(128_000),
+            ..Default::default()
+        },
+    );
+    c.model_overrides = ov;
+    c.shell_workspace_dir = "/tmp/ws".into();
+    c.base_url = "https://legacy.example.com/v1".into();
+    c.model = "legacy-model".into();
+    cfg.set(c.clone()).unwrap();
+    {
+        let conn = db.0.lock().unwrap();
+        db::sync_user_config(&conn, &cfg.get()).unwrap();
+    }
+
+    let client = reqwest::Client::new();
+    let base = srv.addr.clone();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &base,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+
+    // Push → the mirror receives the config row; no API key present.
+    let progress = SyncState::new();
+    push(&ctx, "tok", &progress).await.unwrap();
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "user_config row must be pushed");
+    let payload: Value = serde_json::from_str(posts[0]["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["preferences"], "Always answer in Spanish.");
+    assert_eq!(payload["providers"][0]["id"], "prov-1");
+    assert_eq!(payload["modelOverrides"]["model-a"]["contextWindow"], 128_000);
+    // Legacy mirrors carry the effective provider for non-multi-provider configs.
+    assert_eq!(payload["baseUrl"], "https://legacy.example.com/v1");
+    assert_eq!(payload["model"], "legacy-model");
+    assert!(db::pending_rows(&db).unwrap() == 0);
+
+    // Pull: an EMPTY config arrives with a much higher revision (e.g. a blank
+    // device's default pushed at a faster-clock revision). Because the local
+    // config is non-empty, the apply is NON-DESTRUCTIVE: the configured provider,
+    // preference, and legacy mirrors must NOT be wiped.
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main",
+            "payload": json!({
+                "preferences": "",
+                "providers": [],
+                "activeProviderId": "",
+                "baseUrl": "",
+                "model": "",
+                "modelOverrides": {}
+            }).to_string(),
+            "revision": 9_000_000_000_000_i64,
+            "deleted_at": Value::Null,
+        })],
+    );
+    pull(&ctx, "user-123", "tok").await.unwrap();
+    let after = cfg.get();
+    // A configured device is never clobbered by an empty remote.
+    assert_eq!(after.preferences, "Always answer in Spanish.");
+    assert_eq!(after.providers.len(), 1);
+    assert_eq!(after.providers[0].id, "prov-1");
+    assert_eq!(after.base_url, "https://legacy.example.com/v1");
+    assert_eq!(after.model, "legacy-model");
+    assert_eq!(after.model_overrides.len(), 1);
+    // A non-syncable field is untouched by a config pull.
+    assert_eq!(after.shell_workspace_dir, "/tmp/ws");
+    // ...and the pulled revision was still absorbed (high-water advances; the row
+    // is recorded at the remote revision) so it isn't re-fetched forever.
+    assert_eq!(rev_of(&db, "SELECT revision FROM user_config WHERE id='main'"), 9_000_000_000_000_i64);
+}
+
+/// A blank device holding a dirty EMPTY user_config row must not push it — that
+/// would clobber the canonical config on the mirror under a clock-based revision
+/// (any clock skew makes it "newer"). The row's dirty flag is cleared locally
+/// instead, so nothing is posted and it isn't re-pushed every tick.
+#[tokio::test]
+async fn empty_user_config_row_is_never_pushed() {
+    let srv = MockRest::spawn();
+    let db = temp_db("emptycfg");
+    let mem = temp_memory("emptycfg", &db);
+    let cfg = temp_config("emptycfg");
+
+    // Plant a dirty, empty user_config row directly (what a blank device has).
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 1, 1)
+             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, revision = excluded.revision, dirty = 1",
+            rusqlite::params![json!({
+                "preferences": "", "providers": [], "activeProviderId": "",
+                "baseUrl": "", "model": "", "modelOverrides": {}
+            }).to_string()],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    // The empty config must NOT have been sent to the mirror...
+    assert!(srv.posted("user_config").is_empty(), "empty user_config must not be pushed");
+    // ...and its local dirty flag was cleared so it isn't re-pushed next tick.
+    let dirty: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT dirty FROM user_config WHERE id='main'", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(dirty, 0);
+}
+
+/// Regression for the reviewer's critical finding: a fresh/second device that
+/// syncs must ADOPT the authoritative config from the mirror, not push its own
+/// (default) row over it under a clock-based revision. Simulates the do_sync
+/// ordering (push → pull → post-pull mirror) for two devices sharing one mirror.
+#[tokio::test]
+async fn two_device_first_sync_adopts_canonical_config_not_clobber() {
+    use crate::config::Provider;
+
+    let srv = MockRest::spawn();
+
+    // --- Device A: the device that actually holds the config. ---
+    let db_a = temp_db("2dA");
+    let mem_a = temp_memory("2dA", &db_a);
+    let cfg_a = temp_config("2dA");
+    {
+        let mut c = cfg_a.get();
+        c.preferences = "From device A".into();
+        c.providers = vec![Provider {
+            id: "prov-a".into(),
+            name: "A".into(),
+            base_url: "https://a/v1".into(),
+            default_model: None,
+            catalog_id: None,
+        }];
+        c.active_provider_id = "prov-a".into();
+        cfg_a.set(c).unwrap();
+    }
+    let client_a = reqwest::Client::new();
+    let ctx_a = SyncCtx {
+        client: &client_a,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db_a,
+        memory: &mem_a,
+        config: &cfg_a,
+        key: None,
+    };
+    // A round 1: push (nothing dirty for user_config) + pull (mirror empty) +
+    // post-pull mirror → A's config row becomes dirty.
+    push(&ctx_a, "tok", &SyncState::new()).await.unwrap();
+    pull(&ctx_a, "u", "tok").await.unwrap();
+    {
+        let conn = db_a.0.lock().unwrap();
+        db::sync_user_config(&conn, &cfg_a.get()).unwrap();
+    }
+    // A round 2: push carries A's config to the mirror.
+    push(&ctx_a, "tok", &SyncState::new()).await.unwrap();
+    pull(&ctx_a, "u", "tok").await.unwrap();
+    let pushed_a = srv.posted("user_config").last().expect("A pushed config").clone();
+    let pa: Value = serde_json::from_str(pushed_a["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(pa["preferences"], "From device A");
+    let a_rev = pushed_a["revision"].as_i64().unwrap();
+    // Simulate the server now holding A's row (the mock doesn't echo pushed rows
+    // back to GET, so seed the pull source explicitly).
+    srv.set_get("user_config", vec![pushed_a]);
+
+    // --- Device B: a fresh phone with a default (empty) config, syncs after A. ---
+    let db_b = temp_db("2dB");
+    let mem_b = temp_memory("2dB", &db_b);
+    let cfg_b = temp_config("2dB");
+    let client_b = reqwest::Client::new();
+    let ctx_b = SyncCtx {
+        client: &client_b,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db_b,
+        memory: &mem_b,
+        config: &cfg_b,
+        key: None,
+    };
+    // B's first sync, matching do_sync order: push first (nothing dirty for
+    // user_config on a fresh device), then pull adopts A's canonical config, then
+    // the post-pull mirror. Before the fix, B's empty config was pushed ahead of
+    // the pull and clobbered A's on the server.
+    push(&ctx_b, "tok", &SyncState::new()).await.unwrap();
+    pull(&ctx_b, "u", "tok").await.unwrap();
+    {
+        let conn = db_b.0.lock().unwrap();
+        db::sync_user_config(&conn, &cfg_b.get()).unwrap();
+    }
+
+    // B adopted A's config, not overwritten it.
+    let after_b = cfg_b.get();
+    assert_eq!(after_b.preferences, "From device A");
+    assert_eq!(after_b.providers.len(), 1);
+    assert_eq!(after_b.providers[0].id, "prov-a");
+    // The adopted config must NOT be marked dirty (no re-upload / no clobber).
+    let (b_payload, b_rev, b_dirty): (String, i64, i64) = {
+        let conn = db_b.0.lock().unwrap();
+        conn.query_row(
+            "SELECT payload, revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(b_dirty, 0, "adopted config must not be dirty");
+    assert_eq!(b_rev, a_rev, "adopted config keeps the applied revision");
+    assert_eq!(
+        serde_json::from_str::<Value>(&b_payload).unwrap()["preferences"],
+        "From device A"
+    );
+
+    // A real local edit on B must bump above A's applied revision (so it wins on
+    // the server instead of being a no-op under LWW).
+    {
+        let mut c = cfg_b.get();
+        c.preferences = "Edited on B".into();
+        cfg_b.set(c).unwrap();
+    }
+    {
+        let conn = db_b.0.lock().unwrap();
+        db::sync_user_config(&conn, &cfg_b.get()).unwrap();
+    }
+    let (brev, bdirty): (i64, i64) = {
+        let conn = db_b.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert!(brev > a_rev, "a local edit must bump above the applied remote revision");
+    assert_eq!(bdirty, 1, "the edit must be marked dirty for push");
+}
+
 /// The locked-device probe detects an encrypted remote mirror (so a device
 /// without the key refuses to sync instead of overwriting ciphertext).
 #[tokio::test]
@@ -724,12 +1011,14 @@ async fn probe_detects_encrypted_remote() {
     let client = reqwest::Client::new();
     let base = srv.addr.clone();
     let key = crypt::new_key();
+    let cfg = temp_config("probe");
     let ctx = SyncCtx {
         client: &client,
         base_url: &base,
         anon: "anon",
         db: &db,
         memory: &mem,
+        config: &cfg,
         key: Some(key),
     };
 
