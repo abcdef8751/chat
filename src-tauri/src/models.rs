@@ -11,9 +11,41 @@ struct ModelsResponse {
     data: Vec<ModelObject>,
 }
 
+/// One entry from the provider's `GET /models`. Besides the required `id`, we
+/// capture every unknown field so a per-model context length can be read
+/// regardless of which key the server uses — OpenAI-compatible servers disagree
+/// (`context_length`, `max_model_len`, `max_input_tokens`, …), and flattening
+/// keeps a stray non-numeric field from failing the whole deserialize.
 #[derive(Deserialize)]
 struct ModelObject {
     id: String,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Best-effort context length from a `/models` entry. Tolerates a number or a
+/// numeric string. Keys are tried in order of how unambiguous they are.
+fn context_length_of(extra: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    const KEYS: &[&str] = &[
+        "context_length",
+        "context_window",
+        "max_context_length",
+        "max_model_len",
+        "max_input_tokens",
+        "context",
+    ];
+    for key in KEYS {
+        let Some(value) = extra.get(*key) else {
+            continue;
+        };
+        if let Some(n) = value.as_u64() {
+            return Some(n);
+        }
+        if let Some(n) = value.as_str().and_then(|s| s.parse::<u64>().ok()) {
+            return Some(n);
+        }
+    }
+    None
 }
 
 #[derive(Serialize, PartialEq, Debug)]
@@ -104,8 +136,12 @@ fn with_meta(ids: Vec<String>, meta: &HashMap<String, ModelMeta>) -> Vec<ModelIn
         .collect()
 }
 
-/// `GET /models` on the configured endpoint, returning the raw model ids.
-async fn fetch_provider_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+/// `GET /models` on the configured endpoint, returning each model's id and the
+/// context length it advertises (when it advertises one).
+async fn fetch_provider_models(
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<(String, Option<u64>)>, String> {
     let resp = reqwest::Client::new()
         .get(format!("{base_url}/models"))
         .bearer_auth(api_key)
@@ -121,7 +157,14 @@ async fn fetch_provider_models(base_url: &str, api_key: &str) -> Result<Vec<Stri
         .json()
         .await
         .map_err(|e| format!("parse models: {e}"))?;
-    Ok(models.data.into_iter().map(|m| m.id).collect())
+    Ok(models
+        .data
+        .into_iter()
+        .map(|m| {
+            let ctx = context_length_of(&m.extra);
+            (m.id, ctx)
+        })
+        .collect())
 }
 
 /// List chat-capable models for a provider's endpoint.
@@ -154,11 +197,7 @@ pub async fn list_models(
     // models.dev is used ONLY when the user explicitly picked this provider from
     // the catalog (catalog_id is set). Manual/custom providers always list via
     // the provider's own GET /models — models.dev is never auto-matched by host.
-    let use_catalog = provider
-        .catalog_id
-        .as_deref()
-        .map(|c| !c.trim().is_empty())
-        .unwrap_or(false);
+    let use_catalog = crate::pricing::uses_catalog(&provider);
     let mut ids: Vec<String> = Vec::new();
     if use_catalog {
         let _ = crate::pricing::ensure_cached(&db, &base_url, force).await;
@@ -174,9 +213,19 @@ pub async fn list_models(
         let api_key = crate::providers::resolve(&provider.id)?.ok_or_else(|| {
             "API key not set for this provider — set it in Settings.".to_string()
         })?;
-        ids = fetch_provider_models(&base_url, &api_key)
-            .await?
+        let fetched = fetch_provider_models(&base_url, &api_key).await?;
+        // Some OpenAI-compatible servers advertise a per-model context length;
+        // persist it so the pricing resolver finds it as a cached value (it beats
+        // any bundled family guess). Servers that don't are left alone — a custom
+        // provider's models then default to 200k rather than a wrong family guess.
+        for (id, ctx) in &fetched {
+            if let (Some(ctx), true) = (ctx, is_likely_chat(id)) {
+                crate::pricing::cache_context_window(&db, &base_url, id, *ctx);
+            }
+        }
+        ids = fetched
             .into_iter()
+            .map(|(id, _)| id)
             .filter(|id| is_likely_chat(id))
             .collect();
     }
@@ -210,5 +259,34 @@ mod tests {
         cache.put("http://a/v1".into(), vec!["m1".into()]);
         assert_eq!(cache.get("http://a/v1").unwrap(), vec!["m1".to_string()]);
         assert!(cache.get("http://b/v1").is_none());
+    }
+
+    #[test]
+    fn parses_context_length_from_models_response() {
+        // Different servers name the field differently; the id-only model must
+        // still deserialize, and a non-numeric value must not fail the parse.
+        let raw = r#"{"data":[
+            {"id":"deepseek-v4.1-flash","context_length":1048576},
+            {"id":"Qwen3.8-27B-FP8","max_model_len":262000},
+            {"id":"agents-a1","context_window":"262000"},
+            {"id":"plain-model"},
+            {"id":"weird-model","context_length":"not-a-number"}
+        ]}"#;
+        let resp: ModelsResponse = serde_json::from_str(raw).unwrap();
+        let got: Vec<(String, Option<u64>)> = resp
+            .data
+            .into_iter()
+            .map(|m| (m.id, context_length_of(&m.extra)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("deepseek-v4.1-flash".to_string(), Some(1_048_576)),
+                ("Qwen3.8-27B-FP8".to_string(), Some(262_000)),
+                ("agents-a1".to_string(), Some(262_000)),
+                ("plain-model".to_string(), None),
+                ("weird-model".to_string(), None),
+            ]
+        );
     }
 }

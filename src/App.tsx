@@ -50,6 +50,7 @@ import {
   setConfig,
   setConversationModel,
   setConversationProvider,
+  setModelOverrides as saveModelOverrides,
   stopChat,
   streamChat,
   updateProvider,
@@ -725,6 +726,62 @@ export default function App() {
   const [pricingByModel, setPricingByModel] = createSignal<Record<string, Pricing>>({});
   // Bumped after a catalog refresh so pricing/thinking re-resolve.
   const [catalogVersion, setCatalogVersion] = createSignal(0);
+  // Per-model override editor (Settings). `overrideModel` is the model being
+  // edited; `overrideEffective` is what the app currently resolves for it, so
+  // the user can see the value their override replaces.
+  const [overrideModel, setOverrideModel] = createSignal("");
+  const [overrideEffective, setOverrideEffective] = createSignal<Pricing | null>(null);
+  let overrideReqSeq = 0;
+
+  // A blank override: everything unset, so resolution falls through to the
+  // endpoint's own values and then the bundled defaults.
+  const EMPTY_OVERRIDE: ModelOverride = {
+    contextWindow: null,
+    inputPerMillion: null,
+    outputPerMillion: null,
+    cacheReadPerMillion: null,
+    cacheWritePerMillion: null,
+  };
+
+  const overrideFor = (id: string): ModelOverride => modelOverrides()[id] ?? EMPTY_OVERRIDE;
+
+  // Persist the override map immediately through the dedicated command (so it
+  // never clobbers other unsaved Settings edits with on-disk values). Bump
+  // `catalogVersion` only *after* the write lands, so the header meter and the
+  // "Currently" preview re-resolve against the new value rather than the old.
+  function commitOverrides(next: Record<string, ModelOverride>) {
+    setModelOverrides(next);
+    void saveModelOverrides(next)
+      .then(() => setCatalogVersion((v) => v + 1))
+      .catch((e) => setSettingsError(String(e)));
+  }
+
+  // Merge one field into a model's override. When every field is blank the
+  // entry is dropped entirely, so a cleared override stops shadowing the
+  // endpoint/bundled values.
+  function setOverrideField(id: string, field: keyof ModelOverride, value: number | null) {
+    if (!id) return;
+    const next = { ...modelOverrides() };
+    const cur: ModelOverride = { ...(next[id] ?? EMPTY_OVERRIDE), [field]: value };
+    if (Object.values(cur).every((v) => v == null)) delete next[id];
+    else next[id] = cur;
+    commitOverrides(next);
+  }
+
+  function clearOverride(id: string) {
+    if (!id) return;
+    const next = { ...modelOverrides() };
+    delete next[id];
+    commitOverrides(next);
+  }
+
+  // Parse a numeric input; blank → null (fall through), otherwise a finite number.
+  const numFromInput = (raw: string): number | null => {
+    const t = raw.trim();
+    if (!t) return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  };
 
   // --- Multi-provider state ---
   const [providers, setProviders] = createSignal<ProviderInfo[]>([]);
@@ -859,43 +916,89 @@ export default function App() {
     loadModels(true, cfg.activeProviderId ?? "").catch(() => {});
   });
 
-  // Re-resolve pricing whenever the selected model or the catalog changes.
+  // Re-resolve pricing whenever the selected model, its provider, or the catalog
+  // changes. Keying on the header provider too is essential: the model's fetched
+  // context/prices live under *that* provider's cache, and resolving against the
+  // active provider instead would silently fall back to a bundled family guess.
   createEffect(() => {
     const id = model();
+    const prov = headerProviderId();
     catalogVersion();
     if (!id) {
       setPricing(null);
       return;
     }
-    getPricing(id)
-      .then(setPricing)
-      .catch(() => setPricing(null));
+    const seq = ++pricingReqSeq;
+    getPricing(id, prov)
+      .then((p) => {
+        // A newer model switch superseded this one — drop the stale result so
+        // the context window never shows a previous model's window.
+        if (seq !== pricingReqSeq) return;
+        setPricing(p);
+      })
+      .catch(() => {
+        if (seq === pricingReqSeq) setPricing(null);
+      });
   });
 
-  // Re-resolve the thinking levels whenever the selected model or catalog changes.
+  // Re-resolve the thinking levels whenever the selected model, its provider, or
+  // the catalog changes.
   createEffect(() => {
     const id = model();
+    const prov = headerProviderId();
     catalogVersion();
     if (!id) {
       setThinkingOpts(null);
       return;
     }
-    thinkingOptions(id)
-      .then(setThinkingOpts)
-      .catch(() => setThinkingOpts(null));
+    const seq = ++thinkingReqSeq;
+    thinkingOptions(id, prov)
+      .then((opts) => {
+        if (seq !== thinkingReqSeq) return;
+        setThinkingOpts(opts);
+      })
+      .catch(() => {
+        if (seq === thinkingReqSeq) setThinkingOpts(null);
+      });
+  });
+
+  // Resolve what the app currently uses for the model being edited in Settings,
+  // so the override editor can show the value an override would replace. Re-runs
+  // on `catalogVersion` so edits (which bump it) reflect immediately.
+  createEffect(() => {
+    const id = overrideModel();
+    const prov = headerProviderId();
+    catalogVersion();
+    if (!id) {
+      setOverrideEffective(null);
+      return;
+    }
+    const seq = ++overrideReqSeq;
+    getPricing(id, prov)
+      .then((p) => {
+        if (seq === overrideReqSeq) setOverrideEffective(p);
+      })
+      .catch(() => {
+        if (seq === overrideReqSeq) setOverrideEffective(null);
+      });
   });
 
   // Price past turns with the model that actually produced them. New turns
-  // store a frozen `cost`; only legacy turns without one need a lookup.
+  // store a frozen `cost`; only legacy turns without one need a lookup. A row's
+  // `provider` is its base URL, so map it back to a provider id (when known) to
+  // resolve the correct cache instead of the active provider's.
   createEffect(() => {
     const byModel = pricingByModel();
     const current = model();
+    const norm = (u?: string | null) => (u ?? "").trim().replace(/\/+$/, "");
+    const provs = providers();
     for (const m of messages()) {
       if (m.role !== "assistant" || !m.model) continue;
       const u = parseUsage(m);
       if (u && typeof u.cost === "number") continue;
       if (m.model === current || byModel[m.model]) continue;
-      getPricing(m.model)
+      const pid = provs.find((p) => norm(p.baseUrl) === norm(m.provider))?.id;
+      getPricing(m.model, pid)
         .then((p) => setPricingByModel((prev) => ({ ...prev, [m.model as string]: p })))
         .catch(() => {});
     }
@@ -975,6 +1078,7 @@ export default function App() {
     setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
     setSyncEnabled(cfg.syncEnabled ?? false);
     setModelOverrides(cfg.modelOverrides ?? {});
+    setOverrideModel(model());
     setActiveProviderId(cfg.activeProviderId ?? "");
     setHasKey(await hasApiKey());
     setKeyDraft("");
@@ -1008,7 +1112,7 @@ export default function App() {
       echoReasoningContent: echoReasoning(),
       memoryReflectionEnabled: reflectionEnabled(),
       memoryReflectionIdleMinutes: reflectionIdleMinutes(),
-      modelOverrides: current.modelOverrides ?? {},
+      modelOverrides: modelOverrides(),
       shellWorkspaceDir: shellWorkspaceDir(),
       syncEnabled: syncEnabled(),
       providers: providerConfig(),
@@ -1261,6 +1365,14 @@ export default function App() {
   // against that: only the request that was issued last is allowed to apply its
   // result, so the model list always reflects the most recent selection.
   let modelsReqSeq = 0;
+  // Sequencing guards for the pricing and thinking-options effects. These call
+  // `getPricing` / `thinkingOptions` asynchronously; without a guard a slow
+  // response for a *previous* model can resolve after a fast response for the
+  // *current* one and overwrite it, so the context-window/pricing readouts (and
+  // thinking levels) would keep reflecting the earlier model. Only the request
+  // issued last is allowed to apply its result — same pattern as `loadModels`.
+  let pricingReqSeq = 0;
+  let thinkingReqSeq = 0;
   // Non-reactive bookkeeping for the header-sync effect (below). Tracked via
   // these plain variables instead of signals so the effect doesn't retrigger on
   // changes it itself causes (setModel / loadModels) — see the effect comment.
@@ -1289,7 +1401,7 @@ export default function App() {
     // The warning is about the previous model; re-check against the new one.
     setAttachmentWarning(null);
     // Adopt the new model's thinking levels; drop a level it doesn't accept.
-    const opts = await thinkingOptions(id).catch(() => null);
+    const opts = await thinkingOptions(id, headerProviderId()).catch(() => null);
     setThinkingOpts(opts);
     let level = thinkingLevel();
     if (opts && level && !opts.options.includes(level)) {
@@ -1976,12 +2088,12 @@ export default function App() {
     return Boolean(streaming() && m && m.id.startsWith("tmp-assistant-") && !m.content);
   };
 
-  // Context window + cost readouts for the active conversation. The usable
-  // budget is 80% of the model's window, capped at 200k; unknown → 200k.
-  const contextWindow = () => {
-    const ctx = pricing()?.contextWindow;
-    return ctx ? Math.min(ctx * 0.8, 200_000) : 200_000;
-  };
+  // Context window + cost readouts for the active conversation. The meter shows
+  // the model's actual context window — resolved from a per-model override, the
+  // endpoint's `/models`, models.dev, or the bundled table. `pricing()` is null
+  // only before it resolves; the resolver already falls back to 200k when the
+  // model's window is unknown.
+  const contextWindow = () => pricing()?.contextWindow ?? 200_000;
 
   const contextTokens = () => {
     const assistants = messages().filter((m) => m.role === "assistant");
@@ -2035,7 +2147,8 @@ export default function App() {
     return c == null ? "—" : formatCost(c);
   };
 
-  // Reflection spend (kept separate from conversation cost).
+  // Background maintenance spend (memory reflection + context compaction), kept
+  // separate from conversation cost.
   const reflectionLabel = () => {
     const s = reflectionStats();
     if (!s || s.count <= 0) return null;
@@ -2051,6 +2164,20 @@ export default function App() {
     if (contextPct() >= 90) return "text-red-600 dark:text-red-400";
     if (contextPct() >= 75) return "text-amber-600 dark:text-amber-400";
     return "";
+  };
+
+  // True once this conversation has had a context compaction: older messages are
+  // folded into `compaction_summary`, only the recent tail is sent verbatim.
+  const compacted = () => !!activeConversation()?.compaction_through;
+
+  // Non-blocking heads-up when the conversation nears the model's window. The
+  // turn that crosses 80% is compacted automatically, so this is informational.
+  const contextNote = () => {
+    if (!activeId() || contextPct() < 80) return null;
+    const pct = Math.round(contextPct());
+    return compacted()
+      ? `Context ${pct}% — older messages are compacted into a summary; recent turns stay verbatim.`
+      : `Context ${pct}% — older messages will be compacted into a summary automatically.`;
   };
 
   return (
@@ -2245,7 +2372,9 @@ export default function App() {
                   pricing()?.cacheReadPerMillion ?? "—"
                 } / ${pricing()?.cacheWritePerMillion ?? "—"} USD per 1M${
                   pricing()?.overridden ? "\n(using your overrides)" : ""
-                }${reflectionLabel() ? `\nMemory reflection: ${reflectionLabel()}` : ""}`}
+                }${reflectionLabel() ? `\nBackground maintenance: ${reflectionLabel()}` : ""}${
+                  compacted() ? "\nOlder messages are compacted into a summary." : ""
+                }`}
               >
                 <span class={contextClass()}>
                   {formatTokens(Math.min(contextTokens(), contextWindow()))} /{" "}
@@ -2253,6 +2382,11 @@ export default function App() {
                 </span>
                 <span class="text-neutral-300 dark:text-neutral-600">·</span>
                 <span>{costLabel()}</span>
+                <Show when={compacted()}>
+                  <span class="rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
+                    compacted
+                  </span>
+                </Show>
               </div>
             </Show>
             <button
@@ -2605,6 +2739,11 @@ export default function App() {
                 )}
               </For>
             </div>
+          </Show>
+          <Show when={contextNote()}>
+            <p class="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+              {contextNote()}
+            </p>
           </Show>
           <Show when={attachmentWarning()}>
             <p class="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
@@ -2975,6 +3114,144 @@ export default function App() {
                     is used for new chats.
                   </p>
                 </div>
+
+              <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+                <div class="text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                  Model pricing &amp; context overrides
+                </div>
+                <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                  Custom endpoints often don't report a context limit or prices in /models. Set
+                  them per model here; an override beats the endpoint's own values and the
+                  built-in defaults. Leave a field blank to fall back.
+                </span>
+                <select
+                  class="mt-2 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                  value={overrideModel()}
+                  onChange={(e) => setOverrideModel(e.currentTarget.value)}
+                >
+                  <For each={modelOptions()}>
+                    {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
+                  </For>
+                </select>
+                <Show when={overrideModel()}>
+                  <div class="mt-2 grid grid-cols-2 gap-2">
+                    <label class="col-span-2 block text-[11px] text-neutral-600 dark:text-neutral-300">
+                      Context window (tokens)
+                      <input
+                        type="number"
+                        min="1"
+                        step="1"
+                        class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        placeholder={
+                          overrideEffective()?.contextWindow
+                            ? String(overrideEffective()!.contextWindow)
+                            : "e.g. 262144"
+                        }
+                        value={overrideFor(overrideModel()).contextWindow ?? ""}
+                        onChange={(e) =>
+                          setOverrideField(
+                            overrideModel(),
+                            "contextWindow",
+                            numFromInput(e.currentTarget.value),
+                          )
+                        }
+                      />
+                    </label>
+                    <label class="block text-[11px] text-neutral-600 dark:text-neutral-300">
+                      Input $/1M
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        placeholder={String(overrideEffective()?.inputPerMillion ?? "")}
+                        value={overrideFor(overrideModel()).inputPerMillion ?? ""}
+                        onChange={(e) =>
+                          setOverrideField(
+                            overrideModel(),
+                            "inputPerMillion",
+                            numFromInput(e.currentTarget.value),
+                          )
+                        }
+                      />
+                    </label>
+                    <label class="block text-[11px] text-neutral-600 dark:text-neutral-300">
+                      Output $/1M
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        placeholder={String(overrideEffective()?.outputPerMillion ?? "")}
+                        value={overrideFor(overrideModel()).outputPerMillion ?? ""}
+                        onChange={(e) =>
+                          setOverrideField(
+                            overrideModel(),
+                            "outputPerMillion",
+                            numFromInput(e.currentTarget.value),
+                          )
+                        }
+                      />
+                    </label>
+                    <label class="block text-[11px] text-neutral-600 dark:text-neutral-300">
+                      Cache read $/1M
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        placeholder={String(overrideEffective()?.cacheReadPerMillion ?? "")}
+                        value={overrideFor(overrideModel()).cacheReadPerMillion ?? ""}
+                        onChange={(e) =>
+                          setOverrideField(
+                            overrideModel(),
+                            "cacheReadPerMillion",
+                            numFromInput(e.currentTarget.value),
+                          )
+                        }
+                      />
+                    </label>
+                    <label class="block text-[11px] text-neutral-600 dark:text-neutral-300">
+                      Cache write $/1M
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        placeholder={String(overrideEffective()?.cacheWritePerMillion ?? "")}
+                        value={overrideFor(overrideModel()).cacheWritePerMillion ?? ""}
+                        onChange={(e) =>
+                          setOverrideField(
+                            overrideModel(),
+                            "cacheWritePerMillion",
+                            numFromInput(e.currentTarget.value),
+                          )
+                        }
+                      />
+                    </label>
+                  </div>
+                  <div class="mt-2 flex items-center justify-between gap-2">
+                    <span class="text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                      <Show when={overrideEffective()} fallback="Currently: unknown">
+                        {(p) => (
+                          <>
+                            Currently: {formatTokens(p().contextWindow)} tok · {p().source}
+                          </>
+                        )}
+                      </Show>
+                    </span>
+                    <Show when={modelOverrides()[overrideModel()]}>
+                      <button
+                        type="button"
+                        onClick={() => clearOverride(overrideModel())}
+                        class="text-[11px] text-red-600 transition hover:underline dark:text-red-400"
+                      >
+                        Clear override
+                      </button>
+                    </Show>
+                  </div>
+                </Show>
+              </div>
 
               <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
                 Brave Search API key

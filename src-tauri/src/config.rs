@@ -273,6 +273,21 @@ pub fn set_config(state: tauri::State<'_, ConfigState>, config: AppConfig) -> Re
     state.set(config)
 }
 
+/// Replace just the per-model pricing/context overrides, leaving every other
+/// config field (including unsaved Settings edits) untouched. Used by the
+/// Settings override editor so a value applies the moment it is committed,
+/// without round-tripping the whole `AppConfig` (which would clobber unsaved
+/// provider/endpoint edits with the on-disk values).
+#[tauri::command]
+pub fn set_model_overrides(
+    state: tauri::State<'_, ConfigState>,
+    model_overrides: HashMap<String, ModelOverride>,
+) -> Result<(), String> {
+    let mut cfg = state.get();
+    cfg.model_overrides = model_overrides;
+    state.set(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

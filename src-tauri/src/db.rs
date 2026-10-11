@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   provider_id TEXT,
   system_prompt TEXT,
   compaction_summary TEXT,
+  compaction_through TEXT,
   last_reflected_index INTEGER,
   imported INTEGER NOT NULL DEFAULT 0,
   import_batch INTEGER NOT NULL DEFAULT 0,
@@ -148,6 +149,15 @@ pub fn open(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE conversations ADD COLUMN last_reflected_index INTEGER",
         [],
     );
+    // Older databases predate context compaction. `compaction_through` holds the
+    // id (not index — indices are re-assigned on cross-device pull) of the newest
+    // message folded into `compaction_summary`; messages after it are sent
+    // verbatim. Local-only: it is intentionally not synced, and a mirror without
+    // it simply ignores the summary (see `chat::compacted_history`).
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN compaction_through TEXT",
+        [],
+    );
     // Older databases predate imported-conversation tracking.
     let _ = conn.execute(
         "ALTER TABLE conversations ADD COLUMN imported INTEGER NOT NULL DEFAULT 0",
@@ -224,6 +234,7 @@ pub struct Conversation {
     pub provider_id: Option<String>,
     pub system_prompt: Option<String>,
     pub compaction_summary: Option<String>,
+    pub compaction_through: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -278,7 +289,7 @@ pub fn get_conversation(
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, model, provider_id, system_prompt, compaction_summary, created_at, updated_at
+            "SELECT id, title, model, provider_id, system_prompt, compaction_summary, compaction_through, created_at, updated_at
              FROM conversations WHERE id = ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -291,8 +302,9 @@ pub fn get_conversation(
                 provider_id: r.get(3)?,
                 system_prompt: r.get(4)?,
                 compaction_summary: r.get(5)?,
-                created_at: r.get(6)?,
-                updated_at: r.get(7)?,
+                compaction_through: r.get(6)?,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -465,7 +477,7 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, model, provider_id, system_prompt, compaction_summary, created_at, updated_at
+            "SELECT id, title, model, provider_id, system_prompt, compaction_summary, compaction_through, created_at, updated_at
              FROM conversations ORDER BY updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -478,8 +490,9 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
                 provider_id: r.get(3)?,
                 system_prompt: r.get(4)?,
                 compaction_summary: r.get(5)?,
-                created_at: r.get(6)?,
-                updated_at: r.get(7)?,
+                compaction_through: r.get(6)?,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -513,6 +526,7 @@ pub fn create_conversation(
         provider_id: None,
         system_prompt: None,
         compaction_summary: None,
+        compaction_through: None,
         created_at: now,
         updated_at: now,
     })
@@ -630,7 +644,7 @@ pub fn search_conversations(
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT c.id, c.title, c.model, c.provider_id, c.system_prompt, c.compaction_summary, c.created_at, c.updated_at
+            "SELECT DISTINCT c.id, c.title, c.model, c.provider_id, c.system_prompt, c.compaction_summary, c.compaction_through, c.created_at, c.updated_at
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              WHERE lower(c.title) LIKE ?1 OR lower(m.content) LIKE ?1
@@ -646,8 +660,9 @@ pub fn search_conversations(
                 provider_id: r.get(3)?,
                 system_prompt: r.get(4)?,
                 compaction_summary: r.get(5)?,
-                created_at: r.get(6)?,
-                updated_at: r.get(7)?,
+                compaction_through: r.get(6)?,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -830,6 +845,33 @@ pub fn set_last_reflected_index(db: &Db, conversation_id: &str, index: i64) -> R
     conn.execute(
         "UPDATE conversations SET last_reflected_index = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
         params![conversation_id, index, rev],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Persist a context-compaction pass: the folded summary and the id of the newest
+/// message it covers. One locked statement, touching only the two compaction
+/// columns (plus the sync revision) — so it can never race the reflection
+/// watermark write ([`set_last_reflected_index`]), which owns a different column.
+///
+/// `updated_at` is deliberately left alone: compaction is background maintenance
+/// and must not reset the idle timer the reflection scheduler reads, nor reorder
+/// the sidebar. `compaction_through` is local-only (not synced), so this does not
+/// require a Supabase schema change.
+pub fn set_compaction(
+    db: &Db,
+    conversation_id: &str,
+    summary: &str,
+    through_id: &str,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let rev = bump_revision_c(&conn)?;
+    conn.execute(
+        "UPDATE conversations
+         SET compaction_summary = ?2, compaction_through = ?3, revision = ?4, dirty = 1
+         WHERE id = ?1",
+        params![conversation_id, summary, through_id, rev],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1590,6 +1632,40 @@ mod tests {
             assert_eq!(batch, 0);
         }
         assert_eq!(next_import_batch(&db).unwrap(), 1);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Compaction writes only the two compaction columns and the sync revision —
+    /// never `updated_at`, so it cannot reorder the sidebar or reset the idle
+    /// timer the reflection scheduler reads — and it owns columns disjoint from
+    /// the reflection watermark, so the two maintenance writers cannot clobber
+    /// each other.
+    #[test]
+    fn set_compaction_is_independent_of_reflection_and_preserves_updated_at() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-compaction-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('c', 't', 5, 5)",
+                [],
+            )
+            .unwrap();
+        }
+
+        set_compaction(&db, "c", "the summary", "msg-7").unwrap();
+        set_last_reflected_index(&db, "c", 3).unwrap();
+
+        let conv = get_conversation(&db, "c").unwrap().unwrap();
+        assert_eq!(conv.compaction_summary.as_deref(), Some("the summary"));
+        assert_eq!(conv.compaction_through.as_deref(), Some("msg-7"));
+        assert_eq!(conv.updated_at, 5, "compaction must not touch updated_at");
+        assert_eq!(last_reflected_index(&db, "c").unwrap(), Some(3));
 
         let _ = std::fs::remove_file(&p);
     }

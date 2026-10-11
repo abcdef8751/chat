@@ -23,6 +23,17 @@ use crate::tools::{self, ToolCall, ToolOutput};
 pub(crate) const DEFAULT_SYSTEM_PROMPT: &str =
     r#"You are a helpful general-purpose assistant. Be concise, accurate, and clear."#;
 
+/// Fraction of the model's context window at which a turn forces a compaction
+/// before it runs. The window is measured against the exact request we are about
+/// to send (see [`estimate_context_tokens`]).
+pub(crate) const COMPACTION_THRESHOLD: f64 = 0.8;
+/// How many tokens of the most recent history are kept verbatim after a
+/// compaction; everything older is folded into the summary.
+pub(crate) const COMPACTION_KEEP_TOKENS: u64 = 15_000;
+/// Rough chars-per-token, matching the frontend meter and the backfill sizing.
+/// Only used to pick the verbatim/compacted split and to trigger compaction.
+const CHARS_PER_TOKEN: u64 = 4;
+
 /// Per-conversation cancellation flags so the UI can abort a running stream.
 #[derive(Default)]
 pub struct StreamRegistry {
@@ -719,13 +730,31 @@ pub(crate) fn build_history_messages(
     Ok(out)
 }
 
-/// Convert a system prompt, existing history and a fresh user turn into request
-/// messages.
+/// Convert a system prompt, an optional compaction summary, existing history and
+/// a fresh user turn into request messages.
+///
+/// Layout is exactly: system prompt → compaction summary (as a system message)
+/// → verbatim history → the new user turn. The leading part is shared with the
+/// reflection pass through [`build_context`].
 fn build_messages(
     system_prompt: &str,
+    compaction_summary: Option<&str>,
     history: &[db::MessageRow],
     user_content: &str,
     user_attachments: &[crate::attachments::Attachment],
+) -> Result<Vec<ChatCompletionRequestMessage>, String> {
+    let mut out = build_context(system_prompt, compaction_summary, history)?;
+    out.push(user_request_message(user_content, user_attachments)?);
+    Ok(out)
+}
+
+/// The leading context shared by a live turn and a reflection pass: the system
+/// prompt, the compaction summary when one exists, then the verbatim history.
+/// Both paths build this exact prefix so it stays prompt-cacheable.
+pub(crate) fn build_context(
+    system_prompt: &str,
+    compaction_summary: Option<&str>,
+    history: &[db::MessageRow],
 ) -> Result<Vec<ChatCompletionRequestMessage>, String> {
     let mut out = Vec::new();
     if !system_prompt.trim().is_empty() {
@@ -737,9 +766,259 @@ fn build_messages(
                 .into(),
         );
     }
+    if let Some(summary) = compaction_summary.filter(|s| !s.trim().is_empty()) {
+        out.push(
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(summary.to_string())
+                .build()
+                .map_err(|e| e.to_string())?
+                .into(),
+        );
+    }
     out.extend(build_history_messages(history)?);
-    out.push(user_request_message(user_content, user_attachments)?);
     Ok(out)
+}
+
+/// Split stored history at the compaction watermark: the summary of everything
+/// older, and the index of the first message to send verbatim.
+///
+/// The boundary is matched by message **id** (`compaction_through`), never by
+/// index — cross-device pull renumbers `index`. A boundary that is missing (for
+/// example a summary synced from a device that had compaction onto one that does
+/// not, since the boundary itself is local-only) makes the summary be ignored,
+/// rather than guessing a split that could drop context.
+pub(crate) fn compacted_history(
+    conversation: &db::Conversation,
+    history: &[db::MessageRow],
+) -> (Option<String>, usize) {
+    // BOTH halves are required: the boundary locates the split, the summary is
+    // what replaces the folded messages. If either is missing, ignore the
+    // compaction and send the full history. This matters because they have
+    // different lifetimes — a sync pull applies last-writer-wins to
+    // `compaction_summary` (it is on the synced row) but never to the local-only
+    // `compaction_through`, so a summary can be nulled while the boundary
+    // survives. Slicing then would drop context with nothing injected in its
+    // place.
+    let (Some(boundary), Some(summary)) = (
+        conversation.compaction_through.as_deref(),
+        conversation.compaction_summary.as_deref(),
+    ) else {
+        return (None, 0);
+    };
+    if summary.trim().is_empty() {
+        return (None, 0);
+    }
+    match history.iter().position(|m| m.id == boundary) {
+        Some(pos) => (Some(summary.to_string()), pos + 1),
+        None => (None, 0),
+    }
+}
+
+/// Index of the first history message to keep verbatim, so roughly the last
+/// `keep_tokens` tokens survive and everything before is folded. The kept tail
+/// must never begin with a `tool` row: its assistant tool-call would have been
+/// folded away, orphaning the result (an invalid request), so the whole trailing
+/// tool group is folded instead.
+fn keep_from(history: &[db::MessageRow], keep_tokens: u64) -> usize {
+    let mut acc = 0u64;
+    let mut start = 0usize;
+    for (i, m) in history.iter().enumerate().rev() {
+        // ~4 chars/token plus a small per-message wire overhead.
+        acc += m.content.len() as u64 / CHARS_PER_TOKEN + 8;
+        if acc >= keep_tokens {
+            start = i;
+            break;
+        }
+    }
+    // A kept tail must never begin on a `tool` row: its assistant tool-call
+    // would have been folded away, orphaning the result (an invalid request), so
+    // the whole trailing tool group is folded instead. Only adjust when a tail is
+    // actually being kept (`start > 0`); a leading tool row means nothing was
+    // folded, so leave `start` at 0 and skip compaction.
+    while start > 0 && start < history.len() && history[start].role == "tool" {
+        start += 1;
+    }
+    start
+}
+
+/// Rough token size of a request we are about to send (~4 chars/token over the
+/// serialized messages). Only used to decide whether to compact.
+fn estimate_context_tokens(messages: &[ChatCompletionRequestMessage]) -> u64 {
+    serde_json::to_string(messages)
+        .map(|s| s.len() as u64 / CHARS_PER_TOKEN)
+        .unwrap_or(0)
+}
+
+/// The context size the provider last reported for this conversation (the newest
+/// assistant turn's `context_tokens`, else its prompt+completion). Mirrors the
+/// frontend meter, and is more accurate than the char estimate when present.
+fn reported_context_tokens(history: &[db::MessageRow]) -> Option<u64> {
+    for row in history.iter().rev() {
+        if row.role != "assistant" {
+            continue;
+        }
+        let Some(usage) = row.usage.as_deref() else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(usage) else {
+            continue;
+        };
+        if let Some(n) = v.get("context_tokens").and_then(Value::as_u64) {
+            return Some(n);
+        }
+        let p = v.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let c = v.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+        if p > 0 || c > 0 {
+            return Some(p + c);
+        }
+    }
+    None
+}
+
+/// Sink for internal passes (compaction) that have no UI: events are discarded.
+struct NullSink;
+
+impl EventSink for NullSink {
+    fn emit(&self, _ev: StreamEvent) {}
+}
+
+const COMPACTION_SYSTEM: &str = "You are a conversation summarizer. Produce one dense, factual \
+summary of the conversation so far: decisions, facts the user stated, open threads, and any \
+state needed to continue. Preserve concrete details (names, numbers, file paths, identifiers). \
+No commentary, preamble, or headings — output only the summary.";
+
+const COMPACTION_INSTRUCTION: &str = "Fold the exchange above into the running summary. Keep it \
+self-contained and dense; drop pleasantries and resolved trivia. Output only the updated summary.";
+
+/// One summarization round for a compaction pass: no tools, single completion.
+/// Returns the summary text and the round's usage (for the maintenance cost row).
+async fn summarize_history(
+    cfg: &AppConfig,
+    api_key: &str,
+    previous: Option<&str>,
+    fold: &[db::MessageRow],
+    flag: &AtomicBool,
+) -> Result<(String, Value), String> {
+    let system = match previous.filter(|p| !p.trim().is_empty()) {
+        Some(prev) => format!("{COMPACTION_SYSTEM}\n\nSummary so far:\n{prev}"),
+        None => COMPACTION_SYSTEM.to_string(),
+    };
+    let mut messages = vec![
+        ChatCompletionRequestSystemMessageArgs::default()
+            .content(system)
+            .build()
+            .map_err(|e| e.to_string())?
+            .into(),
+    ];
+    messages.extend(build_history_messages(fold)?);
+    messages.push(
+        ChatCompletionRequestUserMessageArgs::default()
+            .content(COMPACTION_INSTRUCTION.to_string())
+            .build()
+            .map_err(|e| e.to_string())?
+            .into(),
+    );
+
+    let body = completion_body(&cfg.model, &messages, &[], &cfg.thinking_level, None)?;
+    let response = open_completion_stream(&cfg.base_url, api_key, &body).await?;
+    let acc = run_completion(response, &NullSink, flag).await;
+    if acc.failed {
+        return Err(acc.error.unwrap_or_else(|| "compaction failed".into()));
+    }
+    let usage = acc.usage.unwrap_or_else(|| json!({}));
+    // An aborted pass must not persist a partial summary; returning no text makes
+    // the caller skip the compaction and let the turn abort normally.
+    if flag.load(Ordering::SeqCst) {
+        return Ok((String::new(), usage));
+    }
+    Ok((acc.text, usage))
+}
+
+/// Fold newly-old history into the conversation's summary and persist it.
+/// Returns the new summary and the verbatim tail start, or `None` when there is
+/// nothing new to fold. The pass is idempotent and resumable: the previous
+/// summary plus only the messages after the old watermark are summarized, so a
+/// long conversation is never re-summarized from scratch.
+///
+/// Runs inside the live turn, so the conversation is registered as streaming and
+/// the reflection scheduler/its watcher stay out (see [`db::set_compaction`]).
+async fn compact_now(
+    db: &db::Db,
+    conversation: &db::Conversation,
+    history: &[db::MessageRow],
+    cfg: &AppConfig,
+    use_bundled_context: bool,
+    api_key: &str,
+    flag: &AtomicBool,
+) -> Result<Option<(String, usize)>, String> {
+    let start = keep_from(history, COMPACTION_KEEP_TOKENS);
+    if start == 0 {
+        return Ok(None); // everything is still within the verbatim budget
+    }
+    // Where the previous summary ended, so we only fold the newly-old stretch.
+    let prev_start = match conversation.compaction_through.as_deref() {
+        Some(id) => history
+            .iter()
+            .position(|m| m.id == id)
+            .map(|p| p + 1)
+            .unwrap_or(0),
+        None => 0,
+    };
+    if start <= prev_start {
+        return Ok(None);
+    }
+
+    let through_id = history[start - 1].id.clone();
+    let (summary, usage) = match summarize_history(
+        cfg,
+        api_key,
+        conversation.compaction_summary.as_deref(),
+        &history[prev_start..start],
+        flag,
+    )
+    .await
+    {
+        Ok(x) => x,
+        // Best-effort: a summarizer failure must never break the user's turn; it
+        // just runs uncompacted (and may hit the provider limit, as before).
+        Err(e) => {
+            eprintln!("context compaction: {e}");
+            return Ok(None);
+        }
+    };
+    let summary = summary.trim().to_string();
+    if summary.is_empty() {
+        return Ok(None); // aborted, or nothing produced
+    }
+
+    // Best-effort persistence: if the write fails, skip compaction for this turn
+    // and run uncompacted rather than failing the user's turn.
+    if let Err(e) = db::set_compaction(db, &conversation.id, &summary, &through_id) {
+        eprintln!("context compaction: persisting summary failed: {e}");
+        return Ok(None);
+    }
+
+    // Record the spend as background maintenance (kept out of chat cost), the
+    // same as memory reflection.
+    let pricing = crate::pricing::resolve_for_base(
+        db,
+        &cfg.base_url,
+        &cfg.model_overrides,
+        &cfg.model,
+        use_bundled_context,
+    );
+    let cost = crate::pricing::cost_of_usage(&usage, &pricing);
+    let _ = db::insert_reflection(
+        db,
+        &conversation.id,
+        &cfg.model,
+        Some(&usage.to_string()),
+        cost,
+        &[],
+        "Context compacted (older messages summarized)",
+    );
+
+    Ok(Some((summary, start)))
 }
 
 /// Base system prompt, with explicit user preferences injected at the top and
@@ -1151,7 +1430,55 @@ pub(crate) async fn run_chat_turn(
         crate::pricing::cached_model_name(db, &turn_cfg.base_url, &turn_cfg.model)
             .unwrap_or_else(|| turn_cfg.model.clone());
     let system_prompt = build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
-    let messages = build_messages(&system_prompt, &history, &content, &attachments)?;
+
+    // Context layout: system prompt → compaction summary (when one exists) →
+    // verbatim history → the new turn. If the request would cross the threshold
+    // of the model's window, force a compaction and rebuild from its result.
+    let (mut summary, mut keep_start) = compacted_history(&conversation, &history);
+    let mut messages = build_messages(
+        &system_prompt,
+        summary.as_deref(),
+        &history[keep_start..],
+        &content,
+        &attachments,
+    )?;
+    // The bundled context-window table applies only to catalog providers, and it
+    // is the *conversation's* provider that decides — not the global active one.
+    let use_bundled_context = crate::pricing::uses_catalog(&provider);
+    let window = crate::pricing::resolve_for_base(
+        db,
+        &turn_cfg.base_url,
+        &turn_cfg.model_overrides,
+        &turn_cfg.model,
+        use_bundled_context,
+    )
+    .context_window;
+    let current =
+        estimate_context_tokens(&messages).max(reported_context_tokens(&history).unwrap_or(0));
+    if window > 0 && current as f64 >= window as f64 * COMPACTION_THRESHOLD {
+        if let Some((new_summary, new_start)) = compact_now(
+            db,
+            &conversation,
+            &history,
+            &turn_cfg,
+            use_bundled_context,
+            api_key,
+            &flag,
+        )
+        .await?
+        {
+            summary = Some(new_summary);
+            keep_start = new_start;
+            messages = build_messages(
+                &system_prompt,
+                summary.as_deref(),
+                &history[keep_start..],
+                &content,
+                &attachments,
+            )?;
+        }
+    }
+
     let tools_list = tools::tool_specs(tools::brave_available());
 
     let mut result = run_tool_loop(
@@ -1183,6 +1510,7 @@ pub(crate) async fn run_chat_turn(
             &turn_cfg.base_url,
             &turn_cfg.model_overrides,
             &turn_cfg.model,
+            use_bundled_context,
         );
         if let Some(cost) = crate::pricing::cost_of_usage(&result.usage, &pricing) {
             result.usage["cost"] = json!(cost);

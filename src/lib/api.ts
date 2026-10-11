@@ -7,6 +7,8 @@ export interface Conversation {
   provider_id: string | null;
   system_prompt: string | null;
   compaction_summary: string | null;
+  /** Id of the newest message folded into `compaction_summary` (local-only). */
+  compaction_through: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -296,6 +298,13 @@ export function setConfig(config: Config): Promise<void> {
   return invoke<void>("set_config", { config });
 }
 
+/** Replace only the per-model pricing/context overrides (no other config field). */
+export function setModelOverrides(
+  modelOverrides: Record<string, ModelOverride>,
+): Promise<void> {
+  return invoke<void>("set_model_overrides", { modelOverrides });
+}
+
 export function hasApiKey(): Promise<boolean> {
   return invoke<boolean>("has_api_key");
 }
@@ -321,12 +330,23 @@ export function listModels(refresh?: boolean, providerId?: string | null): Promi
   });
 }
 
-export function getPricing(modelId: string): Promise<Pricing> {
-  return invoke<Pricing>("get_pricing", { modelId });
+/** Resolve pricing/context for a model against the provider that owns it. Pass
+ * `providerId` (the header/conversation provider) so a model is looked up in the
+ * right provider's cache rather than the active provider's — otherwise a model
+ * from a non-active provider misses its fetched context and falls back to a
+ * bundled family guess. */
+export function getPricing(modelId: string, providerId?: string | null): Promise<Pricing> {
+  return invoke<Pricing>("get_pricing", { modelId, providerId: providerId ?? null });
 }
 
-export function thinkingOptions(modelId: string): Promise<ThinkingOptions> {
-  return invoke<ThinkingOptions>("thinking_options", { modelId });
+export function thinkingOptions(
+  modelId: string,
+  providerId?: string | null,
+): Promise<ThinkingOptions> {
+  return invoke<ThinkingOptions>("thinking_options", {
+    modelId,
+    providerId: providerId ?? null,
+  });
 }
 
 export function refreshPricing(): Promise<RefreshResult> {

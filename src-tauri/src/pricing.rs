@@ -152,11 +152,17 @@ pub struct RefreshResult {
 }
 
 /// Resolve a model's pricing: user override wins, then a fetched row, then the
-/// bundled table, then defaults.
+/// bundled table (context only when `use_bundled_context`), then defaults.
+///
+/// `use_bundled_context` is false for custom/manual providers: their models are
+/// never in models.dev, so the bundled table's family guesses (every `qwen*` →
+/// 32k, every `deepseek*` → 160k) would be wrong forever. Such models default to
+/// [`DEFAULT_CONTEXT_WINDOW`] instead. Bundled *rates* still apply either way.
 pub fn resolve_with_cache(
     model_id: &str,
     config: &crate::config::AppConfig,
     cached: Option<CachedPrice>,
+    use_bundled_context: bool,
 ) -> Pricing {
     let bundled = bundled_for(model_id);
     let over = config.model_overrides.get(model_id);
@@ -171,7 +177,13 @@ pub fn resolve_with_cache(
     let context_window = over
         .and_then(|o| o.context_window)
         .or_else(|| cached.as_ref().and_then(|c| c.context_window))
-        .or_else(|| bundled.map(|b| b.context_window))
+        .or_else(|| {
+            if use_bundled_context {
+                bundled.map(|b| b.context_window)
+            } else {
+                None
+            }
+        })
         .unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let input_per_million = over
         .and_then(|o| o.input_per_million)
@@ -214,11 +226,13 @@ pub fn resolve_with_cache(
 /// then user overrides, then the bundled table. Shared by the `get_pricing`
 /// command and the chat loop (which freezes a turn's cost with it).
 pub fn resolve_for(db: &Db, config: &crate::config::AppConfig, model_id: &str) -> Pricing {
+    let provider = config.active_provider();
     resolve_for_base(
         db,
-        &config.active_provider().base_url,
+        &provider.base_url,
         &config.model_overrides,
         model_id,
+        uses_catalog(&provider),
     )
 }
 
@@ -226,18 +240,35 @@ pub fn resolve_for(db: &Db, config: &crate::config::AppConfig, model_id: &str) -
 /// an explicit override map, without reading them from `config`. Used by the
 /// chat loop to price a turn against a specific conversation's provider, which
 /// may differ from the active provider. Identical logic to [`resolve_for`].
+///
+/// `use_bundled_context` decides whether the bundled context-window table may
+/// apply; pass [`uses_catalog`] for the owning provider (false → custom provider,
+/// which defaults to [`DEFAULT_CONTEXT_WINDOW`] rather than a family guess).
 pub fn resolve_for_base(
     db: &Db,
     base_url: &str,
     model_overrides: &HashMap<String, crate::config::ModelOverride>,
     model_id: &str,
+    use_bundled_context: bool,
 ) -> Pricing {
     let cached = get_cached(db, &provider_key(base_url), model_id);
     let config = crate::config::AppConfig {
         model_overrides: model_overrides.clone(),
         ..Default::default()
     };
-    resolve_with_cache(model_id, &config, cached)
+    resolve_with_cache(model_id, &config, cached, use_bundled_context)
+}
+
+/// Whether a provider's models come from the models.dev catalog — i.e. it was
+/// added via the catalog picker (`catalog_id` non-empty). Custom/manual providers
+/// return false, so the bundled context-window table is skipped for them (their
+/// models default to [`DEFAULT_CONTEXT_WINDOW`] instead of a wrong family guess).
+pub fn uses_catalog(provider: &crate::config::Provider) -> bool {
+    provider
+        .catalog_id
+        .as_deref()
+        .map(|c| !c.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Dollar cost of one turn's summed `usage` at the given rates. Returns `None`
@@ -505,14 +536,45 @@ fn upsert_cached(
     Ok(())
 }
 
+/// Cache a context window discovered from a provider's own `GET /models`.
+///
+/// Some OpenAI-compatible servers advertise a per-model `context_length`, but
+/// the app doesn't otherwise consult `GET /models` for limits. Writing it into
+/// `model_prices` lets the ordinary resolution path pick it up — `cached`
+/// outranks `bundled`. Uses `upsert_cached`, whose `COALESCE` leaves any other
+/// fields (and a models.dev context, if one is cached later) intact.
+pub fn cache_context_window(db: &Db, base_url: &str, model_id: &str, context_window: u64) {
+    let price = CachedPrice {
+        context_window: Some(context_window),
+        ..Default::default()
+    };
+    let _ = upsert_cached(db, &provider_key(base_url), model_id, &price, now_millis());
+}
+
+/// Resolve pricing/context for a model against the provider that owns it.
+///
+/// `provider_id` selects the provider (its base URL keys the `model_prices`
+/// cache); when `None`/unknown it falls back to the active provider. This matters
+/// whenever the header/selected provider differs from the active one: resolving
+/// against the active provider's cache would miss the model and silently fall
+/// through to the bundled family guess (e.g. every `deepseek*` → 163840 instead
+/// of the 1M models.dev actually reports for the Fireworks entry).
 #[tauri::command]
 pub fn get_pricing(
     config: tauri::State<'_, ConfigState>,
     db: tauri::State<'_, Db>,
     model_id: String,
+    provider_id: Option<String>,
 ) -> Pricing {
     let config = config.get();
-    resolve_for(&db, &config, &model_id)
+    let provider = config.provider_for(provider_id.as_deref().unwrap_or(""));
+    resolve_for_base(
+        &db,
+        &provider.base_url,
+        &config.model_overrides,
+        &model_id,
+        uses_catalog(&provider),
+    )
 }
 
 /// Fetch current prices + context windows for the configured provider from
@@ -662,9 +724,11 @@ pub fn thinking_options(
     config: tauri::State<'_, ConfigState>,
     db: tauri::State<'_, Db>,
     model_id: String,
+    provider_id: Option<String>,
 ) -> ThinkingOptions {
     let config = config.get();
-    let meta = get_meta(&db, &provider_key(&config.base_url), &model_id);
+    let provider = config.provider_for(provider_id.as_deref().unwrap_or(""));
+    let meta = get_meta(&db, &provider_key(&provider.base_url), &model_id);
     thinking_options_for(meta)
 }
 
@@ -690,7 +754,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn resolve(model_id: &str, config: &AppConfig) -> Pricing {
-        resolve_with_cache(model_id, config, None)
+        resolve_with_cache(model_id, config, None, true)
     }
 
     const SAMPLE: &str = r#"{
@@ -801,6 +865,7 @@ mod tests {
             "accounts/fireworks/models/llama-v3p1-8b-instruct",
             &config,
             Some(cached.clone()),
+            true,
         );
         assert_eq!(p.source, "fetched");
         assert_eq!(p.input_per_million, Some(9.99));
@@ -820,6 +885,7 @@ mod tests {
             "accounts/fireworks/models/llama-v3p1-8b-instruct",
             &over,
             Some(cached),
+            true,
         );
         assert_eq!(p.source, "override");
         assert_eq!(p.input_per_million, Some(0.01));
@@ -1036,6 +1102,7 @@ mod tests {
             base,
             &overrides,
             "accounts/fireworks/models/deepseek-v4-pro-0813",
+            true,
         );
         assert_eq!(p.source, "override");
         assert_eq!(p.input_per_million, Some(0.99));
@@ -1044,9 +1111,33 @@ mod tests {
 
         // The explicit base URL keys the cache: an unknown base finds no row and
         // no bundled match, so it falls to defaults.
-        let p2 = resolve_for_base(&db, "https://other.example/v1", &HashMap::new(), "some-local/unknown-model");
+        let p2 = resolve_for_base(
+            &db,
+            "https://other.example/v1",
+            &HashMap::new(),
+            "some-local/unknown-model",
+            true,
+        );
         assert_eq!(p2.source, "default");
         assert_eq!(p2.context_window, DEFAULT_CONTEXT_WINDOW);
         assert_eq!(p2.input_per_million, None);
+    }
+
+    #[test]
+    fn custom_provider_defaults_context_to_default_not_bundled() {
+        // A custom/manual provider (use_bundled_context = false): a model whose
+        // name matches a bundled family pattern must NOT inherit its guess —
+        // `qwen*` would be 32k and `deepseek*` 160k — it defaults to 200k.
+        let p = resolve_with_cache("Qwen3.8-27B-FP8", &AppConfig::default(), None, false);
+        assert_eq!(p.context_window, DEFAULT_CONTEXT_WINDOW);
+        // Bundled *rates* still apply (the ask was context-only).
+        let d = resolve_with_cache(
+            "accounts/fireworks/models/deepseek-v3",
+            &AppConfig::default(),
+            None,
+            false,
+        );
+        assert_eq!(d.context_window, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(d.input_per_million, Some(0.90));
     }
 }

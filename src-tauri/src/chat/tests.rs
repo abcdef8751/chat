@@ -257,7 +257,7 @@
         let base = format!("http://127.0.0.1:{port}/v1");
         let body = completion_body(
             "mock",
-            &build_messages("p", &[], "hi", &[]).unwrap(),
+            &build_messages("p", None, &[], "hi", &[]).unwrap(),
             &tools::tool_specs(false),
             "",
             None,
@@ -273,7 +273,7 @@
         let base = format!("http://127.0.0.1:{port}/v1");
         let body = completion_body(
             "mock",
-            &build_messages("p", &[], "hi", &[]).unwrap(),
+            &build_messages("p", None, &[], "hi", &[]).unwrap(),
             &tools::tool_specs(false),
             "",
             None,
@@ -292,7 +292,7 @@
         let base = format!("http://127.0.0.1:{port}/v1");
         let req = completion_body(
             "mock",
-            &build_messages("p", &[], "hi", &[]).unwrap(),
+            &build_messages("p", None, &[], "hi", &[]).unwrap(),
             &tools::tool_specs(false),
             "",
             None,
@@ -465,7 +465,7 @@
         let base = format!("http://127.0.0.1:{port}/v1");
         let body = completion_body(
             "mock",
-            &build_messages("p", &[], "hi", &[]).unwrap(),
+            &build_messages("p", None, &[], "hi", &[]).unwrap(),
             &tools::tool_specs(false),
             "",
             None,
@@ -1328,7 +1328,7 @@ async fn tool_loop_without_persistence_runs_memory_tool() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = TestSink(events.clone());
 
-    let messages = build_messages("p", &[], "remember I like tea", &[]).unwrap();
+    let messages = build_messages("p", None, &[], "remember I like tea", &[]).unwrap();
     let tools_list = tools::tool_specs(false);
     let result = run_tool_loop(
         &cfg,
@@ -1391,7 +1391,7 @@ async fn write_memory_is_refused_live_and_allowed_in_reflection() {
         let flag = Arc::new(AtomicBool::new(false));
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
-        let messages = build_messages("p", &[], "hi", &[]).unwrap();
+        let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
         let tools_list = tools::tool_specs(false);
         run_tool_loop(
             &cfg,
@@ -1485,7 +1485,7 @@ async fn extract_mode_refuses_every_tool_call() {
     let flag = Arc::new(AtomicBool::new(false));
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = TestSink(events.clone());
-    let messages = build_messages("p", &[], "hi", &[]).unwrap();
+    let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
     let tools_list = tools::tool_specs(false);
     let result = run_tool_loop(
         &cfg,
@@ -1537,7 +1537,7 @@ async fn extract_mode_refuses_every_tool_call() {
 /// entirely — some providers reject an empty `tools` array.
 #[test]
 fn completion_body_omits_tools_when_none_are_advertised() {
-    let messages = build_messages("p", &[], "hi", &[]).unwrap();
+    let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
     let body = completion_body("m", &messages, &[], "", None).unwrap();
     assert!(body.get("tools").is_none());
 
@@ -1679,6 +1679,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
     let tools = tools::tool_specs(false);
     let mut messages = build_messages(
         "You are a tool-using assistant. Think step by step, then call the requested tool.",
+        None,
         &[],
         "Work out 47 * 89 step by step, then use the bash tool to verify it \
          (e.g. `echo $((47*89))`), and report both your computed answer and the tool output.",
@@ -1767,3 +1768,254 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
     );
     eprintln!("round 2 ok: {} chars", round2.text.len());
 }
+
+    // --- context compaction -------------------------------------------------
+
+    fn row(id: &str, role: &str, content: &str) -> crate::db::MessageRow {
+        crate::db::MessageRow {
+            id: id.into(),
+            conversation_id: "c".into(),
+            role: role.into(),
+            index: 0,
+            content: content.into(),
+            model: None,
+            provider: None,
+            thinking_level: None,
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+            attachments: None,
+            created_at: 0,
+        }
+    }
+
+    fn conversation_with(
+        summary: Option<&str>,
+        through: Option<&str>,
+    ) -> crate::db::Conversation {
+        crate::db::Conversation {
+            id: "c".into(),
+            title: "t".into(),
+            model: None,
+            provider_id: None,
+            system_prompt: None,
+            compaction_summary: summary.map(str::to_string),
+            compaction_through: through.map(str::to_string),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// The summary is injected as a system message right after the system prompt,
+    /// ahead of the verbatim history — the exact layout compaction promises.
+    #[test]
+    fn context_puts_summary_before_history() {
+        let history = [row("m1", "user", "hello")];
+        let msgs = build_context("sys", Some("THE-SUMMARY"), &history).unwrap();
+        let v = serde_json::to_value(&msgs).unwrap();
+        let roles: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["system", "system", "user"]);
+        assert_eq!(v[1]["content"], "THE-SUMMARY");
+    }
+
+    #[test]
+    fn compacted_history_slices_after_the_boundary_id() {
+        let history = vec![
+            row("a", "user", "one"),
+            row("b", "assistant", "two"),
+            row("c", "user", "three"),
+        ];
+        let conv = conversation_with(Some("SUM"), Some("b"));
+        let (summary, start) = compacted_history(&conv, &history);
+        assert_eq!(summary.as_deref(), Some("SUM"));
+        assert_eq!(start, 2);
+        assert_eq!(history[start].id, "c");
+    }
+
+    /// A summary without its (local-only) boundary — e.g. synced from another
+    /// device — must be ignored, not applied at a guessed split.
+    #[test]
+    fn compacted_history_ignores_a_missing_boundary() {
+        let history = vec![row("a", "user", "one")];
+        let conv = conversation_with(Some("SUM"), Some("gone"));
+        let (summary, start) = compacted_history(&conv, &history);
+        assert!(summary.is_none());
+        assert_eq!(start, 0);
+    }
+
+    /// The inverse of the above, and the one that bites in practice: a boundary
+    /// whose summary was nulled by a sync pull's last-writer-wins (the summary is
+    /// on the synced row; the boundary is local-only) must NOT slice history away
+    /// with nothing injected in its place. It falls back to the full history.
+    #[test]
+    fn compacted_history_ignores_a_boundary_without_a_summary() {
+        let history = vec![row("a", "user", "one"), row("b", "user", "two")];
+        for summary in [None, Some(""), Some("   ")] {
+            let conv = conversation_with(summary, Some("a"));
+            let (s, start) = compacted_history(&conv, &history);
+            assert!(s.is_none(), "summary {summary:?} must not be applied");
+            assert_eq!(start, 0, "no messages may be dropped");
+        }
+    }
+
+    #[test]
+    fn compacted_history_handles_edge_boundaries() {
+        let history = vec![row("a", "user", "one"), row("b", "user", "two")];
+
+        // Boundary at the first message: the whole history is folded.
+        let (s, start) = compacted_history(&conversation_with(Some("SUM"), Some("a")), &history);
+        assert_eq!(s.as_deref(), Some("SUM"));
+        assert_eq!(start, 1);
+
+        // Boundary at the last message: nothing is kept verbatim.
+        let (s, start) = compacted_history(&conversation_with(Some("SUM"), Some("b")), &history);
+        assert_eq!(s.as_deref(), Some("SUM"));
+        assert_eq!(start, 2);
+        assert!(history[start..].is_empty());
+    }
+
+    /// A history that fits entirely within the verbatim budget must not fold
+    /// anything — even (defensively) when it begins on a `tool` row, `start` must
+    /// stay 0 rather than advancing past it.
+    #[test]
+    fn keep_from_leaves_a_fully_within_budget_history_alone() {
+        let history = vec![row("a", "tool", "result"), row("b", "user", "hi")];
+        assert_eq!(keep_from(&history, u64::MAX), 0);
+    }
+
+    /// The kept tail must never begin with a `tool` row: its assistant tool-call
+    /// would have been folded into the summary, orphaning the result.
+    #[test]
+    fn keep_from_never_starts_on_a_tool_row() {
+        let history = vec![
+            row("a", "user", "hi"),
+            row("b", "assistant", "{\"tool_calls\":[]}"),
+            row("c", "tool", "result"),
+            row("d", "user", "next"),
+        ];
+        let start = keep_from(&history, 10);
+        assert_eq!(start, 3, "the tool result must be folded, not lead the tail");
+        assert_ne!(history[start].role, "tool");
+    }
+
+    /// Past the threshold a turn summarizes the older history and sends the
+    /// summary plus only the recent verbatim tail; a follow-up turn reuses the
+    /// summary without re-compacting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_folds_old_history_then_reuses_the_summary() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    delta_chunk("SUMMARY-OF-OLDER"),
+                    finish_chunk("stop"),
+                    usage_chunk(),
+                ],
+                vec![delta_chunk("first"), finish_chunk("stop"), usage_chunk()],
+                vec![delta_chunk("second"), finish_chunk("stop"), usage_chunk()],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("compact"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+
+        // Window 30k → threshold 24k; 60 × ~500-token messages ≈ 30k tokens, so
+        // turn 1 is over threshold while the fixed 15k verbatim budget still
+        // leaves ~15k to fold.
+        let filler = "x".repeat(2000);
+        for i in 0..60 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let content = if i == 0 {
+                format!("ANCIENT-MARKER {filler}")
+            } else {
+                format!("OLD-{i} {filler}")
+            };
+            crate::db::insert_message(
+                &db,
+                cid.clone(),
+                role.into(),
+                content,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let mut cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        cfg.model_overrides.insert(
+            "mock".into(),
+            crate::config::ModelOverride {
+                context_window: Some(30_000),
+                ..Default::default()
+            },
+        );
+
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("compact");
+        for turn in 0..2 {
+            let flag = Arc::new(AtomicBool::new(false));
+            run_chat_turn(
+                &db,
+                &cfg,
+                "test-key",
+                &brave,
+                &shell,
+                &memory,
+                &approvals,
+                flag,
+                &sink,
+                cid.clone(),
+                format!("turn {turn}"),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        }
+        let _ = handle.join();
+
+        let caps = bodies.lock().unwrap().clone();
+        assert_eq!(caps.len(), 3, "expected summarize + two live turns");
+
+        // The first upstream call is the summarizer: it sees the folded history
+        // and advertises no tools (pure summarization).
+        assert!(
+            caps[0].contains("ANCIENT-MARKER"),
+            "the summarizer must see the folded history"
+        );
+        assert!(
+            request_body(&caps[0]).get("tools").is_none(),
+            "the summarizer must advertise no tools"
+        );
+
+        // Both live turns carry the summary and no longer the folded-away content.
+        for live in [&caps[1], &caps[2]] {
+            assert!(
+                live.contains("SUMMARY-OF-OLDER"),
+                "the live turn must carry the summary"
+            );
+            assert!(
+                !live.contains("ANCIENT-MARKER"),
+                "folded content must be gone from the live turn"
+            );
+        }
+
+        let conv = crate::db::get_conversation(&db, &cid).unwrap().unwrap();
+        assert_eq!(conv.compaction_summary.as_deref(), Some("SUMMARY-OF-OLDER"));
+        assert!(conv.compaction_through.is_some());
+    }

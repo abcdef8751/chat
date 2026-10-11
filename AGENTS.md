@@ -19,7 +19,8 @@ A general-purpose AI chat app (not a coding agent) with:
 - Reasoning traces from thinking models (inline "Thought" bar → popup)
 - Per-turn **activity timeline** grouping reasoning, preamble text, and tool calls
 - Plain-Markdown long-term **memory** curated by an idle reflection pass
-- Context + price counters (per-turn cost is frozen at the model that produced it)
+- Context + price counters (per-turn cost is frozen at the model that produced
+  it), with older history compacted into a summary once a chat nears the window
 - File attachments (native picker + drag-drop; images as vision parts, documents
   folded into the prompt)
 - Dark mode by default (header toggle)
@@ -46,9 +47,9 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **127 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **145 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
-`tsc --noEmit`, `npm run build`, and `npm run e2e` are clean.
+`tsc --noEmit`, and `npm run build` are clean.
 
 | Area              | State | Notes                                                                                                     |
 | ----------------- | ----- | --------------------------------------------------------------------------------------------------------- |
@@ -59,7 +60,7 @@ check, the real-export import, and the real models.dev catalog parse). Clippy,
 | Tools             | ✅    | `bash` (one-shot shell), `read_file`/`write_file` (gated), native Brave search tools (ungated)          |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
 | Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
-| Context + price   | ◑     | Context counter + frozen per-turn cost done; **near-limit banner + compaction (M7) remain**                |
+| Context + price   | ✅    | Context counter, frozen per-turn cost, near-limit note, forced compaction (M7)                            |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
 
 ---
@@ -70,7 +71,8 @@ check, the real-export import, and the real models.dev catalog parse). Clippy,
 
 ```
 prompt(userMessage)
-├─ build context (system + explicit preferences + memory + history [+ compaction summary])
+├─ build context (system + preferences + memory + [compaction summary] + verbatim history)
+├─ if the request is over 80% of the window: fold older history into the summary first
 ├─ stream deltas ─────────────────────────── emit `delta` / `thinkingDelta` events
 ├─ if assistant emits tool calls:
 │   ├─ gate each call (approve / deny / abort)
@@ -96,6 +98,60 @@ following rounds (DeepSeek thinking mode requires it, else HTTP 400); traces are
 
 ---
 
+## Context compaction
+
+Keeps a long conversation inside the model's window without losing the raw
+record. When a live turn's request would reach **80%** of the resolved window
+(`COMPACTION_THRESHOLD`), the turn runs a compaction pass first, then builds the
+request from the result.
+
+- **Layout:** exactly `system prompt → compaction summary (a system message) →
+  last ~15k tokens of history verbatim → the new turn` (`COMPACTION_KEEP_TOKENS`).
+  The summary comes from a single tool-less summarization round.
+- **Incremental:** the pass folds the *previous* summary plus only the messages
+  since the last watermark, so a long chat is never re-summarized from scratch
+  and the summarizer call stays bounded.
+- **Boundary:** `conversations.compaction_through` stores the **id** of the
+  newest folded message — never an index, because cross-device pull renumbers
+  `index`. Messages after it are sent verbatim. The kept tail never begins on a
+  `tool` row, so a tool result is never orphaned from its call.
+- **Storage:** raw messages are **never deleted**; compaction changes only what
+  is *injected*. The summary + boundary live on the conversation row.
+- **Cost:** each pass is recorded in `memory_reflections` (background
+  maintenance spend, kept out of chat cost), like a reflection run.
+- **UI:** a non-blocking note above the composer past 80%, a `compacted` chip in
+  the header meter, and a line in the meter tooltip.
+
+**No race with memory consolidation.** Reflection and compaction both read the
+transcript and write maintenance state, so their interlock is explicit:
+
+1. Compaction runs *inside* the live turn, which is registered in
+   `StreamRegistry` — so the reflection scheduler skips that conversation and an
+   in-flight reflection's watcher aborts it. The two never run at once.
+2. They write **disjoint columns**, one locked statement each: `set_compaction`
+   owns `compaction_summary`/`compaction_through`; `set_last_reflected_index`
+   owns `last_reflected_index`. Compaction never touches `updated_at`, so it
+   cannot reset the reflection idle timer or reorder the sidebar.
+3. Raw messages are never deleted, so a reflection reading the transcript at any
+   moment sees valid data.
+4. Reflection reads its summary + boundary from the **same conversation snapshot**
+   as its history, so an interleaved compaction write cannot desync them (a stale
+   boundary only widens the verbatim range, never drops context).
+
+The per-conversation reflection pass uses the **same compacted view** as a live
+turn, so the shared prefix stays prompt-cacheable and the pass stays bounded on a
+long chat. The backfill's extraction (map) phase deliberately keeps the **raw**
+history — it wants every fact, not the gist.
+
+`compaction_through` is **local-only** (not synced; it needs no Supabase schema
+change). `compaction_summary` still rides the conversation row. Because the two
+halves have different lifetimes, the resolver requires **both**: a summary
+without its boundary, or a boundary whose summary was nulled by a sync pull's
+last-writer-wins, both make the compaction be ignored (full history sent) rather
+than guess a split that could drop context.
+
+---
+
 ## Data model (SQLite)
 
 Schema lives in `db.rs` `SCHEMA` (idempotent `CREATE TABLE IF NOT EXISTS`), with
@@ -104,6 +160,7 @@ best-effort `ALTER TABLE ... ADD COLUMN` migrations in `open()`.
 ```sql
 conversations(
   id, title, model, system_prompt, compaction_summary,
+  compaction_through,            -- id of the newest message folded into the summary (local-only)
   last_reflected_index,          -- memory-reflection watermark
   imported,                      -- 1 = came from an export; backfill-only
   created_at, updated_at)
@@ -560,11 +617,26 @@ and the app is byte-identical to before. Never blocks the UI.
 
 ## Next / open items
 
-**Milestone 7 — context** (the last functional gap):
+**Milestone 7 — context** (done except the optional tail):
 
-1. Reserve + **near-limit banner**: "near context limit — compact or new chat" (non-blocking; never silently compact).
-2. Per-conversation compaction: summarize older messages into `conversations.compaction_summary` and feed that into `build_messages` instead of the full history.
+1. ✅ **Near-limit note**: a non-blocking line above the composer past 80% and a
+   `compacted` chip in the meter. Compaction is automatic, so the note informs
+   rather than prompting action (the original "compact or new chat" wording no
+   longer applies).
+2. ✅ **Per-conversation compaction**: older messages are summarized into
+   `conversations.compaction_summary` and fed into the request as
+   `system + summary + last ~15k tokens verbatim`; forced at 80% of the window.
+   See "Context compaction" above.
 3. Optional: sidebar cost readout; virtualized message list.
+
+**Known limitation (compaction):** `COMPACTION_KEEP_TOKENS` (15k) is a fixed
+absolute budget, so a window whose 80% threshold is below ~19k tokens leaves
+nothing to fold (the whole history fits the verbatim budget) and no compaction
+runs. Also, the first pass folds everything before the 15k tail in one request;
+in practice that is smaller than the request that triggered it, but a very large
+jump (e.g. a freshly imported archive) could produce a large summarizer call.
+Deeper work: a request-size-aware keep budget and window-aware chunking (as the
+backfill reduce does).
 
 **V2 (deferred):** conversation recall via a vector index (sqlite-vec + embedder;
 behind a retrieval seam); container/sandbox tool execution; richer cross-conversation

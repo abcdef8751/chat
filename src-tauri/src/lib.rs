@@ -84,6 +84,7 @@ pub fn run() {
             db::search_conversations,
             config::get_config,
             config::set_config,
+            config::set_model_overrides,
             providers::list_providers,
             providers::add_provider,
             providers::update_provider,

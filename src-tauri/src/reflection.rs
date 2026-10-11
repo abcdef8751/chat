@@ -137,15 +137,14 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     let system_prompt =
         chat::build_system_prompt(&base_prompt, &model_label, &cfg.preferences, &memory);
 
-    let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
-    messages.push(
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content(system_prompt)
-            .build()
-            .map_err(|e| e.to_string())?
-            .into(),
-    );
-    messages.extend(chat::build_history_messages(&history)?);
+    // Use the same compaction-aware context as a live turn (system prompt →
+    // summary → verbatim tail), so the shared prefix stays cacheable and the pass
+    // stays bounded on a long, already-compacted conversation. The boundary and
+    // the summary come from the same conversation snapshot as `history`, so an
+    // interleaved compaction write cannot desync them.
+    let (summary, keep_start) = chat::compacted_history(&conversation, &history);
+    let mut messages =
+        chat::build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
     messages.push(
         ChatCompletionRequestSystemMessageArgs::default()
             .content(reflection_tail(&recent))
