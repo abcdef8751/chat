@@ -97,6 +97,7 @@ fn normalize_catalog_id(catalog_id: &Option<String>) -> Option<String> {
 #[tauri::command]
 pub fn add_provider(
     config: tauri::State<'_, ConfigState>,
+    db: tauri::State<'_, crate::db::Db>,
     name: String,
     base_url: String,
     api_key: Option<String>,
@@ -132,6 +133,10 @@ pub fn add_provider(
         sync_active(&mut cfg, &id);
     }
     config.set(cfg)?;
+    // Mirror the provider-list change into the sync row so the next push backs
+    // it up (same as set_config does for other config edits).
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::db::sync_user_config(&conn, &config.get())?;
     Ok(info_for(&config.get(), &provider))
 }
 
@@ -140,6 +145,7 @@ pub fn add_provider(
 #[tauri::command]
 pub fn update_provider(
     config: tauri::State<'_, ConfigState>,
+    db: tauri::State<'_, crate::db::Db>,
     id: String,
     name: Option<String>,
     base_url: Option<String>,
@@ -179,6 +185,8 @@ pub fn update_provider(
     }
     let result = info_for(&config.get(), &cfg.providers[idx].clone());
     config.set(cfg)?;
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::db::sync_user_config(&conn, &config.get())?;
     Ok(result)
 }
 
@@ -188,6 +196,7 @@ pub fn update_provider(
 #[tauri::command]
 pub fn remove_provider(
     config: tauri::State<'_, ConfigState>,
+    db: tauri::State<'_, crate::db::Db>,
     id: String,
 ) -> Result<Vec<ProviderInfo>, String> {
     let mut cfg = config.get();
@@ -205,6 +214,8 @@ pub fn remove_provider(
         }
     }
     config.set(cfg)?;
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::db::sync_user_config(&conn, &config.get())?;
     Ok(list_providers(config))
 }
 
@@ -212,6 +223,7 @@ pub fn remove_provider(
 #[tauri::command]
 pub fn set_active_provider(
     config: tauri::State<'_, ConfigState>,
+    db: tauri::State<'_, crate::db::Db>,
     id: String,
 ) -> Result<ProviderInfo, String> {
     let mut cfg = config.get();
@@ -220,6 +232,8 @@ pub fn set_active_provider(
     };
     sync_active(&mut cfg, &id);
     config.set(cfg)?;
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::db::sync_user_config(&conn, &config.get())?;
     Ok(info_for(&config.get(), &provider))
 }
 

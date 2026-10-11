@@ -836,7 +836,10 @@ async fn empty_user_config_row_is_never_pushed() {
     let mem = temp_memory("emptycfg", &db);
     let cfg = temp_config("emptycfg");
 
-    // Plant a dirty, empty user_config row directly (what a blank device has).
+    // Plant a dirty user_config row as a real blank device has one: an EMPTY
+    // user-owned config but with the DEFAULT_BASE_URL / DEFAULT_MODEL mirrors
+    // filled in (exactly what `syncable_payload()` emits for a default config).
+    // The guard must still recognize this as "nothing to back up" and NOT push it.
     {
         let conn = db.0.lock().unwrap();
         conn.execute(
@@ -844,7 +847,9 @@ async fn empty_user_config_row_is_never_pushed() {
              ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, revision = excluded.revision, dirty = 1",
             rusqlite::params![json!({
                 "preferences": "", "providers": [], "activeProviderId": "",
-                "baseUrl": "", "model": "", "modelOverrides": {}
+                "baseUrl": "https://api.fireworks.ai/inference/v1",
+                "model": "deepseek-v4-flash-0731",
+                "modelOverrides": {}
             }).to_string()],
         )
         .unwrap();

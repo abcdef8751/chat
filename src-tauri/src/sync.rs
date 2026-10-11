@@ -1002,11 +1002,15 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
 fn syncable_payload_is_empty(payload: &str) -> bool {
     match serde_json::from_str::<SyncableConfig>(payload) {
         Ok(sc) => {
+            // A config is "empty" (nothing user-owned to back up) when every field
+            // the user configures is defaulted. base_url/model are intentionally
+            // NOT considered: `syncable_payload()` always fills them with the
+            // DEFAULT_BASE_URL/DEFAULT_MODEL, so a blank device's default row has
+            // non-empty mirrors — guarding on them would make this dead for real
+            // configs and let a blank device clobber the canonical on the mirror.
             sc.providers.is_empty()
                 && sc.active_provider_id.is_empty()
                 && sc.preferences.trim().is_empty()
-                && sc.base_url.is_empty()
-                && sc.model.is_empty()
                 && sc.model_overrides.is_empty()
         }
         // Unparseable — assume non-empty so it is pushed as-is rather than dropped.
@@ -1779,17 +1783,26 @@ fn apply_user_config(ctx: &SyncCtx, rows: &[Value]) -> Result<(), String> {
                 if !sc.active_provider_id.is_empty() {
                     cfg.active_provider_id = sc.active_provider_id.clone();
                 }
+                // Refresh the legacy mirrors too so a freshly-adopting blank device
+                // does not keep its DEFAULT_BASE_URL/DEFAULT_MODEL (which a later
+                // syncing edit would otherwise push over the canonical).
+                if !sc.base_url.is_empty() {
+                    cfg.base_url = sc.base_url.clone();
+                }
+                if !sc.model.is_empty() {
+                    cfg.model = sc.model.clone();
+                }
                 changed = true;
-            }
-            // Legacy effective provider: only adopt on a device that has no real
-            // providers of its own, so a legacy-only remote can seed a blank one.
-            if cfg.providers.is_empty() && !sc.base_url.is_empty() && cfg.base_url.is_empty() {
-                cfg.base_url = sc.base_url.clone();
-                changed = true;
-            }
-            if cfg.providers.is_empty() && !sc.model.is_empty() && cfg.model.is_empty() {
-                cfg.model = sc.model.clone();
-                changed = true;
+            } else {
+                // Legacy-only remote: seed a blank device's empty mirrors.
+                if !sc.base_url.is_empty() && cfg.base_url.is_empty() {
+                    cfg.base_url = sc.base_url.clone();
+                    changed = true;
+                }
+                if !sc.model.is_empty() && cfg.model.is_empty() {
+                    cfg.model = sc.model.clone();
+                    changed = true;
+                }
             }
         }
         if cfg.model_overrides.is_empty() && !sc.model_overrides.is_empty() {
@@ -1813,6 +1826,25 @@ fn apply_user_config(ctx: &SyncCtx, rows: &[Value]) -> Result<(), String> {
             max_rev = max_rev.max(p.revision);
             if !p.remote_newer {
                 continue; // local already at/above this revision — keep it
+            }
+            // Re-check against a possibly-concurrent local write (Settings save /
+            // provider edit runs on the UI thread while this pulls on a background
+            // thread). If the row's revision has moved past the remote since phase 1,
+            // the local edit wins — do NOT overwrite it or clear its dirty flag, or
+            // that edit would be silently lost (regressed below its own revision and
+            // never pushed). The watermark still advances: the remote was seen, and
+            // the concurrent local edit is dirty and will be pushed on the next tick.
+            let cur: i64 = tx
+                .query_row(
+                    "SELECT revision FROM user_config WHERE id = ?1",
+                    [&p.id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .unwrap_or(-1);
+            if cur >= p.revision && cur != -1 {
+                continue;
             }
             let merged = ctx.config.get().syncable_payload().to_string();
             tx.execute(
