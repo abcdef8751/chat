@@ -676,7 +676,9 @@ export default function App() {
   createEffect(() => {
     if (typeof window === "undefined") return;
     if (wideViewport()) return;
-    const EDGE = 32; // px from the left edge where an opening drag may begin
+    // Touch-only: the drawer has a hamburger/backdrop for mouse users, and
+    // treating drags as touch avoids hijacking text selection with a mouse.
+    const EDGE = 64; // px from the left edge where an opening drag may begin
     const THRESHOLD = 56; // px of horizontal travel needed to trigger
 
     let tracking = false;
@@ -686,7 +688,7 @@ export default function App() {
     let pointerId: number | null = null;
 
     const onPointerDown = (e: PointerEvent) => {
-      if (e.pointerType === "mouse" && e.button !== 0) return;
+      if (e.pointerType !== "touch") return;
       if (!e.isPrimary) return;
       if (wideViewport()) return;
       const fromLeftEdge = e.clientX <= EDGE;
@@ -2365,6 +2367,9 @@ export default function App() {
         "padding-bottom": `${insets().bottom}px`,
         "padding-left": `${insets().left}px`,
         "padding-right": `${insets().right}px`,
+        // Hand horizontal touch drags to JS (for the left-edge drawer swipe)
+        // while keeping vertical scrolling native in the chat/message lists.
+        "touch-action": "pan-y",
       }}
     >
       <Show when={dragOver()}>
@@ -3934,7 +3939,7 @@ export default function App() {
 
                     <div class="flex items-center gap-2">
                       <Show when={memoryError()}>
-                        <span class="max-w-56 truncate text-[11px] text-red-600 dark:text-red-400">
+                        <span class="max-w-64 whitespace-pre-wrap break-words text-[11px] text-red-600 dark:text-red-400">
                           {memoryError()}
                         </span>
                       </Show>
@@ -4122,8 +4127,7 @@ export default function App() {
               </Show>
               <Show when={backfill()?.lastError}>
                 <p
-                  class="mt-1 truncate text-[11px] text-red-600 dark:text-red-400"
-                  title={backfill()!.lastError ?? ""}
+                  class="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded-md bg-red-50 p-2 text-[11px] leading-relaxed text-red-600 dark:bg-red-950/40 dark:text-red-400"
                 >
                   last error: {backfill()!.lastError}
                 </p>
