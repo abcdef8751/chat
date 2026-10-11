@@ -383,8 +383,10 @@ pub const DEFAULT_CONCURRENCY: usize = 8;
 const MAX_CONCURRENCY: usize = 64;
 /// Floor, so a throttled run still makes progress.
 const MIN_CONCURRENCY: usize = 1;
-/// Attempts per pass before it is counted as failed.
-const PASS_ATTEMPTS: u32 = 4;
+/// Attempts per pass before it is counted as failed. Each retry backs off
+/// exponentially (2s, 4s, 8s, 16s, capped at 60s). So up to 5 attempts total
+/// (an initial try + up to 4 retries) on transient provider errors.
+const PASS_ATTEMPTS: u32 = 5;
 /// Fraction of the model's context window the staged summaries may occupy before
 /// the reduce is split into several passes. One pass is preferred: it sees every
 /// summary at once and resolves contradictions better than a fold. Chunking is a
@@ -644,11 +646,16 @@ pub fn backfill_status(state: tauri::State<'_, Backfill>) -> BackfillStatus {
     state.snapshot()
 }
 
-/// Ask a running backfill to stop. It finishes the passes already in flight and
-/// skips the reduce, leaving staged extractions intact for a later run.
+/// Ask a running backfill to stop. In-flight passes are allowed to finish — we
+/// don't tear down requests mid-stream — so the visible phase moves to a
+/// "cancelling" state immediately so the user knows the request was received and
+/// the run is winding down (the passes already in flight will complete, then the
+/// reduce is skipped and it stops, leaving staged extractions intact).
 #[tauri::command]
-pub fn cancel_backfill(state: tauri::State<'_, Backfill>) {
+pub fn cancel_backfill(app: tauri::AppHandle, state: tauri::State<'_, Backfill>) {
     state.cancel.store(true, Ordering::SeqCst);
+    state.set_phase("cancelling — finishing in-flight passes");
+    let _ = app.emit("memory-backfill", state.snapshot());
 }
 
 /// How many conversations are staged vs. still awaiting extraction.
