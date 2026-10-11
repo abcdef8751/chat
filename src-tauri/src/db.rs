@@ -724,7 +724,42 @@ pub fn mark_memory_dirty(conn: &Connection, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// One-time seeding for the first sync: mark every pre-existing row (and every
+/// Ensure dirty rows carry a non-zero revision before a push. Rows that were
+/// inserted without a revision — imported archives or legacy rows that predate
+/// the sync columns — sit at `revision = 0`. Pushed as-is they upload with
+/// `revision: 0`, clear their dirty flag, and yet are invisible to *every* pull
+/// (which filters `revision > last_seen` and starts at 0), a permanent sync
+/// black hole. Bump them to a fresh revision so they become visible.
+///
+/// `table` is one of the two syncable tables (`conversations`/`messages`), both
+/// of which have an `id` primary key plus `revision`/`dirty` columns; the name
+/// is passed as a literal constant by the caller, never attacker input. `limit`
+/// bounds how many rows are bumped in one call so a large backfill (e.g. tens of
+/// thousands of imported message rows) is processed in bounded chunks across
+/// consecutive sync ticks instead of building a giant in-memory push payload at
+/// once (which can exhaust the heap and abort the process).
+pub fn bump_zero_dirty(conn: &Connection, table: &str, limit: i64) -> Result<u64, String> {
+    let ids: Vec<String> = {
+        let mut st = conn
+            .prepare(&format!(
+                "SELECT id FROM {table} WHERE dirty = 1 AND revision = 0 LIMIT ?1"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([limit], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+    };
+    for id in &ids {
+        let rev = bump_revision_c(conn)?;
+        conn.execute(
+            &format!("UPDATE {table} SET revision = ?2, dirty = 1 WHERE id = ?1"),
+            params![id, rev],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(ids.len() as u64)
+}
 /// on-disk memory file) dirty so the initial push mirrors full history — the
 /// "backup" slice. Without this, rows that predate the feature (default revision
 /// 0 / dirty 0) would never be pushed and enabling sync on an existing user
@@ -1270,13 +1305,24 @@ pub fn insert_imported_conversation(
         .execute(
             "INSERT OR IGNORE INTO conversations
                (id, title, model, system_prompt, compaction_summary, last_reflected_index,
-                imported, import_batch, created_at, updated_at)
-             VALUES (?1, ?2, ?3, NULL, NULL, NULL, 1, ?6, ?4, ?5)",
+                imported, import_batch, created_at, updated_at, dirty)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL, 1, ?6, ?4, ?5, 1)",
             params![id, title, model, created_at, updated_at, import_batch],
         )
         .map_err(|e| e.to_string())?
         > 0;
     if !inserted {
+        // The chat already exists from a prior import (re-import is a no-op by
+        // design). Still mark it and its messages dirty so re-importing an
+        // archive re-syncs it — without this, chats imported after the first
+        // sync's one-time seed are never pushed to the mirror.
+        tx.execute("UPDATE conversations SET dirty = 1 WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE messages SET dirty = 1 WHERE conversation_id = ?1 AND role != 'memory'",
+            [id],
+        )
+        .map_err(|e| e.to_string())?;        tx.commit().map_err(|e| e.to_string())?;
         return Ok(false);
     }
 
@@ -1285,8 +1331,8 @@ pub fn insert_imported_conversation(
             .prepare(
                 "INSERT OR IGNORE INTO messages
                    (id, conversation_id, role, \"index\", content, model, provider,
-                    thinking_level, thinking, usage, stop_reason, attachments, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL, ?8, NULL, ?9)",
+                    thinking_level, thinking, usage, stop_reason, attachments, created_at, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL, ?8, NULL, ?9, 1)",
             )
             .map_err(|e| e.to_string())?;
         for m in messages {
@@ -1352,6 +1398,52 @@ mod tests {
         assert_eq!(derive_title(&long), format!("{}…", "x".repeat(60)));
         assert_eq!(derive_title("  \n  spaced  "), "spaced");
         assert_eq!(derive_title(""), "New chat");
+    }
+
+    /// Rows that sit at revision 0 (imported archives / pre-sync legacy rows) are
+    /// invisible to every pull (`revision > last_seen`), even though their dirty
+    /// flag gets cleared after a push. `bump_zero_dirty` must give them a real
+    /// revision so they become visible — without touching rows that already have one.
+    #[test]
+    fn bump_zero_dirty_assigns_revisions_to_rev0_legacy_rows() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-zero-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+        {
+            let conn = db.0.lock().unwrap();
+            // Legacy row at revision 0 / dirty 1 — the never-sync black-hole class.
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at, revision, dirty)
+                 VALUES ('legacy', 'Legacy', 1, 1, 0, 1)",
+                [],
+            )
+            .unwrap();
+            // An already-revisioned dirty row must be left untouched.
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at, revision, dirty)
+                 VALUES ('fresh', 'Fresh', 1, 1, 500, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let n = bump_zero_dirty(&db.0.lock().unwrap(), "conversations", 100).unwrap();
+        assert_eq!(n, 1, "only the one revision-0 dirty row should be bumped");
+
+        let conn = db.0.lock().unwrap();
+        let legacy_rev: i64 = conn
+            .query_row("SELECT revision FROM conversations WHERE id='legacy'", [], |r| r.get(0))
+            .unwrap();
+        let fresh_rev: i64 = conn
+            .query_row("SELECT revision FROM conversations WHERE id='fresh'", [], |r| r.get(0))
+            .unwrap();
+        let legacy_dirty: i64 = conn
+            .query_row("SELECT dirty FROM conversations WHERE id='legacy'", [], |r| r.get(0))
+            .unwrap();
+        assert!(legacy_rev > 0, "legacy row must get a non-zero revision, got {legacy_rev}");
+        assert_eq!(fresh_rev, 500, "already-revisioned row must be left alone");
+        assert_eq!(legacy_dirty, 1, "a bumped row must stay dirty so it gets pushed");
     }
 
     /// An interrupted consolidation must resume at the first unfolded batch, and

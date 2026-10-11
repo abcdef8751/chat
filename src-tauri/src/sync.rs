@@ -633,8 +633,34 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     // First sync: mark all pre-existing rows + memory files dirty so the initial
     // push backs up full history. Scoped per account (a guarded no-op after each
     // account's first run).
-    let mem_names = ctx.memory.file_names();
+    // Only seed memory files that actually hold content. A fresh device auto-
+    // creates EMPTY core files (profile/preferences/goals) at startup; if those
+    // empty stubs were marked dirty here, their freshly-bumped revisions would
+    // beat the real content already on the mirror under last-writer-wins and
+    // silently drop it on pull. An empty file has nothing to back up, so skip it.
+    let mem_names = ctx
+        .memory
+        .file_names()
+        .into_iter()
+        .filter(|n| ctx.memory.read(n).map(|c| !c.trim().is_empty()).unwrap_or(false))
+        .collect::<Vec<_>>();
     db::seed_initial_sync(ctx.db, &session.user_id, &mem_names)?;
+    // Existing imported chats (from an Anthropic archive) were written before the
+    // sync-dirty fix landed, so they (and thousands of their messages) sit at
+    // dirty = 0 / revision = 0 and would never be pushed to the mirror. Re-mark
+    // any never-synced row dirty so the next push backs it up. Idempotent: once
+    // pushed they get a real revision and drop out of the `revision = 0` filter.
+    // `role != 'memory'` excludes the never-synced consolidation notes.
+    {
+        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        conn.execute("UPDATE conversations SET dirty = 1 WHERE revision = 0", [])
+            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE messages SET dirty = 1 WHERE revision = 0 AND role != 'memory'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     // A device without the key must never push plaintext over an encrypted
     // mirror. Detect it and refuse (the UI then asks for the passphrase).
     if ctx.key.is_none() {
@@ -655,6 +681,17 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
             sync.set_error(e.clone());
             return Err(e);
         }
+    }
+    // Record the success time as soon as the push lands — not only after the pull.
+    // A device may have successfully pushed (dirty flags cleared) yet hit a
+    // retryable pull error; without this the config would stay "never synced"
+    // indefinitely even while data flows. The final write below may refresh it.
+    let at = now_ms();
+    sync.set_success(at);
+    {
+        let mut cfg = app.state::<ConfigState>().get();
+        cfg.sync_last_sync_at = Some(at);
+        let _ = app.state::<ConfigState>().set(cfg);
     }
     sync.set_phase("pull");
     match pull(&ctx, &session.user_id, &token).await {
@@ -705,6 +742,9 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
     // Conversations (dirty rows + tombstones).
     let (conv_rows, conv_tombstones) = {
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        // Legacy/imported rows can sit at revision 0; bump them so the push emits
+        // a non-zero revision and they become visible to pulls. (See bump_zero_dirty.)
+        db::bump_zero_dirty(&conn, "conversations", PUSH_CONV_BATCH)?;
         let mut rows = Vec::new();
         let mut stmt = conn
             .prepare(
@@ -775,49 +815,61 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
         total += row_count as u64;
     }
 
-    // Messages.
-    let msg_rows = {
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, conversation_id, role, \"index\", content, model, provider,
-                        thinking_level, thinking, usage, stop_reason, attachments, created_at, revision
-                 FROM messages WHERE dirty = 1",
-            )
-            .map_err(|e| e.to_string())?;
-        let key = ctx.key;
-        let r = stmt
-            .query_map([], |r| {
-                Ok(json!({
-                    "id": r.get::<_, String>(0)?,
-                    "conversation_id": r.get::<_, String>(1)?,
-                    "role": r.get::<_, String>(2)?,
-                    "seq": r.get::<_, i64>(3)?,
-                    "content": enc_str(key, r.get::<_, String>(4)?),
-                    "model": r.get::<_, Option<String>>(5)?,
-                    "provider": r.get::<_, Option<String>>(6)?,
-                    "thinking_level": r.get::<_, Option<String>>(7)?,
-                    "thinking": enc_opt(key, r.get::<_, Option<String>>(8)?),
-                    "usage": enc_opt(key, r.get::<_, Option<String>>(9)?),
-                    "stop_reason": r.get::<_, Option<String>>(10)?,
-                    "attachments": enc_opt(key, r.get::<_, Option<String>>(11)?),
-                    "created_at": r.get::<_, i64>(12)?,
-                    "revision": r.get::<_, i64>(13)?,
-                    "deleted_at": Value::Null,
-                }))
-            })
-            .map_err(|e| e.to_string())?;
-        let rows: Result<Vec<Value>, String> =
-            r.map(|row| row.map_err(|e| e.to_string())).collect();
-        drop(stmt);
-        rows?
-    };
-    if !msg_rows.is_empty() {
-        post_upsert(ctx, "messages", token, &msg_rows, progress, |chunk| {
-            clear_message_keys(ctx.db, chunk)
+    // Messages: drain the whole backlog within this run, in bounded chunks.
+    // Building ~55k messages into one in-memory JSON payload at once can exhaust
+    // the heap and abort the process (a crash we hit with imported archives), so
+    // each chunk is capped at PUSH_MSG_BATCH and uploaded+cleared before the next
+    // is read. The loop keeps going until nothing is left dirty, so a large
+    // backfill completes in one sync run rather than one chunk per 60s tick.
+    loop {
+        let chunk = {
+            let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+            // Bump a bounded batch of still-revision-0 rows to visible revisions.
+            // `revision > 0` in the SELECT guarantees we never re-upload a
+            // revision-0 row. (See bump_zero_dirty.)
+            db::bump_zero_dirty(&conn, "messages", PUSH_MSG_BATCH)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, conversation_id, role, \"index\", content, model, provider,
+                            thinking_level, thinking, usage, stop_reason, attachments, created_at, revision
+                     FROM messages WHERE dirty = 1 AND revision > 0 LIMIT ?1",
+                )
+                .map_err(|e| e.to_string())?;
+            let key = ctx.key;
+            let r = stmt
+                .query_map([PUSH_MSG_BATCH], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "conversation_id": r.get::<_, String>(1)?,
+                        "role": r.get::<_, String>(2)?,
+                        "seq": r.get::<_, i64>(3)?,
+                        "content": enc_str(key, r.get::<_, String>(4)?),
+                        "model": r.get::<_, Option<String>>(5)?,
+                        "provider": r.get::<_, Option<String>>(6)?,
+                        "thinking_level": r.get::<_, Option<String>>(7)?,
+                        "thinking": enc_opt(key, r.get::<_, Option<String>>(8)?),
+                        "usage": enc_opt(key, r.get::<_, Option<String>>(9)?),
+                        "stop_reason": r.get::<_, Option<String>>(10)?,
+                        "attachments": enc_opt(key, r.get::<_, Option<String>>(11)?),
+                        "created_at": r.get::<_, i64>(12)?,
+                        "revision": r.get::<_, i64>(13)?,
+                        "deleted_at": Value::Null,
+                    }))
+                })
+                .map_err(|e| e.to_string())?;
+            let rows: Result<Vec<Value>, String> =
+                r.map(|row| row.map_err(|e| e.to_string())).collect();
+            drop(stmt);
+            rows?
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        post_upsert(ctx, "messages", token, &chunk, progress, |c| {
+            clear_message_keys(ctx.db, c)
         })
         .await?;
-        total += msg_rows.len() as u64;
+        total += chunk.len() as u64;
     }
 
     // Memory files (live content or tombstone).
@@ -977,6 +1029,18 @@ const UPSERT_BATCH_SIZE: usize = 400;
 /// bounded 8-way burst of small POSTs is ordinary web load.
 const PUSH_CONCURRENCY: usize = 8;
 
+/// How many dirty messages to bring into an in-memory push payload per chunk.
+/// A first sync after enabling sync on a large imported archive can have tens of
+/// thousands of dirty messages; building too many at once both sizes the heap
+/// and (holding the DB lock while serializing + clearing) stalls the UI's own
+/// DB reads, which makes a big push feel laggy. Keep the chunk small; the push
+/// loop drains the whole backlog one chunk at a time within a single run.
+const PUSH_MSG_BATCH: i64 = 500;
+
+/// Conversations are far fewer than messages, so this cap is generous — just
+/// enough headroom to never become the binding constraint in practice.
+const PUSH_CONV_BATCH: i64 = 100_000;
+
 async fn post_upsert<F>(
     ctx: &SyncCtx<'_>,
     table: &str,
@@ -1112,40 +1176,69 @@ struct RemoteMemory {
     deleted_at: Option<i64>,
 }
 
-/// Pull rows newer than the per-entity high-water mark and apply them. Returns
-/// the number of rows fetched (so callers can surface live progress).
+/// Pull rows newer than the per-entity high-water mark and apply them, draining
+/// the entire backlog within this one run rather than one 1000-row page per tick.
+/// A first sync on a large archive can have tens of thousands of rows; looping
+/// here (each page advancing the watermark before the next is fetched) completes
+/// the backfill in a single run — the same "batch it within one sync" behaviour
+/// the push uses. Returns the number of rows fetched.
 async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<u64, String> {
-    let last_conv = last_seen(ctx.db, "conversations");
-    let convs = get_table(ctx, "conversations", me, token, last_conv).await?;
-    let last_msg = last_seen(ctx.db, "messages");
-    let msgs = get_table(ctx, "messages", me, token, last_msg).await?;
-    let last_mem = last_seen(ctx.db, "memory");
-    let mems = get_table(ctx, "memory_files", me, token, last_mem).await?;
+    let mut total: u64 = 0;
 
-    // Restore plaintext for the content fields before applying to the local DB.
-    // A row whose ciphertext can't be decrypted (wrong key) is dropped rather
-    // than written to the local DB as ciphertext.
-    let convs = if let Some(key) = ctx.key {
-        decrypt_rows(&key, convs, &["title", "system_prompt", "compaction_summary"])
-    } else {
-        convs
-    };
-    let msgs = if let Some(key) = ctx.key {
-        decrypt_rows(&key, msgs, &["content", "thinking", "usage", "attachments"])
-    } else {
-        msgs
-    };
-    let mems = if let Some(key) = ctx.key {
-        decrypt_rows(&key, mems, &["content"])
-    } else {
-        mems
-    };
+    // Conversations.
+    loop {
+        let since = last_seen(ctx.db, "conversations");
+        let mut rows = get_table(ctx, "conversations", me, token, since).await?;
+        if rows.is_empty() {
+            break;
+        }
+        if let Some(key) = ctx.key {
+            rows = decrypt_rows(&key, rows, &["title", "system_prompt", "compaction_summary"]);
+        }
+        apply_conversations(ctx.db, &rows).await?;
+        total += rows.len() as u64;
+        // Stop when the page wasn't full (drained) or made no progress (e.g. all
+        // rows were local-wins/tombstoned and the watermark didn't move).
+        if rows.len() < 1000 || last_seen(ctx.db, "conversations") <= since {
+            break;
+        }
+    }
 
-    apply_conversations(ctx.db, &convs).await?;
-    apply_messages(ctx.db, &msgs).await?;
-    apply_memory(ctx.db, ctx.memory, &mems)?;
+    // Messages.
+    loop {
+        let since = last_seen(ctx.db, "messages");
+        let mut rows = get_table(ctx, "messages", me, token, since).await?;
+        if rows.is_empty() {
+            break;
+        }
+        if let Some(key) = ctx.key {
+            rows = decrypt_rows(&key, rows, &["content", "thinking", "usage", "attachments"]);
+        }
+        apply_messages(ctx.db, &rows).await?;
+        total += rows.len() as u64;
+        if rows.len() < 1000 || last_seen(ctx.db, "messages") <= since {
+            break;
+        }
+    }
 
-    Ok((convs.len() + msgs.len() + mems.len()) as u64)
+    // Memory files.
+    loop {
+        let since = last_seen(ctx.db, "memory");
+        let mut rows = get_table(ctx, "memory_files", me, token, since).await?;
+        if rows.is_empty() {
+            break;
+        }
+        if let Some(key) = ctx.key {
+            rows = decrypt_rows(&key, rows, &["content"]);
+        }
+        apply_memory(ctx.db, ctx.memory, &rows)?;
+        total += rows.len() as u64;
+        if rows.len() < 1000 || last_seen(ctx.db, "memory") <= since {
+            break;
+        }
+    }
+
+    Ok(total)
 }
 
 /// Decrypt the named string fields of each row. Rows with no encrypted field are
@@ -1307,14 +1400,17 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
     let mut max_rev = 0;
     let mut to_reindex: Vec<String> = Vec::new();
     for r in &parsed {
-        max_rev = max_rev.max(r.revision);
         if r.deleted_at.is_some() {
             tx.execute("DELETE FROM messages WHERE id = ?1", [&r.id])
                 .map_err(|e| e.to_string())?;
+            max_rev = max_rev.max(r.revision); // tombstone absorbed
             continue;
         }
         // FK: skip messages whose conversation isn't present locally (its
-        // conversation will arrive or be tombstoned separately).
+        // conversation will arrive or be tombstoned separately). Do NOT fold the
+        // skipped row into the watermark — otherwise `pull`'s `revision > last_seen`
+        // filter would exclude it forever once its conversation finally lands, and
+        // a large account (>1000 convs) could silently lose message slices.
         let conv_exists: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM conversations WHERE id = ?1",
@@ -1326,6 +1422,7 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
         if conv_exists.is_none() {
             continue;
         }
+        max_rev = max_rev.max(r.revision); // absorbed (inserted, updated, or local-wins)
         let local_rev: Option<i64> = tx
             .query_row("SELECT revision FROM messages WHERE id = ?1", [&r.id], |x| {
                 x.get(0)
@@ -1470,7 +1567,27 @@ fn apply_memory(db: &Db, memory: &MemoryState, rows: &[Value]) -> Result<(), Str
                 .optional()
                 .map_err(|e| e.to_string())?
                 .unwrap_or(-1);
-            applies.push(local_rev < r.revision);
+            if local_rev < r.revision {
+                applies.push(true);
+                continue;
+            }
+            // Empty-aware guard: never let an EMPTY local file win over (or
+            // block) a NON-empty remote one. A fresh device auto-creates empty
+            // core stubs (profile/preferences/goals); if those were ever marked
+            // dirty with a high revision they'd beat the real content under plain
+            // revision-LWW and silently wipe it from this device — and, once
+            // re-pushed, from the mirror too. Deleted rows have no content, so
+            // this only ever forces a non-empty write onto an empty local file.
+            let remote_nonempty = r
+                .content
+                .as_deref()
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false);
+            let local_empty = memory
+                .read(&r.path)
+                .map(|c| c.trim().is_empty())
+                .unwrap_or(true);
+            applies.push(remote_nonempty && local_empty);
         }
     }
     // Phase 2: file I/O (no DB lock held). Record whether each row's write
