@@ -666,6 +666,87 @@ export default function App() {
     if (sidebarOpen()) sidebarSearchEl?.focus();
   });
 
+  // Swipe from the left edge to open the off-canvas drawer (narrow viewports
+  // only). Pointer-based: a drag starting within ~32px of the left edge that
+  // becomes horizontally dominant and crosses ~56px toggles the drawer — a
+  // right swipe opens it, a left swipe closes it. Vertical drags (scrolling
+  // the message / conversation lists) are left untouched: the gesture only
+  // engages once horizontal movement clearly wins, and it never calls
+  // preventDefault, so native scrolling still flows.
+  createEffect(() => {
+    if (typeof window === "undefined") return;
+    if (wideViewport()) return;
+    const EDGE = 32; // px from the left edge where an opening drag may begin
+    const THRESHOLD = 56; // px of horizontal travel needed to trigger
+
+    let tracking = false;
+    let horizontal = false;
+    let startX = 0;
+    let startY = 0;
+    let pointerId: number | null = null;
+
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      if (!e.isPrimary) return;
+      if (wideViewport()) return;
+      const fromLeftEdge = e.clientX <= EDGE;
+      // Only begin from the left edge (to open), or from anywhere once the
+      // drawer is already open (to close it with a left swipe).
+      if (!fromLeftEdge && !sidebarOpen()) return;
+      tracking = true;
+      horizontal = false;
+      startX = e.clientX;
+      startY = e.clientY;
+      pointerId = e.pointerId;
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (!tracking || e.pointerId !== pointerId) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (!horizontal) {
+        // Hand the gesture back to scrolling when vertical movement wins by a
+        // clear margin — otherwise we'd fight the list's own scroll.
+        if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) {
+          tracking = false;
+          return;
+        }
+        // Engage only once the drag is clearly horizontal.
+        if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy)) {
+          horizontal = true;
+        } else {
+          return;
+        }
+      }
+      if (Math.abs(dx) >= THRESHOLD) {
+        if (dx > 0) setSidebarOpen(true);
+        else if (sidebarOpen()) setSidebarOpen(false);
+        tracking = false;
+        horizontal = false;
+        pointerId = null;
+      }
+    };
+
+    const onPointerEnd = () => {
+      tracking = false;
+      horizontal = false;
+      pointerId = null;
+    };
+
+    window.addEventListener("pointerdown", onPointerDown, { passive: true });
+    // Passive move listener: we only observe — never call preventDefault — so
+    // the message/conversation lists keep their native vertical scrolling.
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    window.addEventListener("pointerup", onPointerEnd);
+    window.addEventListener("pointercancel", onPointerEnd);
+    onCleanup(() => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerEnd);
+      window.removeEventListener("pointercancel", onPointerEnd);
+    });
+  });
+
   const [draftTitle, setDraftTitle] = createSignal("");
   const [newOpen, setNewOpen] = createSignal(false);
 
@@ -2478,7 +2559,7 @@ export default function App() {
                 </For>
               </select>
             </Show>
-            <div class="relative">
+            <div>
               <select
                 class="max-w-[9rem] pr-7 truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-60 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
                 title="Model"
@@ -2502,18 +2583,18 @@ export default function App() {
                   {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
                 </For>
               </select>
-              {/* Overlay the spinner on the select so it doesn't take layout
-                  width — an inline sibling here pushes the neighbor controls
-                  out and makes them clip on narrower windows. */}
-              <Show when={modelsLoading()}>
-                <span
-                  role="status"
-                  aria-label="Loading models"
-                  title="Loading models…"
-                  class="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 animate-spin rounded-full border-2 border-neutral-400 border-t-transparent"
-                />
-              </Show>
             </div>
+            {/* Spinner rendered as an inline sibling after the select (not
+                overlaid inside its box). Small + inline so it doesn't clip or
+                push neighbor controls on narrow windows. */}
+            <Show when={modelsLoading()}>
+              <span
+                role="status"
+                aria-label="Loading models"
+                title="Loading models…"
+                class="ml-1 inline-block h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-neutral-400 border-t-transparent"
+              />
+            </Show>
             <Show
               when={thinkingOpts()?.supportsReasoning && thinkingOpts()!.options.length > 0}
             >
