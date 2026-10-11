@@ -78,12 +78,28 @@ class MainActivity : TauriActivity() {
         WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()
       )
       topInset = dp(bars.top)
-      bottomInset = dp(bars.bottom)
+      // Bottom: use the IME (soft keyboard) inset when it is visible and taller
+      // than the nav bar, so the whole app (messages + composer) is raised above
+      // the keyboard instead of the keyboard drawing on top of it. The frontend
+      // root already reserves `bottomInset` as CSS px, so growing this value is
+      // all that is needed — the web layer re-lays out the flex column for us.
+      val ime = insets.getInsets(WindowInsets.Type.ime())
+      if (ime.isVisible) {
+        // Keyboard is showing — reserve its full height (which includes the nav
+        // bar beneath it, so there's no need to add bars.bottom as well).
+        bottomInset = dp(ime.bottom)
+      } else {
+        bottomInset = dp(bars.bottom)
+      }
       leftInset = dp(bars.left)
       rightInset = dp(bars.right)
       // `WindowInsets.CONSUMED` is API 30+ — only return it on this branch.
       return WindowInsets.CONSUMED
     }
+    // Legacy branch (< API 30). With `android:windowSoftInputMode="adjustResize"`
+    // (set in the manifest) the activity is resized to sit above the IME, so the
+    // IME height is already folded into `systemWindowInsetBottom` here — no
+    // separate IME query is needed on these old versions.
     topInset = dp(insets.systemWindowInsetTop)
     bottomInset = dp(insets.systemWindowInsetBottom)
     leftInset = dp(insets.systemWindowInsetLeft)
