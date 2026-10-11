@@ -786,6 +786,11 @@ export default function App() {
   const [backfillThinkingOpts, setBackfillThinkingOpts] = createSignal<ThinkingOptions | null>(
     null,
   );
+  // Models offered in the backfill picker, resolved against the ACTIVE provider
+  // (the endpoint the map/reduce phases hit). Using the header/chat provider's
+  // list here can pitch a model at the wrong endpoint → HTTP 400 "model not
+  // found" during backfill.
+  const [backfillModels, setBackfillModels] = createSignal<ModelInfo[]>([]);
   const [syncEnabled, setSyncEnabled] = createSignal(false);
   const [syncStatusData, setSyncStatusData] = createSignal<SyncStatus | null>(null);
   const [syncEmail, setSyncEmail] = createSignal("");
@@ -1688,6 +1693,28 @@ export default function App() {
       })
       .catch(() => {
         if (seq === backfillThinkingReqSeq) setBackfillThinkingOpts(null);
+      });
+  });
+
+  // Backfill runs on the ACTIVE provider, so load that provider's model list
+  // when the memory dialog opens (or the active provider changes) instead of
+  // reusing the header/chat-scoped list. This guarantees any model the user
+  // picks is valid against the endpoint the backfill actually hits.
+  let backfillModelsReqSeq = 0;
+  createEffect(() => {
+    const ap = activeProviderId();
+    if (!memoryOpen() || !ap) {
+      setBackfillModels([]);
+      return;
+    }
+    const seq = ++backfillModelsReqSeq;
+    setBackfillModels([]);
+    listModels(false, ap)
+      .then((rows) => {
+        if (seq === backfillModelsReqSeq) setBackfillModels(rows);
+      })
+      .catch(() => {
+        if (seq === backfillModelsReqSeq) setBackfillModels([]);
       });
   });
 
@@ -3998,7 +4025,7 @@ export default function App() {
                         }}
                       >
                         <option value="">Active default</option>
-                        <For each={modelOptions()}>
+                        <For each={backfillModels()}>
                           {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
                         </For>
                       </select>

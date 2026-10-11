@@ -742,6 +742,16 @@ async fn backfill_inner(
     }
     let _ = app.emit("memory-backfill", app.state::<Backfill>().snapshot());
 
+    // Nothing to do (e.g. a scoped backfill over chats that are not imported, or
+    // everything already extracted). Say so explicitly instead of racing through
+    // an empty map phase and reporting a silent "done" — the most common "backfill
+    // finished but memory didn't change" trap.
+    if pending.is_empty() {
+        app.state::<Backfill>().set_phase("nothing to backfill");
+        let _ = app.emit("memory-backfill", app.state::<Backfill>().snapshot());
+        return Ok(());
+    }
+
     // Map phase: bounded concurrency. Each pass is read-only with respect to
     // memory, so the only shared resource is the SQLite connection, which is
     // locked briefly for reads and never held across an await. Every task is
@@ -837,9 +847,18 @@ fn active_turn_cfg(cfg: &AppConfig, model: Option<&str>, thinking: Option<&str>)
             .unwrap_or_else(|| cfg.model.clone()),
     };
     turn_cfg.model = resolved;
-    if thinking.map(|t| !t.trim().is_empty()).unwrap_or(false) {
-        turn_cfg.thinking_level = thinking.unwrap().to_string();
-    }
+    // Never inherit the global (chat) thinking level onto a backfill pass. That
+    // level was validated against the chat model, not the backfill model, and
+    // sending an unvalidated reasoning_effort to a model that doesn't accept it
+    // (or to a different provider's endpoint) is the #1 cause of HTTP 400 during
+    // backfill — which silently drops those conversations from memory. Only a
+    // backfill thinking level chosen in the UI is applied; an empty picker choice
+    // means "no reasoning_effort" (the model's own default).
+    turn_cfg.thinking_level = if thinking.map(|t| !t.trim().is_empty()).unwrap_or(false) {
+        thinking.unwrap().to_string()
+    } else {
+        String::new()
+    };
     turn_cfg
 }
 
@@ -1328,6 +1347,17 @@ mod tests {
         let blank = active_turn_cfg(&cfg, Some(""), Some(""));
         assert_eq!(blank.model, "other-model");
         assert_eq!(blank.thinking_level, "");
+
+        // The global (chat) thinking level must NOT leak onto a backfill pass:
+        // it was validated against a different model, and sending it to one that
+        // doesn't accept it is the main cause of HTTP 400 during backfill. A
+        // backfill run with no explicit thinking sends no reasoning_effort at all.
+        let mut chat = cfg.clone();
+        chat.thinking_level = "high".into();
+        let inherited = active_turn_cfg(&chat, None, None);
+        assert_eq!(inherited.thinking_level, "", "global reasoning level must not be inherited");
+        let picked = active_turn_cfg(&chat, None, Some("low"));
+        assert_eq!(picked.thinking_level, "low");
     }
 
     /// One pass is the default: it sees every summary at once, which resolves
