@@ -143,10 +143,20 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
         ret.put("stderr", stderrOut.take(MAX_OUTPUT_CHARS))
         ret.put("exit_code", code)
         invoke.resolve(ret)
+        runCatching { context.unregisterReceiver(this) }
       }
     }
     // Sending a broadcast PendingIntent delivers onReceive on the main thread.
-    activity.registerReceiver(receiver, IntentFilter("com.rp.chat.RUN_COMMAND_RESULT.$id"))
+    // The 2-arg `registerReceiver` is deprecated and THROWS SecurityException on
+    // Android 13+ unless RECEIVER_EXPORTED/RECEIVER_NOT_EXPORTED is given. The
+    // result intent is scoped to our own package (`setPackage(packageName)`), so
+    // it never needs export; use RECEIVER_NOT_EXPORTED on new API levels.
+    val filter = IntentFilter("com.rp.chat.RUN_COMMAND_RESULT.$id")
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      activity.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+    } else {
+      activity.registerReceiver(receiver, filter)
+    }
     return receiver
   }
 }

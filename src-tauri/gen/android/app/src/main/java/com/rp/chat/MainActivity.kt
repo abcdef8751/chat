@@ -69,6 +69,24 @@ class MainActivity : TauriActivity() {
       pushInsets(webView)
       result
     }
+    // The app opens its chat-list drawer with a left-edge swipe, but Android's
+    // gesture-navigation back gesture also starts at the left edge and would
+    // steal that swipe before the WebView ever sees a touch. Exclude a band
+    // along the left edge from the system gesture so horizontal drags there get
+    // delivered to the page. This is a best-effort hint (the OS caps how much
+    // it honors), so the on-screen hamburger remains the guaranteed fallback.
+    excludeLeftEdgeGesture()
+  }
+
+  private fun excludeLeftEdgeGesture() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+    val density = resources.displayMetrics.density
+    val band = Math.round(100f * density).toInt() // ~100dp band on the left edge
+    val height = resources.displayMetrics.heightPixels
+    val decor = window?.decorView ?: return
+    decor.setSystemGestureExclusionRects(
+      listOf(android.graphics.Rect(0, 0, band, height))
+    )
   }
 
   private fun applyInsets(insets: WindowInsets): WindowInsets {

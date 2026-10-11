@@ -685,27 +685,29 @@ export default function App() {
     let horizontal = false;
     let startX = 0;
     let startY = 0;
-    let pointerId: number | null = null;
+    let startId = -1;
 
-    const onPointerDown = (e: PointerEvent) => {
-      if (e.pointerType !== "touch") return;
-      if (!e.isPrimary) return;
+    const onTouchStart = (e: TouchEvent) => {
       if (wideViewport()) return;
-      const fromLeftEdge = e.clientX <= EDGE;
+      const t = e.touches[0];
+      if (!t) return;
+      const fromLeftEdge = t.clientX <= EDGE;
       // Only begin from the left edge (to open), or from anywhere once the
       // drawer is already open (to close it with a left swipe).
       if (!fromLeftEdge && !sidebarOpen()) return;
       tracking = true;
       horizontal = false;
-      startX = e.clientX;
-      startY = e.clientY;
-      pointerId = e.pointerId;
+      startX = t.clientX;
+      startY = t.clientY;
+      startId = t.identifier;
     };
 
-    const onPointerMove = (e: PointerEvent) => {
-      if (!tracking || e.pointerId !== pointerId) return;
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
+    const onTouchMove = (e: TouchEvent) => {
+      if (!tracking) return;
+      const t = Array.from(e.touches).find((x) => x.identifier === startId);
+      if (!t) return;
+      const dx = t.clientX - startX;
+      const dy = t.clientY - startY;
       if (!horizontal) {
         // Hand the gesture back to scrolling when vertical movement wins by a
         // clear margin — otherwise we'd fight the list's own scroll.
@@ -720,32 +722,33 @@ export default function App() {
           return;
         }
       }
+      // Claim the gesture so the WebView doesn't treat the horizontal drag as a
+      // native scroll / edge navigation. Vertical scrolls never reach here, so
+      // native scrolling in the lists is unaffected.
+      if (e.cancelable) e.preventDefault();
       if (Math.abs(dx) >= THRESHOLD) {
         if (dx > 0) setSidebarOpen(true);
         else if (sidebarOpen()) setSidebarOpen(false);
         tracking = false;
         horizontal = false;
-        pointerId = null;
       }
     };
 
-    const onPointerEnd = () => {
+    const onTouchEnd = () => {
       tracking = false;
       horizontal = false;
-      pointerId = null;
     };
 
-    window.addEventListener("pointerdown", onPointerDown, { passive: true });
-    // Passive move listener: we only observe — never call preventDefault — so
-    // the message/conversation lists keep their native vertical scrolling.
-    window.addEventListener("pointermove", onPointerMove, { passive: true });
-    window.addEventListener("pointerup", onPointerEnd);
-    window.addEventListener("pointercancel", onPointerEnd);
+    window.addEventListener("touchstart", onTouchStart, { passive: true });
+    // Non-passive move so a confirmed horizontal edge swipe can preventDefault.
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onTouchEnd, { passive: true });
+    window.addEventListener("touchcancel", onTouchEnd);
     onCleanup(() => {
-      window.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerEnd);
-      window.removeEventListener("pointercancel", onPointerEnd);
+      window.removeEventListener("touchstart", onTouchStart);
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onTouchEnd);
+      window.removeEventListener("touchcancel", onTouchEnd);
     });
   });
 
