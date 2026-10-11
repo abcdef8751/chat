@@ -476,7 +476,14 @@ and the app is byte-identical to before. Never blocks the UI.
   (`last_reflected_index`) rides on the conversation row and is preserved across
   re-index. The first sync per account (guarded by a per-`user_id` sentinel)
   seeds all pre-existing rows +
-  memory files dirty so enabling backs up full history once.
+  memory files dirty so enabling backs up full history once. Two cross-device
+  gotchas are handled explicitly: (1) **imported chats are sync-dirtied** —
+  `insert_imported_conversation` writes them with `dirty = 1` (and a duplicate
+  re-import re-marks them, so an archive imported *after* the first sync still
+  reaches other devices); (2) the first-sync **seed skips empty memory files** —
+  a fresh device auto-creates empty `profile.md`/`preferences.md`/`goals.md`
+  stubs, and if those were seeded dirty their freshly-bumped revisions would beat
+  the real content on the mirror under LWW and silently drop it on pull.
 - **Memory files** sync whole-file (identity by path), tracking metadata in the
   `memory_sync` table; a failed apply is left dirty and retried.
 - **Client-side encryption** (`crypt.rs`, opt-in, **off by default** — see
@@ -557,7 +564,8 @@ and the app is byte-identical to before. Never blocks the UI.
       ├─ tools.rs      # tool specs, host executor, approval registry, native BraveSearch
       ├─ shell.rs      # one-shot host shell executor (fresh `bash -c` per call);
       │                 #   Android routes to the Termux bridge (android.rs)
-      ├─ android.rs    # Android: Termux RUN_COMMAND bridge (`run_command` plugin) [mobile]
+      ├─ android.rs    # Android: Termux RUN_COMMAND bridge (`run_command` plugin) [mobile];
+      │                 #   also hosts the rustls-platform-verifier JNI init (see below)
       ├─ memory.rs     # Plain-Markdown memory: core files, listing, save/read/write, migration
       ├─ import.rs     # Anthropic-export importer (timestamp-preserving, backfill-only)
       ├─ reflection.rs # Idle memory-consolidation scheduler + per-conversation pass
@@ -611,7 +619,37 @@ and the app is byte-identical to before. Never blocks the UI.
 - **GUI needs a display:** use `npm run tauri dev` from the desktop session; scripted checks use `npm run e2e` (same requirement).
 - **One-shot shell:** `bash` runs a fresh `bash -c` per call — no persistent session, so `cd`/`export` do not survive (the agent already assumes non-persistence; see `ANDROID_SHELL.md`). 60s per-call timeout kills the child. On Android, execution happens inside the user's Termux (`crate::android` + `RunCommandPlugin`).
 - **Android:** `npm run tauri android init` created `src-tauri/gen/android`. The Rust bridge compiles for the aarch64 Android target via `cargo check --target aarch64-linux-android` (set `CC_aarch64_linux_android`/`AR_aarch64_linux_android`/linker to the NDK clang). The actual Termux `RUN_COMMAND` round-trip requires a device.
+- **Android TLS (rustls-platform-verifier):** reqwest 0.13 routes *every* HTTPS
+  request (models.dev catalog, streams, Brave, sync) through
+  `rustls-platform-verifier`. On Android that verifier can't reach the OS trust
+  store by itself — it needs a JNI env + `Context`, and without them the first
+  handshake hard-aborts the whole process (SIGABRT, "Expect
+  rustls-platform-verifier to be initialized"). Two things are wired up so this
+  works: (1) `android.rs` exports `Java_com_rp_chat_MainActivity_initRustls`
+  (a `#[no_mangle]` JNI fn) that calls
+  `rustls_platform_verifier::android::init_with_env`, invoked once from
+  `MainActivity.onCreate`; and (2) `app/build.gradle.kts` locates the
+  `rustls-platform-verifier-android` AAR via `cargo metadata` (local maven repo)
+  and bundles its `org.rustls.platformverifier` Kotlin component, with a
+  proguard keep-rule so release minify doesn't strip it. Adding a `reqwest`
+  fallback with webpki roots is an alternative if device CA trust is ever not
+  wanted; `rustls-webpki-roots` isn't in reqwest 0.13.4 yet.
 - **Keychain entry:** service `com.rp.chat`, user `api_key`. A legacy plaintext `apiKey` in `config.json` auto-migrates on first launch.
+- **Android secrets:** the `keyring` crate has **no Android backend** (its `v1`
+  backend is cfg-gated away from Android), so every keychain op would error
+  there. `secrets.rs` abstracts reads/writes behind `read`/`write`/`remove`; on
+  Android those hit one file per secret (`secret_<hex>`) in the app-private data
+  dir (device-encrypted + sandboxed, `0600`), seeded once in `setup` via
+  `secrets::init_android`. Account names are hex-encoded so provider ids can't
+  collide, and an empty file reads as "not set" (matching keyring). Desktop
+  still uses the OS keychain, unchanged. Because the dialog opens *before* its
+  async setup, an unavailable keychain can never block opening Settings.
+- **Android edge-to-edge insets:** edge-to-edge is enforced on Android 15+
+  (targetSdk 35+), so without handling window insets the app's header hides
+  under the status bar and the composer/bottom row under the gesture-nav bar.
+  `MainActivity.onWebViewCreate(webView)` overrides the `WryActivity` hook and
+  sets an `OnApplyWindowInsetsListener` that translates the system-bar +
+  display-cutout insets into WebView padding — one hook, no Rust/plugin changes.
 
 ---
 
