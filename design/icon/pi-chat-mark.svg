@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    Pi Chat — app mark.
+
+    Two interlocking arcs forming a single ring. One circle, centre (512,512),
+    centre-line radius 294, stroke width 156, round caps (ring spans radius
+    216..372). The orange arc runs -105deg..105deg and the teal arc 75deg..285deg,
+    so they overlap in two short laps. At each lap the "over" strand keeps its
+    round cap while the "under" strand is erased by a round-capped keyline drawn
+    along the over strand's own sub-arc, leaving an even gap — a true woven
+    joint. Teal wins at one lap, orange at the other. The whole mark is then
+    rotated -35deg, so orange sits upper-right (matching the app's previous
+    orientation) and the colour split runs on the diagonal.
+
+    Erasing is done with masks rather than a plate-coloured patch, so the same
+    geometry works on any background — see pi-chat-mark-transparent.svg.
+  -->
+  <defs>
+    <!-- erase the orange strand where teal laps over it (lower-right lap) -->
+    <mask id="under-teal" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <rect width="1024" height="1024" fill="#ffffff"/>
+      <path d="M588.09 795.98 A294 294 0 0 1 435.91 795.98"
+            fill="none" stroke="#000000" stroke-width="184" stroke-linecap="round"/>
+    </mask>
+    <!-- erase the teal strand where orange laps over it (upper-left lap) -->
+    <mask id="under-orange" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <rect width="1024" height="1024" fill="#ffffff"/>
+      <path d="M435.91 228.02 A294 294 0 0 1 588.09 228.02"
+            fill="none" stroke="#000000" stroke-width="184" stroke-linecap="round"/>
+    </mask>
+  </defs>
+
+  <!-- app-tile backing (22.5% corner radius, matching the platform squircle) -->
+  <rect width="1024" height="1024" rx="230" fill="#15171C"/>
+
+  <g transform="rotate(-35 512 512)">
+    <!-- teal arc: 75deg -> 285deg -->
+    <g mask="url(#under-orange)">
+      <path d="M588.09 795.98 A294 294 0 1 1 588.09 228.02"
+            fill="none" stroke="#5B7CFA" stroke-width="156" stroke-linecap="round"/>
+    </g>
+    <!-- orange arc: -105deg -> 105deg -->
+    <g mask="url(#under-teal)">
+      <path d="M435.91 228.02 A294 294 0 1 1 435.91 795.98"
+            fill="none" stroke="#FFB800" stroke-width="156" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

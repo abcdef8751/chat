@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    Pi Chat — bare mark, no tile. Same geometry as pi-chat-mark.svg; used for the
+    favicon, tray, and anywhere the icon sits on the app's own background.
+    The over/under joints are cut with masks, so this transparent version is
+    pixel-identical to the tiled one.
+  -->
+  <defs>
+    <mask id="under-teal" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <rect width="1024" height="1024" fill="#ffffff"/>
+      <path d="M588.09 795.98 A294 294 0 0 1 435.91 795.98"
+            fill="none" stroke="#000000" stroke-width="184" stroke-linecap="round"/>
+    </mask>
+    <mask id="under-orange" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <rect width="1024" height="1024" fill="#ffffff"/>
+      <path d="M435.91 228.02 A294 294 0 0 1 588.09 228.02"
+            fill="none" stroke="#000000" stroke-width="184" stroke-linecap="round"/>
+    </mask>
+  </defs>
+
+  <g transform="rotate(-35 512 512)">
+    <g mask="url(#under-orange)">
+      <path d="M588.09 795.98 A294 294 0 1 1 588.09 228.02"
+            fill="none" stroke="#5B7CFA" stroke-width="156" stroke-linecap="round"/>
+    </g>
+    <g mask="url(#under-teal)">
+      <path d="M435.91 228.02 A294 294 0 1 1 435.91 795.98"
+            fill="none" stroke="#FFB800" stroke-width="156" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

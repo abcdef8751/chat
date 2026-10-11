@@ -1,0 +1,7 @@
+{
+  "default": "pi-chat-mark.svg",
+  "bg_color": "#15171C",
+  "android_bg": "pi-chat-android-bg.png",
+  "android_fg": "pi-chat-mark-transparent.svg",
+  "android_fg_scale": 72
+}
