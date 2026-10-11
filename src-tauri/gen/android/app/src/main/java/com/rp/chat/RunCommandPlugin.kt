@@ -67,10 +67,16 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
     private const val EXTRA_WORKDIR = "com.termux.RUN_COMMAND_WORKDIR"
     private const val EXTRA_PENDING_INTENT = "com.termux.RUN_COMMAND_PENDING_INTENT"
     private const val EXTRA_RUNNER = "com.termux.RUN_COMMAND_RUNNER"
-
     // Run the command as a detached background process so output is clean
     // (stdout/stderr separate) and no terminal session is opened per call.
     private const val RUNNER_APP_SHELL = "app-shell"
+    // Reinforce background mode. Termux resolves the runner as EXTRA_RUNNER if
+    // set, otherwise falls back to `EXTRA_BACKGROUND ? app-shell : terminal-session`.
+    // Old Termux builds may not know EXTRA_RUNNER at all; without BACKGROUND=true
+    // they would default to a *foreground terminal session*, which calls
+    // startTermuxActivity() and pops the app window. Setting BACKGROUND=true too
+    // guarantees app-shell (no window) on both old and new builds.
+    private const val EXTRA_BACKGROUND = "com.termux.RUN_COMMAND_BACKGROUND"
 
     // Result extras Termux delivers to the result pending intent, nested under a
     // single "result" Bundle (TermuxConstants.EXTRA_PLUGIN_RESULT_BUNDLE).
@@ -132,6 +138,9 @@ class RunCommandPlugin(private val activity: Activity) : Plugin(activity) {
       putExtra(EXTRA_ARGUMENTS, arrayOf("-c", command))
       if (!workdir.isNullOrBlank()) putExtra(EXTRA_WORKDIR, workdir)
       putExtra(EXTRA_RUNNER, RUNNER_APP_SHELL)
+      // Ensures background app-shell execution even on Termux builds that
+      // predate EXTRA_RUNNER (see constant docs). Prevents opening Termux.
+      putExtra(EXTRA_BACKGROUND, true)
       putExtra(EXTRA_PENDING_INTENT, pendingIntent)
     }
 
