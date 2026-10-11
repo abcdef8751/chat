@@ -85,6 +85,7 @@ import {
   type ThinkingOptions,
 } from "./lib/api";
 import Markdown from "./lib/Markdown";
+import markUrl from "./assets/logo.svg";
 
 const THEME_KEY = "pi-chat-theme";
 
@@ -469,6 +470,13 @@ function groupTurns(messages: Message[], liveTools: LiveTool[], streaming: boole
     }
   }
   return turns;
+}
+
+/** The app mark — the assistant's face, and the app's identity in the sidebar. */
+function MarkAvatar(props: { class?: string }) {
+  return (
+    <img src={markUrl} alt="" aria-hidden="true" draggable={false} class={props.class} />
+  );
 }
 
 function ThoughtRow(props: {
@@ -2207,7 +2215,10 @@ export default function App() {
         }`}
       >
         <div class="flex items-center gap-2 border-b border-neutral-200 p-3 dark:border-neutral-800">
-          <span class="mr-auto pl-1 text-sm font-semibold tracking-tight">Pi Chat</span>
+          <span class="mr-auto flex items-center gap-2 pl-1">
+            <MarkAvatar class="h-5 w-5 shrink-0" />
+            <span class="text-sm font-semibold tracking-tight">Pi Chat</span>
+          </span>
 
           <Dialog open={newOpen()} onOpenChange={setNewOpen}>
             <Dialog.Trigger class="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300">
@@ -2635,10 +2646,13 @@ export default function App() {
                         <div class="flex justify-start">
                           <div class="max-w-[80%]">
                             <div class="rounded-xl bg-neutral-100 px-4 py-2.5 text-sm dark:bg-neutral-800">
-                              <div class="mb-0.5 text-[11px] opacity-60">
-                                assistant
-                                {answer()!.stop_reason === "aborted" && " (aborted)"}
-                                {answer()!.stop_reason === "error" && " (error)"}
+                              <div class="mb-1 flex items-center gap-1.5 text-[11px]">
+                                <MarkAvatar class="h-3.5 w-3.5 shrink-0" />
+                                <span class="opacity-60">
+                                  assistant
+                                  {answer()!.stop_reason === "aborted" && " (aborted)"}
+                                  {answer()!.stop_reason === "error" && " (error)"}
+                                </span>
                               </div>
                               <Show when={parseAttachments(answer()!).length > 0}>
                                 <div class="mb-2 flex flex-wrap items-end gap-2">
