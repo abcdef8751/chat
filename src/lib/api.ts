@@ -407,12 +407,26 @@ export function reflectNow(conversationId: string): Promise<void> {
  * Extract durable facts from every conversation that needs it, in parallel, then
  * consolidate the staged summaries into memory in one serial pass. Returns
  * immediately; progress arrives on the `memory-backfill` event.
+ *
+ * `model` / `thinkingLevel` optionally override which model (and reasoning
+ * level) the phases run on; empty/`null` means the active provider's default.
+ * `allHistory` switches the map phase to every pending conversation instead of
+ * just the newest import batch.
  */
-export function backfillMemories(
-  minChars?: number,
-  concurrency?: number,
-): Promise<BackfillStatus> {
-  return invoke<BackfillStatus>("backfill_memories", { minChars, concurrency });
+export function backfillMemories(opts: {
+  minChars?: number;
+  concurrency?: number;
+  model?: string | null;
+  thinkingLevel?: string | null;
+  allHistory?: boolean;
+}): Promise<BackfillStatus> {
+  return invoke<BackfillStatus>("backfill_memories", {
+    minChars: opts.minChars ?? null,
+    concurrency: opts.concurrency ?? null,
+    model: opts.model ?? null,
+    thinkingLevel: opts.thinkingLevel ?? null,
+    allHistory: opts.allHistory ?? null,
+  });
 }
 
 export function backfillStatus(): Promise<BackfillStatus> {
