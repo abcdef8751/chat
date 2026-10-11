@@ -3,10 +3,20 @@
 //! The key never crosses the IPC boundary: commands here report presence and
 //! accept updates, and backend code (`chat`, `models`) reads the secret
 //! directly via [`get`].
+//!
+//! **Desktop** stores each secret in the OS keychain via `keyring`. **Android**
+//! has no `keyring` backend (`v1` is cfg-gated away from Android), so we fall
+//! back to one small file per secret in the application's private data
+//! directory — device-encrypted and sandboxed to the app, mirroring the stance
+//! of keeping the local SQLite DB plaintext on-device. Secrets are never sent
+//! to Supabase; only backend code reads them, never through the IPC boundary.
 
+#[cfg(not(target_os = "android"))]
 use keyring::Entry;
 
-/// Keychain service identifier (matches the Tauri app identifier).
+/// Keychain service identifier (matches the Tauri app identifier). Not used on
+/// Android, where the file-store keys on the account name alone.
+#[cfg(not(target_os = "android"))]
 const SERVICE: &str = "com.rp.chat";
 /// Keychain user/account name for the API key entry.
 const USER: &str = "api_key";
@@ -24,46 +34,149 @@ const SESSION_USER: &str = "sync_session";
 /// passphrase every launch ("remember on this device").
 const ENC_KEY_USER: &str = "sync_enc_key";
 
-fn entry() -> Result<Entry, String> {
-    Entry::new(SERVICE, USER).map_err(|e| format!("open keychain entry: {e}"))
-}
+// --- Storage backends -------------------------------------------------------
+// Desktop: the OS keychain via `keyring`. Android: app-private files (see the
+// module docs). The three operations (`read`/`write`/`remove`) are the seam the
+// rest of this file uses, so every secret maps to a single account name across
+// both platforms.
 
-fn brave_entry() -> Result<Entry, String> {
-    Entry::new(SERVICE, BRAVE_USER).map_err(|e| format!("open keychain entry: {e}"))
-}
-
-fn provider_entry(id: &str) -> Result<Entry, String> {
-    Entry::new(SERVICE, &format!("{PROVIDER_KEY_PREFIX}{id}"))
-        .map_err(|e| format!("open keychain entry: {e}"))
-}
-
-fn session_entry() -> Result<Entry, String> {
-    Entry::new(SERVICE, SESSION_USER).map_err(|e| format!("open keychain entry: {e}"))
-}
-
-/// Read the stored API key. `Ok(None)` when no key has been saved yet.
-pub fn get() -> Result<Option<String>, String> {
-    match entry()?.get_password() {
+/// Read a stored secret for `user`. `Ok(None)` when none has been saved yet.
+#[cfg(not(target_os = "android"))]
+fn read(user: &str) -> Result<Option<String>, String> {
+    let entry = Entry::new(SERVICE, user).map_err(|e| format!("open keychain entry: {e}"))?;
+    match entry.get_password() {
         Ok(key) => Ok(Some(key)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(format!("keychain read: {e}")),
     }
 }
 
-/// Store (or replace) the API key.
-pub fn set(key: &str) -> Result<(), String> {
-    entry()?
-        .set_password(key)
+/// Overwrite (or create) a stored secret for `user`.
+#[cfg(not(target_os = "android"))]
+fn write(user: &str, value: &str) -> Result<(), String> {
+    let entry = Entry::new(SERVICE, user).map_err(|e| format!("open keychain entry: {e}"))?;
+    entry
+        .set_password(value)
         .map_err(|e| format!("keychain write: {e}"))
 }
 
-/// Remove the stored API key. Removing a missing entry is a no-op.
-pub fn delete() -> Result<(), String> {
-    match entry()?.delete_credential() {
+/// Remove a stored secret for `user`. Removing a missing entry is a no-op.
+#[cfg(not(target_os = "android"))]
+fn remove(user: &str) -> Result<(), String> {
+    let entry = Entry::new(SERVICE, user).map_err(|e| format!("open keychain entry: {e}"))?;
+    match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("keychain delete: {e}")),
     }
+}
+
+/// Android file-backed store (see module docs). One file per `user` name under
+/// the app data dir; `init` is called once from `setup`.
+#[cfg(target_os = "android")]
+mod android_store {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    /// Initialize the secrets directory. Called once from `setup` with the app
+    /// data dir (already created there), so secrets land in app-private,
+    /// device-encrypted storage.
+    pub fn init(dir: PathBuf) {
+        let _ = DIR.set(dir);
+    }
+
+    fn dir() -> &'static PathBuf {
+        DIR.get()
+            .expect("secrets::android_store::init must run before any secret access")
+    }
+
+    fn path_for(user: &str) -> PathBuf {
+        // Lossless hex encoding of the account name so two distinct accounts
+        // can never collide — provider ids may contain `/`, `:`, `_`, etc.,
+        // and a collapsing replace would let e.g. `a/b` and `a_b` share a file.
+        use std::fmt::Write as _;
+        let mut name = String::with_capacity(user.len() * 2);
+        for b in user.bytes() {
+            let _ = write!(name, "{b:02x}");
+        }
+        dir().join(format!("secret_{name}"))
+    }
+
+    pub fn read(user: &str) -> Result<Option<String>, String> {
+        let p = path_for(user);
+        match std::fs::read_to_string(&p) {
+            // Match desktop keychain semantics: an empty value is "not set",
+            // never a present-but-empty secret.
+            Ok(s) if s.is_empty() => Ok(None),
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("secrets read {}: {e}", p.display())),
+        }
+    }
+
+    pub fn write(user: &str, value: &str) -> Result<(), String> {
+        let p = path_for(user);
+        std::fs::write(&p, value).map_err(|e| format!("secrets write {}: {e}", p.display()))?;
+        // The app-private dir is already sandboxed; tighten to owner-only too.
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        Ok(())
+    }
+
+    pub fn remove(user: &str) -> Result<(), String> {
+        let p = path_for(user);
+        match std::fs::remove_file(&p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("secrets delete {}: {e}", p.display())),
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn read(user: &str) -> Result<Option<String>, String> {
+    android_store::read(user)
+}
+
+#[cfg(target_os = "android")]
+fn write(user: &str, value: &str) -> Result<(), String> {
+    android_store::write(user, value)
+}
+
+#[cfg(target_os = "android")]
+fn remove(user: &str) -> Result<(), String> {
+    android_store::remove(user)
+}
+
+/// Seed the Android file-store with the app data dir. A no-op on every other
+/// platform; called from `setup` so Android secrets resolve a directory.
+#[cfg(target_os = "android")]
+pub fn init_android(dir: std::path::PathBuf) {
+    android_store::init(dir);
+}
+
+/// Seed the Android file-store with the app data dir. A no-op on every other
+/// platform; called from `setup` so Android secrets resolve a directory.
+#[cfg(not(target_os = "android"))]
+pub fn init_android(_dir: std::path::PathBuf) {}
+
+// --- API key ----------------------------------------------------------------
+
+/// Read the stored API key. `Ok(None)` when no key has been saved yet.
+pub fn get() -> Result<Option<String>, String> {
+    read(USER)
+}
+
+/// Store (or replace) the API key.
+pub fn set(key: &str) -> Result<(), String> {
+    write(USER, key)
+}
+
+/// Remove the stored API key. Removing a missing entry is a no-op.
+pub fn delete() -> Result<(), String> {
+    remove(USER)
 }
 
 // --- Per-provider API keys --------------------------------------------------
@@ -72,27 +185,17 @@ pub fn delete() -> Result<(), String> {
 
 /// Read a provider's stored API key. `Ok(None)` when none is saved yet.
 pub fn get_provider_key(provider_id: &str) -> Result<Option<String>, String> {
-    match provider_entry(provider_id)?.get_password() {
-        Ok(key) => Ok(Some(key)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keychain read: {e}")),
-    }
+    read(&format!("{PROVIDER_KEY_PREFIX}{provider_id}"))
 }
 
 /// Store (or replace) a provider's API key.
 pub fn set_provider_key(provider_id: &str, key: &str) -> Result<(), String> {
-    provider_entry(provider_id)?
-        .set_password(key)
-        .map_err(|e| format!("keychain write: {e}"))
+    write(&format!("{PROVIDER_KEY_PREFIX}{provider_id}"), key)
 }
 
 /// Remove a provider's API key. Removing a missing entry is a no-op.
 pub fn delete_provider_key(provider_id: &str) -> Result<(), String> {
-    match provider_entry(provider_id)?.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keychain delete: {e}")),
-    }
+    remove(&format!("{PROVIDER_KEY_PREFIX}{provider_id}"))
 }
 
 /// Whether a specific provider has a stored key.
@@ -120,95 +223,24 @@ pub fn set_api_key(api_key: Option<String>) -> Result<(), String> {
     }
 }
 
+// --- Brave Search API key ---------------------------------------------------
+
 fn brave_get() -> Result<Option<String>, String> {
-    match brave_entry()?.get_password() {
-        Ok(key) => Ok(Some(key)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keychain read: {e}")),
-    }
+    read(BRAVE_USER)
 }
 
 fn brave_set(key: &str) -> Result<(), String> {
-    brave_entry()?
-        .set_password(key)
-        .map_err(|e| format!("keychain write: {e}"))
+    write(BRAVE_USER, key)
 }
 
 fn brave_delete() -> Result<(), String> {
-    match brave_entry()?.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keychain delete: {e}")),
-    }
-}
-
-// --- Supabase sync session -------------------------------------------------
-
-/// Read the stored sync-session JSON blob. `Ok(None)` when none exists yet.
-pub fn session_get() -> Result<Option<String>, String> {
-    match session_entry()?.get_password() {
-        Ok(s) => Ok(Some(s)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keychain read: {e}")),
-    }
-}
-
-/// Store (or replace) the sync-session JSON blob.
-pub fn session_set(json: &str) -> Result<(), String> {
-    session_entry()?
-        .set_password(json)
-        .map_err(|e| format!("keychain write: {e}"))
-}
-
-/// Remove the stored sync session. Removing a missing entry is a no-op.
-pub fn session_delete() -> Result<(), String> {
-    match session_entry()?.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keychain delete: {e}")),
-    }
-}
-
-// --- Client-side encryption keys --------------------------------------------
-
-fn enc_key_entry() -> Result<Entry, String> {
-    Entry::new(SERVICE, ENC_KEY_USER).map_err(|e| format!("open keychain entry: {e}"))
-}
-
-/// Read the cached data key (base64) from the keychain. `Ok(None)` = off.
-pub fn enc_key_get() -> Result<Option<String>, String> {
-    match enc_key_entry()?.get_password() {
-        Ok(k) => Ok(Some(k)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keychain read: {e}")),
-    }
-}
-
-pub fn enc_key_set(key: &str) -> Result<(), String> {
-    enc_key_entry()?
-        .set_password(key)
-        .map_err(|e| format!("keychain write: {e}"))
-}
-
-pub fn enc_key_delete() -> Result<(), String> {
-    match enc_key_entry()?.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keychain delete: {e}")),
-    }
-}
-
-/// Whether client-side encryption is configured (data key present).
-pub fn has_encryption() -> bool {
-    matches!(enc_key_get(), Ok(Some(k)) if !k.is_empty())
+    remove(BRAVE_USER)
 }
 
 /// Whether a Brave Search API key is stored. Used by `tools::brave_available`
 /// to decide whether the ungated Brave web tools are offered at all.
-pub fn has_brave_key() -> bool {    match brave_get() {
-        Ok(Some(k)) => !k.is_empty(),
-        _ => false,
-    }
+pub fn has_brave_key() -> bool {
+    matches!(brave_get(), Ok(Some(k)) if !k.is_empty())
 }
 
 /// Whether a Brave Search API key is stored (frontend status check).
@@ -233,7 +265,44 @@ pub fn set_brave_key(brave_key: Option<String>) -> Result<(), String> {
     }
 }
 
-#[cfg(test)]
+// --- Supabase sync session -------------------------------------------------
+
+/// Read the stored sync-session JSON blob. `Ok(None)` when none exists yet.
+pub fn session_get() -> Result<Option<String>, String> {
+    read(SESSION_USER)
+}
+
+/// Store (or replace) the sync-session JSON blob.
+pub fn session_set(json: &str) -> Result<(), String> {
+    write(SESSION_USER, json)
+}
+
+/// Remove the stored sync session. Removing a missing entry is a no-op.
+pub fn session_delete() -> Result<(), String> {
+    remove(SESSION_USER)
+}
+
+// --- Client-side encryption keys --------------------------------------------
+
+/// Read the cached data key (base64) from the keychain. `Ok(None)` = off.
+pub fn enc_key_get() -> Result<Option<String>, String> {
+    read(ENC_KEY_USER)
+}
+
+pub fn enc_key_set(key: &str) -> Result<(), String> {
+    write(ENC_KEY_USER, key)
+}
+
+pub fn enc_key_delete() -> Result<(), String> {
+    remove(ENC_KEY_USER)
+}
+
+/// Whether client-side encryption is configured (data key present).
+pub fn has_encryption() -> bool {
+    matches!(enc_key_get(), Ok(Some(k)) if !k.is_empty())
+}
+
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
 

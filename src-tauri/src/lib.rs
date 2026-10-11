@@ -32,6 +32,10 @@ pub fn run() {
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             std::fs::create_dir_all(&dir)
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+            // Android secrets live in app-private files (the `keyring` crate has
+            // no Android backend); seed the store with the app data dir. No-op
+            // on every other platform, where the OS keychain is used instead.
+            crate::secrets::init_android(dir.clone());
             let conn = db::open(&dir.join("chat.sqlite"))
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) })?;
             let conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
