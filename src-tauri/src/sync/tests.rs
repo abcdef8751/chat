@@ -924,6 +924,124 @@ async fn legacy_custom_config_is_still_pushed() {
     assert_eq!(payload["model"], "my-custom-model");
 }
 
+/// A device that edited config OFFLINE at a STALER (lower) revision than the
+/// canonical on the server must NOT push its row. The server's enforce_revision
+/// trigger clamps only the revision column, not the payload, so a stale push
+/// would overwrite the canonical payload while keeping the higher revision — the
+/// clock-skew clobber for non-empty configs. The row stays dirty so the pull /
+/// post-pull mirror can reconcile it.
+#[tokio::test]
+async fn stale_config_is_not_pushed_over_newer_server_row() {
+    let srv = MockRest::spawn();
+    let db = temp_db("stalecfg");
+    let mem = temp_memory("stalecfg", &db);
+    let cfg = temp_config("stalecfg");
+
+    // The server already holds a NEWER canonical row (revision 5000).
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main",
+            "payload": json!({
+                "preferences": "Canonical", "providers": [], "activeProviderId": "",
+                "baseUrl": crate::config::DEFAULT_BASE_URL,
+                "model": crate::config::DEFAULT_MODEL,
+                "modelOverrides": {}
+            }).to_string(),
+            "revision": 5000, "deleted_at": Value::Null,
+        })],
+    );
+
+    // A device edited offline at a STALER revision (100 < 5000) with its own
+    // non-empty content.
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 100, 1)
+             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, revision = excluded.revision, dirty = 1",
+            rusqlite::params![json!({
+                "preferences": "stale offline edit", "providers": [], "activeProviderId": "",
+                "baseUrl": crate::config::DEFAULT_BASE_URL,
+                "model": crate::config::DEFAULT_MODEL,
+                "modelOverrides": {}
+            }).to_string()],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    // The stale row must NOT clobber the canonical on the server.
+    assert!(srv.posted("user_config").is_empty(), "stale config must not be pushed");
+    // ...and stays dirty so the post-pull mirror can reconcile it.
+    let dirty: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT dirty FROM user_config WHERE id='main'", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(dirty, 1, "a stale-skipped row must remain dirty (not lost)");
+}
+
+/// The read-before-write guard only blocks STALER rows: a device whose local edit
+/// is NEWER than the server's row (higher revision) still pushes normally.
+#[tokio::test]
+async fn newer_config_is_still_pushed() {
+    let srv = MockRest::spawn();
+    let db = temp_db("newcfg");
+    let mem = temp_memory("newcfg", &db);
+    let cfg = temp_config("newcfg");
+
+    // Server holds an older row (revision 100).
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main",
+            "payload": "whatever",
+            "revision": 100, "deleted_at": Value::Null,
+        })],
+    );
+
+    // This device's edit is newer (revision 5000 > 100).
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 5000, 1)
+             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, revision = excluded.revision, dirty = 1",
+            rusqlite::params![json!({
+                "preferences": "fresh edit", "providers": [], "activeProviderId": "",
+                "baseUrl": crate::config::DEFAULT_BASE_URL,
+                "model": crate::config::DEFAULT_MODEL,
+                "modelOverrides": {}
+            }).to_string()],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    // A NEWER config is pushed (guard only blocks staler rows).
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "newer config must be pushed");
+}
+
 /// Regression for the reviewer's critical finding: a fresh/second device that
 /// syncs must ADOPT the authoritative config from the mirror, not push its own
 /// (default) row over it under a clock-based revision. Simulates the do_sync

@@ -942,45 +942,58 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
 
     // User config (preferences + providers + price/context overrides): a single
     // 'main' row. Small, so fetched + pushed in one go.
-    let cfg_rows = {
+    let cfg_pending: Vec<(String, String, i64)> = {
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, payload, revision FROM user_config WHERE dirty = 1",
             )
             .map_err(|e| e.to_string())?;
-        let key = ctx.key;
-        let mut out = Vec::new();
-        for row in stmt
+        let rows = stmt
             .query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             })
-            .map_err(|e| e.to_string())?
-        {
-            let (id, payload, revision) = row.map_err(|e| e.to_string())?;
-            // Never push an EMPTY config — it must not clobber the canonical row
-            // (see `syncable_payload_is_empty`). Nothing to back up, so just clear
-            // the dirty flag locally and move on.
-            if syncable_payload_is_empty(&payload) {
-                conn.execute(
-                    "UPDATE user_config SET dirty = 0 WHERE id = ?1 AND revision = ?2",
-                    rusqlite::params![id, revision],
-                )
-                .map_err(|e| e.to_string())?;
-                continue;
-            }
-            out.push(json!({
-                "id": id,
-                "payload": enc_str(key, payload),
-                "revision": revision,
-                "deleted_at": Value::Null,
-                "created_at": now_ms(),
-                "updated_at": now_ms(),
-            }));
-        }
+            .map_err(|e| e.to_string())?;
+        let out: Result<Vec<_>, _> = rows.collect();
         drop(stmt);
-        out
+        out.map_err(|e| e.to_string())?
     };
+    let mut cfg_rows: Vec<Value> = Vec::new();
+    for (id, payload, revision) in cfg_pending {
+        // Never push an EMPTY config — it must not clobber the canonical row (see
+        // `syncable_payload_is_empty`). Nothing to back up, so just clear the dirty
+        // flag locally and move on.
+        if syncable_payload_is_empty(&payload) {
+            let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE user_config SET dirty = 0 WHERE id = ?1 AND revision = ?2",
+                rusqlite::params![id, revision],
+            )
+            .map_err(|e| e.to_string())?;
+            continue;
+        }
+        // Read-before-write: the server's enforce_revision trigger clamps only the
+        // revision column, not the payload. A STALE (lower-revision) push from a
+        // device that edited offline at a slower clock would therefore overwrite the
+        // canonical payload while keeping the higher revision — the clock-skew
+        // clobber, for non-empty configs. So never push a local row staler than the
+        // server's; the pull that follows (and the post-pull mirror) reconciles it.
+        match fetch_user_config_revision(ctx, token, &id).await {
+            // Server holds a newer revision → leave this row dirty; don't push.
+            Ok(Some(server_rev)) if revision < server_rev => continue,
+            Ok(_) => {}
+            // Can't confirm the server state → don't risk overwriting canonical.
+            Err(_) => continue,
+        }
+        cfg_rows.push(json!({
+            "id": id,
+            "payload": enc_str(ctx.key, payload),
+            "revision": revision,
+            "deleted_at": Value::Null,
+            "created_at": now_ms(),
+            "updated_at": now_ms(),
+        }));
+    }
     if !cfg_rows.is_empty() {
         post_upsert(ctx, "user_config", token, &cfg_rows, progress, |chunk| {
             clear_user_config_keys(ctx.db, chunk)
@@ -990,6 +1003,41 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
     }
 
     Ok(total)
+}
+
+/// Return the server's current revision for a `user_config` row, or `None` if the
+/// row isn't on the server. RLS scopes the lookup to this user, and the row id is
+/// the single global `'main'`. Used by the push's read-before-write guard so a
+/// device never overwrites a canonical config with a stale lower-revision edit.
+async fn fetch_user_config_revision(
+    ctx: &SyncCtx<'_>,
+    token: &str,
+    id: &str,
+) -> Result<Option<i64>, String> {
+    let url = format!(
+        "{}/rest/v1/user_config?id=eq.{}&select=revision",
+        ctx.base_url, id
+    );
+    let resp = ctx
+        .client
+        .get(&url)
+        .header("apikey", ctx.anon)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("read server user_config revision: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("read server user_config revision: HTTP {}", resp.status()));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("read server user_config revision body: {e}"))?;
+    // A malformed body is a "can't confirm server state" case — treat it as an
+    // error so the caller skips the push rather than guessing the row is absent.
+    let rows: Vec<Value> =
+        serde_json::from_str(&text).map_err(|e| format!("read server user_config revision parse: {e}"))?;
+    Ok(rows.first().and_then(|r| r.get("revision").and_then(|v| v.as_i64())))
 }
 
 /// True when a `user_config` payload carries nothing that could back anything up.
