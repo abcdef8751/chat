@@ -4149,10 +4149,10 @@ export default function App() {
                       })
                     }
                     disabled={backfill()?.running}
-                    title="Re-run consolidation over the summaries already staged (no re-extraction, so it's fast and can't lose a good summary). Re-writes memory from what was previously extracted."
+                    title="Re-extract every conversation even if it was already backfilled (ignores the 'already extracted' watermark), then consolidate into memory. A full re-mine — slower than 'Backfill all history'."
                     class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
                   >
-                    Force re-consolidate
+                    Force backfill all history
                   </button>
                 </div>
               </div>

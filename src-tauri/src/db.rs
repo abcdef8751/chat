@@ -1262,26 +1262,46 @@ pub fn conversations_pending_extraction_all(
     Ok(out)
 }
 
-/// How many staged extraction rows exist (folded or not). The force
-/// re-consolidation reports "nothing to backfill" when nothing has ever been
-/// extracted, since it has no staged summaries to re-fold.
-pub fn count_extractions(db: &Db) -> Result<usize, String> {
+/// Every conversation with enough content, imported or not, that a force run
+/// should RE-MINE. Differs from the normal/all-history scopes in two ways:
+///
+/// - It ignores the `watermark` — a conversation that was already fully
+///   extracted AND folded (`folded = 1`) is still re-picked, so force re-does
+///   completed work rather than treating it as done.
+/// - It SKIPS conversations currently staged but not yet folded
+///   (`folded = 0`). Those are mid-flight summaries from a paused/interrupted
+///   run; a resumed force run reuses them (the reduce still folds them) instead
+///   of re-extracting. That is what makes force resumable.
+///
+/// So: force re-mines ~everything, but a restarted force run continues from
+/// where it stopped rather than redone the finished staged work. Newest first.
+pub fn conversations_all_force_extraction(
+    db: &Db,
+    min_chars: i64,
+) -> Result<Vec<String>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM memory_extractions", [], |r| r.get(0))
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id FROM conversations c
+             WHERE COALESCE((SELECT MAX(m.\"index\") FROM messages m
+                             WHERE m.conversation_id = c.id AND m.role != 'memory'), -1) >= 0
+               AND (SELECT COALESCE(SUM(LENGTH(m.content)), 0) FROM messages m
+                    WHERE m.conversation_id = c.id AND m.role != 'memory') >= ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_extractions e
+                   WHERE e.conversation_id = c.id AND e.folded = 0
+               )
+             ORDER BY c.updated_at DESC",
+        )
         .map_err(|e| e.to_string())?;
-    Ok(n as usize)
-}
-
-/// Flip every staged extraction back to pending (`folded = 0`). Used by the
-/// force re-consolidation, which re-folds the summaries that already exist
-/// instead of re-extracting them. Retiring/`folded=1` rows are re-queued too;
-/// the reduce re-partitions empty ones out.
-pub fn unfold_all_extractions(db: &Db) -> Result<(), String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    conn.execute("UPDATE memory_extractions SET folded = 0", [])
+    let rows = stmt
+        .query_map([min_chars], |r| r.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
-    Ok(())
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 ///
@@ -1861,11 +1881,12 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Force re-consolidation: `count_extractions` sees staged rows regardless of
-    /// the `folded` flag, and `unfold_all_extractions` re-queues them (sets
-    /// `folded = 0`) so the reduce will re-fold them.
+    /// Force re-mine semantics: a chat that was already fully extracted AND
+    /// folded (folded = 1) is re-picked (force re-does completed work), while a
+    /// chat currently staged-but-unfolded (folded = 0) is skipped so a resumed
+    /// run reuses its in-progress summary rather than re-extracting it.
     #[test]
-    fn force_refold_unfolds_staged_extractions() {
+    fn force_refolds_completed_but_reuses_in_progress() {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-batch-force-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
@@ -1873,37 +1894,43 @@ mod tests {
         let now = now_ms();
 
         let conn = db.0.lock().unwrap();
-        conn.execute(
-            "INSERT INTO conversations (id, title, imported, import_batch, created_at, updated_at)
-             VALUES ('done', 'done', 1, 1, ?1, ?1)",
-            params![now],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at)
-             VALUES ('m', 'done', 'user', 0, ?1, ?2)",
-            params!["x".repeat(3000), now],
-        )
-        .unwrap();
-        // The chat was already folded into memory (folded = 1).
+        for id in ["done", "inflight"] {
+            conn.execute(
+                "INSERT INTO conversations (id, title, imported, import_batch, created_at, updated_at)
+                 VALUES (?1, ?1, 1, 1, ?2, ?2)",
+                params![id, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at)
+                 VALUES (?, ?1, 'user', 0, ?2, ?3)",
+                params![id, "x".repeat(3000), now],
+            )
+            .unwrap();
+        }
+        // 'done' was fully folded into memory (folded = 1)...
         conn.execute(
             "INSERT INTO memory_extractions (conversation_id, watermark, payload, folded, created_at)
              VALUES ('done', 0, ?1, 1, ?2)",
             params!["x", now],
         )
         .unwrap();
+        // ...'inflight' was staged by a paused run but not yet folded (folded = 0).
+        conn.execute(
+            "INSERT INTO memory_extractions (conversation_id, watermark, payload, folded, created_at)
+             VALUES ('inflight', 0, ?1, 0, ?2)",
+            params!["x", now],
+        )
+        .unwrap();
         drop(conn);
 
-        // count_extractions sees the row even though it is folded...
-        assert_eq!(count_extractions(&db).unwrap(), 1);
-        // ...and list_extractions (folded = 0 only) does not yet.
-        assert!(list_extractions(&db).unwrap().is_empty());
-
-        // A force re-consolidation re-queues it for the reduce.
-        unfold_all_extractions(&db).unwrap();
-        let rows = list_extractions(&db).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].conversation_id, "done");
+        // Normal/all-history scopes skip both (watermark covers the newest msg).
+        assert!(conversations_pending_extraction_all(&db, 2000).unwrap().is_empty());
+        // Force re-mines the completed chat but reuses (skips) the in-progress one.
+        assert_eq!(
+            conversations_all_force_extraction(&db, 2000).unwrap(),
+            vec!["done".to_string()]
+        );
 
         let _ = std::fs::remove_file(&p);
     }
