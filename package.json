@@ -9,7 +9,9 @@
     "build": "vite build",
     "serve": "vite preview",
     "tauri": "tauri",
-    "e2e": "bash e2e/run.sh"
+    "e2e": "bash e2e/run.sh",
+    "android:release": "bash scripts/android-release.sh",
+    "android:debug": "bash scripts/android-debug.sh"
   },
   "license": "MIT",
   "dependencies": {
