@@ -384,9 +384,10 @@ const MAX_CONCURRENCY: usize = 64;
 /// Floor, so a throttled run still makes progress.
 const MIN_CONCURRENCY: usize = 1;
 /// Attempts per pass before it is counted as failed. Each retry backs off
-/// exponentially (2s, 4s, 8s, 16s, capped at 60s). So up to 5 attempts total
-/// (an initial try + up to 4 retries) on transient provider errors.
-const PASS_ATTEMPTS: u32 = 5;
+/// exponentially (2s, 4s, 8s, 16s, 32s, capped at 60s). Set for 5 retries
+/// (i.e. 6 attempts total), so the cumulative backoff (~62s) clears the
+/// common per-minute rate-limit window before the last retry.
+const PASS_ATTEMPTS: u32 = 6;
 /// Fraction of the model's context window the staged summaries may occupy before
 /// the reduce is split into several passes. One pass is preferred: it sees every
 /// summary at once and resolves contradictions better than a fold. Chunking is a
