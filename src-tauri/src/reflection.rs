@@ -673,7 +673,9 @@ pub fn clear_extractions(db: tauri::State<'_, db::Db>) -> Result<usize, String> 
 /// `model` / `thinking_level` optionally override which model (and reasoning
 /// level) the map + reduce phases run on; when `None` they fall back to the
 /// active provider's default (see [`active_turn_cfg`]). `all_history` switches
-/// the map phase from the newest import batch to every pending conversation.
+/// the map phase from the newest import batch to every pending conversation, and
+/// `force` re-extracts even conversations already marked extracted (it re-stages
+/// and re-folds them).
 #[tauri::command]
 pub async fn backfill_memories(
     app: AppHandle,
@@ -682,6 +684,7 @@ pub async fn backfill_memories(
     model: Option<String>,
     thinking_level: Option<String>,
     all_history: Option<bool>,
+    force: Option<bool>,
 ) -> Result<BackfillStatus, String> {
     {
         let state = app.state::<Backfill>();
@@ -704,7 +707,8 @@ pub async fn backfill_memories(
         let min = min_chars.unwrap_or(DEFAULT_MIN_CHARS);
         let conc = concurrency.unwrap_or(DEFAULT_CONCURRENCY).max(1);
         let all = all_history.unwrap_or(false);
-        let outcome = backfill_inner(&handle, min, conc, model, thinking_level, all).await;
+        let force = force.unwrap_or(false);
+        let outcome = backfill_inner(&handle, min, conc, model, thinking_level, all, force).await;
         let state = handle.state::<Backfill>();
         match outcome {
             Ok(()) => state.set_phase(if state.cancelled() { "cancelled" } else { "done" }),
@@ -727,10 +731,14 @@ async fn backfill_inner(
     model: Option<String>,
     thinking: Option<String>,
     all_history: bool,
+    force: bool,
 ) -> Result<(), String> {
     let pending = {
         let db = app.state::<db::Db>();
-        if all_history {
+        if force {
+            // Re-backfill everything, ignoring the extraction watermark.
+            db::conversations_all_force_extraction(&db, min_chars)?
+        } else if all_history {
             db::conversations_pending_extraction_all(&db, min_chars)?
         } else {
             db::conversations_pending_extraction(&db, min_chars)?

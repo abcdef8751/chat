@@ -420,6 +420,7 @@ export function backfillMemories(
     model?: string | null;
     thinkingLevel?: string | null;
     allHistory?: boolean;
+    force?: boolean;
   } = {},
 ): Promise<BackfillStatus> {
   return invoke<BackfillStatus>("backfill_memories", {
@@ -428,6 +429,7 @@ export function backfillMemories(
     model: opts.model ?? null,
     thinkingLevel: opts.thinkingLevel ?? null,
     allHistory: opts.allHistory ?? null,
+    force: opts.force ?? null,
   });
 }
 

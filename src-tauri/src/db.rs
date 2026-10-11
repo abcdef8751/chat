@@ -1262,9 +1262,37 @@ pub fn conversations_pending_extraction_all(
     Ok(out)
 }
 
-/// Staged extractions that have not yet been folded into memory, in
-/// chronological order so the reduce folds history forward and later facts
-/// naturally win over earlier ones.
+/// Every conversation with enough content, imported or not and regardless of the
+/// extraction watermark — the "force" re-backfill scope. Used by the explicit
+/// "re-backfill everything" control, which deliberately ignores which chats were
+/// already extracted (`upsert_extraction` re-stages and marks them unfolded, so
+/// the reduce re-folds them). Same as [`conversations_pending_extraction_all`]
+/// but WITHOUT the `watermark < newest message` guard. Ordered newest first.
+pub fn conversations_all_force_extraction(
+    db: &Db,
+    min_chars: i64,
+) -> Result<Vec<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id FROM conversations c
+             WHERE COALESCE((SELECT MAX(m.\"index\") FROM messages m
+                             WHERE m.conversation_id = c.id AND m.role != 'memory'), -1) >= 0
+               AND (SELECT COALESCE(SUM(LENGTH(m.content)), 0) FROM messages m
+                    WHERE m.conversation_id = c.id AND m.role != 'memory') >= ?1
+             ORDER BY c.updated_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([min_chars], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
 ///
 /// Folded rows are excluded, which is what makes an interrupted consolidation
 /// resumable: a re-run picks up at the first batch that did not land.
@@ -1842,9 +1870,49 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// A database written before import-batch scoping existed must migrate
-    /// cleanly: the new column defaults existing imported chats to batch 0, and
-    /// with no newer import that batch is still the one the backfill targets.
+    /// The force scope deliberately ignores the extraction watermark: a chat that
+    /// was already extracted (has a folded extraction row) still gets re-picked.
+    #[test]
+    fn force_extraction_ignores_the_extraction_watermark() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-batch-force-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+        let now = now_ms();
+
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, title, imported, import_batch, created_at, updated_at)
+             VALUES ('done', 'done', 1, 1, ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at)
+             VALUES ('m', 'done', 'user', 0, ?1, ?2)",
+            params!["x".repeat(3000), now],
+        )
+        .unwrap();
+        // The chat is already extracted (watermark == max index AND folded).
+        conn.execute(
+            "INSERT INTO memory_extractions (conversation_id, watermark, payload, folded, created_at)
+             VALUES ('done', 0, ?1, 1, ?2)",
+            params!["x", now],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Not pending under the normal/all scopes (watermark is up to date)...
+        assert!(conversations_pending_extraction_all(&db, 2000).unwrap().is_empty());
+        // ...but the force scope still re-picks it.
+        assert_eq!(
+            conversations_all_force_extraction(&db, 2000).unwrap(),
+            vec!["done".to_string()]
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
     #[test]
     fn import_batch_migration_defaults_existing_imports() {
         let mut p = std::env::temp_dir();

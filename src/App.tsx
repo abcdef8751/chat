@@ -1656,6 +1656,7 @@ export default function App() {
     model?: string | null;
     thinkingLevel?: string | null;
     allHistory?: boolean;
+    force?: boolean;
   }) {
     setMemoryError(null);
     try {
@@ -1716,6 +1717,19 @@ export default function App() {
       .catch(() => {
         if (seq === backfillModelsReqSeq) setBackfillModels([]);
       });
+  });
+
+  // WebKit clears a <select> when its options rebuild, and the `value` binding
+  // won't restore `backfillModel()` because the signal is unchanged — so the
+  // picker "reverts to default" after backfillModels() reloads. Force the DOM
+  // value back whenever the selection or the option list changes.
+  let backfillModelSelectEl: HTMLSelectElement | undefined;
+  createEffect(() => {
+    backfillModels();
+    backfillModel();
+    if (backfillModelSelectEl && backfillModelSelectEl.value !== backfillModel()) {
+      backfillModelSelectEl.value = backfillModel();
+    }
   });
 
   async function discardExtractions() {
@@ -4009,6 +4023,7 @@ export default function App() {
                     <label class="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">
                       Backfill model
                       <select
+                        ref={(el) => (backfillModelSelectEl = el)}
                         class="rounded-md border border-neutral-300 bg-white px-2 py-1 text-[11px] text-neutral-700 outline-none focus:border-neutral-500 dark:border-neutral-600 dark:bg-neutral-800 dark:text-neutral-200"
                         value={backfillModel()}
                         disabled={backfill()?.running}
@@ -4121,6 +4136,20 @@ export default function App() {
                     class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
                   >
                     Backfill all history
+                  </button>
+                  <button
+                    onClick={() =>
+                      void startBackfill({
+                        force: true,
+                        model: backfillModel() || null,
+                        thinkingLevel: backfillThinking() || null,
+                      })
+                    }
+                    disabled={backfill()?.running}
+                    title="Re-extract every conversation regardless of whether it was already backfilled, then consolidate again. Costs a full re-run."
+                    class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                  >
+                    Force backfill all
                   </button>
                 </div>
               </div>
