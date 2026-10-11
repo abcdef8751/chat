@@ -1036,9 +1036,11 @@ export default function App() {
     );
     onCleanup(() => unlistenBackfill());
 
-    // Background/manual sync pull finished: local data may have changed. Refresh
-    // the conversation list and the open conversation's messages.
-    const unlistenSync = await listen("sync-changed", () => {
+    // Background/manual sync pull finished and applied remote rows. Refresh the
+    // conversation list and the open conversation's messages only when data
+    // actually changed, so the 60s idle tick doesn't re-scroll an idle chat.
+    const unlistenSync = await listen<{ changed: boolean }>("sync-changed", (event) => {
+      if (!event.payload?.changed) return;
       refreshConversations().catch(() => {});
       const id = activeId();
       if (id && !streaming()) listMessages(id).then(setMessages);
@@ -4076,7 +4078,13 @@ export default function App() {
                     </button>
                   </Show>
                   <button
-                    onClick={() => void startBackfill({ allHistory: true })}
+                    onClick={() =>
+                      void startBackfill({
+                        allHistory: true,
+                        model: backfillModel() || null,
+                        thinkingLevel: backfillThinking() || null,
+                      })
+                    }
                     disabled={backfill()?.running}
                     class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
                   >
