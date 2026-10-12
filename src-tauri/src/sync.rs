@@ -53,6 +53,23 @@ fn anon_key() -> String {
     std::env::var("SYNC_ANON").unwrap_or_else(|_| SUPABASE_ANON.to_string())
 }
 
+/// Sync can't work when the resolved base URL is the build-time fallback
+/// (`https://localhost.supabase.co`), i.e. `.env` was absent or empty at compile
+/// time — see `build.rs`. Every request would hit a bogus host and fail with an
+/// opaque "error sending request". Callers check the *resolved* URL first so a
+/// mis-built binary reports something actionable instead. (Checked against the
+/// URL, not the const, so the in-process test override is unaffected.)
+fn ensure_configured(base_url: &str) -> Result<(), String> {
+    if base_url.trim_end_matches('/') == "https://localhost.supabase.co" {
+        return Err(
+            "Cloud sync is not configured in this build: SUPABASE_URL was empty at compile time. \
+             Populate .env and rebuild the app."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Public status surface for the frontend.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -366,6 +383,7 @@ pub async fn sync_sign_in(
     password: String,
 ) -> Result<SyncStatus, String> {
     let sync = app.state::<SyncState>();
+    ensure_configured(&sync.base_url)?;
     let url = format!("{}/auth/v1/token?grant_type=password", sync.base_url);
     let resp = sync
         .client
@@ -405,6 +423,7 @@ pub fn sync_sign_out(_app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn sync_sign_up(app: AppHandle, email: String, password: String) -> Result<SyncStatus, String> {
     let sync = app.state::<SyncState>();
+    ensure_configured(&sync.base_url)?;
     let url = format!("{}/auth/v1/signup", sync.base_url);
     let resp = sync
         .client
@@ -605,6 +624,7 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     };
     let sync = app.state::<SyncState>();
+    ensure_configured(&sync.base_url)?;
     if sync.syncing.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
     }

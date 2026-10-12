@@ -1847,8 +1847,13 @@ export default function App() {
     if (providers().length === 0) return [];
     const id = model();
     const rest = models().filter((m) => m.id !== id);
-    const current = models().find((m) => m.id === id);
-    return [{ id, name: current?.name ?? id, vision: current?.vision ?? null }, ...rest];
+    // Keep the *full* catalog entry for the active model — including
+    // `modalities`/`attachment`/`reasoning` — so the Settings Capabilities card
+    // can render it. Only synthesize a stub when the model isn't in the catalog
+    // (no metadata to show). Rebuilding a `{id,name,vision}`-only object here
+    // silently dropped the capability fields.
+    const current = models().find((m) => m.id === id) ?? { id, name: id, vision: null };
+    return [current, ...rest];
   };
 
   // Resolve the reasoning popup's source from `thinkingOpenId`. A persisted (or

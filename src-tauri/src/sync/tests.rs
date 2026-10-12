@@ -15,6 +15,17 @@ use super::*;
 use crate::db::{self, Db};
 use crate::memory::MemoryState;
 
+#[test]
+fn ensure_configured_rejects_the_build_time_fallback_host() {
+    // A binary built without a populated `.env` embeds the fallback URL; sync
+    // must fail with an actionable message rather than a bogus request.
+    assert!(ensure_configured("https://localhost.supabase.co").is_err());
+    assert!(ensure_configured("https://localhost.supabase.co/").is_err());
+    // A real project URL, or the test override, is fine.
+    assert!(ensure_configured("https://abcdefgh.supabase.co").is_ok());
+    assert!(ensure_configured("http://127.0.0.1:54321").is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
