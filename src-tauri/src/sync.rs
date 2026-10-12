@@ -750,26 +750,14 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
             return Err(e);
         }
     };
-    // Mirror the user config AFTER the pull, never before. Because `user_config`
-    // is a single global 'main' row, a device that mirrors+pushes its own config
-    // ahead of the pull would push its (default) row over the authoritative
-    // remote config under a clock-based revision — clobbering it on the server
-    // and then seeing local-wins on its own pull (nothing appears). Pulling first
-    // lets a fresh/second device adopt the canonical config, at which point the
-    // mirror is a no-op (its config equals what it just applied); a genuine local
-    // edit still wins because `sync_user_config` bumps the revision above the
-    // latest applied/pulled one. It is pushed on the next tick.
-    let cfg_after = app.state::<ConfigState>().get();
-    {
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        db::sync_user_config(&conn, &cfg_after)?;
-    }
-    // Reconcile a user-config row stuck at the server's revision with a never-
-    // pushed payload (the absorption bug's residue — equal-revision rows are
-    // invisible to the pull high-water, and the mirror above no-ops on them).
-    // Best-effort: a hiccup here must not fail a sync that otherwise succeeded;
-    // the check simply repeats on the next tick.
-    let _ = reconcile_user_config(&ctx, &token).await;
+    // The pull is done — clear the phase so the panel stops showing "Pulling
+    // changes…" (with a frozen full bar) while the config tail below runs its
+    // own round-trip. `syncing` stays true until this function returns, so the
+    // row remains visible but reads as a generic "Syncing…".
+    sync.set_phase("");
+    // Mirror + reconcile the user config after the pull. Split into a helper so
+    // the ordering is testable without an `AppHandle`.
+    reconcile_config_after_pull(&ctx, &token).await?;
     // Persist the success timestamp so it survives restarts (the live value in
     // SyncState is in-memory only; without this the page would show "never"
     // after a relaunch even though syncs ran in earlier sessions).
@@ -1194,6 +1182,34 @@ async fn fetch_user_config_remote(
                 r.get("payload")?.as_str()?.to_string(),
             ))
         }))
+}
+
+/// Mirror the live config into the sync row and reconcile it against the server
+/// — the post-pull config tail of `do_sync`, split out so its ordering is
+/// testable without an `AppHandle`.
+///
+/// The mirror runs AFTER the pull, never before: `user_config` is a single
+/// global 'main' row, so a device that mirror-pushes its own config ahead of
+/// the pull would push its (default) row over the authoritative remote config
+/// under a clock-based revision — clobbering it on the server and then seeing
+/// local-wins on its own pull (nothing appears). Pulling first lets a
+/// fresh/second device adopt the canonical config, at which point the mirror is
+/// a no-op (its config equals what it just applied); a genuine local edit still
+/// wins because `sync_user_config` bumps the revision above the latest
+/// applied/pulled one, and is pushed on the next tick.
+///
+/// The reconcile then catches what the pull cannot: a row stuck at the server's
+/// revision with a divergent payload (equal-revision residue, invisible to the
+/// pull high-water). It is best-effort — a hiccup must not fail a sync that
+/// otherwise succeeded, so it repeats on the next tick.
+async fn reconcile_config_after_pull(ctx: &SyncCtx<'_>, token: &str) -> Result<(), String> {
+    let cfg_after = ctx.config.get();
+    {
+        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        db::sync_user_config(&conn, &cfg_after)?;
+    }
+    let _ = reconcile_user_config(ctx, token).await;
+    Ok(())
 }
 
 /// Reconcile the local `user_config` row against the server after a pull.
@@ -1833,7 +1849,10 @@ async fn get_table(
 }
 
 /// Parse PostgREST's `Content-Range` total, e.g. `0-999/1042` → `1042`.
-/// `*/1042` (unknown lower bound) and a missing/non-numeric total → `None`.
+/// A missing or non-numeric total → `None` (indeterminate progress). An empty
+/// result set reports `*/0` → `Some(0)`: `pull_total` then stays 0 and the bar
+/// remains indeterminate, which is indistinguishable from an uncounted server —
+/// harmless, since an empty pull registers no progress to show anyway.
 fn total_from_content_range(h: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
     let s = h?.to_str().ok()?;
     let total = s.rsplit('/').next()?;

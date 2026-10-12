@@ -192,7 +192,28 @@ impl MockRest {
                 } else {
                     match &table {
                         Some(t) => {
-                            let rows = g.lock().unwrap().get(t).cloned().unwrap_or_default();
+                            // Emulate PostgREST's `revision=gt.<n>` filter so the
+                            // returned rows (and the Content-Range total) reflect
+                            // the FILTERED set, not the whole table. Absent the
+                            // parameter (revision-less probes such as
+                            // fetch_user_config_revision) everything matches.
+                            let since: i64 = path
+                                .split("revision=gt.")
+                                .nth(1)
+                                .and_then(|s| s.split('&').next())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(i64::MIN);
+                            let rows: Vec<Value> = g
+                                .lock()
+                                .unwrap()
+                                .get(t)
+                                .cloned()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|v| {
+                                    v.get("revision").and_then(|r| r.as_i64()).unwrap_or(0) > since
+                                })
+                                .collect();
                             let js = serde_json::to_string(&rows).unwrap_or("[]".into());
                             let extra = if prefer_count {
                                 let n = rows.len();
@@ -1657,6 +1678,81 @@ async fn adoption_after_skip_mirrors_union_upward() {
     };
     assert_eq!(dirty, 1);
     assert!(rev > 1000, "the union must land above the pull high-water");
+}
+
+/// End-to-end guard for the combined post-pull config tail
+/// (`reconcile_config_after_pull`): the mirror and the reconcile run in the
+/// order `do_sync` uses them and, together, repair a row stuck at the server's
+/// revision (the absorption residue) so the real push path then uploads it.
+/// This pins the one seam the individual unit tests can't reach — `do_sync`
+/// itself needs an `AppHandle`.
+///
+/// The planted row payload is built FROM the live config, so the mirror is a
+/// no-op by construction and the RECONCILE is necessarily the thing that
+/// re-dirties the row (removing the reconcile call would fail this test).
+#[tokio::test]
+async fn post_pull_tail_repairs_stuck_row_and_pushes_it() {
+    let db = temp_db("tail");
+    let mem = temp_memory("tail", &db);
+    let cfg = temp_config("tail");
+    // Live config and the server's older payload differ ONLY in `preferences`.
+    let mut c = cfg.get();
+    c.preferences = "Local newer".into();
+    cfg.set(c).unwrap();
+    let live = cfg.get();
+    let local_new = live.syncable_payload().to_string();
+    let mut server_cfg = live.clone();
+    server_cfg.preferences = "Server old".into();
+    let server_old = server_cfg.syncable_payload().to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": server_old, "revision": 100,
+            "deleted_at": Value::Null,
+        })],
+    );
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            [&local_new],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    // The tail: mirror (no-op — row equals the live config) then reconcile
+    // (equal-revision divergence → re-dirty above the server).
+    reconcile_config_after_pull(&ctx, "tok").await.unwrap();
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 1);
+    assert!(rev > 100);
+    // ...and the ordinary push path then uploads the repaired row.
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "repaired row must push");
+    assert!(posts[posts.len() - 1]["payload"]
+        .as_str()
+        .unwrap()
+        .contains("Local newer"));
 }
 
 /// A server payload that looks encrypted is skipped even when a key IS present
