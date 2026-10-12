@@ -903,6 +903,13 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
     // local row is already gone, so the stored `conversation_id` plus
     // placeholder NOT NULL fields are sent; consumers delete on `deleted_at`
     // alone and never read the placeholders.
+    //
+    // Residual limitation (shared with conversation tombstones): a tombstone is
+    // only fetched when its revision exceeds the `messages` pull high-water mark,
+    // and revisions are wall-clock based. A device whose clock lags can mint a
+    // tombstone revision at or below another device's watermark, in which case
+    // that device never pulls the deletion. Same pre-existing skew edge as
+    // `tombstone_conversation`; fixing it needs a server-side monotonic revision.
     let msg_tombstones = {
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
