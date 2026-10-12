@@ -129,7 +129,13 @@ export default function App() {
     userText: string;
     userAttachments: Attachment[];
     tempUserId: string | null;
+    /// True once any visible assistant text delta has arrived. Used by `stop()`
+    /// to decide whether the user's draft should be handed back.
     receivedText: boolean;
+    /// True once any thinking delta / tool call / tool result has arrived. A
+    /// turn that only got this far has still persisted the user row, so its
+    /// draft must NOT be restored (that would duplicate it on re-send).
+    receivedActivity: boolean;
   } | null = null;
   let turnToken = 0;
 
@@ -384,11 +390,12 @@ export default function App() {
 
     // Android hardware/gesture back: pop exactly one layer per press, in
     // priority order (memory detail → memory dialog → settings → new chat →
-    // reasoning popup → sidebar drawer). Returning `false` when nothing is open
-    // lets the native side finish the activity, so back exits only on the chat
-    // page. Each close goes through the same setter/handler as its visible
-    // control (e.g. `closeSettings` saves). Inert on desktop, where no `pi-back`
-    // event is ever dispatched.
+    // reasoning popup → sidebar drawer → inline edit). Returning `false` when
+    // nothing is open lets the native side finish the activity, so back exits
+    // only on the chat page. Each close goes through the same setter/handler as
+    // its visible control (e.g. `closeSettings` saves, the edit branch cancels
+    // the inline editor). Inert on desktop, where no `pi-back` event is ever
+    // dispatched.
     const offBack = onBack(() => {
       if (memoryOpen() && memoryDetailOpen()) {
         setMemoryDetailOpen(false);
@@ -406,13 +413,17 @@ export default function App() {
         setNewOpen(false);
         return true;
       }
-      if (thinkingOpenId()) {
+      if (openThinking()) {
         setThinkingOpenId(null);
         return true;
       }
       if (sidebarOpen()) {
         setSidebarOpen(false);
         hamburgerEl?.focus();
+        return true;
+      }
+      if (editingId()) {
+        cancelEditMessage();
         return true;
       }
       return false;
@@ -1285,10 +1296,16 @@ export default function App() {
     }
     const atts: Attachment[] = [];
     for (const p of paths) {
-      if (isAndroid || p.startsWith("content://")) {
-        atts.push(await readAttachmentFromUri(p));
-      } else {
-        atts.push(...(await readAttachments([p])));
+      // One unreadable item must not drop the whole selection: keep the
+      // survivors, matching the desktop `readAttachments` per-file behavior.
+      try {
+        if (isAndroid || p.startsWith("content://")) {
+          atts.push(await readAttachmentFromUri(p));
+        } else {
+          atts.push(...(await readAttachments([p])));
+        }
+      } catch {
+        // Skip this item and continue with the rest.
       }
     }
     return atts;
@@ -1344,6 +1361,10 @@ export default function App() {
     text: string,
     staged: Attachment[],
     tempUserId: string | null,
+    /// `true` when the user row already exists in the transcript (an edit
+    /// re-run): the backend must build the turn without persisting a second
+    /// `user` row. Normal sends leave this `false`.
+    regenerate = false,
   ) {
     const assistantKey = `tmp-assistant-${tempId++}`;
     const assistantMsg: Message = {
@@ -1376,6 +1397,7 @@ export default function App() {
       userAttachments: staged,
       tempUserId,
       receivedText: false,
+      receivedActivity: false,
     };
 
     const received = { current: false };
@@ -1393,6 +1415,7 @@ export default function App() {
         );
       } else if (ev.type === "thinkingDelta") {
         received.current = true;
+        if (streamTurn) streamTurn.receivedActivity = true;
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantKey ? { ...m, thinking: (m.thinking ?? "") + ev.text } : m,
@@ -1400,6 +1423,7 @@ export default function App() {
         );
       } else if (ev.type === "toolCall") {
         received.current = true;
+        if (streamTurn) streamTurn.receivedActivity = true;
         // Flush the round's streamed reasoning + preamble text onto this call,
         // then reset the in-flight message so the next round starts clean. The
         // final round emits no `toolCall`, so whatever text remains stays as the
@@ -1429,6 +1453,8 @@ export default function App() {
           },
         ]);
       } else if (ev.type === "toolResult") {
+        received.current = true;
+        if (streamTurn) streamTurn.receivedActivity = true;
         setLiveTools((prev) =>
           prev.map((t) =>
             t.callId === ev.callId
@@ -1447,7 +1473,7 @@ export default function App() {
     };
 
     try {
-      await streamChat(id, text, staged, channel);
+      await streamChat(id, text, staged, channel, regenerate);
     } catch (e) {
       if (activeId() !== id || token !== turnToken) return;
       if (!received.current) {
@@ -1507,27 +1533,35 @@ export default function App() {
   async function stop() {
     const id = activeId();
     if (!id) return;
-    // Return to an idle state immediately rather than waiting on the stream's
-    // `done` event: clear live activity and re-enable/focus the composer (the
-    // Composer focuses itself when `streaming` drops). The partial assistant
-    // text is already in `messages`, so it stays in the transcript. The stream's
-    // own `done` event then reloads the persisted rows (reconstructing the
-    // timeline) — we do NOT supersede the turn token here, or that reload would
-    // be dropped.
+    // Close the abort race: keep `streaming` set until `stop_chat` has been
+    // delivered. Otherwise the composer is re-enabled while the abort is still
+    // in flight and a quick re-send can be cancelled by the late `stop_chat`.
+    // The command only raises the backend's cancel flag (it returns
+    // immediately), so the composer re-enables as soon as it lands. The
+    // stream's own `done` event still reloads the persisted rows (the turn
+    // token is deliberately not superseded), so the timeline still reconciles.
     const turn = streamTurn;
-    streamTurn = null;
-    setStreaming(false);
-    setLiveTools([]);
-    if (turn && !turn.receivedText && activeId() === turn.id && !draft().trim()) {
-      // Aborted before any assistant text: hand the user's message back so it
-      // can be re-sent.
-      setDraft(turn.userText);
-      if (turn.userAttachments.length > 0) setPendingAttachments(turn.userAttachments);
-    }
     try {
       await stopChat(id);
     } catch {
       // noop — the backend still settles the aborted turn.
+    }
+    streamTurn = null;
+    setStreaming(false);
+    setLiveTools([]);
+    // Aborted before any assistant output at all: hand the user's message back
+    // so it can be re-sent. A turn that got as far as reasoning or a tool call
+    // has already persisted the user row, so restoring the draft there would
+    // duplicate it on the next send.
+    if (
+      turn &&
+      !turn.receivedText &&
+      !turn.receivedActivity &&
+      activeId() === turn.id &&
+      !draft().trim()
+    ) {
+      setDraft(turn.userText);
+      if (turn.userAttachments.length > 0) setPendingAttachments(turn.userAttachments);
     }
   }
 
@@ -1600,7 +1634,9 @@ export default function App() {
       // The stream's `done` reload below still reconciles state.
     }
     if (activeId() !== id) return;
-    await runAssistantTurn(id, text, atts, null);
+    // The edited user row already exists — the backend must not insert a second
+    // one, so mark this re-run as a regeneration.
+    await runAssistantTurn(id, text, atts, null, true);
   }
 
   function approveLiveTool(callId: string) {
@@ -1849,16 +1885,25 @@ export default function App() {
     return [{ id, name: current?.name ?? id, vision: current?.vision ?? null }, ...rest];
   };
 
-  const openThinking = () => {
+  // Resolve the reasoning popup's source from `thinkingOpenId`. A persisted (or
+  // current-round) trace lives on a message row; a *flushed* live round's trace
+  // lives on its `LiveTool` — its synthetic `live:<callId>:thought` id matches
+  // no message, so it must be resolved against `liveTools()`. Returns null when
+  // the id is stale/unresolvable, which also serves as the "popup is open"
+  // predicate (see the hardware-back handler).
+  const openThinking = (): { text: string; live: boolean } | null => {
     const id = thinkingOpenId();
     if (!id) return null;
+    if (id.startsWith("live:")) {
+      const rest = id.slice("live:".length);
+      const callId = rest.endsWith(":thought") ? rest.slice(0, -":thought".length) : rest;
+      const t = liveTools().find((x) => x.callId === callId);
+      return t?.thinking?.trim() ? { text: t.thinking, live: true } : null;
+    }
     const m = messages().find((x) => x.id === id);
-    return m && m.thinking?.trim() ? m : null;
-  };
-
-  const thinkingLive = () => {
-    const m = openThinking();
-    return Boolean(streaming() && m && m.id.startsWith("tmp-assistant-") && !m.content);
+    if (!m?.thinking?.trim()) return null;
+    const live = Boolean(streaming() && m.id.startsWith("tmp-assistant-") && !m.content);
+    return { text: m.thinking, live };
   };
 
   // Context window + cost readouts for the active conversation. The meter shows
@@ -2246,7 +2291,7 @@ export default function App() {
             <div class="flex items-center justify-between border-b border-neutral-200 px-5 py-3 dark:border-neutral-800">
               <p class="text-sm font-medium">
                 Reasoning trace
-                <Show when={thinkingLive()}>
+                <Show when={openThinking()?.live}>
                   <span class="ml-2 text-xs text-neutral-400 dark:text-neutral-500">
                     (live)
                   </span>
@@ -2262,7 +2307,7 @@ export default function App() {
             </div>
             <div class="overflow-y-auto px-5 py-4">
               <pre class="whitespace-pre-wrap break-words text-sm leading-relaxed text-neutral-700 dark:text-neutral-300">
-                {openThinking()?.thinking}
+                {openThinking()?.text}
               </pre>
             </div>
           </div>
