@@ -43,6 +43,18 @@ jni = { version = "0.22", default-features = false }
 rustls-platform-verifier = "0.7"
 
 
+# ---------------------------------------------------------------------------
+# Vendored crate patch: `tauri-runtime-wry` 2.11.4 is copied under `vendor/` so
+# we can apply upstream PR tauri-apps/tauri#15678. On mobile, `Event::Resumed`
+# only dispatched per-window events, so the app-level `RunEvent::Resumed`
+# callback never fired when no window was alive — which is exactly the state
+# after Android swipes the app away while `prevent_exit()` + the keep-alive
+# foreground service hold the process open. Without it, relaunch leaves a blank
+# window (tauri#15671). The patch makes the resume reach `RunEvent::Resumed` in
+# `src/lib.rs`. Drop this once a released dependency includes the fix.
+[patch.crates-io]
+tauri-runtime-wry = { path = "vendor/tauri-runtime-wry" }
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1

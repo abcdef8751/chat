@@ -169,6 +169,8 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
+        // `_app` is only read on Android (window recreate on resume); the
+        // underscore keeps the desktop build warning-free.
         .run(|_app, event| match event {
             #[cfg(target_os = "android")]
             tauri::RunEvent::ExitRequested { api, .. } => {
@@ -181,17 +183,33 @@ pub fn run() {
             }
             #[cfg(target_os = "android")]
             tauri::RunEvent::Resumed => {
-                // Known Tauri gap (tauri#15671): after swipe-away the process
-                // survives, but a relaunched activity gets no WebView → blank
-                // screen. Recreate the main window when resumed with none open.
+                // Android blank-screen-on-relaunch fix (tauri#15671). This event
+                // only reaches us because `tauri-runtime-wry` is vendored and
+                // patched with upstream PR #15678 (see [patch.crates-io] in
+                // Cargo.toml): upstream 2.11.4 emits `RunEvent::Resumed` only on
+                // `StartCause::Poll`, an arm its `ControlFlow::Wait` loop never
+                // hits, so on Android the resume was silently dropped. It matters
+                // here because swipe-away does NOT exit: `ExitRequested` calls
+                // `prevent_exit()` and `KeepAliveService` keeps the process (and
+                // its sync/reflection schedulers) alive. The relaunched activity
+                // therefore resumes with no window at all → blank screen until
+                // the process is killed. Recreate the main window in that case;
+                // the label matches `tauri.conf.json` so Tauri's window registry
+                // stays consistent.
                 if _app.webview_windows().is_empty() {
-                    let _ = tauri::WebviewWindowBuilder::new(
+                    match tauri::WebviewWindowBuilder::new(
                         _app,
                         "main",
                         tauri::WebviewUrl::default(),
                     )
                     .title("Pi Chat")
-                    .build();
+                    .build()
+                    {
+                        Ok(_) => eprintln!("android: recreated main window on resume"),
+                        Err(e) => {
+                            eprintln!("android: failed to recreate main window on resume: {e}")
+                        }
+                    }
                 }
             }
             #[cfg(target_os = "linux")]
