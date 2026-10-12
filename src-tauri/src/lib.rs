@@ -244,6 +244,7 @@ async fn read_attachment_from_uri(
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
-async fn read_attachment_from_uri(_uri: String) -> Result<attachments::Attachment, String> {
+async fn read_attachment_from_uri(uri: String) -> Result<attachments::Attachment, String> {
+    let _ = uri;
     Err("read_attachment_from_uri is only available on Android".into())
 }
