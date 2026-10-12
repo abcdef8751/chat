@@ -529,6 +529,7 @@
         let task = tokio::spawn(async move {
             run_chat_turn(
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink, cid_task, "hi".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -620,6 +621,7 @@
         let task = tokio::spawn(async move {
             run_chat_turn(
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink, cid_task, "ping".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -664,6 +666,7 @@
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
                 cid_task, "hi".into(),
                 Vec::new(),
+            false,
             )
             .await
         });
@@ -725,6 +728,7 @@
             run_chat_turn(
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
                 cid_task, "look".into(), attachments,
+            false,
             )
             .await
         });
@@ -787,6 +791,7 @@
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
                 cid_task, "hi".into(),
                 Vec::new(),
+            false,
             )
             .await
         });
@@ -829,6 +834,7 @@
         let task = tokio::spawn(async move {
             run_chat_turn(
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink, cid_task, "q".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -891,6 +897,7 @@
                 cid2,
                 "run echo hi".into(),
                 Vec::new(),
+            false,
             )
             .await
         });
@@ -982,6 +989,7 @@
             run_chat_turn(
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
                 cid2, "run echo hi".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -1061,6 +1069,7 @@
             run_chat_turn(
                 &db2, &cfg2, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
                 cid2, "run echo hi".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -1090,6 +1099,7 @@
         run_chat_turn(
             &db, &cfg, "test-key", &mcp2, &shell2, &memory2, &approvals, flag2, &sink2,
             cid.clone(), "again".into(), Vec::new(),
+        false,
         )
         .await
         .unwrap();
@@ -1142,6 +1152,7 @@
             run_chat_turn(
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink,
                 cid2, "run echo hi".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -1208,6 +1219,7 @@
         let task = tokio::spawn(async move {
             run_chat_turn(
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink, cid2, "do it".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -1269,6 +1281,7 @@
         let task = tokio::spawn(async move {
             run_chat_turn(
                 &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag2, &sink, cid2, "say something".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -1983,6 +1996,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
                 cid.clone(),
                 format!("turn {turn}"),
                 Vec::new(),
+            false,
             )
             .await
             .unwrap();
@@ -2060,6 +2074,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             run_chat_turn(
                 &db2, &cfg, "test-key", &brave, &shell, &memory, &approvals2, flag, &sink,
                 cid2, "go".into(), Vec::new(),
+            false,
             )
             .await
         });
@@ -2206,6 +2221,94 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert_eq!(msgs(&db, &cid)[0].content, "two");
     }
 
+    /// Editing a user message keeps that row and re-runs the turn with
+    /// `regenerate = true`: the backend must neither persist a second `user` row
+    /// nor send the turn twice in the request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn regenerate_turn_does_not_duplicate_the_edited_user_row() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![vec![
+                delta_chunk("Edited reply"),
+                finish_chunk("stop"),
+                usage_chunk(),
+            ]],
+            0,
+        );
+        let db = Arc::new(open_db("regen-edit"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+
+        // Seed the user turn, then edit it through the real DB path (which keeps
+        // the row and clears everything after it).
+        let row = crate::db::insert_message(
+            &db,
+            cid.clone(),
+            "user".into(),
+            "original".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        crate::db::apply_user_message_edit(&db, &cid, &row.id, "edited text", None).unwrap();
+
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("regen-edit");
+        let flag = Arc::new(AtomicBool::new(false));
+
+        run_chat_turn(
+            &db,
+            &cfg,
+            "test-key",
+            &brave,
+            &shell,
+            &memory,
+            &approvals,
+            flag,
+            &sink,
+            cid.clone(),
+            "edited text".into(),
+            Vec::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        // Exactly one user row, and it is the pre-existing edited row.
+        let rows = msgs(&db, &cid);
+        let user_rows: Vec<_> = rows.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(user_rows.len(), 1, "regenerate must not insert a second user row");
+        assert_eq!(user_rows[0].id, row.id);
+        assert_eq!(user_rows[0].content, "edited text");
+        assert_eq!(rows.len(), 2, "the edited user turn + the assistant reply");
+        assert_eq!(rows[1].role, "assistant");
+        assert_eq!(rows[1].content, "Edited reply");
+
+        // And the upstream request carries the turn exactly once.
+        let caps = bodies.lock().unwrap().clone();
+        let req = request_body(&caps[0]);
+        let sent: Vec<_> = req["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .collect();
+        assert_eq!(sent.len(), 1, "the user turn must appear once upstream");
+        assert_eq!(sent[0]["content"], "edited text");
+    }
+
     // --- read_file images (item 9) ------------------------------------------
 
     /// Register `mock` as a vision model for the given provider key so the chat
@@ -2262,6 +2365,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         run_chat_turn(
             &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-vision"), &approvals,
             flag, &sink, cid.clone(), "look".into(), Vec::new(),
+        false,
         )
         .await
         .unwrap();
@@ -2335,6 +2439,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         run_chat_turn(
             &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-text"), &approvals,
             flag, &sink, cid.clone(), "look".into(), Vec::new(),
+        false,
         )
         .await
         .unwrap();
@@ -2399,6 +2504,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         run_chat_turn(
             &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-oversize"),
             &approvals, flag, &sink, cid.clone(), "look".into(), Vec::new(),
+        false,
         )
         .await
         .unwrap();
@@ -2461,6 +2567,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         run_chat_turn(
             &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-svg"), &approvals, flag,
             &sink, cid.clone(), "look".into(), Vec::new(),
+        false,
         )
         .await
         .unwrap();

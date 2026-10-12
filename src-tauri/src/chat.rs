@@ -1503,6 +1503,10 @@ pub(crate) async fn run_tool_loop(
 
 /// The live chat turn: persist the user message, run the capped tool loop with
 /// DB persistence, freeze the turn's price, and store the final assistant turn.
+///
+/// When `regenerate` is true the user message is assumed to already exist (the
+/// `edit_user_message` path), so no `user` row is inserted; the turn is built
+/// from `content` all the same.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_chat_turn(
     db: &db::Db,
@@ -1517,10 +1521,11 @@ pub(crate) async fn run_chat_turn(
     conversation_id: String,
     content: String,
     attachments: Vec<crate::attachments::Attachment>,
+    regenerate: bool,
 ) -> Result<(), String> {
     let conversation = db::get_conversation(db, &conversation_id)?
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
-    let history = db::read_messages(db, &conversation_id)?;
+    let mut history = db::read_messages(db, &conversation_id)?;
 
     // Resolve this conversation's provider and model once, falling back to the
     // active provider and the app's configured model when unset. The override is
@@ -1538,24 +1543,36 @@ pub(crate) async fn run_chat_turn(
     turn_cfg.model = model.clone();
 
     // Persist the incoming user turn before streaming so it survives an abort/error.
-    let attachments_json = if attachments.is_empty() {
-        None
+    //
+    // `regenerate` is the edit path: `apply_user_message_edit` already updated the
+    // existing `user` row in place, so inserting another here would duplicate the
+    // turn. Instead, drop the (now last) user row from the history we send and
+    // rebuild the request from `content` — exactly one copy of the turn goes
+    // upstream, and no new row is persisted. A normal send has no such row yet.
+    if regenerate {
+        if history.last().is_some_and(|m| m.role == "user") {
+            history.pop();
+        }
     } else {
-        Some(serde_json::to_string(&attachments).map_err(|e| e.to_string())?)
-    };
-    db::insert_message_full(
-        db,
-        conversation_id.clone(),
-        "user".into(),
-        content.clone(),
-        Some(turn_cfg.model.clone()),
-        Some(turn_cfg.base_url.clone()),
-        None,
-        None,
-        None,
-        None,
-        attachments_json,
-    )?;
+        let attachments_json = if attachments.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&attachments).map_err(|e| e.to_string())?)
+        };
+        db::insert_message_full(
+            db,
+            conversation_id.clone(),
+            "user".into(),
+            content.clone(),
+            Some(turn_cfg.model.clone()),
+            Some(turn_cfg.base_url.clone()),
+            None,
+            None,
+            None,
+            None,
+            attachments_json,
+        )?;
+    }
 
     let base_prompt = conversation
         .system_prompt
@@ -1673,12 +1690,16 @@ pub(crate) async fn run_chat_turn(
 
 /// Stream an assistant reply for the given conversation: read config + key,
 /// register the cancel flag, and hand off to the tool-loop core.
+///
+/// `regenerate` is `true` after `edit_user_message`: the edited user row already
+/// exists, so the turn must not insert a second one.
 #[tauri::command]
 pub async fn stream_chat(
     app: tauri::AppHandle,
     conversation_id: String,
     content: String,
     attachments: Option<Vec<crate::attachments::Attachment>>,
+    regenerate: bool,
     channel: Channel<StreamEvent>,
 ) -> Result<(), String> {
     let config = app.state::<ConfigState>().get();
@@ -1723,6 +1744,7 @@ pub async fn stream_chat(
         conversation_id.clone(),
         content,
         attachments.unwrap_or_default(),
+        regenerate,
     )
     .await;
 

@@ -1136,6 +1136,7 @@ fn syncable_payload_is_empty(payload: &str) -> bool {
         Err(_) => false,
     }
 }
+/// Clear the dirty flag (guarded by revision) for the message rows in a batch
 /// that just pushed successfully. Rows mutated mid-flight fail the guard and
 /// stay dirty for the next tick. This runs per batch so `pending` shrinks live.
 fn clear_message_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Text files larger than this are attached by name only (keeps messages sane).
-const MAX_TEXT_BYTES: u64 = 1_000_000;
+pub(crate) const MAX_TEXT_BYTES: u64 = 1_000_000;
 
 /// Images larger than this are not read into a data URL at all. An image is
 /// base64-inflated (~4/3) and the resulting data URL is re-sent on every
@@ -40,7 +40,7 @@ pub struct Attachment {
     pub text: Option<String>,
 }
 
-fn mime_for(ext: &str) -> &'static str {
+pub(crate) fn mime_for(ext: &str) -> &'static str {
     match ext {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -68,7 +68,7 @@ fn mime_for(ext: &str) -> &'static str {
     }
 }
 
-fn is_text_like(ext: &str) -> bool {
+pub(crate) fn is_text_like(ext: &str) -> bool {
     matches!(
         ext,
         "txt"
@@ -145,7 +145,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// most vision APIs reject them, which makes the whole turn fail provider-side
 /// instead of telling the model it cannot view the file. Non-raster files fall
 /// back to the text path (SVG is XML text) or a metadata-only attachment.
-fn is_raster_image_ext(ext: &str) -> bool {
+pub(crate) fn is_raster_image_ext(ext: &str) -> bool {
     matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
 }
 
@@ -191,6 +191,9 @@ pub fn read_image(path: &str) -> Result<(String, String), String> {
 }
 
 /// Read one file into an [`Attachment`]. Directories and unreadable paths error.
+///
+/// A raster image larger than [`MAX_IMAGE_BYTES`] is not turned into a data URL;
+/// it degrades to a metadata-only `file` attachment (see the image branch).
 pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
     let meta =
         std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -209,7 +212,7 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
     let size = meta.len();
     let id = Uuid::new_v4().to_string();
 
-    if is_raster_image_ext(&ext) {
+    if is_raster_image_ext(&ext) && size <= MAX_IMAGE_BYTES {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let data_url = format!("data:{};base64,{}", mime, base64_encode(&bytes));
         return Ok(Attachment {
@@ -222,6 +225,13 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
             text: None,
         });
     }
+    // An oversized raster image deliberately falls through: producing a data URL
+    // here would base64-inflate it (~4/3) and re-send it on every remaining round
+    // of the turn, which can blow a provider's body limit and fails the whole
+    // turn. Instead it becomes a metadata-only `file` attachment (the same
+    // fallback as any other unreadable file): the user still sees it attached,
+    // and the model is never handed bytes it cannot use. This mirrors the cap
+    // the `read_file` tool already enforces via [`read_image`].
 
     if is_text_like(&ext) && size <= MAX_TEXT_BYTES {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -301,6 +311,25 @@ mod tests {
         assert_eq!(a.kind, "image");
         assert_eq!(a.mime, "image/png");
         assert_eq!(a.data_url.as_deref(), Some("data:image/png;base64,AAECAw=="));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn attachment_oversized_image_falls_back_to_metadata_only() {
+        // A raster image past the cap must NOT become a data URL (which would be
+        // base64-inflated and re-sent every round); it degrades to a metadata-only
+        // `file` attachment. Sparse file: metadata reports the length without
+        // writing the bytes.
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-attach-oversize-{}.png", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        drop(f);
+        let a = read_attachment(&p).unwrap();
+        assert_eq!(a.kind, "file");
+        assert!(a.data_url.is_none());
+        assert_eq!(a.mime, "image/png");
+        assert_eq!(a.size, MAX_IMAGE_BYTES + 1);
         let _ = std::fs::remove_file(&p);
     }
 
