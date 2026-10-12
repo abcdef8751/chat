@@ -22,7 +22,10 @@ use tauri::plugin::{Builder, PluginHandle, TauriPlugin};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
-use crate::attachments::Attachment;
+use crate::attachments::{
+    is_raster_image_ext, is_text_like, mime_for, Attachment, MAX_IMAGE_BYTES,
+    MAX_TEXT_BYTES,
+};
 
 /// Initialize `rustls-platform-verifier` with Android's system trust store
 /// before the first TLS handshake.
@@ -120,88 +123,10 @@ pub fn file_plugin() -> TauriPlugin<tauri::Wry> {
         .build()
 }
 
-/// Text files larger than this are attached by name only (mirrors
-/// `attachments::MAX_TEXT_BYTES`; that constant is private to the module).
-const MAX_TEXT_BYTES: u64 = 1_000_000;
-
-/// Extension → mime, mirroring `attachments::mime_for`. Replicated because the
-/// original is private and the task scope forbids editing `attachments.rs`; it
-/// is only a fallback for providers that report no mime (see the caller).
-fn mime_for(ext: &str) -> &'static str {
-    match ext {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "pdf" => "application/pdf",
-        "json" => "application/json",
-        "csv" => "text/csv",
-        "md" | "markdown" => "text/markdown",
-        "txt" | "log" | "ini" | "conf" | "toml" | "yaml" | "yml" => "text/plain",
-        "xml" => "application/xml",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "js" | "mjs" | "cjs" => "text/javascript",
-        "ts" | "tsx" => "text/typescript",
-        "rs" => "text/x-rust",
-        "py" => "text/x-python",
-        "go" => "text/x-go",
-        "java" => "text/x-java",
-        "sh" | "bash" | "zsh" => "text/x-sh",
-        _ => "application/octet-stream",
-    }
-}
-
-/// Text-like extension check, mirroring `attachments::is_text_like`.
-fn is_text_like(ext: &str) -> bool {
-    matches!(
-        ext,
-        "txt"
-            | "log"
-            | "ini"
-            | "conf"
-            | "toml"
-            | "yaml"
-            | "yml"
-            | "json"
-            | "csv"
-            | "md"
-            | "markdown"
-            | "xml"
-            | "html"
-            | "htm"
-            | "css"
-            | "js"
-            | "mjs"
-            | "cjs"
-            | "ts"
-            | "tsx"
-            | "jsx"
-            | "rs"
-            | "py"
-            | "go"
-            | "java"
-            | "c"
-            | "cc"
-            | "cpp"
-            | "h"
-            | "hpp"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "sql"
-            | "env"
-            | "gitignore"
-    )
-}
-
 /// Read an Android `content://` URI into the same [`Attachment`] shape the
-/// path-based `attachments::read_attachment` produces: images carry a base64
-/// data URL, text-like files carry their decoded contents, anything else keeps
-/// only its metadata.
+/// path-based `attachments::read_attachment` produces: raster images carry a
+/// base64 data URL, text-like files carry their decoded contents, anything else
+/// keeps only its metadata.
 pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<Attachment, String> {
     let handle = app.state::<FileBridgeHandle>();
     let out: UriAttachment = handle
@@ -223,7 +148,11 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
     };
     let size = out.size;
 
-    if mime.starts_with("image/") {
+    // Classify by extension against the shared raster-only table, exactly as the
+    // desktop path does: SVG/ICO are *not* images here (SVG falls back to text),
+    // and an image past `MAX_IMAGE_BYTES` must not become a data URL. Reusing the
+    // shared `attachments.rs` helpers keeps both pickers in lockstep.
+    if is_raster_image_ext(&ext) && size <= MAX_IMAGE_BYTES {
         return Ok(Attachment {
             id: Uuid::new_v4().to_string(),
             name: out.name,
