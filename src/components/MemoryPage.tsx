@@ -1,4 +1,4 @@
-import { createEffect, For, Show } from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import type {
   BackfillStatus,
@@ -69,6 +69,147 @@ export function MemoryPage(props: {
     }
   });
 
+  // Narrow viewports split the dialog into two pages: a names-only list and a
+  // full-screen editor for the tapped file. Wide viewports keep the two-pane
+  // layout, so this is only ever set below `lg`.
+  const [mobileDetail, setMobileDetail] = createSignal(false);
+
+  // Always reopen on the list page after the dialog closes.
+  createEffect(() => {
+    if (!props.memoryOpen) setMobileDetail(false);
+  });
+
+  // A tap selects the file; on a narrow viewport it also drills into the
+  // full-screen editor page.
+  function chooseFile(file: MemoryFile) {
+    props.selectMemoryFile(file);
+    if (!props.wideViewport) setMobileDetail(true);
+  }
+
+  function deleteSelected(name: string) {
+    void props.removeMemoryFile(name);
+    // After a delete the edited file is gone — return to the list.
+    setMobileDetail(false);
+  }
+
+  const fileButtonClass = (f: MemoryFile) =>
+    `w-full shrink-0 truncate rounded-md px-2 py-1.5 text-left text-xs transition ${
+      props.memorySelected === f.name
+        ? "bg-neutral-200 font-medium dark:bg-neutral-800"
+        : "text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
+    }`;
+
+  // The Core / Other file buttons, shared by the wide list column and the
+  // narrow names-only page.
+  const fileList = () => (
+    <>
+      <p class="shrink-0 px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+        Core
+      </p>
+      <For each={props.memoryFiles.filter((f) => f.core)}>
+        {(f) => (
+          <button onClick={() => chooseFile(f)} class={fileButtonClass(f)}>
+            {f.name}
+          </button>
+        )}
+      </For>
+      <Show when={props.memoryFiles.some((f) => !f.core)}>
+        <p class="mt-3 shrink-0 px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+          Other
+        </p>
+        <For each={props.memoryFiles.filter((f) => !f.core)}>
+          {(f) => (
+            <button onClick={() => chooseFile(f)} class={fileButtonClass(f)}>
+              {f.name}
+            </button>
+          )}
+        </For>
+      </Show>
+    </>
+  );
+
+  // Editor / preview plus the Edit-Preview-Save and Delete controls. Shared by
+  // the wide right pane and the narrow full-screen detail page.
+  const fileEditor = () => (
+    <>
+      <Show
+        when={!props.memoryPreview}
+        fallback={
+          <div class="min-h-0 flex-1 overflow-y-auto rounded-lg border border-neutral-300 bg-white p-4 dark:border-neutral-700 dark:bg-neutral-950">
+            <Show
+              when={props.memoryDraft.trim()}
+              fallback={
+                <p class="text-xs text-neutral-400 dark:text-neutral-500">(empty)</p>
+              }
+            >
+              <Markdown text={props.memoryDraft} class="prose-sm" />
+            </Show>
+          </div>
+        }
+      >
+        <textarea
+          class="min-h-0 flex-1 resize-none rounded-lg border border-neutral-300 bg-white p-3 font-mono text-xs outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
+          spellcheck={false}
+          value={props.memoryDraft}
+          onInput={(e) => props.setMemoryDraft(e.currentTarget.value)}
+        />
+      </Show>
+      <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
+        <Show
+          when={props.memoryConfirmDelete === props.selectedMemoryFile?.name}
+          fallback={
+            <button
+              onClick={() =>
+                props.setMemoryConfirmDelete(props.selectedMemoryFile?.name ?? null)
+              }
+              class="text-[11px] text-red-600 transition hover:underline dark:text-red-400"
+            >
+              Delete file
+            </button>
+          }
+        >
+          <div class="flex items-center gap-2">
+            <span class="text-[11px] text-neutral-500 dark:text-neutral-400">
+              Delete {props.selectedMemoryFile?.name}?
+            </span>
+            <button
+              onClick={() => deleteSelected(props.selectedMemoryFile?.name ?? "")}
+              class="rounded bg-red-600 px-2 py-1 text-[11px] text-white transition hover:bg-red-500"
+            >
+              Delete
+            </button>
+            <button
+              onClick={() => props.setMemoryConfirmDelete(null)}
+              class="text-[11px] text-neutral-500 transition hover:underline dark:text-neutral-400"
+            >
+              Cancel
+            </button>
+          </div>
+        </Show>
+
+        <div class="flex items-center gap-2">
+          <Show when={props.memoryError}>
+            <span class="max-w-64 whitespace-pre-wrap break-words text-[11px] text-red-600 dark:text-red-400">
+              {props.memoryError}
+            </span>
+          </Show>
+          <button
+            onClick={() => props.setMemoryPreview((p) => !p)}
+            class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+          >
+            {props.memoryPreview ? "Edit" : "Preview"}
+          </button>
+          <button
+            onClick={() => void props.saveSelectedMemory()}
+            class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
   return (
     <Dialog open={props.memoryOpen} onOpenChange={props.setMemoryOpen}>
       <Dialog.Portal>
@@ -103,137 +244,35 @@ export function MemoryPage(props: {
             are set in Settings and kept separate.
           </Dialog.Description>
 
-          <div class="mt-4 flex min-h-0 flex-1 gap-4">
-            <div class="flex w-44 shrink-0 flex-col gap-1 overflow-y-auto">
-              <p class="shrink-0 px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
-                Core
-              </p>
-              <For each={props.memoryFiles.filter((f) => f.core)}>
-                {(f) => (
-                  <button
-                    onClick={() => props.selectMemoryFile(f)}
-                    class={`truncate shrink-0 rounded-md px-2 py-1.5 text-left text-xs transition ${
-                      props.memorySelected === f.name
-                        ? "bg-neutral-200 font-medium dark:bg-neutral-800"
-                        : "text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
-                    }`}
-                  >
-                    {f.name}
-                  </button>
-                )}
-              </For>
-              <Show when={props.memoryFiles.some((f) => !f.core)}>
-                <p class="mt-3 shrink-0 px-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
-                  Other
-                </p>
-                <For each={props.memoryFiles.filter((f) => !f.core)}>
-                  {(f) => (
-                    <button
-                      onClick={() => props.selectMemoryFile(f)}
-                      class={`truncate shrink-0 rounded-md px-2 py-1.5 text-left text-xs transition ${
-                        props.memorySelected === f.name
-                          ? "bg-neutral-200 font-medium dark:bg-neutral-800"
-                          : "text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
-                      }`}
-                    >
-                      {f.name}
-                    </button>
-                  )}
-                </For>
-              </Show>
-            </div>
+          {/* Wide viewports: the classic two-pane list + editor. */}
+          <Show when={props.wideViewport}>
+            <div class="mt-4 flex min-h-0 flex-1 gap-4">
+              <div class="flex w-44 shrink-0 flex-col gap-1 overflow-y-auto">
+                {fileList()}
+              </div>
 
-            <div class="flex min-w-0 flex-1 flex-col">
-              <Show
-                when={props.selectedMemoryFile}
-                fallback={
-                  <p class="text-sm text-neutral-400 dark:text-neutral-500">
-                    No memory file selected.
-                  </p>
-                }
-              >
+              <div class="flex min-w-0 flex-1 flex-col">
                 <Show
-                  when={!props.memoryPreview}
+                  when={props.selectedMemoryFile}
                   fallback={
-                    <div class="min-h-0 flex-1 overflow-y-auto rounded-lg border border-neutral-300 bg-white p-4 dark:border-neutral-700 dark:bg-neutral-950">
-                      <Show
-                        when={props.memoryDraft.trim()}
-                        fallback={
-                          <p class="text-xs text-neutral-400 dark:text-neutral-500">
-                            (empty)
-                          </p>
-                        }
-                      >
-                        <Markdown text={props.memoryDraft} class="prose-sm" />
-                      </Show>
-                    </div>
+                    <p class="text-sm text-neutral-400 dark:text-neutral-500">
+                      No memory file selected.
+                    </p>
                   }
                 >
-                  <textarea
-                    class="min-h-0 flex-1 resize-none rounded-lg border border-neutral-300 bg-white p-3 font-mono text-xs outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
-                    spellcheck={false}
-                    value={props.memoryDraft}
-                    onInput={(e) => props.setMemoryDraft(e.currentTarget.value)}
-                  />
+                  {fileEditor()}
                 </Show>
-                <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
-                  <Show
-                    when={props.memoryConfirmDelete === props.selectedMemoryFile?.name}
-                    fallback={
-                      <button
-                        onClick={() =>
-                          props.setMemoryConfirmDelete(props.selectedMemoryFile?.name ?? null)
-                        }
-                        class="text-[11px] text-red-600 transition hover:underline dark:text-red-400"
-                      >
-                        Delete file
-                      </button>
-                    }
-                  >
-                    <div class="flex items-center gap-2">
-                      <span class="text-[11px] text-neutral-500 dark:text-neutral-400">
-                        Delete {props.selectedMemoryFile?.name}?
-                      </span>
-                      <button
-                        onClick={() =>
-                          void props.removeMemoryFile(props.selectedMemoryFile?.name ?? "")
-                        }
-                        class="rounded bg-red-600 px-2 py-1 text-[11px] text-white transition hover:bg-red-500"
-                      >
-                        Delete
-                      </button>
-                      <button
-                        onClick={() => props.setMemoryConfirmDelete(null)}
-                        class="text-[11px] text-neutral-500 transition hover:underline dark:text-neutral-400"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </Show>
-
-                  <div class="flex items-center gap-2">
-                    <Show when={props.memoryError}>
-                      <span class="max-w-64 whitespace-pre-wrap break-words text-[11px] text-red-600 dark:text-red-400">
-                        {props.memoryError}
-                      </span>
-                    </Show>
-                    <button
-                      onClick={() => props.setMemoryPreview((p) => !p)}
-                      class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
-                    >
-                      {props.memoryPreview ? "Edit" : "Preview"}
-                    </button>
-                    <button
-                      onClick={() => void props.saveSelectedMemory()}
-                      class="rounded-md bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
-                    >
-                      Save
-                    </button>
-                  </div>
-                </div>
-              </Show>
+              </div>
             </div>
-          </div>
+          </Show>
+
+          {/* Narrow viewports: a names-only list. Tapping a name opens the
+              full-screen editor page below. */}
+          <Show when={!props.wideViewport}>
+            <div class="mt-4 flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
+              {fileList()}
+            </div>
+          </Show>
 
           {/* Import an archive, then backfill it: map (parallel extraction)
               then reduce (one writer). */}
@@ -449,6 +488,40 @@ export function MemoryPage(props: {
               Close
             </Dialog.CloseButton>
           </div>
+
+          {/* Narrow viewports: the full-screen file editor page, layered over
+              the list so the dialog can drill in and back out. */}
+          <Show when={!props.wideViewport && mobileDetail()}>
+            <div
+              class="fixed inset-0 z-[60] flex h-full w-full flex-col overflow-y-auto bg-white p-5 focus:outline-none dark:bg-neutral-900"
+              style={props.fullscreenInsetStyle()}
+            >
+              <div class="flex items-center gap-2">
+                <button
+                  onClick={() => setMobileDetail(false)}
+                  title="Back to memory files"
+                  aria-label="Back to memory files"
+                  class="shrink-0 rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
+                >
+                  <BackArrowIcon />
+                </button>
+                <h2 class="truncate text-base font-semibold">
+                  {props.selectedMemoryFile?.name}
+                </h2>
+              </div>
+
+              <Show
+                when={props.selectedMemoryFile}
+                fallback={
+                  <p class="mt-4 text-sm text-neutral-400 dark:text-neutral-500">
+                    No memory file selected.
+                  </p>
+                }
+              >
+                <div class="mt-4 flex min-h-0 flex-1 flex-col">{fileEditor()}</div>
+              </Show>
+            </div>
+          </Show>
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog>
