@@ -8,6 +8,14 @@ export interface LiveTool {
   state: "pending" | "running" | "done";
   ok?: boolean;
   output?: string;
+  /// Streamed reasoning that preceded this call's round, captured when the
+  /// call arrived. Mirrors the reasoning the backend persists on the round's
+  /// preamble row (or its tool-call row when there is no preamble text).
+  thinking?: string;
+  /// Streamed preamble text for this call's round, captured when the call
+  /// arrived. Mirrors the backend's `assistant(text)` row so the live and
+  /// reloaded timelines interleave identically.
+  text?: string;
 }
 
 export type ProcessEntry =
@@ -247,16 +255,24 @@ export function groupTurns(messages: Message[], liveTools: LiveTool[], streaming
   const live = turns[turns.length - 1];
   if (live && streaming && messages.some((m) => m.id.startsWith("tmp-assistant-"))) {
     live.live = true;
-    // Keep the live thought first so its DOM node survives streamed updates as
-    // tool entries append after it.
-    const thought = live.answer?.id.startsWith("tmp-assistant-")
-      ? live.answer?.thinking?.trim()
-      : null;
     live.entries = [];
-    if (thought && live.answer) {
-      live.entries.push({ kind: "thought", id: live.answer.id, text: thought });
-    }
+    // Live rounds are rebuilt to match what `buildEntries` will derive once the
+    // turn is persisted: for each tool round, the streamed reasoning + preamble
+    // text land as entries *before* that round's call(s). App captures that
+    // preamble onto the first call of the round when the call arrives and resets
+    // the in-flight assistant message, so the entries stay in arrival order and
+    // are append-only (the `Index`-keyed DOM nodes at each position survive).
     for (const t of liveTools) {
+      if (t.thinking?.trim()) {
+        live.entries.push({
+          kind: "thought",
+          id: `live:${t.callId}:thought`,
+          text: t.thinking,
+        });
+      }
+      if (t.text?.trim()) {
+        live.entries.push({ kind: "text", id: `live:${t.callId}:text`, text: t.text });
+      }
       live.entries.push({
         kind: "call",
         id: `live:${t.callId}`,
@@ -266,6 +282,16 @@ export function groupTurns(messages: Message[], liveTools: LiveTool[], streaming
         result: t.state === "done" ? { output: t.output ?? "", error: !t.ok } : null,
         live: t,
       });
+    }
+    // The current (not-yet-flushed) round's reasoning trails the flushed ones;
+    // its text stays on the answer bubble ("text remaining at done is the
+    // answer"). Keeping it last means its DOM node survives as later rounds
+    // append entries after it.
+    const thought = live.answer?.id.startsWith("tmp-assistant-")
+      ? live.answer?.thinking?.trim()
+      : null;
+    if (thought && live.answer) {
+      live.entries.push({ kind: "thought", id: live.answer.id, text: thought });
     }
   } else {
     // Persisted turns: the answer row's reasoning is a trailing timeline entry.
