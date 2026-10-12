@@ -650,6 +650,163 @@ pub async fn delete_conversation(
     Ok(())
 }
 
+/// Apply an edit to a user message: replace its content (and attachments), then
+/// delete every message that followed it, so the conversation forks from the
+/// edit point. The compaction boundary is cleared when it no longer sits before
+/// the edit, and the reflection watermark is lowered so the edited region is
+/// re-consolidated.
+///
+/// Kept separate from the Tauri command so it can be unit-tested without a
+/// `tauri::State`.
+#[allow(dead_code)]
+pub fn apply_user_message_edit(
+    db: &Db,
+    conversation_id: &str,
+    message_id: &str,
+    content: &str,
+    attachments: Option<Vec<crate::attachments::Attachment>>,
+) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    // The edit target must be a user turn in this conversation.
+    let target = tx
+        .query_row(
+            "SELECT \"index\", role FROM messages WHERE id = ?1 AND conversation_id = ?2",
+            params![message_id, conversation_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((target_index, role)) = target else {
+        return Err(format!("message not found: {message_id}"));
+    };
+    if role != "user" {
+        return Err(format!("only user messages can be edited (got '{role}')"));
+    }
+
+    let attachments_json = match attachments {
+        Some(list) if !list.is_empty() => {
+            Some(serde_json::to_string(&list).map_err(|e| e.to_string())?)
+        }
+        _ => None,
+    };
+    let rev = bump_revision_c(&tx)?;
+    tx.execute(
+        "UPDATE messages SET content = ?2, attachments = ?3, revision = ?4, dirty = 1 WHERE id = ?1",
+        params![message_id, content, attachments_json, rev],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Truncate: drop every later message so nothing survives the fork.
+    tx.execute(
+        "DELETE FROM messages WHERE conversation_id = ?1 AND \"index\" > ?2",
+        params![conversation_id, target_index],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // The compaction boundary is still valid only if its message survived the
+    // truncation AND sits strictly before the edit point. Otherwise the summary
+    // describes content that changed or is gone — clear both halves so the turn
+    // falls back to the full (truncated) history rather than slicing on a stale
+    // boundary.
+    let through: Option<String> = tx
+        .query_row(
+            "SELECT compaction_through FROM conversations WHERE id = ?1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if let Some(through_id) = through {
+        let boundary_index: Option<i64> = tx
+            .query_row(
+                "SELECT \"index\" FROM messages WHERE id = ?1",
+                [&through_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if !boundary_index.is_some_and(|i| i < target_index) {
+            let rev = bump_revision_c(&tx)?;
+            tx.execute(
+                "UPDATE conversations SET compaction_summary = NULL, compaction_through = NULL, \
+                 revision = ?2, dirty = 1 WHERE id = ?1",
+                params![conversation_id, rev],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Lower the reflection watermark (never raise it) so the edited tail is
+    // re-consolidated on the next idle pass.
+    let reflected: Option<i64> = tx
+        .query_row(
+            "SELECT last_reflected_index FROM conversations WHERE id = ?1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if let Some(current) = reflected {
+        let lowered = target_index - 1;
+        if current > lowered {
+            let rev = bump_revision_c(&tx)?;
+            tx.execute(
+                "UPDATE conversations SET last_reflected_index = ?2, revision = ?3, dirty = 1 \
+                 WHERE id = ?1",
+                params![conversation_id, lowered, rev],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Refresh the sidebar order / reflection idle timer, and re-derive an
+    // auto-generated title when the edited turn is the first user message.
+    let first_user_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM messages WHERE conversation_id = ?1 AND role = 'user' \
+             ORDER BY \"index\" ASC LIMIT 1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let is_first_user = first_user_id.as_deref() == Some(message_id);
+    let rev = bump_revision_c(&tx)?;
+    tx.execute(
+        "UPDATE conversations
+         SET updated_at = ?2,
+             title = CASE WHEN ?3 AND (title = 'New chat' OR title = '') THEN ?4 ELSE title END,
+             revision = ?5, dirty = 1
+         WHERE id = ?1",
+        params![
+            conversation_id,
+            now(),
+            i64::from(is_first_user),
+            derive_title(content),
+            rev
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Edit a user message and fork the conversation from that point (delete every
+/// later message). Registered in `lib.rs` by the orchestrator, not here — hence
+/// the `dead_code` allow until that registration lands.
+#[tauri::command]
+#[allow(dead_code)]
+pub async fn edit_user_message(
+    db: tauri::State<'_, Db>,
+    conversation_id: String,
+    message_id: String,
+    content: String,
+    attachments: Option<Vec<crate::attachments::Attachment>>,
+) -> Result<(), String> {
+    apply_user_message_edit(&db, &conversation_id, &message_id, &content, attachments)
+}
+
 /// Search conversations by title or message content (case-insensitive
 /// substring). Used by the sidebar search box.
 #[tauri::command]

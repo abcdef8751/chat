@@ -2019,3 +2019,337 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert_eq!(conv.compaction_summary.as_deref(), Some("SUMMARY-OF-OLDER"));
         assert!(conv.compaction_through.is_some());
     }
+
+    // --- YOLO auto-approve --------------------------------------------------
+
+    /// With `auto_approve_tools` on, a gated call runs immediately, is announced
+    /// as ungated (so the UI never shows the approve/deny prompt), and the loop
+    /// never parks on the approval channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn yolo_auto_approves_gated_tool_without_prompting() {
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag(0, "call_1", "bash", ""),
+                    tool_frag(0, "", "", r#"{\"command\":\"echo yolo\"}"#),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("done"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("yolo"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            auto_approve_tools: true,
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let (db2, approvals2) = (db.clone(), approvals.clone());
+        let cid2 = cid.clone();
+        let memory = temp_memory("yolo");
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg, "test-key", &brave, &shell, &memory, &approvals2, flag, &sink,
+                cid2, "go".into(), Vec::new(),
+            )
+            .await
+        });
+        // Deliberately no `approvals.resolve`: YOLO must finish on its own. A
+        // hang here is a real failure (the loop parked waiting for approval).
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("YOLO turn must not wait for an approval")
+            .unwrap()
+            .unwrap();
+        let _ = handle.join();
+
+        let rows = msgs(&db, &cid);
+        assert_eq!(rows.len(), 4);
+        let tr: Value = serde_json::from_str(&rows[2].content).unwrap();
+        assert_eq!(tr["error"], false);
+        assert_eq!(tr["output"], "yolo");
+
+        let guard = events.lock().unwrap();
+        assert!(
+            guard
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCall { gated: false, name, .. } if name == "bash")),
+            "a YOLO gated call must be emitted ungated"
+        );
+        assert!(
+            !guard.iter().any(|e| matches!(e, StreamEvent::ToolCall { gated: true, .. })),
+            "no gated tool call may be emitted under YOLO"
+        );
+    }
+
+    // --- editable messages (edit -> truncate) -------------------------------
+
+    /// Insert four alternating turns and return their ids in order.
+    fn seed_turns(db: &Db, cid: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        for (role, content) in [
+            ("user", "one"),
+            ("assistant", "two"),
+            ("user", "three"),
+            ("assistant", "four"),
+        ] {
+            let row = crate::db::insert_message(
+                db,
+                cid.to_string(),
+                role.into(),
+                content.into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            ids.push(row.id);
+        }
+        ids
+    }
+
+    /// Editing an early user message forks the conversation: later messages are
+    /// deleted, the compaction summary that folded the removed tail is cleared,
+    /// and the reflection watermark drops below the edit so it re-runs.
+    #[test]
+    fn edit_user_message_truncates_and_clears_stale_maintenance_state() {
+        use crate::attachments::Attachment;
+        let db = open_db("edit-truncate");
+        let cid = insert_conv(&db);
+        let ids = seed_turns(&db, &cid);
+        // Compaction folded through the last message; reflection covered all of it.
+        crate::db::set_compaction(&db, &cid, "SUM", &ids[3]).unwrap();
+        crate::db::set_last_reflected_index(&db, &cid, 3).unwrap();
+
+        let att = Attachment {
+            id: "a".into(),
+            name: "x.txt".into(),
+            mime: "text/plain".into(),
+            size: 1,
+            kind: "file".into(),
+            data_url: None,
+            text: Some("new context".into()),
+        };
+        crate::db::apply_user_message_edit(&db, &cid, &ids[0], "edited", Some(vec![att])).unwrap();
+
+        let rows = msgs(&db, &cid);
+        assert_eq!(rows.len(), 1, "everything after the edited turn is gone");
+        assert_eq!(rows[0].id, ids[0]);
+        assert_eq!(rows[0].content, "edited");
+        assert!(rows[0]
+            .attachments
+            .as_deref()
+            .unwrap()
+            .contains("new context"));
+
+        let conv = crate::db::get_conversation(&db, &cid).unwrap().unwrap();
+        assert!(
+            conv.compaction_summary.is_none(),
+            "a summary folding a deleted message must be cleared"
+        );
+        assert!(conv.compaction_through.is_none());
+        assert_eq!(crate::db::last_reflected_index(&db, &cid).unwrap(), Some(-1));
+    }
+
+    /// When the compaction boundary sits strictly before the edit it survives the
+    /// truncation, so the summary is kept; earlier messages are untouched.
+    #[test]
+    fn edit_user_message_keeps_earlier_messages_and_a_surviving_boundary() {
+        let db = open_db("edit-keep");
+        let cid = insert_conv(&db);
+        let ids = seed_turns(&db, &cid);
+        crate::db::set_compaction(&db, &cid, "SUM", &ids[1]).unwrap();
+        crate::db::set_last_reflected_index(&db, &cid, 3).unwrap();
+
+        crate::db::apply_user_message_edit(&db, &cid, &ids[2], "edited", None).unwrap();
+
+        let rows = msgs(&db, &cid);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].content, "edited");
+        let conv = crate::db::get_conversation(&db, &cid).unwrap().unwrap();
+        assert_eq!(conv.compaction_summary.as_deref(), Some("SUM"));
+        assert_eq!(conv.compaction_through.as_deref(), Some(ids[1].as_str()));
+        assert_eq!(crate::db::last_reflected_index(&db, &cid).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn edit_user_message_rejects_non_user_or_missing_targets() {
+        let db = open_db("edit-reject");
+        let cid = insert_conv(&db);
+        let row = crate::db::insert_message(
+            &db,
+            cid.clone(),
+            "assistant".into(),
+            "two".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(crate::db::apply_user_message_edit(&db, &cid, &row.id, "x", None).is_err());
+        assert!(crate::db::apply_user_message_edit(&db, &cid, "missing", "x", None).is_err());
+        assert_eq!(msgs(&db, &cid)[0].content, "two");
+    }
+
+    // --- read_file images (item 9) ------------------------------------------
+
+    /// Register `mock` as a vision model for the given provider key so the chat
+    /// loop's `meta_for_provider` lookup reports it multimodal.
+    fn mark_model_vision(db: &Db, provider_key: &str) {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO model_prices (provider, model_id, modalities) VALUES (?1, 'mock', ?2)",
+            rusqlite::params![provider_key, r#"{"input":["text","image"]}"#],
+        )
+        .unwrap();
+    }
+
+    fn escape_args(v: Value) -> String {
+        v.to_string().replace('"', "\\\"")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_file_image_on_multimodal_model_injects_an_image_part() {
+        let img =
+            std::env::temp_dir().join(format!("pi-read-image-vision-{}.png", std::process::id()));
+        std::fs::write(&img, [0u8, 1, 2, 3]).unwrap();
+        let path = img.to_str().unwrap().to_string();
+        let args = escape_args(json!({ "path": path }));
+
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    tool_frag(0, "call_1", "read_file", ""),
+                    tool_frag(0, "", "", &args),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("I see it"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("read-image-vision"));
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        mark_model_vision(&db, &base_url);
+
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: base_url.clone(),
+            model: "mock".into(),
+            auto_approve_tools: true,
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        run_chat_turn(
+            &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-vision"), &approvals,
+            flag, &sink, cid.clone(), "look".into(), Vec::new(),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        // The tool result is a short text note, not the image bytes.
+        let rows = msgs(&db, &cid);
+        let tr: Value = serde_json::from_str(&rows[2].content).unwrap();
+        assert_eq!(tr["error"], false);
+        assert!(
+            tr["output"].as_str().unwrap().contains("image"),
+            "expected an image note, got {}",
+            tr["output"]
+        );
+        assert_eq!(rows.len(), 4, "the synthetic image turn is not persisted");
+
+        // The follow-up request carries the image as a user image_url part.
+        let caps = bodies.lock().unwrap();
+        let second = request_body(&caps[1]);
+        let msgs_v = second["messages"].as_array().unwrap();
+        assert!(
+            msgs_v.iter().any(|m| {
+                m["role"] == "user"
+                    && m["content"]
+                        .as_array()
+                        .map(|parts| {
+                            parts.iter().any(|p| p["type"] == "image_url")
+                        })
+                        .unwrap_or(false)
+            }),
+            "expected a synthetic user image_url message: {second}"
+        );
+        assert!(caps[1].contains("AAECAw=="), "image bytes must reach the model");
+        let _ = std::fs::remove_file(&img);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_file_image_on_text_model_reports_it_cannot_view() {
+        let img =
+            std::env::temp_dir().join(format!("pi-read-image-text-{}.png", std::process::id()));
+        std::fs::write(&img, [0u8, 1, 2, 3]).unwrap();
+        let path = img.to_str().unwrap().to_string();
+        let args = escape_args(json!({ "path": path }));
+
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    tool_frag(0, "call_1", "read_file", ""),
+                    tool_frag(0, "", "", &args),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("ok"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("read-image-text"));
+        // No model_prices row: the provider is unknown, so vision is false.
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            auto_approve_tools: true,
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        run_chat_turn(
+            &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-text"), &approvals,
+            flag, &sink, cid.clone(), "look".into(), Vec::new(),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        let rows = msgs(&db, &cid);
+        let tr: Value = serde_json::from_str(&rows[2].content).unwrap();
+        assert_eq!(tr["error"], false);
+        assert!(
+            tr["output"].as_str().unwrap().contains("cannot view"),
+            "expected a cannot-view note, got {}",
+            tr["output"]
+        );
+
+        // No image part is sent to a text-only model.
+        assert!(!bodies.lock().unwrap()[1].contains("image_url"));
+        let _ = std::fs::remove_file(&img);
+    }

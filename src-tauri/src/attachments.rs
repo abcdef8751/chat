@@ -128,6 +128,39 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Whether a path's extension denotes an image (png/jpg/gif/webp/bmp/svg/ico).
+/// Used by `read_file` to route image files through the vision path instead of
+/// trying to decode them as UTF-8 text.
+pub fn is_image_path(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    mime_for(&ext).starts_with("image/")
+}
+
+/// Read an image file into `(mime, data_url)`, where `data_url` is a
+/// `data:<mime>;base64,…` URL ready to hand to a multimodal model. Errors when
+/// the path is unreadable, is not a file, or is not an image by extension.
+pub fn read_image(path: &str) -> Result<(String, String), String> {
+    let p = Path::new(path);
+    let meta = std::fs::metadata(p).map_err(|e| format!("{path}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    let ext = p
+        .extension()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = mime_for(&ext).to_string();
+    if !mime.starts_with("image/") {
+        return Err(format!("{path} is not an image"));
+    }
+    let bytes = std::fs::read(p).map_err(|e| format!("{path}: {e}"))?;
+    let data_url = format!("data:{};base64,{}", mime, base64_encode(&bytes));
+    Ok((mime, data_url))
+}
+
 /// Read one file into an [`Attachment`]. Directories and unreadable paths error.
 pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
     let meta =
@@ -246,5 +279,31 @@ mod tests {
     fn rejects_directories() {
         let dir = std::env::temp_dir();
         assert!(read_attachment(&dir).is_err());
+    }
+
+    #[test]
+    fn is_image_path_checks_extension_case_insensitively() {
+        assert!(is_image_path("/tmp/a.png"));
+        assert!(is_image_path("/tmp/a.JPG"));
+        assert!(is_image_path("photo.webp"));
+        assert!(!is_image_path("/tmp/notes.txt"));
+        assert!(!is_image_path("/tmp/noext"));
+    }
+
+    #[test]
+    fn read_image_returns_data_url_and_rejects_non_images() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-read-image-{}.png", std::process::id()));
+        std::fs::write(&p, [0u8, 1, 2, 3]).unwrap();
+        let (mime, url) = read_image(p.to_str().unwrap()).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(url, "data:image/png;base64,AAECAw==");
+        let _ = std::fs::remove_file(&p);
+
+        let mut t = std::env::temp_dir();
+        t.push(format!("pi-chat-read-image-{}.txt", std::process::id()));
+        std::fs::write(&t, "hi").unwrap();
+        assert!(read_image(t.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&t);
     }
 }
