@@ -368,7 +368,11 @@ async fn fetch_encrypted_sample(
     ctx: &SyncCtx<'_>,
     token: &str,
 ) -> Result<Option<String>, String> {
-    for (table, field) in [("conversations", "title"), ("messages", "content")] {
+    for (table, field) in [
+        ("conversations", "title"),
+        ("messages", "content"),
+        ("user_config", "payload"),
+    ] {
         let url = format!("{}/rest/v1/{}?select={}&limit=1", ctx.base_url, table, field);
         let resp = ctx
             .client
@@ -760,6 +764,12 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
         db::sync_user_config(&conn, &cfg_after)?;
     }
+    // Reconcile a user-config row stuck at the server's revision with a never-
+    // pushed payload (the absorption bug's residue — equal-revision rows are
+    // invisible to the pull high-water, and the mirror above no-ops on them).
+    // Best-effort: a hiccup here must not fail a sync that otherwise succeeded;
+    // the check simply repeats on the next tick.
+    let _ = reconcile_user_config(&ctx, &token).await;
     // Persist the success timestamp so it survives restarts (the live value in
     // SyncState is in-memory only; without this the page would show "never"
     // after a relaunch even though syncs ran in earlier sessions).
@@ -1145,6 +1155,138 @@ async fn fetch_user_config_revision(
     Ok(rows.first().and_then(|r| r.get("revision").and_then(|v| v.as_i64())))
 }
 
+/// Fetch the server's `user_config` row (revision + payload) for `id`, or
+/// `None` when the row doesn't exist on the server (including a tombstoned
+/// row — a manual server-side delete reads as "no row", matching the pull's
+/// `remote_live` handling, so the reconcile never resurrects it).
+async fn fetch_user_config_remote(
+    ctx: &SyncCtx<'_>,
+    token: &str,
+    id: &str,
+) -> Result<Option<(i64, String)>, String> {
+    let url = format!(
+        "{}/rest/v1/user_config?id=eq.{}&select=revision,payload,deleted_at",
+        ctx.base_url, id
+    );
+    let resp = ctx
+        .client
+        .get(&url)
+        .header("apikey", ctx.anon)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("read server user_config: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("read server user_config: HTTP {}", resp.status()));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("read server user_config body: {e}"))?;
+    let rows: Vec<Value> = serde_json::from_str(&text)
+        .map_err(|e| format!("read server user_config parse: {e}"))?;
+    Ok(rows
+        .first()
+        .filter(|r| r.get("deleted_at").and_then(|v| v.as_i64()).is_none())
+        .and_then(|r| {
+            Some((
+                r.get("revision")?.as_i64()?,
+                r.get("payload")?.as_str()?.to_string(),
+            ))
+        }))
+}
+
+/// Reconcile the local `user_config` row against the server after a pull.
+///
+/// The pull's high-water only fetches rows with `revision > last_seen`, so a
+/// row that diverged from the server at an EQUAL revision is never re-fetched —
+/// the state `apply_user_config`'s absorption bug used to create (a never-
+/// pushed payload sitting clean at the remote's revision; the older fix's
+/// push-side guard only covers *lower* revisions and the post-pull mirror
+/// no-ops because the row already equals the live config). This reads the
+/// server row explicitly and, when the payloads diverge at an EQUAL (tie) or
+/// OLDER server revision, re-marks the local row dirty at a revision above the
+/// server's so the next push uploads it. A strictly-newer non-empty server row
+/// is never fought (this clean local row holds older content; escalating would
+/// start a per-tick push/pull fight), and an undecryptable server payload is
+/// left alone (locked-device contract).
+///
+/// Best-effort by design: a fetch/parse failure here must not fail a sync that
+/// otherwise succeeded — the comparison is simply retried on the next tick.
+/// Skipped entirely when the row is already dirty (the push handles it), the
+/// row doesn't exist yet (the mirror / pull adoption creates it), or the local
+/// payload is empty (nothing to push, and the empty-guard would fight us).
+async fn reconcile_user_config(ctx: &SyncCtx<'_>, token: &str) -> Result<(), String> {
+    let (id, local_payload, local_rev, local_dirty) = {
+        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT id, payload, revision, dirty FROM user_config WHERE id = 'main'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        row.unwrap_or(("main".into(), String::new(), 0, 0))
+    };
+    if local_dirty != 0 || local_rev == 0 {
+        return Ok(());
+    }
+    // An empty local row has nothing to push — escalating would only make the
+    // push's empty-guard clear the flag again next tick (churn every tick).
+    if syncable_payload_is_empty(&local_payload) {
+        return Ok(());
+    }
+    let Some((server_rev, server_payload)) = fetch_user_config_remote(ctx, token, &id).await?
+    else {
+        return Ok(()); // no server row — nothing to diverge from
+    };
+    // Decrypt the server side on encrypted mirrors. A payload we CANNOT decrypt
+    // is left alone — never risk pushing (plaintext or re-encrypted) over a
+    // mirror whose content we can't verify (the locked-device contract: never
+    // overwrite ciphertext we can't read).
+    let server_clear = match (server_payload.as_str(), ctx.key) {
+        (p, _) if !crypt::looks_encrypted(p) => Some(p.to_string()),
+        (p, Some(k)) => crypt::decrypt(&k, p),
+        _ => None,
+    };
+    let Some(server_clear) = server_clear else {
+        return Ok(());
+    };
+    let local_json = serde_json::from_str::<serde_json::Value>(&local_payload).ok();
+    let server_json = serde_json::from_str::<serde_json::Value>(&server_clear).ok();
+    if local_json == server_json {
+        return Ok(()); // genuinely in sync (or both unparseable — leave as-is)
+    }
+    // A strictly-newer NON-EMPTY server row is not fought: this clean local row
+    // holds older content, and re-dirtying it above the server would start a
+    // push/pull fight between configured devices every tick. Escalation is for
+    // the equal-revision tie (pre-fix absorption residue — the state this
+    // function exists to repair), an older server, or a strictly-newer EMPTY
+    // server row (an empty row must never freeze out non-empty content — same
+    // rule Phase 3 applies at pull time).
+    if server_rev > local_rev && !syncable_payload_is_empty(&server_clear) {
+        return Ok(());
+    }
+    // Diverged at an equal or older server revision: push our side.
+    let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    let bumped = db::bump_revision_c(&conn)?;
+    let rev = bumped.max(server_rev.saturating_add(1));
+    conn.execute(
+        "UPDATE user_config SET dirty = 1, revision = ?1 WHERE id = ?2",
+        rusqlite::params![rev, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// True when a `user_config` payload carries nothing that could back anything up.
 /// An EMPTY config must never be pushed: `user_config` is a single global row and
 /// a blank device's default (empty) payload would clobber the server's canonical
@@ -1157,17 +1299,19 @@ fn syncable_payload_is_empty(payload: &str) -> bool {
         Ok(sc) => {
             // A config is "empty" (nothing user-owned to back up) when every field
             // the user configures is defaulted. base_url/model only count as
-            // empty when they are STILL the factory defaults: `syncable_payload()`
-            // always fills them, so a blank device's defaults would otherwise
-            // defeat the guard; but a legacy (pre-multi-provider) user whose only
-            // content is a custom base_url/model must still be recognized as
-            // non-empty or their config would never sync.
+            // empty when they are unset OR still the factory defaults:
+            // `syncable_payload()` always fills the mirrors on a local row, but a
+            // REMOTE row written by another (possibly older) device can carry ""
+            // for them — both shapes must read as empty so an empty remote can
+            // never freeze out non-empty content; and a legacy (pre-multi-
+            // provider) user whose only content is a custom base_url/model must
+            // still be recognized as non-empty or their config would never sync.
             sc.providers.is_empty()
                 && sc.active_provider_id.is_empty()
                 && sc.preferences.trim().is_empty()
                 && sc.model_overrides.is_empty()
-                && sc.base_url == crate::config::DEFAULT_BASE_URL
-                && sc.model == crate::config::DEFAULT_MODEL
+                && (sc.base_url.is_empty() || sc.base_url == crate::config::DEFAULT_BASE_URL)
+                && (sc.model.is_empty() || sc.model == crate::config::DEFAULT_MODEL)
         }
         // Unparseable — assume non-empty so it is pushed as-is rather than dropped.
         Err(_) => false,
@@ -1983,6 +2127,10 @@ fn apply_user_config(ctx: &SyncCtx, rows: &[Value]) -> Result<(), String> {
         adopt: Option<SyncableConfig>,
         id: String,
         revision: i64,
+        /// The raw (already-decrypted) payload the remote sent for this row,
+        /// kept for the phase-3 divergence check.
+        remote_live: bool,
+        remote_payload: Option<String>,
     }
     let mut plans: Vec<Plan> = Vec::with_capacity(parsed.len());
     let mut parse_failed = false;
@@ -2015,6 +2163,8 @@ fn apply_user_config(ctx: &SyncCtx, rows: &[Value]) -> Result<(), String> {
                 adopt,
                 id: r.id.clone(),
                 revision: r.revision,
+                remote_live: r.deleted_at.is_none(),
+                remote_payload: Some(r.payload.clone()),
             });
         }
     }
@@ -2087,25 +2237,65 @@ fn apply_user_config(ctx: &SyncCtx, rows: &[Value]) -> Result<(), String> {
             // that edit would be silently lost (regressed below its own revision and
             // never pushed). The watermark still advances: the remote was seen, and
             // the concurrent local edit is dirty and will be pushed on the next tick.
-            let cur: i64 = tx
+            let (cur, cur_dirty): (i64, i64) = tx
                 .query_row(
-                    "SELECT revision FROM user_config WHERE id = ?1",
+                    "SELECT revision, dirty FROM user_config WHERE id = ?1",
                     [&p.id],
-                    |r| r.get::<_, i64>(0),
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                 )
                 .optional()
                 .map_err(|e| e.to_string())?
-                .unwrap_or(-1);
+                .unwrap_or((-1, 0));
             if cur >= p.revision && cur != -1 {
                 continue;
             }
+            // A pulled row is only recorded as APPLIED CLEAN when the merged
+            // payload matches what the remote actually sent. The live config can
+            // hold edits that were never pushed — a capability/preferences/
+            // providers change made before this row was first seen, or an offline
+            // edit that lost the revision race. Baking THAT payload into the row
+            // at the remote's revision with dirty = 0 would mark it synced
+            // without ever uploading it (the post-pull mirror no-ops because the
+            // row already equals the live config, and the push only selects
+            // dirty rows) — the pull-side twin of the stale-push clobber.
+            // Comparison is semantic (JSON value), not byte-wise: model_overrides
+            // is a HashMap whose serialized key order varies across processes.
             let merged = ctx.config.get().syncable_payload().to_string();
+            let remote_payload = p.remote_payload.as_deref().unwrap_or_default();
+            let differs = p.remote_live
+                && serde_json::from_str::<serde_json::Value>(&merged).ok()
+                    != serde_json::from_str::<serde_json::Value>(remote_payload).ok();
+            // Divergent content is only escalated (stored DIRTY at a revision
+            // above the remote's, so the next push uploads OUR side) when this
+            // device plausibly owns unpushed edits: a fresh row (no local
+            // revision yet), a row already dirty (an edit that lost the push
+            // race), or an EMPTY remote (an empty row must never freeze out
+            // non-empty content — the empty-guard's intent). A CLEAN local row
+            // at a lower revision vs a non-empty newer remote is left untouched
+            // (the high-water still advances): escalating there would
+            // manufacture a higher revision from older content and start a
+            // push/pull fight between two configured devices every tick. Note
+            // that "untouched" is scoped to this phase — the post-pull mirror
+            // may still legitimately dirty the row when Phase-2 adoption
+            // changed the live config (a filled empty field makes the merged
+            // payload a hybrid), which is the intended convergent path.
+            let escalate =
+                differs && (cur == -1 || cur_dirty == 1 || syncable_payload_is_empty(remote_payload));
+            if differs && !escalate {
+                continue;
+            }
+            let (rev, dirty) = if escalate {
+                let bumped = db::bump_revision_c(&tx)?;
+                (bumped.max(p.revision.saturating_add(1)), 1)
+            } else {
+                (p.revision, 0)
+            };
             tx.execute(
                 "INSERT INTO user_config(id, payload, revision, dirty)
-                 VALUES (?1, ?2, ?3, 0)
+                 VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(id) DO UPDATE SET
-                   payload = excluded.payload, revision = excluded.revision, dirty = 0",
-                rusqlite::params![p.id, merged, p.revision],
+                   payload = excluded.payload, revision = excluded.revision, dirty = excluded.dirty",
+                rusqlite::params![p.id, merged, rev, dirty],
             )
             .map_err(|e| e.to_string())?;
         }

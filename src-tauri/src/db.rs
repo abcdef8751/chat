@@ -954,7 +954,27 @@ pub fn sync_user_config(conn: &Connection, cfg: &crate::config::AppConfig) -> Re
             return Ok(()); // unchanged — keep the stored revision and clean state
         }
     }
-    let base = existing.as_ref().map(|(_, r)| *r).unwrap_or(0);
+    // The revision floor is the row's own OR the pull high-water, whichever is
+    // higher. `apply_user_config`'s non-fight path can leave a row strictly
+    // below the watermark (a seen-but-not-adopted remote row advances the
+    // watermark but not the row). Bumping from the row's revision alone would
+    // then stamp a slow-clock edit BELOW the server's revision and the push's
+    // read-before-write guard would refuse it forever — a sticky non-sync
+    // wedge. Flooring at the watermark lands every edit above the highest
+    // SEEN server revision, so the push always accepts it. (Owned by sync;
+    // only ever read here, under the caller's lock.)
+    let wm: i64 = conn
+        .query_row(
+            "SELECT last_seen_revision FROM sync_state WHERE entity = 'user_config'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let base = existing
+        .as_ref()
+        .map(|(_, r)| *r)
+        .unwrap_or(0)
+        .max(wm);
     let global = bump_revision_c(conn)?;
     let rev = if global > base { global } else { base + 1 };
     conn.execute(
