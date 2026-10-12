@@ -11,6 +11,66 @@ import type {
 import { BackArrowIcon } from "../lib/icons";
 import { formatTokens } from "../lib/turns";
 
+/// Parsed subset of models.dev's `modalities` JSON, e.g.
+/// `{"input":["text","image"],"output":["text"]}`. Each field is `null` when its
+/// array is absent; the whole result is `null` when the JSON is missing,
+/// invalid, or carries neither list.
+interface ModelModalities {
+  input: string[] | null;
+  output: string[] | null;
+}
+
+/// Defensive parse of `ModelInfo.modalities`. Never throws: absent / empty /
+/// null / malformed input, or a value without an `input`/`output` array, all
+/// collapse to `null` so callers can fall back to the coarse `attachment` flag.
+function parseModalities(raw: string | null | undefined): ModelModalities | null {
+  if (!raw) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const obj = value as Record<string, unknown>;
+  const list = (x: unknown): string[] | null =>
+    Array.isArray(x) ? x.filter((m): m is string => typeof m === "string") : null;
+  const input = list(obj.input);
+  const output = list(obj.output);
+  if (input === null && output === null) return null;
+  return { input, output };
+}
+
+/// Friendly badge text for a models.dev modality token.
+function modalityLabel(modality: string): string {
+  switch (modality) {
+    case "image":
+      return "images";
+    case "pdf":
+    case "document":
+      return "documents";
+    default:
+      return modality;
+  }
+}
+
+/// Small read-only capability chip used in the model configurator.
+function CapabilityBadge(props: { tone: "on" | "off" | "muted"; children: JSX.Element }) {
+  return (
+    <span
+      class={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+        props.tone === "on"
+          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400"
+          : props.tone === "off"
+            ? "bg-neutral-200 text-neutral-500 dark:bg-neutral-700 dark:text-neutral-400"
+            : "bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+      }`}
+    >
+      {props.children}
+    </span>
+  );
+}
+
 /// The Settings dialog: provider manager, model pricing/context overrides,
 /// Brave key, preferences, reflection + shell options, and cloud sync.
 export function SettingsDialog(props: {
@@ -112,6 +172,11 @@ export function SettingsDialog(props: {
   settingsError: string | null;
   setSettingsError: (value: string | null) => void;
 }) {
+  /// The model the pricing/context override block is currently pointed at, or
+  /// `null` when no provider/model is selected (or known).
+  const selectedModel = () =>
+    props.modelOptions().find((m) => m.id === props.overrideModel) ?? null;
+
   return (
     <Dialog
       open={props.settingsOpen}
@@ -405,6 +470,79 @@ export function SettingsDialog(props: {
                   {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
                 </For>
               </select>
+              <Show when={selectedModel()}>
+                {(m) => {
+                  const parsed = () => parseModalities(m().modalities);
+                  // Mirror the backend's `ModelMeta::vision()` precedence: an
+                  // explicit `modalities.input` list wins; only when it is
+                  // absent do we fall back to the coarse `attachment` flag
+                  // (which covers documents + images).
+                  const inputModalities = () => {
+                    const input = parsed()?.input ?? null;
+                    if (input !== null) return input;
+                    return m().attachment ? ["image", "document"] : [];
+                  };
+                  const outputModalities = () => parsed()?.output ?? [];
+                  return (
+                    <div class="mt-2 rounded-lg border border-neutral-200 bg-neutral-50 px-2.5 py-2 dark:border-neutral-700 dark:bg-neutral-800/50">
+                      <div class="truncate text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                        Capabilities
+                      </div>
+                      <div class="mt-1.5 space-y-1">
+                        <div class="flex items-start gap-2">
+                          <span class="w-14 shrink-0 pt-px text-[10px] font-medium uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                            Input
+                          </span>
+                          <div class="flex flex-wrap gap-1">
+                            <Show
+                              when={inputModalities().length > 0}
+                              fallback={<CapabilityBadge tone="muted">unknown</CapabilityBadge>}
+                            >
+                              <For each={inputModalities()}>
+                                {(mod) => (
+                                  <CapabilityBadge tone="on">{modalityLabel(mod)}</CapabilityBadge>
+                                )}
+                              </For>
+                            </Show>
+                          </div>
+                        </div>
+                        <div class="flex items-start gap-2">
+                          <span class="w-14 shrink-0 pt-px text-[10px] font-medium uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                            Output
+                          </span>
+                          <div class="flex flex-wrap gap-1">
+                            <Show
+                              when={outputModalities().length > 0}
+                              fallback={<CapabilityBadge tone="muted">unknown</CapabilityBadge>}
+                            >
+                              <For each={outputModalities()}>
+                                {(mod) => (
+                                  <CapabilityBadge tone="on">{modalityLabel(mod)}</CapabilityBadge>
+                                )}
+                              </For>
+                            </Show>
+                          </div>
+                        </div>
+                        <div class="flex items-center gap-2">
+                          <span class="w-14 shrink-0 text-[10px] font-medium uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                            Reasoning
+                          </span>
+                          <Show
+                            when={m().reasoning === true}
+                            fallback={
+                              <CapabilityBadge tone={m().reasoning === false ? "off" : "muted"}>
+                                {m().reasoning === false ? "not supported" : "unknown"}
+                              </CapabilityBadge>
+                            }
+                          >
+                            <CapabilityBadge tone="on">supported</CapabilityBadge>
+                          </Show>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                }}
+              </Show>
               <Show when={props.overrideModel}>
                 <div class="mt-2 grid grid-cols-2 gap-2">
                   <label class="col-span-2 block text-[11px] text-neutral-600 dark:text-neutral-300">
@@ -590,6 +728,23 @@ export function SettingsDialog(props: {
                 unknown fields.
               </span>
             </label>
+
+            <div class="rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-900/60 dark:bg-amber-950/30">
+              <label class="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                <input
+                  type="checkbox"
+                  class="h-4 w-4 rounded border-neutral-300 dark:border-neutral-700"
+                  checked={props.autoApproveTools}
+                  onChange={(e) => props.setAutoApproveTools(e.currentTarget.checked)}
+                />
+                Auto-approve tool calls (YOLO)
+              </label>
+              <span class="mt-1 block text-[11px] font-normal text-amber-700 dark:text-amber-400">
+                Gated tools — <code>bash</code>, <code>read_file</code>, <code>write_file</code> —
+                run <strong>without</strong> per-call approval. Only enable this when you trust the
+                model and the workspace it can touch.
+              </span>
+            </div>
 
             <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
               <label class="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
