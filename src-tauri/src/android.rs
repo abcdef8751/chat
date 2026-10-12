@@ -23,7 +23,7 @@ use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
 use crate::attachments::{
-    is_raster_image_ext, is_text_like, mime_for, Attachment, MAX_IMAGE_BYTES,
+    is_text_like, is_viewable_image, mime_for, Attachment, MAX_IMAGE_BYTES,
     MAX_TEXT_BYTES,
 };
 
@@ -148,11 +148,13 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
     };
     let size = out.size;
 
-    // Classify by extension against the shared raster-only table, exactly as the
-    // desktop path does: SVG/ICO are *not* images here (SVG falls back to text),
-    // and an image past `MAX_IMAGE_BYTES` must not become a data URL. Reusing the
-    // shared `attachments.rs` helpers keeps both pickers in lockstep.
-    if is_raster_image_ext(&ext) && size <= MAX_IMAGE_BYTES {
+    // Classify with the shared predicate, exactly as the desktop path does:
+    // raster extensions (or a concrete non-vector `image/*` MIME the resolver
+    // reported — e.g. an extensionless `image/heic` pick) count as images, while
+    // SVG/ICO never do (SVG falls back to text), and an image past
+    // `MAX_IMAGE_BYTES` must not become a data URL. Reusing the shared
+    // `attachments.rs` helper keeps both pickers in lockstep.
+    if is_viewable_image(&ext, Some(&mime)) && size <= MAX_IMAGE_BYTES {
         return Ok(Attachment {
             id: Uuid::new_v4().to_string(),
             name: out.name,

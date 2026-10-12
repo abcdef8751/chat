@@ -485,6 +485,9 @@ export function SettingsDialog(props: {
                     return m().attachment ? ["image", "document"] : [];
                   };
                   const outputModalities = () => parsed()?.output ?? [];
+                  // Same explicit-vs-absent distinction as `input` above: a
+                  // present-but-empty `output` list means "none", not "unknown".
+                  const outputKnown = () => parsed()?.output != null;
                   // An explicit `input` list — even an empty one — is
                   // authoritative (mirrors the backend's `vision()`): `[]` means
                   // "cannot see images", distinct from an absent list ("unknown",
@@ -526,7 +529,13 @@ export function SettingsDialog(props: {
                           <div class="flex flex-wrap gap-1">
                             <Show
                               when={outputModalities().length > 0}
-                              fallback={<CapabilityBadge tone="muted">unknown</CapabilityBadge>}
+                              fallback={
+                                outputKnown() ? (
+                                  <CapabilityBadge tone="none">none</CapabilityBadge>
+                                ) : (
+                                  <CapabilityBadge tone="muted">unknown</CapabilityBadge>
+                                )
+                              }
                             >
                               <For each={outputModalities()}>
                                 {(mod) => (

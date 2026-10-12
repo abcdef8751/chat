@@ -149,6 +149,29 @@ pub(crate) fn is_raster_image_ext(ext: &str) -> bool {
     matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
 }
 
+/// Whether a file should be treated as a viewable image, given what we know
+/// about it: its extension and (optionally) a MIME type from a resolver.
+///
+/// A raster extension is sufficient. Otherwise, a concrete `image/*` MIME that
+/// is **not** a vector/legacy format also qualifies — this matters on Android,
+/// where a `content://` pick may carry no usable extension in its display name
+/// but still reports a real type (`image/heic`, `image/avif`, …). This is the
+/// one place the two pickers share the decision, so the desktop path (which
+/// derives the MIME from the extension via [`mime_for`]) and the Android path
+/// (which trusts the resolver) agree. SVG/ICO never qualify.
+pub(crate) fn is_viewable_image(ext: &str, mime: Option<&str>) -> bool {
+    if is_raster_image_ext(ext) {
+        return true;
+    }
+    matches!(
+        mime,
+        Some(m) if m.starts_with("image/")
+            && m != "image/svg+xml"
+            && m != "image/x-icon"
+            && m != "image/vnd.microsoft.icon"
+    )
+}
+
 /// Whether a path's extension denotes a raster image (png/jpg/gif/webp/bmp).
 /// Used by `read_file` to route image files through the vision path instead of
 /// trying to decode them as UTF-8 text. SVG and ICO are intentionally *not*
@@ -212,7 +235,7 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
     let size = meta.len();
     let id = Uuid::new_v4().to_string();
 
-    if is_raster_image_ext(&ext) && size <= MAX_IMAGE_BYTES {
+    if is_viewable_image(&ext, Some(&mime)) && size <= MAX_IMAGE_BYTES {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let data_url = format!("data:{};base64,{}", mime, base64_encode(&bytes));
         return Ok(Attachment {
@@ -356,6 +379,25 @@ mod tests {
         assert!(!is_image_path("/tmp/logo.SVG"));
         assert!(!is_image_path("/tmp/favicon.ico"));
         assert!(is_image_path("/tmp/photo.bmp"));
+    }
+
+    #[test]
+    fn is_viewable_image_accepts_raster_ext_or_non_vector_image_mime() {
+        // A raster extension is enough, regardless of mime.
+        assert!(is_viewable_image("png", None));
+        assert!(is_viewable_image("webp", Some("application/octet-stream")));
+        // An extensionless / non-table pick is still an image when the resolver
+        // reports a concrete non-vector `image/*` mime (the Android regression).
+        assert!(is_viewable_image("", Some("image/heic")));
+        assert!(is_viewable_image("bin", Some("image/avif")));
+        // Vector/legacy mimes never qualify, even with no raster extension.
+        assert!(!is_viewable_image("svg", Some("image/svg+xml")));
+        assert!(!is_viewable_image("", Some("image/svg+xml")));
+        assert!(!is_viewable_image("ico", Some("image/x-icon")));
+        // Non-images never qualify.
+        assert!(!is_viewable_image("txt", Some("text/plain")));
+        assert!(!is_viewable_image("", None));
+        assert!(!is_viewable_image("pdf", Some("application/pdf")));
     }
 
     #[test]

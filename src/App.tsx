@@ -1315,7 +1315,14 @@ export default function App() {
     if (paths.length === 0) return;
     try {
       const atts = await readPickedAttachments(paths);
-      if (atts.length === 0) return;
+      if (atts.length === 0) {
+        // Every item failed (e.g. an unreadable `content://` URI). Surface it
+        // instead of silently doing nothing.
+        setStreamError(
+          paths.length === 1 ? "Could not read the selected file." : "Could not read the selected files.",
+        );
+        return;
+      }
       setPendingAttachments((prev) => [...prev, ...atts]);
       const images = atts.filter((a) => a.kind === "image").length;
       if (images > 0 && currentModelVision() === false) {
