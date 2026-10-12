@@ -8,6 +8,7 @@ import android.util.Log
 import android.view.WindowInsets
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 
 class MainActivity : TauriActivity() {
@@ -22,6 +23,11 @@ class MainActivity : TauriActivity() {
   private var leftInset = 0
   @Volatile
   private var rightInset = 0
+
+  // The live WebView, captured in onWebViewCreate. Used to dispatch the
+  // `pi-back` event when the hardware/gesture back is pressed.
+  @Volatile
+  private var appWebView: WebView? = null
 
   // Convert physical px (what getInsets/setPadding use) to dp (what CSS px
   // means), so the values this app injects as `px` in its styles scale right.
@@ -44,6 +50,21 @@ class MainActivity : TauriActivity() {
     fun getRight(): Int = rightInset
   }
 
+  // JS-visible object (`window.PiBack`) — the JS→native half of the back
+  // bridge. The web layer calls `exit()` when it has exhausted its own history
+  // (nothing left to pop) and wants the activity to finish. Hardware back does
+  // NOT need this: `handleBack` finishes on its own when `pi-back` is
+  // unhandled. Exposed so an in-page "Quit"/"Exit" affordance can leave the app
+  // deliberately instead of only via the system back gesture.
+  private inner class BackBridge {
+    @JavascriptInterface
+    fun exit() {
+      // JavascriptInterface methods run on a WebView bridge thread, so bounce
+      // to the UI thread before touching the Activity.
+      runOnUiThread { finish() }
+    }
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     // Edge-to-edge is enforced on Android 15+ (targetSdk 35+); the app draws
     // behind the status/nav bars. We translate the bars into insets exposed to
@@ -63,6 +84,41 @@ class MainActivity : TauriActivity() {
       startForegroundService(Intent(this, KeepAliveService::class.java))
     } catch (e: Exception) {
       Log.w("MainActivity", "could not start keep-alive service", e)
+    }
+    // Hardware/gesture back: route it through the web layer instead of always
+    // finishing. TauriActivity sets `handleBackNavigation = false`, so without
+    // this the system back would simply destroy the activity on every page.
+    // The callback (enabled = true) disables the default finish; `handleBack`
+    // finishes explicitly only when the page reports it did not handle the
+    // press. This fires for both the 3-button/gesture back and (when the OS
+    // routes it) predictive back.
+    onBackPressedDispatcher.addCallback(
+      this,
+      object : OnBackPressedCallback(true) {
+        override fun handleOnBackPressed() {
+          handleBack()
+        }
+      }
+    )
+  }
+
+  /**
+   * Dispatch a cancelable `pi-back` event into the page (the JS half lives in
+   * `src/lib/platform.ts`). A listener that consumed the press calls
+   * `preventDefault()`; if nobody did, there is nothing left to pop, so the
+   * activity finishes. `evaluateJavascript` hands the JS result to the
+   * callback as JSON — a boolean arrives as the literal `"true"`/`"false"`.
+   */
+  private fun handleBack() {
+    val webView = appWebView
+    if (webView == null) {
+      finish()
+      return
+    }
+    webView.evaluateJavascript(BACK_JS) { result ->
+      if (result != "true") {
+        finish()
+      }
     }
   }
 
@@ -86,7 +142,9 @@ class MainActivity : TauriActivity() {
   @SuppressLint("AddJavascriptInterface")
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
+    appWebView = webView
     webView.addJavascriptInterface(InsetsBridge(), "PiInsets")
+    webView.addJavascriptInterface(BackBridge(), "PiBack")
     webView.setOnApplyWindowInsetsListener { _, insets ->
       val result = applyInsets(insets)
       pushInsets(webView)
@@ -170,6 +228,14 @@ class MainActivity : TauriActivity() {
   private external fun initRustls()
 
   companion object {
+    // Dispatch a cancelable `pi-back` event and report whether a listener
+    // consumed it (`defaultPrevented`). Wrapped in try/catch so a page that
+    // isn't ready yet yields `false` (→ finish) instead of throwing.
+    private const val BACK_JS =
+      "(function(){try{var e=new CustomEvent('pi-back',{cancelable:true});" +
+        "window.dispatchEvent(e);return e.defaultPrevented===true;}" +
+        "catch(err){return false;}})()"
+
     init {
       // Ensure the native lib (which holds the initRustls export) is loaded
       // before the first call; idempotent alongside the `Rust` object's load.

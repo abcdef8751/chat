@@ -21,9 +21,12 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
-    // Android-only host-shell bridge (Termux RUN_COMMAND).
+    // Android-only native bridges: the host-shell bridge (Termux RUN_COMMAND)
+    // and the content-URI file bridge (ContentResolver).
     #[cfg(target_os = "android")]
-    let builder = builder.plugin(crate::android::plugin());
+    let builder = builder
+        .plugin(crate::android::plugin())
+        .plugin(crate::android::file_plugin());
     // Linux: "close to tray". Clicking the X hides the window instead of quitting,
     // so the process (and its background sync/reflection schedulers) keep running.
     // The tray menu is the only reliable reopen path on Linux (tray click events
@@ -155,6 +158,7 @@ pub fn run() {
             pricing::refresh_pricing,
             pricing::thinking_options,
             attachments::read_attachments,
+            read_attachment_from_uri,
             import::import_conversations,
             sync::sync_sign_in,
             sync::sync_sign_out,
@@ -169,6 +173,8 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
+        // `_app` is only read on Android (window recreate on resume); the
+        // underscore keeps the desktop build warning-free.
         .run(|_app, event| match event {
             #[cfg(target_os = "android")]
             tauri::RunEvent::ExitRequested { api, .. } => {
@@ -179,19 +185,33 @@ pub fn run() {
                 // it. Block that so the foreground service keeps them alive.
                 api.prevent_exit();
             }
+            // Android blank-screen-on-relaunch fix (tauri#15671). This event only
+            // reaches us because `tauri-runtime-wry` is vendored and patched with
+            // upstream PR #15678 (see [patch.crates-io] in Cargo.toml): upstream
+            // 2.11.4 emits `RunEvent::Resumed` only on `StartCause::Poll`, an arm
+            // its `ControlFlow::Wait` loop never hits, so on Android the resume
+            // was silently dropped. It matters here because swipe-away does NOT
+            // exit: `ExitRequested` calls `prevent_exit()` and `KeepAliveService`
+            // keeps the process (and its sync/reflection schedulers) alive. The
+            // relaunched activity therefore resumes with no window at all → a
+            // blank screen until the process is killed. The guard keeps this a
+            // no-op when a window already exists; recreate the main window
+            // otherwise. The label matches `tauri.conf.json` so Tauri's window
+            // registry stays consistent.
             #[cfg(target_os = "android")]
-            tauri::RunEvent::Resumed => {
-                // Known Tauri gap (tauri#15671): after swipe-away the process
-                // survives, but a relaunched activity gets no WebView → blank
-                // screen. Recreate the main window when resumed with none open.
-                if _app.webview_windows().is_empty() {
-                    let _ = tauri::WebviewWindowBuilder::new(
-                        _app,
-                        "main",
-                        tauri::WebviewUrl::default(),
-                    )
-                    .title("Pi Chat")
-                    .build();
+            tauri::RunEvent::Resumed if _app.webview_windows().is_empty() => {
+                match tauri::WebviewWindowBuilder::new(
+                    _app,
+                    "main",
+                    tauri::WebviewUrl::default(),
+                )
+                .title("Pi Chat")
+                .build()
+                {
+                    Ok(_) => eprintln!("android: recreated main window on resume"),
+                    Err(e) => {
+                        eprintln!("android: failed to recreate main window on resume: {e}")
+                    }
                 }
             }
             #[cfg(target_os = "linux")]
@@ -204,4 +224,25 @@ pub fn run() {
             }
             _ => {}
         });
+}
+
+/// Read an attachment from an Android `content://` URI — what
+/// `tauri-plugin-dialog` hands back there, and what `std::fs` cannot open (so
+/// the path-based `attachments::read_attachments` silently dropped every picked
+/// file). The Kotlin `ContentResolver` bridge reads the bytes/mime/name and
+/// this assembles the same `Attachment` shape. Android only; the stub keeps
+/// the command available (and the invoke handler stable) on other platforms.
+#[cfg(target_os = "android")]
+#[tauri::command]
+async fn read_attachment_from_uri(
+    app: tauri::AppHandle,
+    uri: String,
+) -> Result<attachments::Attachment, String> {
+    crate::android::read_attachment_from_uri(&app, uri).await
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+async fn read_attachment_from_uri(_uri: String) -> Result<attachments::Attachment, String> {
+    Err("read_attachment_from_uri is only available on Android".into())
 }
