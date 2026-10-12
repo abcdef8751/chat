@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, Show } from "solid-js";
+import { createEffect, For, Show } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import type {
   BackfillStatus,
@@ -18,6 +18,11 @@ import { formatCost } from "../lib/turns";
 export function MemoryPage(props: {
   memoryOpen: boolean;
   setMemoryOpen: (open: boolean) => void;
+  // Narrow-viewport detail page. Lifted to App so the Android hardware-back
+  // handler can close the detail page before the dialog; App/`onBack` owns the
+  // "return to the list" transition (see App.tsx).
+  memoryDetailOpen: boolean;
+  setMemoryDetailOpen: (open: boolean) => void;
   wideViewport: boolean;
   fullscreenInsetStyle: () => Record<string, string>;
   memoryFiles: MemoryFile[];
@@ -71,25 +76,24 @@ export function MemoryPage(props: {
 
   // Narrow viewports split the dialog into two pages: a names-only list and a
   // full-screen editor for the tapped file. Wide viewports keep the two-pane
-  // layout, so this is only ever set below `lg`.
-  const [mobileDetail, setMobileDetail] = createSignal(false);
-
-  // Always reopen on the list page after the dialog closes.
+  // layout, so this is only ever meaningfully set below `lg`. The flag itself
+  // lives in App (so hardware-back can close the detail page first); closing
+  // the dialog resets it to the list.
   createEffect(() => {
-    if (!props.memoryOpen) setMobileDetail(false);
+    if (!props.memoryOpen) props.setMemoryDetailOpen(false);
   });
 
   // A tap selects the file; on a narrow viewport it also drills into the
   // full-screen editor page.
   function chooseFile(file: MemoryFile) {
     props.selectMemoryFile(file);
-    if (!props.wideViewport) setMobileDetail(true);
+    if (!props.wideViewport) props.setMemoryDetailOpen(true);
   }
 
   function deleteSelected(name: string) {
     void props.removeMemoryFile(name);
     // After a delete the edited file is gone — return to the list.
-    setMobileDetail(false);
+    props.setMemoryDetailOpen(false);
   }
 
   const fileButtonClass = (f: MemoryFile) =>
@@ -491,14 +495,14 @@ export function MemoryPage(props: {
 
           {/* Narrow viewports: the full-screen file editor page, layered over
               the list so the dialog can drill in and back out. */}
-          <Show when={!props.wideViewport && mobileDetail()}>
+          <Show when={!props.wideViewport && props.memoryDetailOpen}>
             <div
               class="fixed inset-0 z-[60] flex h-full w-full flex-col overflow-y-auto bg-white p-5 focus:outline-none dark:bg-neutral-900"
               style={props.fullscreenInsetStyle()}
             >
               <div class="flex items-center gap-2">
                 <button
-                  onClick={() => setMobileDetail(false)}
+                  onClick={() => props.setMemoryDetailOpen(false)}
                   title="Back to memory files"
                   aria-label="Back to memory files"
                   class="shrink-0 rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
