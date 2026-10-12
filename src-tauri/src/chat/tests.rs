@@ -2353,3 +2353,128 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert!(!bodies.lock().unwrap()[1].contains("image_url"));
         let _ = std::fs::remove_file(&img);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_file_oversized_image_is_not_injected() {
+        // Sparse file: metadata reports the length without writing the bytes.
+        let img = std::env::temp_dir().join(format!(
+            "pi-read-image-oversize-{}.png",
+            std::process::id()
+        ));
+        let f = std::fs::File::create(&img).unwrap();
+        f.set_len(crate::attachments::MAX_IMAGE_BYTES + 1).unwrap();
+        drop(f);
+        let path = img.to_str().unwrap().to_string();
+        let args = escape_args(json!({ "path": path }));
+
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    tool_frag(0, "call_1", "read_file", ""),
+                    tool_frag(0, "", "", &args),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("ok"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("read-image-oversize"));
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        // Even a vision model must not receive an oversized image.
+        mark_model_vision(&db, &base_url);
+
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: base_url.clone(),
+            model: "mock".into(),
+            auto_approve_tools: true,
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        run_chat_turn(
+            &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-oversize"),
+            &approvals, flag, &sink, cid.clone(), "look".into(), Vec::new(),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        // A plain text result telling the model it cannot view the image.
+        let rows = msgs(&db, &cid);
+        let tr: Value = serde_json::from_str(&rows[2].content).unwrap();
+        assert_eq!(tr["error"], false);
+        assert!(
+            tr["output"].as_str().unwrap().contains("too large"),
+            "expected a too-large note, got {}",
+            tr["output"]
+        );
+        assert_eq!(rows.len(), 4, "no synthetic image turn is persisted");
+
+        // The image is never injected as a data URL.
+        let caps = bodies.lock().unwrap();
+        assert!(!caps[1].contains("image_url"), "oversized image must not be sent");
+        assert!(!caps[1].contains("base64"), "oversized image must not be read");
+        let _ = std::fs::remove_file(&img);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_file_svg_falls_back_to_text_and_is_not_an_image_part() {
+        let svg = std::env::temp_dir().join(format!("pi-read-svg-{}.svg", std::process::id()));
+        std::fs::write(&svg, "<svg><rect/></svg>").unwrap();
+        let path = svg.to_str().unwrap().to_string();
+        let args = escape_args(json!({ "path": path }));
+
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    tool_frag(0, "call_1", "read_file", ""),
+                    tool_frag(0, "", "", &args),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("ok"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("read-svg"));
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        // Even with a vision model, an SVG must not be turned into an image part.
+        mark_model_vision(&db, &base_url);
+
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: base_url.clone(),
+            model: "mock".into(),
+            auto_approve_tools: true,
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        run_chat_turn(
+            &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-svg"), &approvals, flag,
+            &sink, cid.clone(), "look".into(), Vec::new(),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        // The SVG is read as ordinary text, not as a base64 image.
+        let rows = msgs(&db, &cid);
+        let tr: Value = serde_json::from_str(&rows[2].content).unwrap();
+        assert_eq!(tr["error"], false);
+        assert!(
+            tr["output"].as_str().unwrap().contains("<svg>"),
+            "expected the SVG text as a tool result, got {}",
+            tr["output"]
+        );
+        assert!(!bodies.lock().unwrap()[1].contains("image_url"));
+        let _ = std::fs::remove_file(&svg);
+    }

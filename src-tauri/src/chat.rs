@@ -1121,6 +1121,21 @@ impl DispatchedTool {
 /// text result plus the image (returned for injection); text-only models get a
 /// result telling them they cannot view it, so they can relay that to the user.
 fn read_file_image(path: &str, cfg: &AppConfig, db: Option<&db::Db>) -> DispatchedTool {
+    // Oversized images are never read (no data URL, no injection): base64
+    // inflation plus re-sending on every remaining round of the turn makes a
+    // huge image expensive, and most providers cap the request body anyway.
+    // Hand the model a plain text result so it can relay the limitation.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_file() && meta.len() > crate::attachments::MAX_IMAGE_BYTES {
+            return DispatchedTool::plain(ToolOutput::ok(format!(
+                "read_file: \"{path}\" is an image, but it is too large to view \
+                 ({} bytes; the limit is {} bytes). Tell the user you cannot see its \
+                 contents.",
+                meta.len(),
+                crate::attachments::MAX_IMAGE_BYTES
+            )));
+        }
+    }
     let (mime, data_url) = match crate::attachments::read_image(path) {
         Ok(x) => x,
         Err(e) => return DispatchedTool::plain(ToolOutput::err(format!("read_file: {e}"))),
