@@ -126,6 +126,117 @@ impl ModelMeta {
     }
 }
 
+/// Defaults used when nothing is known about a model (custom provider with no
+/// models.dev entry and no user override): text in, text out, reasoning assumed
+/// supported.
+pub const DEFAULT_INPUT_MODALITIES: &[&str] = &["text"];
+pub const DEFAULT_OUTPUT_MODALITIES: &[&str] = &["text"];
+
+/// Effective capability set for a model, resolved as
+/// user override → models.dev cache → default.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+    pub input: Vec<String>,
+    pub output: Vec<String>,
+    pub reasoning: bool,
+    /// True when any user override contributed to the result.
+    pub overridden: bool,
+}
+
+impl Capabilities {
+    /// Whether the model accepts image input.
+    pub fn vision(&self) -> bool {
+        self.input.iter().any(|m| m == "image")
+    }
+}
+
+/// Parse a raw models.dev `modalities` JSON into its `(input, output)` lists.
+fn parse_modalities(raw: Option<&str>) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    let Some(raw) = raw else {
+        return (None, None);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return (None, None);
+    };
+    let list = |key: &str| {
+        value.get(key).and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+    };
+    (list("input"), list("output"))
+}
+
+/// Resolve a model's effective capabilities: a user override wins, then the
+/// models.dev cache (`meta`), then the text/text/reasoning defaults. Shared by
+/// the model picker (so the vision warning respects overrides) and the chat
+/// loop's `read_file` image path.
+pub fn resolve_capabilities(
+    config: &crate::config::AppConfig,
+    model_id: &str,
+    meta: Option<&ModelMeta>,
+) -> Capabilities {
+    let over = config.model_overrides.get(model_id);
+    let (md_input, md_output) = parse_modalities(meta.and_then(|m| m.modalities.as_deref()));
+
+    let input = over
+        .and_then(|o| o.input_modalities.clone())
+        .or(md_input)
+        .or_else(|| {
+            // No explicit modality list reached us: fall back to the coarse
+            // `attachment` flag via `ModelMeta::vision`, treating an
+            // attachment-capable model as image input.
+            meta.filter(|m| m.vision())
+                .map(|_| vec!["text".to_string(), "image".to_string()])
+        })
+        .unwrap_or_else(|| {
+            DEFAULT_INPUT_MODALITIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
+    let output = over
+        .and_then(|o| o.output_modalities.clone())
+        .or(md_output)
+        .unwrap_or_else(|| {
+            DEFAULT_OUTPUT_MODALITIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
+    let reasoning = over
+        .and_then(|o| o.reasoning)
+        .or_else(|| meta.and_then(|m| m.reasoning))
+        .unwrap_or(true);
+    let overridden = over
+        .map(|o| {
+            o.input_modalities.is_some() || o.output_modalities.is_some() || o.reasoning.is_some()
+        })
+        .unwrap_or(false);
+
+    Capabilities {
+        input,
+        output,
+        reasoning,
+        overridden,
+    }
+}
+
+/// Effective capabilities for the model a live turn will use. Convenience over
+/// [`resolve_capabilities`] that fetches the cached models.dev row itself.
+pub fn capabilities_for(
+    db: &Db,
+    config: &crate::config::AppConfig,
+    model_id: &str,
+) -> Capabilities {
+    let meta = meta_for_provider(db, &config.base_url)
+        .get(model_id)
+        .cloned();
+    resolve_capabilities(config, model_id, meta.as_ref())
+}
+
 /// Resolved pricing/context for one model, serialized straight to the frontend.
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -838,6 +949,7 @@ mod tests {
                 output_per_million: Some(3.0),
                 cache_read_per_million: Some(0.15),
                 cache_write_per_million: Some(1.9),
+                ..Default::default()
             },
         );
         let p = resolve("my-model", &config);
@@ -848,6 +960,49 @@ mod tests {
         assert_eq!(p.cache_write_per_million, Some(1.9));
         assert!(p.overridden);
         assert_eq!(p.source, "override");
+    }
+
+    #[test]
+    fn capabilities_prefer_override_then_models_dev_then_default() {
+        let mut config = AppConfig::default();
+        let meta = ModelMeta {
+            name: None,
+            reasoning: Some(false),
+            reasoning_options: None,
+            attachment: None,
+            modalities: Some(r#"{"input":["text","image"],"output":["text"]}"#.into()),
+        };
+
+        // models.dev beats the default (and its `reasoning: false` is honoured).
+        let c = resolve_capabilities(&config, "m", Some(&meta));
+        assert_eq!(c.input, vec!["text", "image"]);
+        assert_eq!(c.output, vec!["text"]);
+        assert!(!c.reasoning);
+        assert!(c.vision());
+        assert!(!c.overridden);
+
+        // No metadata at all → text in / text out / reasoning supported.
+        let c = resolve_capabilities(&config, "m", None);
+        assert_eq!(c.input, vec!["text"]);
+        assert_eq!(c.output, vec!["text"]);
+        assert!(c.reasoning);
+        assert!(!c.vision());
+
+        // A user override (the only option for a custom provider) beats both.
+        config.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                input_modalities: Some(vec!["text".into(), "audio".into()]),
+                output_modalities: Some(vec!["text".into()]),
+                reasoning: Some(true),
+                ..Default::default()
+            },
+        );
+        let c = resolve_capabilities(&config, "m", Some(&meta));
+        assert_eq!(c.input, vec!["text", "audio"]);
+        assert!(c.reasoning, "override wins over models.dev's `false`");
+        assert!(!c.vision(), "no image in the override");
+        assert!(c.overridden);
     }
 
     #[test]

@@ -292,6 +292,9 @@ export default function App() {
     outputPerMillion: null,
     cacheReadPerMillion: null,
     cacheWritePerMillion: null,
+    inputModalities: null,
+    outputModalities: null,
+    reasoning: null,
   };
 
   const overrideFor = (id: string): ModelOverride => modelOverrides()[id] ?? EMPTY_OVERRIDE;
@@ -310,11 +313,20 @@ export default function App() {
   // Merge one field into a model's override. When every field is blank the
   // entry is dropped entirely, so a cleared override stops shadowing the
   // endpoint/bundled values.
-  function setOverrideField(id: string, field: keyof ModelOverride, value: number | null) {
+  function setOverrideField<K extends keyof ModelOverride>(
+    id: string,
+    field: K,
+    value: ModelOverride[K],
+  ) {
     if (!id) return;
     const next = { ...modelOverrides() };
     const cur: ModelOverride = { ...(next[id] ?? EMPTY_OVERRIDE), [field]: value };
-    if (Object.values(cur).every((v) => v == null)) delete next[id];
+    // Drop the entry once nothing is set, so a cleared override stops shadowing
+    // the endpoint/bundled/catalog values. An empty modality list counts as unset.
+    const blank = Object.values(cur).every(
+      (v) => v == null || (Array.isArray(v) && v.length === 0),
+    );
+    if (blank) delete next[id];
     else next[id] = cur;
     commitOverrides(next);
   }

@@ -129,13 +129,24 @@ impl ModelCache {
 }
 
 /// Attach cached models.dev metadata to a list of model ids.
-fn with_meta(ids: Vec<String>, meta: &HashMap<String, ModelMeta>) -> Vec<ModelInfo> {
+///
+/// `vision` is resolved through [`crate::pricing::resolve_capabilities`] so a
+/// user's modality override (needed for custom providers, which have no
+/// models.dev data) is honoured by the composer's image warning. The raw
+/// `reasoning`/`attachment`/`modalities` fields are passed through untouched so
+/// the Settings editor can show the underlying catalog values.
+fn with_meta(
+    ids: Vec<String>,
+    meta: &HashMap<String, ModelMeta>,
+    config: &crate::config::AppConfig,
+) -> Vec<ModelInfo> {
     ids.into_iter()
         .map(|id| {
             let m = meta.get(&id);
+            let caps = crate::pricing::resolve_capabilities(config, &id, m);
             ModelInfo {
                 name: m.and_then(|m| m.name.clone()),
-                vision: m.map(ModelMeta::vision),
+                vision: Some(caps.vision()),
                 reasoning: m.and_then(|m| m.reasoning),
                 attachment: m.and_then(|m| m.attachment),
                 modalities: m.and_then(|m| m.modalities.clone()),
@@ -199,7 +210,7 @@ pub async fn list_models(
     if !force {
         if let Some(ids) = app.state::<ModelCache>().get(&base_url) {
             let meta = crate::pricing::meta_for_provider(&db, &base_url);
-            return Ok(with_meta(ids, &meta));
+            return Ok(with_meta(ids, &meta, &config));
         }
     }
 
@@ -243,7 +254,7 @@ pub async fn list_models(
     ids.dedup();
     app.state::<ModelCache>().put(base_url.clone(), ids.clone());
     let meta = crate::pricing::meta_for_provider(&db, &base_url);
-    Ok(with_meta(ids, &meta))
+    Ok(with_meta(ids, &meta, &config))
 }
 
 #[cfg(test)]

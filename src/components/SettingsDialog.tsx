@@ -54,7 +54,12 @@ function modalityLabel(modality: string): string {
   }
 }
 
-/// Small read-only capability chip used in the model configurator.
+/// Modality tokens offered in the capabilities editor (models.dev vocabulary).
+const INPUT_MODALITY_OPTIONS = ["text", "image", "audio", "video"];
+const OUTPUT_MODALITY_OPTIONS = ["text", "image", "audio"];
+
+/// Small capability chip used in the model configurator (read-only when rendered
+/// standalone, clickable when wrapped in a button by the editor).
 function CapabilityBadge(props: { tone: "on" | "off" | "none" | "muted"; children: JSX.Element }) {
   return (
     <span
@@ -115,7 +120,11 @@ export function SettingsDialog(props: {
   overrideModel: string;
   setOverrideModel: (value: string) => void;
   overrideFor: (id: string) => ModelOverride;
-  setOverrideField: (id: string, field: keyof ModelOverride, value: number | null) => void;
+  setOverrideField: (
+    id: string,
+    field: keyof ModelOverride,
+    value: ModelOverride[keyof ModelOverride],
+  ) => void;
   overrideEffective: Pricing | null;
   modelOverrides: Record<string, ModelOverride>;
   clearOverride: (id: string) => void;
@@ -475,51 +484,67 @@ export function SettingsDialog(props: {
               <Show when={selectedModel()}>
                 {(m) => {
                   const parsed = () => parseModalities(m().modalities);
-                  // Mirror the backend's `ModelMeta::vision()` precedence: an
-                  // explicit `modalities.input` list wins; only when it is
-                  // absent do we fall back to the coarse `attachment` flag
-                  // (which covers documents + images).
-                  const inputModalities = () => {
-                    const input = parsed()?.input ?? null;
-                    if (input !== null) return input;
-                    return m().attachment ? ["image", "document"] : [];
-                  };
-                  const outputModalities = () => parsed()?.output ?? [];
-                  // Same explicit-vs-absent distinction as `input` above: a
-                  // present-but-empty `output` list means "none", not "unknown".
-                  const outputKnown = () => parsed()?.output != null;
-                  // An explicit `input` list — even an empty one — is
-                  // authoritative (mirrors the backend's `vision()`): `[]` means
-                  // "cannot see images", distinct from an absent list ("unknown",
-                  // which may still fall back to the coarse `attachment` flag).
-                  const inputKnown = () => parsed()?.input != null;
+                  const over = () => props.overrideFor(m().id);
+                  // Effective capabilities: user override → models.dev → the
+                  // text/text/reasoning defaults. Mirrors the backend's
+                  // `resolve_capabilities`, so a custom provider with no catalog
+                  // entry can still be declared here.
+                  const inputModalities = (): string[] =>
+                    over().inputModalities ??
+                    parsed()?.input ??
+                    (m().attachment ? ["text", "image"] : ["text"]);
+                  const outputModalities = (): string[] =>
+                    over().outputModalities ?? parsed()?.output ?? ["text"];
+                  const reasoningSupported = (): boolean =>
+                    over().reasoning ?? m().reasoning ?? true;
+                  const isOverridden = () =>
+                    over().inputModalities != null ||
+                    over().outputModalities != null ||
+                    over().reasoning != null;
+                  const toggle = (cur: string[], mod: string): string[] =>
+                    cur.includes(mod) ? cur.filter((x) => x !== mod) : [...cur, mod];
                   return (
                     <div class="mt-2 rounded-lg border border-neutral-200 bg-neutral-50 px-2.5 py-2 dark:border-neutral-700 dark:bg-neutral-800/50">
-                      <div class="truncate text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
-                        Capabilities
+                      <div class="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                        <span>Capabilities</span>
+                        <Show when={isOverridden()}>
+                          <span class="normal-case text-amber-600 dark:text-amber-400">
+                            (customized)
+                          </span>
+                        </Show>
                       </div>
+                      <p class="mt-0.5 text-[10px] font-normal text-neutral-400 dark:text-neutral-500">
+                        Click to toggle. Custom providers report nothing, so these
+                        default to text-in / text-out with reasoning supported.
+                      </p>
                       <div class="mt-1.5 space-y-1">
                         <div class="flex items-start gap-2">
                           <span class="w-14 shrink-0 pt-px text-[10px] font-medium uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
                             Input
                           </span>
                           <div class="flex flex-wrap gap-1">
-                            <Show
-                              when={inputModalities().length > 0}
-                              fallback={
-                                inputKnown() ? (
-                                  <CapabilityBadge tone="none">none</CapabilityBadge>
-                                ) : (
-                                  <CapabilityBadge tone="muted">unknown</CapabilityBadge>
-                                )
-                              }
-                            >
-                              <For each={inputModalities()}>
-                                {(mod) => (
-                                  <CapabilityBadge tone="on">{modalityLabel(mod)}</CapabilityBadge>
-                                )}
-                              </For>
-                            </Show>
+                            <For each={INPUT_MODALITY_OPTIONS}>
+                              {(mod) => (
+                                <button
+                                  type="button"
+                                  class="cursor-pointer"
+                                  title={`Toggle ${mod} input`}
+                                  onClick={() =>
+                                    props.setOverrideField(
+                                      m().id,
+                                      "inputModalities",
+                                      toggle(inputModalities(), mod),
+                                    )
+                                  }
+                                >
+                                  <CapabilityBadge
+                                    tone={inputModalities().includes(mod) ? "on" : "off"}
+                                  >
+                                    {modalityLabel(mod)}
+                                  </CapabilityBadge>
+                                </button>
+                              )}
+                            </For>
                           </div>
                         </div>
                         <div class="flex items-start gap-2">
@@ -527,38 +552,46 @@ export function SettingsDialog(props: {
                             Output
                           </span>
                           <div class="flex flex-wrap gap-1">
-                            <Show
-                              when={outputModalities().length > 0}
-                              fallback={
-                                outputKnown() ? (
-                                  <CapabilityBadge tone="none">none</CapabilityBadge>
-                                ) : (
-                                  <CapabilityBadge tone="muted">unknown</CapabilityBadge>
-                                )
-                              }
-                            >
-                              <For each={outputModalities()}>
-                                {(mod) => (
-                                  <CapabilityBadge tone="on">{modalityLabel(mod)}</CapabilityBadge>
-                                )}
-                              </For>
-                            </Show>
+                            <For each={OUTPUT_MODALITY_OPTIONS}>
+                              {(mod) => (
+                                <button
+                                  type="button"
+                                  class="cursor-pointer"
+                                  title={`Toggle ${mod} output`}
+                                  onClick={() =>
+                                    props.setOverrideField(
+                                      m().id,
+                                      "outputModalities",
+                                      toggle(outputModalities(), mod),
+                                    )
+                                  }
+                                >
+                                  <CapabilityBadge
+                                    tone={outputModalities().includes(mod) ? "on" : "off"}
+                                  >
+                                    {modalityLabel(mod)}
+                                  </CapabilityBadge>
+                                </button>
+                              )}
+                            </For>
                           </div>
                         </div>
                         <div class="flex items-center gap-2">
                           <span class="w-14 shrink-0 text-[10px] font-medium uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
                             Reasoning
                           </span>
-                          <Show
-                            when={m().reasoning === true}
-                            fallback={
-                              <CapabilityBadge tone={m().reasoning === false ? "off" : "muted"}>
-                                {m().reasoning === false ? "not supported" : "unknown"}
-                              </CapabilityBadge>
+                          <button
+                            type="button"
+                            class="cursor-pointer"
+                            title="Toggle reasoning support"
+                            onClick={() =>
+                              props.setOverrideField(m().id, "reasoning", !reasoningSupported())
                             }
                           >
-                            <CapabilityBadge tone="on">supported</CapabilityBadge>
-                          </Show>
+                            <CapabilityBadge tone={reasoningSupported() ? "on" : "off"}>
+                              {reasoningSupported() ? "supported" : "not supported"}
+                            </CapabilityBadge>
+                          </button>
                         </div>
                       </div>
                     </div>

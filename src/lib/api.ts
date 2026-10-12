@@ -45,6 +45,16 @@ export interface ModelOverride {
   outputPerMillion: number | null;
   cacheReadPerMillion: number | null;
   cacheWritePerMillion: number | null;
+  /**
+   * User-set input modalities (models.dev vocabulary, e.g. `["text","image"]`).
+   * Beats models.dev; the only way to declare capability for a custom provider,
+   * which has no catalog entry. `null` = fall through.
+   */
+  inputModalities: string[] | null;
+  /** User-set output modalities (e.g. `["text"]`). `null` = fall through. */
+  outputModalities: string[] | null;
+  /** User-set reasoning support. `null` = fall through. */
+  reasoning: boolean | null;
 }
 
 export interface Provider {

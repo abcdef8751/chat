@@ -1140,12 +1140,13 @@ fn read_file_image(path: &str, cfg: &AppConfig, db: Option<&db::Db>) -> Dispatch
         Ok(x) => x,
         Err(e) => return DispatchedTool::plain(ToolOutput::err(format!("read_file: {e}"))),
     };
-    // Vision is a property of the *turn's* active provider/model; an unknown
-    // provider (no cached metadata) is treated as not-vision so we never inject
-    // an image part a text-only endpoint would reject.
+    // Vision is a property of the *turn's* active provider/model, resolved the
+    // same way as the picker: a user modality override → models.dev → the
+    // text-only default. A model we know nothing about (custom provider, no
+    // override) stays not-vision, so we never inject an image part a text-only
+    // endpoint would reject.
     let vision = db
-        .map(|db| crate::pricing::meta_for_provider(db, &cfg.base_url))
-        .and_then(|metas| metas.get(&cfg.model).map(|m| m.vision()))
+        .map(|db| crate::pricing::capabilities_for(db, cfg, &cfg.model).vision())
         .unwrap_or(false);
     if vision {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);

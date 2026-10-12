@@ -22,6 +22,14 @@ pub struct ModelOverride {
     pub output_per_million: Option<f64>,
     pub cache_read_per_million: Option<f64>,
     pub cache_write_per_million: Option<f64>,
+    /// User-set input modalities (models.dev vocabulary, e.g. `["text","image"]`).
+    /// Beats models.dev; a manually-added provider has no models.dev data at all,
+    /// so this is how its capabilities get declared.
+    pub input_modalities: Option<Vec<String>>,
+    /// User-set output modalities (e.g. `["text"]`). Beats models.dev.
+    pub output_modalities: Option<Vec<String>>,
+    /// User-set reasoning support. Beats models.dev.
+    pub reasoning: Option<bool>,
 }
 
 /// One OpenAI-compatible provider: its own base URL and (optionally) a favorite
