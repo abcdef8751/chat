@@ -159,6 +159,7 @@ pub fn run() {
             pricing::thinking_options,
             attachments::read_attachments,
             read_attachment_from_uri,
+            db::edit_user_message,
             import::import_conversations,
             sync::sync_sign_in,
             sync::sync_sign_out,

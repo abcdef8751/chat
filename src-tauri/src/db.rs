@@ -658,7 +658,6 @@ pub async fn delete_conversation(
 ///
 /// Kept separate from the Tauri command so it can be unit-tested without a
 /// `tauri::State`.
-#[allow(dead_code)]
 pub fn apply_user_message_edit(
     db: &Db,
     conversation_id: &str,
@@ -793,10 +792,8 @@ pub fn apply_user_message_edit(
 }
 
 /// Edit a user message and fork the conversation from that point (delete every
-/// later message). Registered in `lib.rs` by the orchestrator, not here — hence
-/// the `dead_code` allow until that registration lands.
+/// later message). Registered in `lib.rs`'s `invoke_handler`.
 #[tauri::command]
-#[allow(dead_code)]
 pub async fn edit_user_message(
     db: tauri::State<'_, Db>,
     conversation_id: String,
