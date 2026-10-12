@@ -2309,6 +2309,102 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert_eq!(sent[0]["content"], "edited text");
     }
 
+    /// The `regenerate` dedup must not rely on the edited row being the literal
+    /// tail: a row appended after the edit (e.g. a `memory` note) must still
+    /// leave the turn sent exactly once upstream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn regenerate_dedup_survives_a_row_appended_after_the_edit() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![vec![
+                delta_chunk("Reply"),
+                finish_chunk("stop"),
+                usage_chunk(),
+            ]],
+            0,
+        );
+        let db = Arc::new(open_db("regen-appended"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+
+        let row = crate::db::insert_message(
+            &db,
+            cid.clone(),
+            "user".into(),
+            "original".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        crate::db::apply_user_message_edit(&db, &cid, &row.id, "edited text", None).unwrap();
+        // A row lands after the edit, so the edited user row is no longer the
+        // last message — the content match (not a blind tail pop) must find it.
+        crate::db::insert_message(
+            &db,
+            cid.clone(),
+            "memory".into(),
+            "a note".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("regen-appended");
+        let flag = Arc::new(AtomicBool::new(false));
+
+        run_chat_turn(
+            &db,
+            &cfg,
+            "test-key",
+            &brave,
+            &shell,
+            &memory,
+            &approvals,
+            flag,
+            &sink,
+            cid.clone(),
+            "edited text".into(),
+            Vec::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        // The request still carries the user turn exactly once.
+        let caps = bodies.lock().unwrap().clone();
+        let req = request_body(&caps[0]);
+        let sent: Vec<_> = req["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .collect();
+        assert_eq!(sent.len(), 1, "the edited turn must still appear once upstream");
+        assert_eq!(sent[0]["content"], "edited text");
+
+        // No second user row was persisted, and the appended row survived.
+        let rows = msgs(&db, &cid);
+        assert_eq!(rows.iter().filter(|m| m.role == "user").count(), 1);
+        assert!(rows.iter().any(|m| m.role == "memory"));
+    }
+
     // --- read_file images (item 9) ------------------------------------------
 
     /// Register `mock` as a vision model for the given provider key so the chat

@@ -121,22 +121,8 @@ export default function App() {
   const [editDraft, setEditDraft] = createSignal("");
   const [editAttachments, setEditAttachments] = createSignal<Attachment[]>([]);
 
-  // The turn currently streaming, plus a monotonic token so a superseded turn's
-  // late channel events (after Stop / a re-send) are ignored.
-  let streamTurn: {
-    id: string;
-    assistantKey: string;
-    userText: string;
-    userAttachments: Attachment[];
-    tempUserId: string | null;
-    /// True once any visible assistant text delta has arrived. Used by `stop()`
-    /// to decide whether the user's draft should be handed back.
-    receivedText: boolean;
-    /// True once any thinking delta / tool call / tool result has arrived. A
-    /// turn that only got this far has still persisted the user row, so its
-    /// draft must NOT be restored (that would duplicate it on re-send).
-    receivedActivity: boolean;
-  } | null = null;
+  // A monotonic token so a superseded turn's late channel events (after Stop /
+  // a re-send) are ignored.
   let turnToken = 0;
 
   // Files staged for the next message (picked or dropped).
@@ -1397,15 +1383,6 @@ export default function App() {
     setThinkingOpenId(null);
 
     const token = ++turnToken;
-    streamTurn = {
-      id,
-      assistantKey,
-      userText: text,
-      userAttachments: staged,
-      tempUserId,
-      receivedText: false,
-      receivedActivity: false,
-    };
 
     const received = { current: false };
     const channel = new Channel<StreamEvent>();
@@ -1414,7 +1391,6 @@ export default function App() {
       if (activeId() !== id || token !== turnToken) return;
       if (ev.type === "delta") {
         received.current = true;
-        if (streamTurn) streamTurn.receivedText = true;
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantKey ? { ...m, content: m.content + ev.text } : m,
@@ -1422,7 +1398,6 @@ export default function App() {
         );
       } else if (ev.type === "thinkingDelta") {
         received.current = true;
-        if (streamTurn) streamTurn.receivedActivity = true;
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantKey ? { ...m, thinking: (m.thinking ?? "") + ev.text } : m,
@@ -1430,7 +1405,6 @@ export default function App() {
         );
       } else if (ev.type === "toolCall") {
         received.current = true;
-        if (streamTurn) streamTurn.receivedActivity = true;
         // Flush the round's streamed reasoning + preamble text onto this call,
         // then reset the in-flight message so the next round starts clean. The
         // final round emits no `toolCall`, so whatever text remains stays as the
@@ -1461,7 +1435,6 @@ export default function App() {
         ]);
       } else if (ev.type === "toolResult") {
         received.current = true;
-        if (streamTurn) streamTurn.receivedActivity = true;
         setLiveTools((prev) =>
           prev.map((t) =>
             t.callId === ev.callId
@@ -1473,7 +1446,6 @@ export default function App() {
         if (ev.type === "error") setStreamError(ev.message);
         setStreaming(false);
         setLiveTools([]);
-        streamTurn = null;
         listMessages(id).then(setMessages);
         refreshConversations().catch(() => {});
       }
@@ -1497,7 +1469,6 @@ export default function App() {
       }
       setStreaming(false);
       setLiveTools([]);
-      streamTurn = null;
       setStreamError(String(e));
     }
   }
@@ -1547,29 +1518,17 @@ export default function App() {
     // immediately), so the composer re-enables as soon as it lands. The
     // stream's own `done` event still reloads the persisted rows (the turn
     // token is deliberately not superseded), so the timeline still reconciles.
-    const turn = streamTurn;
     try {
       await stopChat(id);
     } catch {
       // noop — the backend still settles the aborted turn.
     }
-    streamTurn = null;
     setStreaming(false);
     setLiveTools([]);
-    // Aborted before any assistant output at all: hand the user's message back
-    // so it can be re-sent. A turn that got as far as reasoning or a tool call
-    // has already persisted the user row, so restoring the draft there would
-    // duplicate it on the next send.
-    if (
-      turn &&
-      !turn.receivedText &&
-      !turn.receivedActivity &&
-      activeId() === turn.id &&
-      !draft().trim()
-    ) {
-      setDraft(turn.userText);
-      if (turn.userAttachments.length > 0) setPendingAttachments(turn.userAttachments);
-    }
+    // The user message is persisted by the backend *before* streaming starts, so
+    // it is already in the transcript. Handing the draft back here would
+    // duplicate it on the next send, so Stop simply returns the composer to its
+    // idle state; the message can be edited to re-run the turn.
   }
 
   // --- Inline editing of user messages (Item 13) --------------------------

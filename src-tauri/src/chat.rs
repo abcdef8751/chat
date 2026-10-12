@@ -1550,7 +1550,18 @@ pub(crate) async fn run_chat_turn(
     // rebuild the request from `content` — exactly one copy of the turn goes
     // upstream, and no new row is persisted. A normal send has no such row yet.
     if regenerate {
-        if history.last().is_some_and(|m| m.role == "user") {
+        // `apply_user_message_edit` truncated everything after the edited row, so
+        // it is the last persisted message. Match it by content at the last
+        // `user` position rather than blindly popping the tail: if anything were
+        // appended in the interim (e.g. a `memory` note), popping the tail would
+        // miss and the turn would be sent upstream twice.
+        if let Some(pos) = history
+            .iter()
+            .rposition(|m| m.role == "user" && m.content == content)
+        {
+            history.remove(pos);
+        } else if history.last().is_some_and(|m| m.role == "user") {
+            // Defensive fallback: the row we expect is still the last message.
             history.pop();
         }
     } else {
