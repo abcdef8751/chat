@@ -620,6 +620,35 @@ pub(crate) fn user_request_message(
         .into())
 }
 
+/// Build the synthetic user message that carries an image loaded by `read_file`
+/// on a multimodal model. Reuses [`user_request_message`]'s image-part
+/// construction (async-openai's tool-message content has no image variant).
+fn image_request_message(
+    call: &ToolCall,
+    data_url: String,
+) -> Result<ChatCompletionRequestMessage, String> {
+    let name = call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .and_then(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "image".to_string());
+    let attachment = crate::attachments::Attachment {
+        id: format!("read_file-image-{}", call.id),
+        name,
+        mime: String::new(),
+        size: 0,
+        kind: "image".into(),
+        data_url: Some(data_url),
+        text: None,
+    };
+    user_request_message("", &[attachment])
+}
+
 /// Parse the stored attachment JSON on a user row (empty when absent/invalid).
 fn row_attachments(row: &db::MessageRow) -> Vec<crate::attachments::Attachment> {
     row.attachments
@@ -1066,15 +1095,81 @@ pub(crate) struct ToolLoopResult {
     pub error: Option<String>,
 }
 
+/// A dispatched tool outcome, plus an optional image the model should see.
+///
+/// async-openai 0.41 tool messages are text-only (`ChatCompletionRequestToolMessageContentPart`
+/// has only `Text`), so a `read_file` call that loads an image cannot ride the
+/// tool result. Instead [`dispatch_tool`] returns the image here and the tool
+/// loop injects it as a synthetic user `image_url` part after the tool result.
+struct DispatchedTool {
+    output: ToolOutput,
+    /// `data:<mime>;base64,…` for an image loaded by `read_file` on a
+    /// multimodal model; `None` for every other call.
+    image: Option<String>,
+}
+
+impl DispatchedTool {
+    fn plain(output: ToolOutput) -> Self {
+        Self {
+            output,
+            image: None,
+        }
+    }
+}
+
+/// Handle a `read_file` call for an image path. Multimodal models get a short
+/// text result plus the image (returned for injection); text-only models get a
+/// result telling them they cannot view it, so they can relay that to the user.
+fn read_file_image(path: &str, cfg: &AppConfig, db: Option<&db::Db>) -> DispatchedTool {
+    let (mime, data_url) = match crate::attachments::read_image(path) {
+        Ok(x) => x,
+        Err(e) => return DispatchedTool::plain(ToolOutput::err(format!("read_file: {e}"))),
+    };
+    // Vision is a property of the *turn's* active provider/model; an unknown
+    // provider (no cached metadata) is treated as not-vision so we never inject
+    // an image part a text-only endpoint would reject.
+    let vision = db
+        .map(|db| crate::pricing::meta_for_provider(db, &cfg.base_url))
+        .and_then(|metas| metas.get(&cfg.model).map(|m| m.vision()))
+        .unwrap_or(false);
+    if vision {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        DispatchedTool {
+            output: ToolOutput::ok(format!(
+                "read_file: loaded image \"{path}\" ({mime}, {size} bytes). The image is \
+                 attached below; describe or analyze it as requested."
+            )),
+            image: Some(data_url),
+        }
+    } else {
+        DispatchedTool::plain(ToolOutput::ok(format!(
+            "read_file: \"{path}\" is an image, but the active model (\"{}\") cannot view \
+             images. Tell the user you cannot see its contents.",
+            cfg.model
+        )))
+    }
+}
+
 /// Execute one model-requested tool. Memory tools are handled in-process; host
-/// tools run with per-call approval (gating is handled by the caller).
+/// tools run with per-call approval (gating is handled by the caller). `read_file`
+/// on an image path is intercepted here so the turn's model capability (`cfg`)
+/// and the DB metadata cache decide whether the image can be delivered.
 async fn dispatch_tool(
     call: &ToolCall,
     brave: &tools::BraveSearch,
     shell: &ShellExecutor,
     memory: &crate::memory::MemoryState,
-) -> ToolOutput {
-    if call.name.starts_with("brave_") {
+    cfg: &AppConfig,
+    db: Option<&db::Db>,
+) -> DispatchedTool {
+    if call.name == "read_file" {
+        if let Some(path) = call.arguments.get("path").and_then(Value::as_str) {
+            if crate::attachments::is_image_path(path) {
+                return read_file_image(path, cfg, db);
+            }
+        }
+    }
+    let output = if call.name.starts_with("brave_") {
         brave.call_tool(&call.name, &call.arguments).await
     } else if matches!(
         call.name.as_str(),
@@ -1083,7 +1178,8 @@ async fn dispatch_tool(
         crate::memory::execute_tool(call, memory).await
     } else {
         tools::execute_host_tool(call, shell).await
-    }
+    };
+    DispatchedTool::plain(output)
 }
 
 /// Which tools a tool loop may actually run. The tool *list* sent to the model is
@@ -1239,12 +1335,21 @@ pub(crate) async fn run_tool_loop(
             );
 
             let mut aborted_mid_tools = false;
+            // Images loaded by `read_file` are delivered after every tool result
+            // in the round, so the request never interleaves a user turn between
+            // an assistant `tool_calls` message and its tool responses.
+            let mut injected_images: Vec<ChatCompletionRequestMessage> = Vec::new();
             for call in &acc.tool_calls {
+                // YOLO mode treats a gated call as ungated: it runs immediately
+                // and is announced with `gated: false` so the UI never renders
+                // (or waits on) the approve/deny prompt.
+                let host_gated = tools::is_gated(&call.name);
+                let yolo = cfg.auto_approve_tools;
                 sink.emit(StreamEvent::ToolCall {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.to_string(),
-                    gated: tools::is_gated(&call.name),
+                    gated: host_gated && !yolo,
                 });
 
                 let is_memory_tool = matches!(
@@ -1275,11 +1380,13 @@ pub(crate) async fn run_tool_loop(
                     )),
                     _ => None,
                 };
-                let output = if let Some(message) = refused {
-                    ToolOutput::err(message)
+                let (output, image) = if let Some(message) = refused {
+                    (ToolOutput::err(message), None)
                 } else {
-                    let mut approved = !tools::is_gated(&call.name);
-                    if !approved {
+                    // A gated call is auto-approved under YOLO, skipped entirely
+                    // otherwise (ungated), or parked on the approval channel.
+                    let mut approved = !host_gated || yolo;
+                    if host_gated && !yolo {
                         let mut rx = approvals.register(call.id.clone());
                         loop {
                             tokio::select! {
@@ -1296,12 +1403,17 @@ pub(crate) async fn run_tool_loop(
                         }
                     }
                     if approved {
-                        dispatch_tool(call, brave, shell, memory).await
+                        let dispatched =
+                            dispatch_tool(call, brave, shell, memory, cfg, persist).await;
+                        (dispatched.output, dispatched.image)
                     } else {
-                        ToolOutput {
-                            content: "The user denied this tool call.".into(),
-                            is_error: true,
-                        }
+                        (
+                            ToolOutput {
+                                content: "The user denied this tool call.".into(),
+                                is_error: true,
+                            },
+                            None,
+                        )
                     }
                 };
 
@@ -1335,6 +1447,13 @@ pub(crate) async fn run_tool_loop(
                         .into(),
                 );
 
+                // A `read_file` on an image hands the model a synthetic user
+                // image part (tool messages are text-only). It is request-scoped:
+                // never persisted, so it does not appear as a turn or replay.
+                if let Some(data_url) = image {
+                    injected_images.push(image_request_message(call, data_url)?);
+                }
+
                 if flag.load(Ordering::SeqCst) {
                     aborted_mid_tools = true;
                     break;
@@ -1347,6 +1466,7 @@ pub(crate) async fn run_tool_loop(
                 final_text = String::new();
                 break;
             }
+            messages.extend(injected_images);
             continue;
         }
 
