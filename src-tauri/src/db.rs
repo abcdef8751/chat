@@ -118,6 +118,10 @@ CREATE TABLE IF NOT EXISTS sync_tombstones (
   entity TEXT NOT NULL,
   id TEXT NOT NULL,
   revision BIGINT NOT NULL,
+  -- Set for per-message tombstones (edit-time truncation): the local row is
+  -- gone by push time, so the remote `messages` NOT NULL `conversation_id` is
+  -- carried here instead. NULL for conversation tombstones.
+  conversation_id TEXT,
   PRIMARY KEY (entity, id)
 );
 
@@ -229,8 +233,14 @@ pub fn open(path: &Path) -> Result<Connection, String> {
            entity TEXT NOT NULL,
            id TEXT NOT NULL,
            revision BIGINT NOT NULL,
+           conversation_id TEXT,
            PRIMARY KEY (entity, id)
          )",
+        [],
+    );
+    // Older databases predate per-message tombstones (edit-time truncation).
+    let _ = conn.execute(
+        "ALTER TABLE sync_tombstones ADD COLUMN conversation_id TEXT",
         [],
     );
     // Older databases predate the syncable user-config entity.
@@ -697,7 +707,20 @@ pub fn apply_user_message_edit(
     )
     .map_err(|e| e.to_string())?;
 
-    // Truncate: drop every later message so nothing survives the fork.
+    // Truncate: drop every later message so nothing survives the fork. Record a
+    // per-message tombstone for each one first — the conversation row survives
+    // the edit, so without a message tombstone a second device keeps the stale
+    // tail (torn history).
+    let stale_ids: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM messages WHERE conversation_id = ?1 AND \"index\" > ?2")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![conversation_id, target_index], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<String>, _>>().map_err(|e| e.to_string())?
+    };
+    tombstone_messages(&tx, conversation_id, &stale_ids)?;
     tx.execute(
         "DELETE FROM messages WHERE conversation_id = ?1 AND \"index\" > ?2",
         params![conversation_id, target_index],
@@ -1037,6 +1060,39 @@ pub fn tombstone_conversation(conn: &Connection, conversation_id: &str) -> Resul
         params![conversation_id, rev],
     )
     .map_err(|e| e.to_string())?;
+    Ok(rev)
+}
+
+/// Record locally hard-deleted *messages* as tombstones to push.
+///
+/// Edit-time truncation hard-deletes the tail after the edited turn, but the
+/// conversation row itself survives — so unlike `delete_conversation` there is
+/// no cascading tombstone to carry the deletion to other devices. Without this,
+/// a second synced device keeps the stale tail (torn history: the edited
+/// message plus orphaned later messages). The deleted local rows are gone by
+/// push time, so `conversation_id` is stored alongside the id (the remote
+/// `messages` table requires it NOT NULL); the push fills placeholder values for
+/// the other NOT NULL columns, which consumers never read because they delete
+/// on `deleted_at` alone.
+pub fn tombstone_messages(
+    conn: &Connection,
+    conversation_id: &str,
+    ids: &[String],
+) -> Result<i64, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let rev = bump_revision_c(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "INSERT OR REPLACE INTO sync_tombstones(entity, id, revision, conversation_id)
+             VALUES ('messages', ?1, ?2, ?3)",
+        )
+        .map_err(|e| e.to_string())?;
+    for id in ids {
+        stmt.execute(params![id, rev, conversation_id])
+            .map_err(|e| e.to_string())?;
+    }
     Ok(rev)
 }
 

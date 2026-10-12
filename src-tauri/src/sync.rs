@@ -898,6 +898,60 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
         total += chunk.len() as u64;
     }
 
+    // Message tombstones (edit-time truncation): a hard-deleted message must
+    // carry a remote tombstone or a second device keeps the stale tail. The
+    // local row is already gone, so the stored `conversation_id` plus
+    // placeholder NOT NULL fields are sent; consumers delete on `deleted_at`
+    // alone and never read the placeholders.
+    let msg_tombstones = {
+        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, revision, conversation_id FROM sync_tombstones WHERE entity = 'messages'",
+            )
+            .map_err(|e| e.to_string())?;
+        let r = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let rows: Result<Vec<(String, i64, Option<String>)>, String> =
+            r.map(|row| row.map_err(|e| e.to_string())).collect();
+        drop(stmt);
+        rows?
+    };
+    if !msg_tombstones.is_empty() {
+        let now = now_ms();
+        let body: Vec<Value> = msg_tombstones
+            .iter()
+            .filter_map(|(id, rev, cid)| {
+                // Without a conversation_id the remote row would violate its
+                // NOT NULL / FK; skip rather than emit a malformed tombstone.
+                let cid = cid.as_deref()?;
+                Some(json!({
+                    "id": id, "conversation_id": cid, "role": "user", "seq": 0,
+                    "content": "", "model": Value::Null, "provider": Value::Null,
+                    "thinking_level": Value::Null, "thinking": Value::Null,
+                    "usage": Value::Null, "stop_reason": Value::Null,
+                    "attachments": Value::Null, "created_at": now,
+                    "revision": rev, "deleted_at": now,
+                }))
+            })
+            .collect();
+        if !body.is_empty() {
+            let n = body.len() as u64;
+            post_upsert(ctx, "messages", token, &body, progress, |c| {
+                clear_message_tombstones(ctx.db, c)
+            })
+            .await?;
+            total += n;
+        }
+    }
+
     // Memory files (live content or tombstone).
     let mem_rows = {
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
@@ -1161,6 +1215,34 @@ fn clear_memory_keys(db: &Db, chunk: &[Value]) -> Result<(), String> {    let mu
         .map_err(|e| e.to_string())?;
     for (path, rev) in &keys {
         stmt.execute(rusqlite::params![path, rev]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Remove the *message* tombstones (edit-time truncation) in a batch that just
+/// pushed successfully, guarded by revision so one recorded mid-flight stays.
+fn clear_message_tombstones(db: &Db, chunk: &[Value]) -> Result<(), String> {
+    let mut rows: Vec<(String, i64)> = Vec::new();
+    for v in chunk {
+        if let (Some(id), Some(rev)) = (
+            v.get("id").and_then(|x| x.as_str()),
+            v.get("revision").and_then(|x| x.as_i64()),
+        ) {
+            rows.push((id.to_string(), rev));
+        }
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "DELETE FROM sync_tombstones
+             WHERE entity = 'messages' AND id = ?1 AND revision = ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    for (id, rev) in &rows {
+        stmt.execute(rusqlite::params![id, rev]).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

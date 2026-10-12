@@ -1345,3 +1345,124 @@ fn reindex_preserves_reflection_watermark() {
     assert_eq!(rev_of(&db, "SELECT \"index\" FROM messages WHERE id = 'm3'"), 1);
     assert_eq!(rev_of(&db, "SELECT \"index\" FROM messages WHERE id = 'm1'"), 2);
 }
+
+// ---------------------------------------------------------------------------
+// edit-time truncation tombstones
+// ---------------------------------------------------------------------------
+
+/// Seed a conversation with three turns and return `(cid, m1, m2, m3)`.
+fn seed_edit_turns(db: &Db) -> (String, String, String, String) {
+    let cid = insert_conv(db);
+    let m1 = db::insert_message(
+        db, cid.clone(), "user".into(), "first".into(), None, None, None, None, None, None,
+    )
+    .unwrap();
+    let m2 = db::insert_message(
+        db, cid.clone(), "assistant".into(), "second".into(), None, None, None, None, None, None,
+    )
+    .unwrap();
+    let m3 = db::insert_message(
+        db, cid.clone(), "user".into(), "third".into(), None, None, None, None, None, None,
+    )
+    .unwrap();
+    (cid, m1.id, m2.id, m3.id)
+}
+
+/// Editing a user message truncates every later row. Each truncated row must
+/// leave a per-message tombstone so the fork propagates cross-device (otherwise
+/// a second synced device keeps the stale tail beside the edited turn).
+#[test]
+fn edit_truncation_records_message_tombstones() {
+    let db = temp_db("edit-tomb");
+    let (cid, m1, m2, m3) = seed_edit_turns(&db);
+
+    db::apply_user_message_edit(&db, &cid, &m1, "edited", None).unwrap();
+
+    let conn = db.0.lock().unwrap();
+    let count = |id: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sync_tombstones WHERE entity = 'messages' AND id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count(&m2), 1, "truncated assistant row must be tombstoned");
+    assert_eq!(count(&m3), 1, "truncated user row must be tombstoned");
+    assert_eq!(count(&m1), 0, "the edited row survives and is not tombstoned");
+    let stored_cid: String = conn
+        .query_row(
+            "SELECT conversation_id FROM sync_tombstones WHERE entity = 'messages' AND id = ?1",
+            [&m2],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_cid, cid, "tombstone carries the conversation id for push");
+}
+
+/// A remote message tombstone (e.g. from another device's edit) must hard-delete
+/// the stale local row, matching how conversation tombstones behave.
+#[tokio::test]
+async fn remote_message_tombstone_deletes_the_stale_tail() {
+    let db = temp_db("msg-tomb-pull");
+    let cid = insert_conv(&db);
+    let stale = db::insert_message(
+        &db, cid.clone(), "assistant".into(), "stale".into(), None, None, None, None, None, None,
+    )
+    .unwrap();
+
+    let remote = vec![json!({
+        "id": stale.id, "conversation_id": cid, "role": "assistant", "content": "",
+        "seq": 0, "created_at": 1, "revision": 9_000_000_000_i64, "deleted_at": 9_000_000_001_i64
+    })];
+    apply_messages(&db, &remote).await.unwrap();
+
+    let remaining: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM messages WHERE id = ?1", [&stale.id], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(remaining, 0, "the tombstoned message must be deleted locally");
+}
+
+/// The push must carry those tombstones to the remote as rows with a non-null
+/// `deleted_at`, then retire them locally.
+#[tokio::test]
+async fn push_emits_message_tombstones_for_edit_truncation() {
+    let srv = MockRest::spawn();
+    let db = temp_db("edit-tomb-push");
+    let mem = temp_memory("edit-tomb-push", &db);
+    let (cid, m1, m2, m3) = seed_edit_turns(&db);
+    db::apply_user_message_edit(&db, &cid, &m1, "edited", None).unwrap();
+
+    let client = reqwest::Client::new();
+    let base = srv.addr.clone();
+    let cfg = temp_config("edit-tomb-push");
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &base,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    let posted = srv.posted("messages");
+    let find = |id: &str| posted.iter().find(|v| v["id"] == id).cloned();
+    let t2 = find(&m2).expect("truncated assistant row must be pushed");
+    assert!(
+        t2["deleted_at"].as_i64().is_some(),
+        "truncated row must be a tombstone: {t2}"
+    );
+    assert_eq!(t2["conversation_id"], cid);
+    let t3 = find(&m3).expect("truncated user row must be pushed");
+    assert!(t3["deleted_at"].as_i64().is_some(), "truncated row must be a tombstone");
+    // The edited row is still live (no deleted_at).
+    let live = find(&m1).expect("edited row must be pushed");
+    assert!(live["deleted_at"].is_null(), "edited row must stay live");
+
+    // Successful push retires the tombstones and clears every dirty flag.
+    assert_eq!(db::pending_rows(&db).unwrap(), 0);
+}
