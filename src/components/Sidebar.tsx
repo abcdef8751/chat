@@ -31,12 +31,12 @@ export function Sidebar(props: {
   removeConversation: (id: string) => void;
 }) {
   const drawerHidden = () => !props.wideViewport && !props.sidebarOpen;
-  let sidebarSearchEl: HTMLInputElement | undefined;
 
-  // Move focus into the drawer when it opens (it is only openable below `lg`).
-  createEffect(() => {
-    if (props.sidebarOpen) sidebarSearchEl?.focus();
-  });
+  // NOTE: the drawer deliberately does NOT move focus into the search field on
+  // open. Focusing a text input raises the Android soft keyboard, which would
+  // cover the chat list the moment the drawer appears. The search field stays
+  // reachable by tapping it, which is when the IME should come up. Desktop is
+  // unaffected: the sidebar is always in flow at `lg`, so no focus is stolen.
 
   // Swipe from the left edge to open the off-canvas drawer (narrow viewports
   // only). Pointer-based: a drag starting within ~32px of the left edge that
@@ -202,7 +202,6 @@ export function Sidebar(props: {
 
         <div class="border-b border-neutral-200 px-3 py-2 dark:border-neutral-800">
           <input
-            ref={(el) => (sidebarSearchEl = el)}
             class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
             placeholder="Search chats…"
             value={props.searchQuery}
@@ -244,7 +243,9 @@ export function Sidebar(props: {
                     >
                       {c.title}
                     </button>
-                    <div class="absolute right-1.5 top-1/2 hidden -translate-y-1/2 gap-0.5 group-hover:flex">
+                    {/* Row actions: hover-revealed at `lg`; always visible on
+                        narrow (touch) viewports where there is no hover. */}
+                    <div class="absolute right-1.5 top-1/2 flex -translate-y-1/2 gap-0.5 lg:hidden lg:group-hover:flex">
                       <button
                         title="Rename"
                         class="rounded px-1.5 py-1 text-xs text-neutral-400 transition hover:bg-neutral-200 hover:text-neutral-700 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
