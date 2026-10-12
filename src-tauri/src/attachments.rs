@@ -13,6 +13,14 @@ use uuid::Uuid;
 /// Text files larger than this are attached by name only (keeps messages sane).
 const MAX_TEXT_BYTES: u64 = 1_000_000;
 
+/// Images larger than this are not read into a data URL at all. An image is
+/// base64-inflated (~4/3) and the resulting data URL is re-sent on every
+/// remaining round of the turn, so an unbounded image can dominate the request
+/// and blow a provider's body limit. This mirrors the spirit of
+/// [`MAX_TEXT_BYTES`] while staying well under the 25 MB ceiling the Android
+/// Termux bridge already enforces on the transport.
+pub const MAX_IMAGE_BYTES: u64 = 10_000_000;
+
 /// One attached file, serialized straight to the frontend and stored (as JSON)
 /// on the message row.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -99,6 +107,10 @@ fn is_text_like(ext: &str) -> bool {
             | "sql"
             | "env"
             | "gitignore"
+            // SVG is XML text; excluding it from the raster/image path means an
+            // attached SVG is handed to the model as readable text instead of a
+            // data URL that most vision APIs reject.
+            | "svg"
     )
 }
 
@@ -128,20 +140,31 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Whether a path's extension denotes an image (png/jpg/gif/webp/bmp/svg/ico).
+/// Raster image extensions a multimodal model can reliably consume. Vector
+/// formats (`svg`) and legacy containers (`ico`) are deliberately excluded:
+/// most vision APIs reject them, which makes the whole turn fail provider-side
+/// instead of telling the model it cannot view the file. Non-raster files fall
+/// back to the text path (SVG is XML text) or a metadata-only attachment.
+fn is_raster_image_ext(ext: &str) -> bool {
+    matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+}
+
+/// Whether a path's extension denotes a raster image (png/jpg/gif/webp/bmp).
 /// Used by `read_file` to route image files through the vision path instead of
-/// trying to decode them as UTF-8 text.
+/// trying to decode them as UTF-8 text. SVG and ICO are intentionally *not*
+/// images here (see [`is_raster_image_ext`]).
 pub fn is_image_path(path: &str) -> bool {
     let ext = Path::new(path)
         .extension()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    mime_for(&ext).starts_with("image/")
+    is_raster_image_ext(&ext)
 }
 
 /// Read an image file into `(mime, data_url)`, where `data_url` is a
 /// `data:<mime>;base64,…` URL ready to hand to a multimodal model. Errors when
-/// the path is unreadable, is not a file, or is not an image by extension.
+/// the path is unreadable, is not a file, is not a raster image by extension,
+/// or exceeds [`MAX_IMAGE_BYTES`].
 pub fn read_image(path: &str) -> Result<(String, String), String> {
     let p = Path::new(path);
     let meta = std::fs::metadata(p).map_err(|e| format!("{path}: {e}"))?;
@@ -152,10 +175,16 @@ pub fn read_image(path: &str) -> Result<(String, String), String> {
         .extension()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let mime = mime_for(&ext).to_string();
-    if !mime.starts_with("image/") {
-        return Err(format!("{path} is not an image"));
+    if !is_raster_image_ext(&ext) {
+        return Err(format!("{path} is not a supported image"));
     }
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "{path}: image is too large to view ({} bytes > {MAX_IMAGE_BYTES} byte limit)",
+            meta.len()
+        ));
+    }
+    let mime = mime_for(&ext).to_string();
     let bytes = std::fs::read(p).map_err(|e| format!("{path}: {e}"))?;
     let data_url = format!("data:{};base64,{}", mime, base64_encode(&bytes));
     Ok((mime, data_url))
@@ -180,7 +209,7 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
     let size = meta.len();
     let id = Uuid::new_v4().to_string();
 
-    if mime.starts_with("image/") {
+    if is_raster_image_ext(&ext) {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let data_url = format!("data:{};base64,{}", mime, base64_encode(&bytes));
         return Ok(Attachment {
@@ -288,6 +317,50 @@ mod tests {
         assert!(is_image_path("photo.webp"));
         assert!(!is_image_path("/tmp/notes.txt"));
         assert!(!is_image_path("/tmp/noext"));
+    }
+
+    #[test]
+    fn svg_and_ico_are_not_image_paths() {
+        // Vector/legacy formats must fall back to the text "cannot view" path
+        // rather than being turned into an `image_url` part.
+        assert!(!is_image_path("/tmp/logo.svg"));
+        assert!(!is_image_path("/tmp/logo.SVG"));
+        assert!(!is_image_path("/tmp/favicon.ico"));
+        assert!(is_image_path("/tmp/photo.bmp"));
+    }
+
+    #[test]
+    fn svg_attaches_as_text_not_a_data_url() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-attach-{}.svg", std::process::id()));
+        std::fs::write(&p, "<svg><rect/></svg>").unwrap();
+        let a = read_attachment(&p).unwrap();
+        assert_eq!(a.kind, "file");
+        assert!(a.data_url.is_none());
+        assert_eq!(a.text.as_deref(), Some("<svg><rect/></svg>"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_image_rejects_oversized_files() {
+        // Sparse file: metadata reports the length without writing the bytes.
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-oversize-{}.png", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        drop(f);
+        let err = read_image(p.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_image_rejects_svg() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-read-svg-{}.svg", std::process::id()));
+        std::fs::write(&p, "<svg/>").unwrap();
+        assert!(read_image(p.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
