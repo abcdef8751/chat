@@ -55,7 +55,7 @@ function modalityLabel(modality: string): string {
 }
 
 /// Small read-only capability chip used in the model configurator.
-function CapabilityBadge(props: { tone: "on" | "off" | "muted"; children: JSX.Element }) {
+function CapabilityBadge(props: { tone: "on" | "off" | "none" | "muted"; children: JSX.Element }) {
   return (
     <span
       class={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
@@ -63,7 +63,9 @@ function CapabilityBadge(props: { tone: "on" | "off" | "muted"; children: JSX.El
           ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400"
           : props.tone === "off"
             ? "bg-neutral-200 text-neutral-500 dark:bg-neutral-700 dark:text-neutral-400"
-            : "bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+            : props.tone === "none"
+              ? "bg-neutral-100 text-neutral-400 dark:bg-neutral-800 dark:text-neutral-500"
+              : "bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
       }`}
     >
       {props.children}
@@ -483,6 +485,11 @@ export function SettingsDialog(props: {
                     return m().attachment ? ["image", "document"] : [];
                   };
                   const outputModalities = () => parsed()?.output ?? [];
+                  // An explicit `input` list — even an empty one — is
+                  // authoritative (mirrors the backend's `vision()`): `[]` means
+                  // "cannot see images", distinct from an absent list ("unknown",
+                  // which may still fall back to the coarse `attachment` flag).
+                  const inputKnown = () => parsed()?.input != null;
                   return (
                     <div class="mt-2 rounded-lg border border-neutral-200 bg-neutral-50 px-2.5 py-2 dark:border-neutral-700 dark:bg-neutral-800/50">
                       <div class="truncate text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
@@ -496,7 +503,13 @@ export function SettingsDialog(props: {
                           <div class="flex flex-wrap gap-1">
                             <Show
                               when={inputModalities().length > 0}
-                              fallback={<CapabilityBadge tone="muted">unknown</CapabilityBadge>}
+                              fallback={
+                                inputKnown() ? (
+                                  <CapabilityBadge tone="none">none</CapabilityBadge>
+                                ) : (
+                                  <CapabilityBadge tone="muted">unknown</CapabilityBadge>
+                                )
+                              }
                             >
                               <For each={inputModalities()}>
                                 {(mod) => (

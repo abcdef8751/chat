@@ -80,7 +80,10 @@ export function MemoryPage(props: {
   // lives in App (so hardware-back can close the detail page first); closing
   // the dialog resets it to the list.
   createEffect(() => {
-    if (!props.memoryOpen) props.setMemoryDetailOpen(false);
+    // Clear the lifted detail flag when the detail page can no longer show:
+    // the dialog is closed, or the viewport widened so the two-pane layout took
+    // over. Otherwise a stale flag would consume the next hardware-back press.
+    if (!props.memoryOpen || props.wideViewport) props.setMemoryDetailOpen(false);
   });
 
   // A tap selects the file; on a narrow viewport it also drills into the
