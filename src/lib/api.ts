@@ -401,12 +401,20 @@ export function streamChat(
   content: string,
   attachments: Attachment[],
   channel: Channel<StreamEvent>,
+  /**
+   * `true` when the user message already exists in the transcript (e.g. after
+   * `editUserMessage`, which keeps the edited row): the backend builds the turn
+   * from `content` but must NOT persist a second `user` row. Defaults to
+   * `false` for a normal send.
+   */
+  regenerate = false,
 ): Promise<void> {
   return invoke<void>("stream_chat", {
     conversationId,
     content,
     attachments: attachments.length > 0 ? attachments : null,
     channel,
+    regenerate,
   });
 }
 
