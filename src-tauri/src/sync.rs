@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -85,6 +85,11 @@ pub struct SyncStatus {
     pub phase: String,
     pub pushed: u64,
     pub pulled: u64,
+    // Total remote rows the ongoing pull knows it must fetch, learned from
+    // PostgREST `Prefer: count=exact` on each table's first page. 0 = unknown
+    // (server didn't report a count), in which case the UI shows an
+    // indeterminate bar. The push-side analogue is `pending`.
+    pub pull_total: u64,
     // Whether client-side encryption is configured (data sent to Supabase is
     // ciphertext; only this device's keychain can decrypt it).
     pub encryption: bool,
@@ -100,6 +105,7 @@ struct SyncStats {
     phase: String,
     pushed: u64,
     pulled: u64,
+    pull_total: u64,
     locked: bool,
 }
 
@@ -162,6 +168,7 @@ impl SyncState {
             s.phase = "push".into();
             s.pushed = 0;
             s.pulled = 0;
+            s.pull_total = 0;
         }
     }
 
@@ -183,13 +190,22 @@ impl SyncState {
         }
     }
 
+    /// Record the total remote rows for the ongoing pull. Accumulated per table
+    /// (each table's first page reports its own count), so it sums across the
+    /// four pull loops.
+    fn add_pull_total(&self, n: u64) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.pull_total += n;
+        }
+    }
+
     fn set_locked(&self, locked: bool) {
         if let Ok(mut s) = self.stats.lock() {
             s.locked = locked;
         }
     }
 
-    fn snapshot(&self) -> (bool, Option<i64>, Option<String>, String, u64, u64, bool) {
+    fn snapshot(&self) -> (bool, Option<i64>, Option<String>, String, u64, u64, u64, bool) {
         let syncing = self.syncing.load(Ordering::SeqCst);
         match self.stats.lock() {
             Ok(s) => (
@@ -199,9 +215,10 @@ impl SyncState {
                 s.phase.clone(),
                 s.pushed,
                 s.pulled,
+                s.pull_total,
                 s.locked,
             ),
-            Err(_) => (syncing, None, None, String::new(), 0, 0, false),
+            Err(_) => (syncing, None, None, String::new(), 0, 0, 0, false),
         }
     }
 }
@@ -241,7 +258,8 @@ fn status(app: &AppHandle) -> SyncStatus {
     let cfg = app.state::<ConfigState>().get();
     let session = load_session().ok().flatten();
     let sync = app.state::<SyncState>();
-    let (syncing, last_sync_at, last_error, phase, pushed, pulled, locked) = sync.snapshot();
+    let (syncing, last_sync_at, last_error, phase, pushed, pulled, pull_total, locked) =
+        sync.snapshot();
     let pending = db::pending_rows(app.state::<Db>().inner()).unwrap_or(0);
     // Prefer the live in-memory value while it is set; otherwise fall back to the
     // timestamp persisted in config so a fresh process does not forget past syncs.
@@ -257,6 +275,7 @@ fn status(app: &AppHandle) -> SyncStatus {
         phase,
         pushed,
         pulled,
+        pull_total,
         encryption: secrets::has_encryption(),
         locked,
     }
@@ -719,11 +738,9 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         let _ = app.state::<ConfigState>().set(cfg);
     }
     sync.set_phase("pull");
-    let n = match pull(&ctx, &session.user_id, &token).await {
-        Ok(n) => {
-            sync.add_pulled(n);
-            n
-        }
+    // Progress (pulled / pull_total) is updated per page inside `pull`.
+    let n = match pull(&ctx, &session.user_id, &token, Some(&sync)).await {
+        Ok(n) => n,
         Err(e) => {
             sync.set_error(e.clone());
             return Err(e);
@@ -1466,21 +1483,41 @@ struct RemoteMemory {
 /// here (each page advancing the watermark before the next is fetched) completes
 /// the backfill in a single run — the same "batch it within one sync" behaviour
 /// the push uses. Returns the number of rows fetched.
-async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<u64, String> {
+async fn pull(
+    ctx: &SyncCtx<'_>,
+    me: &str,
+    token: &str,
+    progress: Option<&SyncState>,
+) -> Result<u64, String> {
     let mut total: u64 = 0;
 
     // Conversations.
+    // `want_count` is true for each table's first page only: with
+    // `Prefer: count=exact` PostgREST reports the remote total in the
+    // Content-Range header, which is what turns the UI into a real progress
+    // bar. Later pages skip it (and servers that don't support it simply never
+    // contribute a total, leaving the bar indeterminate).
+    let mut want_count = true;
     loop {
         let since = last_seen(ctx.db, "conversations");
-        let mut rows = get_table(ctx, "conversations", me, token, since).await?;
+        let (mut rows, remote_total) =
+            get_table(ctx, "conversations", me, token, since, want_count).await?;
+        if let (Some(progress), Some(t)) = (progress, remote_total) {
+            progress.add_pull_total(t);
+        }
+        want_count = false;
         if rows.is_empty() {
             break;
         }
+        let n = rows.len() as u64;
         if let Some(key) = ctx.key {
             rows = decrypt_rows(&key, rows, &["title", "system_prompt", "compaction_summary"]);
         }
         apply_conversations(ctx.db, &rows).await?;
-        total += rows.len() as u64;
+        if let Some(progress) = progress {
+            progress.add_pulled(n);
+        }
+        total += n;
         // Stop when the page wasn't full (drained) or made no progress (e.g. all
         // rows were local-wins/tombstoned and the watermark didn't move).
         if rows.len() < 1000 || last_seen(ctx.db, "conversations") <= since {
@@ -1489,51 +1526,79 @@ async fn pull(ctx: &SyncCtx<'_>, me: &str, token: &str) -> Result<u64, String> {
     }
 
     // Messages.
+    let mut want_count = true;
     loop {
         let since = last_seen(ctx.db, "messages");
-        let mut rows = get_table(ctx, "messages", me, token, since).await?;
+        let (mut rows, remote_total) = get_table(ctx, "messages", me, token, since, want_count).await?;
+        if let (Some(progress), Some(t)) = (progress, remote_total) {
+            progress.add_pull_total(t);
+        }
+        want_count = false;
         if rows.is_empty() {
             break;
         }
+        let n = rows.len() as u64;
         if let Some(key) = ctx.key {
             rows = decrypt_rows(&key, rows, &["content", "thinking", "usage", "attachments"]);
         }
         apply_messages(ctx.db, &rows).await?;
-        total += rows.len() as u64;
+        if let Some(progress) = progress {
+            progress.add_pulled(n);
+        }
+        total += n;
         if rows.len() < 1000 || last_seen(ctx.db, "messages") <= since {
             break;
         }
     }
 
     // Memory files.
+    let mut want_count = true;
     loop {
         let since = last_seen(ctx.db, "memory");
-        let mut rows = get_table(ctx, "memory_files", me, token, since).await?;
+        let (mut rows, remote_total) = get_table(ctx, "memory_files", me, token, since, want_count).await?;
+        if let (Some(progress), Some(t)) = (progress, remote_total) {
+            progress.add_pull_total(t);
+        }
+        want_count = false;
         if rows.is_empty() {
             break;
         }
+        let n = rows.len() as u64;
         if let Some(key) = ctx.key {
             rows = decrypt_rows(&key, rows, &["content"]);
         }
         apply_memory(ctx.db, ctx.memory, &rows)?;
-        total += rows.len() as u64;
+        if let Some(progress) = progress {
+            progress.add_pulled(n);
+        }
+        total += n;
         if rows.len() < 1000 || last_seen(ctx.db, "memory") <= since {
             break;
         }
     }
 
     // Syncable user config (preferences/providers/overrides).
+    let mut want_count = true;
     loop {
         let since = last_seen(ctx.db, "user_config");
-        let mut rows = get_table(ctx, "user_config", me, token, since).await?;
+        let (mut rows, remote_total) =
+            get_table(ctx, "user_config", me, token, since, want_count).await?;
+        if let (Some(progress), Some(t)) = (progress, remote_total) {
+            progress.add_pull_total(t);
+        }
+        want_count = false;
         if rows.is_empty() {
             break;
         }
+        let n = rows.len() as u64;
         if let Some(key) = ctx.key {
             rows = decrypt_rows(&key, rows, &["payload"]);
         }
         apply_user_config(ctx, &rows)?;
-        total += rows.len() as u64;
+        if let Some(progress) = progress {
+            progress.add_pulled(n);
+        }
+        total += n;
         if rows.len() < 1000 || last_seen(ctx.db, "user_config") <= since {
             break;
         }
@@ -1587,19 +1652,26 @@ async fn get_table(
     me: &str,
     token: &str,
     since: i64,
-) -> Result<Vec<Value>, String> {
+    want_count: bool,
+) -> Result<(Vec<Value>, Option<u64>), String> {
     let url = format!(
         "{}/rest/v1/{}?user_id=eq.{}&revision=gt.{}&order=revision.asc&limit=1000",
         ctx.base_url, table, me, since
     );
-    let resp = ctx
+    let mut req = ctx
         .client
         .get(&url)
         .header("apikey", ctx.anon)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|e| format!("pull {table}: {e}"))?;
+        .header(AUTHORIZATION, format!("Bearer {token}"));
+    // First page of a table: ask PostgREST for the exact remote row count so
+    // the frontend can render real pull progress (pulled / total). The count
+    // comes back in the Content-Range header (`0-999/1042`). Servers without
+    // `count=exact` support (or the mock in tests, unless asked) simply omit
+    // it, and `remote_total` stays `None` → indeterminate progress.
+    if want_count {
+        req = req.header("Prefer", "count=exact");
+    }
+    let resp = req.send().await.map_err(|e| format!("pull {table}: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -1609,9 +1681,22 @@ async fn get_table(
             body.chars().take(300).collect::<String>()
         ));
     }
+    let remote_total = total_from_content_range(resp.headers().get(CONTENT_RANGE));
     let text = resp.text().await.map_err(|e| format!("pull {table} body: {e}"))?;
     // A non-array body (e.g. an object/error) parses to an empty vec.
-    Ok(serde_json::from_str(&text).unwrap_or_default())
+    let rows = serde_json::from_str(&text).unwrap_or_default();
+    Ok((rows, remote_total))
+}
+
+/// Parse PostgREST's `Content-Range` total, e.g. `0-999/1042` → `1042`.
+/// `*/1042` (unknown lower bound) and a missing/non-numeric total → `None`.
+fn total_from_content_range(h: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    let s = h?.to_str().ok()?;
+    let total = s.rsplit('/').next()?;
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
 }
 
 /// Advance the high-water mark for an entity to `max_rev` (never backwards).

@@ -956,11 +956,17 @@ export default function App() {
     return "Syncing…";
   }
 
-  // During the push phase we know how much is left, so the bar is real progress
-  // (pushed / pushed+pending). Pull has no total, so it stays full + pulsing.
+  // Push knows how much is left (pending → total). Pull knows the remote row
+  // count only when the backend could read it from the server (`pullTotal` >
+  // 0), so the bar is real progress then and falls back to full + pulsing when
+  // the count is unknown.
   function syncBarWidth(d: SyncStatus | null): number {
-    if (!d || d.phase !== "push" || d.pushed + d.pending === 0) return 100;
-    return Math.max(6, Math.min(100, Math.round((d.pushed / (d.pushed + d.pending)) * 100)));
+    if (!d) return 100;
+    if (d.phase === "push" && d.pushed + d.pending > 0)
+      return Math.max(6, Math.min(100, Math.round((d.pushed / (d.pushed + d.pending)) * 100)));
+    if (d.phase === "pull" && (d.pullTotal ?? 0) > 0)
+      return Math.max(6, Math.min(100, Math.round(((d.pulled ?? 0) / d.pullTotal) * 100)));
+    return 100;
   }
 
   // Keep the Cloud sync + memory backfill panels live while Settings is open,

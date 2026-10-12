@@ -1064,14 +1064,21 @@ export function SettingsDialog(props: {
                     <div class="flex items-baseline justify-between gap-2 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
                       <span>{props.syncLabel(props.syncStatusData)}</span>
                       <span class="tabular-nums">
-                        ↑{props.syncStatusData?.pushed ?? 0} · ↓{props.syncStatusData?.pulled ?? 0}{" "}
+                        ↑{props.syncStatusData?.pushed ?? 0} ·{" "}
+                        {props.syncStatusData?.phase === "pull" &&
+                        (props.syncStatusData?.pullTotal ?? 0) > 0
+                          ? `↓${props.syncStatusData?.pulled ?? 0}/${props.syncStatusData?.pullTotal ?? 0}`
+                          : `↓${props.syncStatusData?.pulled ?? 0}`}{" "}
                         · {props.syncStatusData?.pending ?? 0} pending
                       </span>
                     </div>
                     <div class="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
                       <div
                         class={`h-full rounded-full bg-neutral-500 transition-all duration-500 dark:bg-neutral-400 ${
-                          props.syncStatusData?.phase === "pull" ? "animate-pulse" : ""
+                          props.syncStatusData?.phase === "pull" &&
+                          !(props.syncStatusData?.pullTotal ?? 0)
+                            ? "animate-pulse"
+                            : ""
                         }`}
                         style={{ width: `${props.syncBarWidth(props.syncStatusData)}%` }}
                       />

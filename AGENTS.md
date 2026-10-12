@@ -514,7 +514,12 @@ and the app is byte-identical to before. Never blocks the UI.
   row written mid-flight isn't dropped); pull fetches `revision > last_seen` and
   applies with last-writer-wins by revision, tombstones (`deleted_at` → local
   hard-delete), and re-orders a conversation's local `index` by `(created_at,
-  id)` for consistent cross-device ordering. The reflection watermark
+  id)` for consistent cross-device ordering. **Live progress** rides
+  `SyncStatus` for the Settings panel: push reports per batch against `pending`,
+  and pull reports per page with a real total (`pull_total`, from PostgREST
+  `Prefer: count=exact` → `Content-Range` on each table's first page) that the
+  UI turns into a bar; a server without the count leaves pull `↓N` without a
+  denominator. The reflection watermark
   (`last_reflected_index`) rides on the conversation row and is preserved across
   re-index. The first sync per account (guarded by a per-`user_id` sentinel)
   seeds all pre-existing rows +

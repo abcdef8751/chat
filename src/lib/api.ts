@@ -212,6 +212,7 @@ export interface SyncStatus {
   phase: string; // "push" | "pull" | "" when idle
   pushed: number;
   pulled: number;
+  pullTotal: number; // remote rows this pull must fetch (0 = unknown/indeterminate)
   encryption: boolean; // client-side encryption configured
   locked: boolean; // remote is encrypted but this device has no key yet
 }

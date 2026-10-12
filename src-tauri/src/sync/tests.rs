@@ -135,13 +135,22 @@ impl MockRest {
                 let method = parts.next().unwrap_or("").to_string();
                 let path = parts.next().unwrap_or("").to_string();
                 let mut clen = 0usize;
+                let mut headers: Vec<(String, String)> = Vec::new();
                 for l in lines {
                     if let Some((k, v)) = l.split_once(':') {
-                        if k.trim().eq_ignore_ascii_case("content-length") {
-                            clen = v.trim().parse().unwrap_or(0);
-                        }
+                        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
                     }
                 }
+                for (k, v) in &headers {
+                    if k == "content-length" {
+                        clen = v.parse().unwrap_or(0);
+                    }
+                }
+                // Mimic PostgREST: when asked for an exact count, report the
+                // remote row total in the Content-Range header (`0-9/10`).
+                let prefer_count = headers
+                    .iter()
+                    .any(|(k, v)| k == "prefer" && v.contains("count=exact"));
                 while buf.len() < header_end + clen {
                     match sock.read(&mut tmp) {
                         Ok(0) | Err(_) => break,
@@ -157,7 +166,7 @@ impl MockRest {
                     .nth(1)
                     .map(|s| s.split('?').next().unwrap_or("").to_string());
 
-                let (status, resp_body, ctype) = if path.contains("/auth/v1/token") {
+                let (status, resp_body, ctype, extra) = if path.contains("/auth/v1/token") {
                     (
                         201,
                         json!({
@@ -168,6 +177,7 @@ impl MockRest {
                         })
                         .to_string(),
                         "application/json",
+                        String::new(),
                     )
                 } else if method == "POST" {
                     match &table {
@@ -175,22 +185,33 @@ impl MockRest {
                             let rows: Vec<Value> =
                                 serde_json::from_str(&body_str).unwrap_or_default();
                             p.lock().unwrap().entry(t.clone()).or_default().extend(rows);
-                            (201, "[]".to_string(), "application/json")
+                            (201, "[]".to_string(), "application/json", String::new())
                         }
-                        None => (404, "{}".to_string(), "application/json"),
+                        None => (404, "{}".to_string(), "application/json", String::new()),
                     }
                 } else {
                     match &table {
                         Some(t) => {
                             let rows = g.lock().unwrap().get(t).cloned().unwrap_or_default();
                             let js = serde_json::to_string(&rows).unwrap_or("[]".into());
-                            (200, js, "application/json")
+                            let extra = if prefer_count {
+                                let n = rows.len();
+                                let range = if n > 0 {
+                                    format!("0-{}/{}", n - 1, n)
+                                } else {
+                                    "*/0".into()
+                                };
+                                format!("Content-Range: {range}\r\n")
+                            } else {
+                                String::new()
+                            };
+                            (200, js, "application/json", extra)
                         }
-                        None => (404, "{}".to_string(), "application/json"),
+                        None => (404, "{}".to_string(), "application/json", String::new()),
                     }
                 };
                 let resp = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {}\r\n\r\n{}",
                     resp_body.len(),
                     resp_body
                 );
@@ -613,7 +634,7 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
     );
 
     // --- Pull ---
-    pull(&ctx, "user-123", "fake-token").await.unwrap();
+    pull(&ctx, "user-123", "fake-token", None).await.unwrap();
 
     // Conversation + message applied locally.
     let conv_title: String = {
@@ -642,6 +663,57 @@ async fn push_then_pull_syncs_end_to_end_against_mock() {
             .unwrap();
         assert!(wm > 0, "high-water missing for {entity}");
     }
+}
+
+/// Pull reports progress live: `pulled` climbs per applied page and
+/// `pull_total` reflects the remote row counts (from the mock's
+/// Content-Range), so the Settings UI can render a real bar instead of an
+/// always-zero counter. Regression test for "the sync UI doesn't show pull
+/// progress": previously the total was only added after the entire pull
+/// finished — and then wiped by `set_success` moments later — so the 1s status
+/// poll never observed a non-zero value.
+#[tokio::test]
+async fn pull_reports_live_pulled_and_pull_total() {
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "conversations",
+        vec![json!({
+            "id": "r-conv", "title": "From B", "provider_id": "p-remote",
+            "revision": 100, "created_at": 1, "updated_at": 2, "deleted_at": Value::Null
+        })],
+    );
+    srv.set_get(
+        "messages",
+        vec![json!({
+            "id": "r-msg", "conversation_id": "r-conv", "role": "assistant",
+            "content": "Hi", "created_at": 3, "revision": 101, "deleted_at": Value::Null
+        })],
+    );
+    let db = temp_db("pull-progress");
+    let mem = temp_memory("pull-progress", &db);
+    let cfg = temp_config("pull-progress");
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    let progress = SyncState::for_url(&srv.addr, "anon");
+
+    let n = pull(&ctx, "user-123", "tok", Some(&progress)).await.unwrap();
+    assert_eq!(n, 2);
+
+    // Live counters: each applied page is counted as it lands...
+    let (_, _, _, _, pushed, pulled, pull_total, _) = progress.snapshot();
+    assert_eq!(pushed, 0);
+    assert_eq!(pulled, 2);
+    // ...and the remote totals (1 conversation + 1 message) became the bar's
+    // denominator, so the UI can show `↓2/2` at 100%.
+    assert_eq!(pull_total, 2);
 }
 
 /// Client-side encryption: push uploads ciphertext (Supabase never sees
@@ -719,7 +791,7 @@ async fn encryption_roundtrips_through_push_and_pull() {
             "revision": 102, "deleted_at": Value::Null
         })],
     );
-    pull(&ctx, "user-123", "tok").await.unwrap();
+    pull(&ctx, "user-123", "tok", None).await.unwrap();
 
     let title: String = {
         let conn = db.0.lock().unwrap();
@@ -820,7 +892,7 @@ async fn config_syncs_preferences_providers_and_overrides() {
             "deleted_at": Value::Null,
         })],
     );
-    pull(&ctx, "user-123", "tok").await.unwrap();
+    pull(&ctx, "user-123", "tok", None).await.unwrap();
     let after = cfg.get();
     // A configured device is never clobbered by an empty remote.
     assert_eq!(after.preferences, "Always answer in Spanish.");
@@ -1093,14 +1165,14 @@ async fn two_device_first_sync_adopts_canonical_config_not_clobber() {
     // A round 1: push (nothing dirty for user_config) + pull (mirror empty) +
     // post-pull mirror → A's config row becomes dirty.
     push(&ctx_a, "tok", &SyncState::new()).await.unwrap();
-    pull(&ctx_a, "u", "tok").await.unwrap();
+    pull(&ctx_a, "u", "tok", None).await.unwrap();
     {
         let conn = db_a.0.lock().unwrap();
         db::sync_user_config(&conn, &cfg_a.get()).unwrap();
     }
     // A round 2: push carries A's config to the mirror.
     push(&ctx_a, "tok", &SyncState::new()).await.unwrap();
-    pull(&ctx_a, "u", "tok").await.unwrap();
+    pull(&ctx_a, "u", "tok", None).await.unwrap();
     let pushed_a = srv.posted("user_config").last().expect("A pushed config").clone();
     let pa: Value = serde_json::from_str(pushed_a["payload"].as_str().unwrap()).unwrap();
     assert_eq!(pa["preferences"], "From device A");
@@ -1128,7 +1200,7 @@ async fn two_device_first_sync_adopts_canonical_config_not_clobber() {
     // the post-pull mirror. Before the fix, B's empty config was pushed ahead of
     // the pull and clobbered A's on the server.
     push(&ctx_b, "tok", &SyncState::new()).await.unwrap();
-    pull(&ctx_b, "u", "tok").await.unwrap();
+    pull(&ctx_b, "u", "tok", None).await.unwrap();
     {
         let conn = db_b.0.lock().unwrap();
         db::sync_user_config(&conn, &cfg_b.get()).unwrap();
