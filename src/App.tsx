@@ -126,6 +126,8 @@ export default function App() {
   const [preferences, setPreferences] = createSignal("");
   const [thinkingLevel, setThinkingLevel] = createSignal("");
   const [echoReasoning, setEchoReasoning] = createSignal(true);
+  // "YOLO mode": auto-approve gated tool calls (Settings toggle; backend gate).
+  const [autoApproveTools, setAutoApproveTools] = createSignal(false);
   const [thinkingOpts, setThinkingOpts] = createSignal<ThinkingOptions | null>(null);
   const [models, setModels] = createSignal<ModelInfo[]>([]);
   const [attachmentWarning, setAttachmentWarning] = createSignal<string | null>(null);
@@ -427,6 +429,7 @@ export default function App() {
     setPreferences(cfg.preferences ?? "");
     setThinkingLevel(cfg.thinkingLevel ?? "");
     setEchoReasoning(cfg.echoReasoningContent ?? true);
+    setAutoApproveTools(cfg.autoApproveTools ?? false);
     setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
     setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
     setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
@@ -615,6 +618,7 @@ export default function App() {
       setPreferences(cfg.preferences ?? "");
       setThinkingLevel(cfg.thinkingLevel ?? "");
       setEchoReasoning(cfg.echoReasoningContent ?? true);
+      setAutoApproveTools(cfg.autoApproveTools ?? false);
       setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
       setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
       setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
@@ -647,6 +651,7 @@ export default function App() {
       preferences: preferences(),
       thinkingLevel: current.thinkingLevel,
       echoReasoningContent: echoReasoning(),
+      autoApproveTools: autoApproveTools(),
       memoryReflectionEnabled: reflectionEnabled(),
       memoryReflectionIdleMinutes: reflectionIdleMinutes(),
       modelOverrides: modelOverrides(),
@@ -946,6 +951,7 @@ export default function App() {
         preferences: preferences(),
         thinkingLevel: level,
         echoReasoningContent: echoReasoning(),
+        autoApproveTools: autoApproveTools(),
         memoryReflectionEnabled: reflectionEnabled(),
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
@@ -973,6 +979,7 @@ export default function App() {
         preferences: preferences(),
         thinkingLevel: level,
         echoReasoningContent: echoReasoning(),
+        autoApproveTools: autoApproveTools(),
         memoryReflectionEnabled: reflectionEnabled(),
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
@@ -1905,6 +1912,8 @@ export default function App() {
         setPreferences={setPreferences}
         echoReasoning={echoReasoning()}
         setEchoReasoning={setEchoReasoning}
+        autoApproveTools={autoApproveTools()}
+        setAutoApproveTools={setAutoApproveTools}
         reflectionEnabled={reflectionEnabled()}
         setReflectionEnabled={setReflectionEnabled}
         reflectionIdleMinutes={reflectionIdleMinutes()}

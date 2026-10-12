@@ -67,6 +67,13 @@ export function SettingsDialog(props: {
   setPreferences: (value: string) => void;
   echoReasoning: boolean;
   setEchoReasoning: (value: boolean) => void;
+  /**
+   * "YOLO mode": auto-approve every gated tool call. Declared here as the frozen
+   * Phase-1 contract — App.json plumbed by the app shell; the toggle UI is added
+   * with the other Settings work.
+   */
+  autoApproveTools: boolean;
+  setAutoApproveTools: (value: boolean) => void;
   reflectionEnabled: boolean;
   setReflectionEnabled: (value: boolean) => void;
   reflectionIdleMinutes: number;
