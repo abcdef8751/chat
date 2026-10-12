@@ -1063,9 +1063,9 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
     };
     let mut cfg_rows: Vec<Value> = Vec::new();
     for (id, payload, revision) in cfg_pending {
-        // Never push an EMPTY config — it must not clobber the canonical row (see
-        // `syncable_payload_is_empty`). Nothing to back up, so just clear the dirty
-        // flag locally and move on.
+        // Nothing user-owned to back up (mirror-only config on the default
+        // endpoint). Clear the dirty flag locally and never publish it — a
+        // near-empty device must not blank a configured mirror.
         if syncable_payload_is_empty(&payload) {
             let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
             conn.execute(
@@ -1075,23 +1075,72 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
             .map_err(|e| e.to_string())?;
             continue;
         }
-        // Read-before-write: the server's enforce_revision trigger clamps only the
-        // revision column, not the payload. A STALE (lower-revision) push from a
-        // device that edited offline at a slower clock would therefore overwrite the
-        // canonical payload while keeping the higher revision — the clock-skew
-        // clobber, for non-empty configs. So never push a local row staler than the
-        // server's; the pull that follows (and the post-pull mirror) reconciles it.
-        match fetch_user_config_revision(ctx, token, &id).await {
-            // Server holds a newer revision → leave this row dirty; don't push.
-            Ok(Some(server_rev)) if revision < server_rev => continue,
-            Ok(_) => {}
-            // Can't confirm the server state → don't risk overwriting canonical.
+        // Read-before-write, made CONTENT-AWARE: `user_config` is a single
+        // global row mirrored under whole-row last-writer-wins, so a plain push
+        // from a device whose config is empty in some fields would blank those
+        // fields on the server (the phone-blanked-the-desktop clobber). So we
+        // fetch the server's payload and upsert the UNION — our values win the
+        // fields we set, the server's fill the ones we left unset — and we only
+        // push when we actually ADD content it lacks. A push therefore never
+        // drops server content in the fields we left unset (providers and
+        // overrides merge per key); a scalar conflict on a field we set still
+        // resolves local-wins, which is the app's documented policy.
+        let (push_payload, push_rev) = match fetch_user_config_remote(ctx, token, &id).await {
+            Ok(Some((server_rev, server_raw))) => {
+                // A payload we cannot read (locked device) must not be
+                // overwritten — same rule as the reconcile.
+                let Some(server_clear) = decrypt_server_payload(ctx.key, &server_raw) else {
+                    continue;
+                };
+                match (parse_syncable(&payload), parse_syncable(&server_clear)) {
+                    (Some(local), Some(server)) => {
+                        let merged = local.union_with(&server);
+                        let merged_json =
+                            serde_json::to_value(&merged).map_err(|e| e.to_string())?;
+                        let server_json =
+                            serde_json::to_value(&server).map_err(|e| e.to_string())?;
+                        if merged_json == server_json {
+                            // The server already holds everything we have —
+                            // nothing to add. Clear dirty and skip; the server's
+                            // fields (if any we lack) arrive on the pull.
+                            let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+                            conn.execute(
+                                "UPDATE user_config SET dirty = 0 WHERE id = ?1 AND revision = ?2",
+                                rusqlite::params![id, revision],
+                            )
+                            .map_err(|e| e.to_string())?;
+                            continue;
+                        }
+                        // We add content → push the union at a revision above
+                        // the server's so it lands, and persist it locally
+                        // (adopting the server's fields into our config). If a
+                        // concurrent edit moved the row, skip: it will push.
+                        let rev = revision.max(server_rev.saturating_add(1));
+                        if !persist_merged_user_config(ctx, &id, &merged, rev, revision)? {
+                            continue;
+                        }
+                        (merged_json.to_string(), rev)
+                    }
+                    // One side isn't mergeable JSON (legacy/garbage payload) —
+                    // fall back to the revision guard: push ours only when it
+                    // isn't staler than the server's.
+                    _ => {
+                        if revision < server_rev {
+                            continue;
+                        }
+                        (payload, revision)
+                    }
+                }
+            }
+            // No server row → nothing to merge; push ours as-is.
+            Ok(None) => (payload, revision),
+            // Can't confirm the server state → don't risk overwriting it.
             Err(_) => continue,
-        }
+        };
         cfg_rows.push(json!({
             "id": id,
-            "payload": enc_str(ctx.key, payload),
-            "revision": revision,
+            "payload": enc_str(ctx.key, push_payload),
+            "revision": push_rev,
             "deleted_at": Value::Null,
             "created_at": now_ms(),
             "updated_at": now_ms(),
@@ -1108,39 +1157,52 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
     Ok(total)
 }
 
-/// Return the server's current revision for a `user_config` row, or `None` if the
-/// row isn't on the server. RLS scopes the lookup to this user, and the row id is
-/// the single global `'main'`. Used by the push's read-before-write guard so a
-/// device never overwrites a canonical config with a stale lower-revision edit.
-async fn fetch_user_config_revision(
+/// Persist a merged `user_config` payload into the local row (dirty, at `rev`)
+/// and adopt its server-filled fields into the LIVE config, so the UI reflects
+/// the union immediately and the post-pull mirror stays a no-op. Used by the
+/// push after it unions with the server.
+///
+/// The row write is revision-guarded: a concurrent Settings edit that bumped the
+/// row past `expect_rev` (it can land during the push's awaited fetch) is left
+/// untouched. Returns `false` in that case so the caller skips the push for this
+/// row too — the concurrent edit is authoritative and will be pushed next tick.
+/// Adopting the union into the live config in that window would revert the edit
+/// in memory (and then the post-pull mirror would overwrite the row with the
+/// reverted value, losing it for good), so we bail before touching the config.
+/// (A second edit landing between a *successful* UPDATE and the config write is
+/// not covered — that window is synchronous and only reachable from another
+/// Tauri command thread; the row keeps that edit and re-pushes it.)
+fn persist_merged_user_config(
     ctx: &SyncCtx<'_>,
-    token: &str,
     id: &str,
-) -> Result<Option<i64>, String> {
-    let url = format!(
-        "{}/rest/v1/user_config?id=eq.{}&select=revision",
-        ctx.base_url, id
-    );
-    let resp = ctx
-        .client
-        .get(&url)
-        .header("apikey", ctx.anon)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|e| format!("read server user_config revision: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("read server user_config revision: HTTP {}", resp.status()));
+    merged: &SyncableConfig,
+    rev: i64,
+    expect_rev: i64,
+) -> Result<bool, String> {
+    let payload = serde_json::to_string(merged).map_err(|e| e.to_string())?;
+    let touched = {
+        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE user_config SET payload = ?3, revision = ?4, dirty = 1
+             WHERE id = ?1 AND revision = ?2",
+            rusqlite::params![id, expect_rev, payload, rev],
+        )
+        .map_err(|e| e.to_string())?
+    };
+    if touched == 0 {
+        // Row moved under us — a concurrent edit owns it now.
+        return Ok(false);
     }
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("read server user_config revision body: {e}"))?;
-    // A malformed body is a "can't confirm server state" case — treat it as an
-    // error so the caller skips the push rather than guessing the row is absent.
-    let rows: Vec<Value> =
-        serde_json::from_str(&text).map_err(|e| format!("read server user_config revision parse: {e}"))?;
-    Ok(rows.first().and_then(|r| r.get("revision").and_then(|v| v.as_i64())))
+    let mut cfg = ctx.config.get();
+    cfg.preferences = merged.preferences.clone();
+    cfg.providers = merged.providers.clone();
+    cfg.active_provider_id = merged.active_provider_id.clone();
+    cfg.base_url = merged.base_url.clone();
+    cfg.model = merged.model.clone();
+    cfg.model_overrides = merged.model_overrides.clone();
+    // Best-effort: a failed write only delays the local adoption to the pull.
+    let _ = ctx.config.set(cfg);
+    Ok(true)
 }
 
 /// Fetch the server's `user_config` row (revision + payload) for `id`, or
@@ -1264,34 +1326,24 @@ async fn reconcile_user_config(ctx: &SyncCtx<'_>, token: &str) -> Result<(), Str
     else {
         return Ok(()); // no server row — nothing to diverge from
     };
-    // Decrypt the server side on encrypted mirrors. A payload we CANNOT decrypt
-    // is left alone — never risk pushing (plaintext or re-encrypted) over a
-    // mirror whose content we can't verify (the locked-device contract: never
-    // overwrite ciphertext we can't read).
-    let server_clear = match (server_payload.as_str(), ctx.key) {
-        (p, _) if !crypt::looks_encrypted(p) => Some(p.to_string()),
-        (p, Some(k)) => crypt::decrypt(&k, p),
-        _ => None,
-    };
-    let Some(server_clear) = server_clear else {
+    let Some(server_clear) = decrypt_server_payload(ctx.key, &server_payload) else {
         return Ok(());
     };
-    let local_json = serde_json::from_str::<serde_json::Value>(&local_payload).ok();
-    let server_json = serde_json::from_str::<serde_json::Value>(&server_clear).ok();
-    if local_json == server_json {
-        return Ok(()); // genuinely in sync (or both unparseable — leave as-is)
-    }
-    // A strictly-newer NON-EMPTY server row is not fought: this clean local row
-    // holds older content, and re-dirtying it above the server would start a
-    // push/pull fight between configured devices every tick. Escalation is for
-    // the equal-revision tie (pre-fix absorption residue — the state this
-    // function exists to repair), an older server, or a strictly-newer EMPTY
-    // server row (an empty row must never freeze out non-empty content — same
-    // rule Phase 3 applies at pull time).
-    if server_rev > local_rev && !syncable_payload_is_empty(&server_clear) {
+    // Only escalate when this row ADDS content the server lacks. A pure conflict
+    // (both sides set the same field to different values) is deliberately not
+    // "adding" — escalating there would start a per-tick push/pull fight between
+    // configured devices, and nothing is lost by leaving it (a genuine local
+    // edit is dirty and goes out through the normal push, which unions).
+    let (Some(local_cfg), Some(server_cfg)) = (parse_syncable(&local_payload), parse_syncable(&server_clear))
+    else {
+        return Ok(()); // unparseable on either side — leave as-is
+    };
+    if !local_cfg.adds_content_over(&server_cfg) {
         return Ok(());
     }
-    // Diverged at an equal or older server revision: push our side.
+    // We can add content the server lacks: mark dirty above the server's
+    // revision. The next push unions with the server's payload, so the server's
+    // other fields survive.
     let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
     let bumped = db::bump_revision_c(&conn)?;
     let rev = bumped.max(server_rev.saturating_add(1));
@@ -1313,21 +1365,22 @@ async fn reconcile_user_config(ctx: &SyncCtx<'_>, token: &str) -> Result<(), Str
 fn syncable_payload_is_empty(payload: &str) -> bool {
     match serde_json::from_str::<SyncableConfig>(payload) {
         Ok(sc) => {
-            // A config is "empty" (nothing user-owned to back up) when every field
-            // the user configures is defaulted. base_url/model only count as
-            // empty when they are unset OR still the factory defaults:
-            // `syncable_payload()` always fills the mirrors on a local row, but a
-            // REMOTE row written by another (possibly older) device can carry ""
-            // for them — both shapes must read as empty so an empty remote can
-            // never freeze out non-empty content; and a legacy (pre-multi-
-            // provider) user whose only content is a custom base_url/model must
-            // still be recognized as non-empty or their config would never sync.
+            // A config is "empty" (nothing user-owned to back up) when every
+            // field the user configures is unset. `base_url` only counts as
+            // empty when it is unset OR still the factory default: a legacy
+            // (pre-multi-provider) user whose only content is a CUSTOM base_url
+            // must still be recognized as non-empty or their config would never
+            // sync. `model` is deliberately NOT part of the test — a device
+            // whose only non-default content is the `model` mirror on the
+            // DEFAULT endpoint (it merely picked a model, with no provider or
+            // preferences bound to it) carries nothing transferable and must
+            // never publish over a configured mirror. That was the exact
+            // "empty phone blanked the canonical config" clobber.
             sc.providers.is_empty()
                 && sc.active_provider_id.is_empty()
                 && sc.preferences.trim().is_empty()
                 && sc.model_overrides.is_empty()
                 && (sc.base_url.is_empty() || sc.base_url == crate::config::DEFAULT_BASE_URL)
-                && (sc.model.is_empty() || sc.model == crate::config::DEFAULT_MODEL)
         }
         // Unparseable — assume non-empty so it is pushed as-is rather than dropped.
         Err(_) => false,
@@ -2104,7 +2157,7 @@ struct RemoteUserConfig {
 }
 
 /// The syncable config subset, deserialized from `user_config.payload`.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SyncableConfig {
     #[serde(default)]
@@ -2119,6 +2172,128 @@ struct SyncableConfig {
     model: String,
     #[serde(default)]
     model_overrides: HashMap<String, crate::config::ModelOverride>,
+}
+
+impl SyncableConfig {
+    /// Whether each field is "unset" — the same default-aware notion
+    /// `syncable_payload_is_empty` uses (the legacy `base_url`/`model` mirrors
+    /// count as unset when they are empty or still the factory defaults).
+    fn preferences_empty(&self) -> bool {
+        self.preferences.trim().is_empty()
+    }
+    fn providers_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+    fn active_provider_empty(&self) -> bool {
+        self.active_provider_id.is_empty()
+    }
+    fn base_url_empty(&self) -> bool {
+        self.base_url.is_empty() || self.base_url == crate::config::DEFAULT_BASE_URL
+    }
+    fn model_empty(&self) -> bool {
+        self.model.is_empty() || self.model == crate::config::DEFAULT_MODEL
+    }
+    fn overrides_empty(&self) -> bool {
+        self.model_overrides.is_empty()
+    }
+
+    /// Field-wise UNION with the server's payload: OUR value wins wherever we
+    /// set one; the server's fills the fields we left unset. Providers and
+    /// override entries merge PER KEY (id / model), so the result always
+    /// contains every provider and override the server held — pushing it can
+    /// only ADD entries to the mirror. Scalar fields we set (preferences, a
+    /// custom base_url) resolve local-wins, which is the app's documented
+    /// "a genuine local edit still wins" policy; the server's value for such a
+    /// conflict is the one thing a push can replace, and that residual is
+    /// inherent to a single row with no per-field versions.
+    fn union_with(&self, server: &SyncableConfig) -> SyncableConfig {
+        // Providers: union by id, local wins a shared id.
+        let mut providers = self.providers.clone();
+        for p in &server.providers {
+            if !providers.iter().any(|q| q.id == p.id) {
+                providers.push(p.clone());
+            }
+        }
+        // Overrides: union by model key, local wins a shared key.
+        let mut model_overrides = self.model_overrides.clone();
+        for (k, v) in &server.model_overrides {
+            model_overrides.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        // Prefer the server's active id when we have none — but only if it names
+        // a provider that exists in the merged list, so we can never emit a
+        // dangling id. (The union appends every server provider by id, so a
+        // server active id that pointed at one of its own providers is always
+        // valid here.) Decided before `providers` is moved into the struct.
+        let active_provider_id = if self.active_provider_empty()
+            && (server.active_provider_id.is_empty()
+                || providers.iter().any(|p| p.id == server.active_provider_id))
+        {
+            server.active_provider_id.clone()
+        } else {
+            self.active_provider_id.clone()
+        };
+        SyncableConfig {
+            preferences: if self.preferences_empty() {
+                server.preferences.clone()
+            } else {
+                self.preferences.clone()
+            },
+            providers,
+            active_provider_id,
+            base_url: if self.base_url_empty() {
+                server.base_url.clone()
+            } else {
+                self.base_url.clone()
+            },
+            model: if self.model_empty() {
+                server.model.clone()
+            } else {
+                self.model.clone()
+            },
+            model_overrides,
+        }
+    }
+
+    /// True when WE hold user content the server LACKS (a field we set that the
+    /// server left unset, or a provider / override key it doesn't have). This is
+    /// the ADDITIVE criterion the reconcile uses: a pure conflict (both set the
+    /// same field to different values) is deliberately NOT "adding", so a clean
+    /// row only re-pushes when it would add content — never to fight over a
+    /// value. (An actual local edit is dirty and goes out through the normal
+    /// push, which unions.)
+    fn adds_content_over(&self, server: &SyncableConfig) -> bool {
+        (!self.preferences_empty() && server.preferences_empty())
+            || (!self.providers_empty() && server.providers_empty())
+            || self
+                .providers
+                .iter()
+                .any(|p| !server.providers.iter().any(|q| q.id == p.id))
+            || (!self.active_provider_empty() && server.active_provider_empty())
+            || (!self.overrides_empty() && server.overrides_empty())
+            || self
+                .model_overrides
+                .keys()
+                .any(|k| !server.model_overrides.contains_key(k))
+            || (!self.base_url_empty() && server.base_url_empty())
+    }
+}
+
+/// Parse a `user_config` payload into the syncable subset, or `None` when it
+/// isn't valid JSON for it (a legacy/garbage payload we can't safely merge).
+fn parse_syncable(payload: &str) -> Option<SyncableConfig> {
+    serde_json::from_str::<SyncableConfig>(payload).ok()
+}
+
+/// The plaintext of a server `user_config` payload: unchanged when it isn't
+/// encrypted, decrypted when it is and we hold the key, and `None` when it looks
+/// encrypted but we cannot read it — a payload we must never overwrite (the
+/// locked-device contract).
+fn decrypt_server_payload(key: Option<[u8; 32]>, raw: &str) -> Option<String> {
+    match (raw, key) {
+        (p, _) if !crypt::looks_encrypted(p) => Some(p.to_string()),
+        (p, Some(k)) => crypt::decrypt(&k, p),
+        _ => None,
+    }
 }
 
 /// Apply pulled user-config rows. This is deliberately NON-DESTRUCTIVE: a pulled

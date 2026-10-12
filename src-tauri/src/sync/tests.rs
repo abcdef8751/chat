@@ -196,7 +196,7 @@ impl MockRest {
                             // returned rows (and the Content-Range total) reflect
                             // the FILTERED set, not the whole table. Absent the
                             // parameter (revision-less probes such as
-                            // fetch_user_config_revision) everything matches.
+                            // fetch_user_config_remote) everything matches.
                             let since: i64 = path
                                 .split("revision=gt.")
                                 .nth(1)
@@ -1035,31 +1035,25 @@ async fn legacy_custom_config_is_still_pushed() {
     assert_eq!(payload["model"], "my-custom-model");
 }
 
-/// A device that edited config OFFLINE at a STALER (lower) revision than the
-/// canonical on the server must NOT push its row. The server's enforce_revision
-/// trigger clamps only the revision column, not the payload, so a stale push
-/// would overwrite the canonical payload while keeping the higher revision — the
-/// clock-skew clobber for non-empty configs. The row stays dirty so the pull /
-/// post-pull mirror can reconcile it.
+/// The remaining stale guard: when the server's payload can't be MERGED (an
+/// unreadable/legacy payload, or ciphertext we lack the key for), we can't
+/// verify what a push would drop — so a staler local row is refused rather than
+/// risk a destructive overwrite. (A stale row with a MERGEABLE server payload is
+/// now pushed as a union instead; see `stale_dirty_edit_is_pushed_as_a_union`.)
 #[tokio::test]
-async fn stale_config_is_not_pushed_over_newer_server_row() {
+async fn stale_push_is_refused_when_the_server_payload_is_unreadable() {
     let srv = MockRest::spawn();
     let db = temp_db("stalecfg");
     let mem = temp_memory("stalecfg", &db);
     let cfg = temp_config("stalecfg");
 
-    // The server already holds a NEWER canonical row (revision 5000).
+    // The server already holds a NEWER canonical row (revision 5000), but its
+    // payload is not mergeable JSON (a legacy/garbage blob).
     srv.set_get(
         "user_config",
         vec![json!({
-            "id": "main",
-            "payload": json!({
-                "preferences": "Canonical", "providers": [], "activeProviderId": "",
-                "baseUrl": crate::config::DEFAULT_BASE_URL,
-                "model": crate::config::DEFAULT_MODEL,
-                "modelOverrides": {}
-            }).to_string(),
-            "revision": 5000, "deleted_at": Value::Null,
+            "id": "main", "payload": "not-mergeable-json", "revision": 5000,
+            "deleted_at": Value::Null,
         })],
     );
 
@@ -1463,25 +1457,29 @@ async fn reconcile_skips_undecryptable_server_payload() {
     assert!(srv.posted("user_config").is_empty());
 }
 
-/// Winner policy, pinned end-to-end: a stale OFFLINE edit (dirty row at a
-/// lower revision than the server's canonical) is refused by the push's
-/// read-before-write guard, but the pull's Phase 3 then escalates it (dirty row
-/// = unpushed local content, which per the app's documented contract "a genuine
-/// local edit still wins" propagates) and the NEXT push uploads it. The push
-/// guard is a first-line per-tick check; it is deliberately overridden after
-/// the pull has SEEN the server row and the local edit is still unpushed —
-/// otherwise the offline edit would be absorbed and lost instead.
+/// Winner policy, pinned end-to-end: a stale OFFLINE edit (dirty row at a lower
+/// revision than the server's canonical) goes out as a UNION — our values win
+/// the fields we set, the server's content survives everywhere else — so the
+/// edit propagates without ever dropping the canonical, and the union lands at
+/// a revision above the server's so it isn't refused as stale. Only an
+/// UNMERGEABLE server payload (legacy/garbage text, or ciphertext we can't
+/// read) falls back to refusing a stale push.
 #[tokio::test]
-async fn stale_dirty_edit_is_escalated_by_pull_and_then_pushed() {
+async fn stale_dirty_edit_is_pushed_as_a_union() {
     let pa = json!({
         "activeProviderId": "", "baseUrl": "", "model": "",
         "modelOverrides": {}, "preferences": "Offline edit on A", "providers": [],
     })
     .to_string();
+    // The canonical holds a provider we do NOT have — it must survive the push.
     let pb = json!({
-        "activeProviderId": "", "baseUrl": "https://api.fireworks.ai/inference/v1",
+        "activeProviderId": "prov-b", "baseUrl": "https://b.example/v1",
         "model": "m-b", "modelOverrides": {},
-        "preferences": "Canonical from B", "providers": [],
+        "preferences": "Canonical from B",
+        "providers": [{
+            "id": "prov-b", "name": "B", "baseUrl": "https://b.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
     })
     .to_string();
     let srv = MockRest::spawn();
@@ -1492,9 +1490,9 @@ async fn stale_dirty_edit_is_escalated_by_pull_and_then_pushed() {
             "deleted_at": Value::Null,
         })],
     );
-    let db = temp_db("stale-escalate");
-    let mem = temp_memory("stale-escalate", &db);
-    let cfg = temp_config("stale-escalate");
+    let db = temp_db("stale-union");
+    let mem = temp_memory("stale-union", &db);
+    let cfg = temp_config("stale-union");
     {
         let mut c = cfg.get();
         c.preferences = "Offline edit on A".into();
@@ -1517,34 +1515,26 @@ async fn stale_dirty_edit_is_escalated_by_pull_and_then_pushed() {
         config: &cfg,
         key: None,
     };
-    // Tick 1: push refuses the stale row (read-before-write)... then the pull
-    // escalates the dirty row above the server's revision.
-    push(&ctx, "tok", &SyncState::new()).await.unwrap();
-    assert!(srv.posted("user_config").is_empty(), "stale push must be refused");
-    let row = json!({
-        "id": "main", "payload": pb.clone(), "revision": 5000,
-        "deleted_at": Value::Null,
-    });
-    apply_user_config(&ctx, std::slice::from_ref(&row)).unwrap();
-    let (rev, dirty): (i64, i64) = {
-        let conn = db.0.lock().unwrap();
-        conn.query_row(
-            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap()
-    };
-    assert_eq!(dirty, 1);
-    assert!(rev > 5000, "escalated above the canonical revision");
-    // Tick 2: the push uploads the offline edit (local wins, per contract).
+    // The stale dirty edit goes out IMMEDIATELY as a union (never dropped).
     push(&ctx, "tok", &SyncState::new()).await.unwrap();
     let posts = srv.posted("user_config");
-    assert!(!posts.is_empty(), "escalated edit must reach the mirror");
-    assert!(posts[posts.len() - 1]["payload"]
-        .as_str()
-        .unwrap()
-        .contains("Offline edit on A"));
+    assert!(!posts.is_empty(), "the union push must go out");
+    let sent = &posts[posts.len() - 1];
+    let payload: Value = serde_json::from_str(sent["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["preferences"], "Offline edit on A", "local edit wins");
+    assert_eq!(payload["providers"][0]["id"], "prov-b", "server content survives");
+    assert!(
+        sent["revision"].as_i64().unwrap() > 5000,
+        "union must land above the canonical revision"
+    );
+    // The union was persisted locally too (we adopted the server's provider).
+    let local: String = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT payload FROM user_config WHERE id = 'main'", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert!(local.contains("prov-b"), "union persisted locally");
+    assert_eq!(cfg.get().providers.len(), 1, "live config adopted the provider");
 }
 
 /// The non-fight skip leaves a row's revision below the pull high-water; the
@@ -1695,14 +1685,16 @@ async fn post_pull_tail_repairs_stuck_row_and_pushes_it() {
     let db = temp_db("tail");
     let mem = temp_memory("tail", &db);
     let cfg = temp_config("tail");
-    // Live config and the server's older payload differ ONLY in `preferences`.
+    // Live config carries content the server's row LACKS (the server row is
+    // empty), so the reconcile's additive rule fires.
     let mut c = cfg.get();
     c.preferences = "Local newer".into();
     cfg.set(c).unwrap();
     let live = cfg.get();
     let local_new = live.syncable_payload().to_string();
     let mut server_cfg = live.clone();
-    server_cfg.preferences = "Server old".into();
+    server_cfg.preferences = String::new();
+    server_cfg.providers.clear();
     let server_old = server_cfg.syncable_payload().to_string();
     let srv = MockRest::spawn();
     srv.set_get(
@@ -1753,6 +1745,581 @@ async fn post_pull_tail_repairs_stuck_row_and_pushes_it() {
         .as_str()
         .unwrap()
         .contains("Local newer"));
+}
+
+/// The push UNION invariant: a device whose config is non-empty but PARTIAL
+/// (it sets one field, leaves others unset) must not drop the server's content.
+/// Here we have a preference but no provider; the server has a provider and no
+/// preference. The push must carry both.
+#[tokio::test]
+async fn push_unions_with_server_and_never_drops_its_content() {
+    let local = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Only on this device", "providers": [],
+    })
+    .to_string();
+    let server = json!({
+        "activeProviderId": "prov-s", "baseUrl": "https://s.example/v1",
+        "model": "m-s", "modelOverrides": {},
+        "preferences": "",
+        "providers": [{
+            "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": server, "revision": 900,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("union-push");
+    let mem = temp_memory("union-push", &db);
+    let cfg = temp_config("union-push");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Only on this device".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 800, 1)",
+            [&local],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "the partial config must push its union");
+    let sent: Value = serde_json::from_str(posts[posts.len() - 1]["payload"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(sent["preferences"], "Only on this device", "our field wins");
+    assert_eq!(sent["providers"][0]["id"], "prov-s", "server field survives");
+}
+
+/// A configured device stranded below a content-POOR newer server row heals
+/// itself: the reconcile's additive rule re-dirties it and the push restores
+/// the union, so the server's own fields survive too.
+#[tokio::test]
+async fn stranded_richer_row_heals_and_pushes_the_union() {
+    // Local is rich; the server row is newer but missing our content and holds
+    // one provider we lack.
+    let local = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Local config", "providers": [],
+    })
+    .to_string();
+    let server = json!({
+        "activeProviderId": "prov-s", "baseUrl": "https://s.example/v1",
+        "model": "m-s", "modelOverrides": {},
+        "preferences": "",
+        "providers": [{
+            "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": server, "revision": 1000,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("heal");
+    let mem = temp_memory("heal", &db);
+    let cfg = temp_config("heal");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Local config".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            [&local],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    // The reconcile sees content the server lacks → re-dirty above it.
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+    let rev: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT revision FROM user_config WHERE id='main'", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert!(rev > 1000, "must be re-armed above the server");
+    // The push restores it — as a union that keeps the server's provider.
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty());
+    let sent: Value = serde_json::from_str(posts[posts.len() - 1]["payload"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(sent["preferences"], "Local config");
+    assert_eq!(sent["providers"][0]["id"], "prov-s");
+
+    // Convergence / no flap: with the server now holding the union, a second
+    // reconcile must NOT re-arm the row again.
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": sent.to_string(), "revision": rev + 1,
+            "deleted_at": Value::Null,
+        })],
+    );
+    {
+        // Clear dirty as a successful push would, and settle the row payload to
+        // the union the push uploaded.
+        let conn = db.0.lock().unwrap();
+        conn.execute("UPDATE user_config SET dirty = 0", []).unwrap();
+    }
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+    let rev_after: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT revision FROM user_config WHERE id='main'", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rev_after, rev, "no further escalation once the server has our content");
+}
+
+/// A pure CONFLICT (both sides set the same field to different values) is not
+/// "adding content" — the reconcile must leave a clean row alone rather than
+/// start a per-tick push/pull fight.
+#[tokio::test]
+async fn reconcile_does_not_fight_a_pure_conflict() {
+    let local = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Value A", "providers": [],
+    })
+    .to_string();
+    let server = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Value B", "providers": [],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": server, "revision": 5000,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("conflict");
+    let mem = temp_memory("conflict", &db);
+    let cfg = temp_config("conflict");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Value A".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            [&local],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!((rev, dirty), (100, 0), "a pure conflict is left alone");
+    assert!(srv.posted("user_config").is_empty());
+}
+
+/// The empty-guard ignores the `model` mirror on the default endpoint: a device
+/// that merely picked a model (no provider/preferences bound to it) carries
+/// nothing portable and must read as empty — this is the phone-blanked-the-
+/// desktop shape. A CUSTOM base_url still reads as non-empty (legacy configs).
+#[test]
+fn empty_guard_ignores_model_mirror_but_keeps_legacy_base_url() {
+    let model_only = json!({
+        "preferences": "", "providers": [], "activeProviderId": "",
+        "baseUrl": crate::config::DEFAULT_BASE_URL,
+        "model": "some-picked-model",
+        "modelOverrides": {},
+    })
+    .to_string();
+    assert!(
+        syncable_payload_is_empty(&model_only),
+        "a model-only config on the default endpoint is empty"
+    );
+
+    let legacy = json!({
+        "preferences": "", "providers": [], "activeProviderId": "",
+        "baseUrl": "https://my.selfhosted.example/v1",
+        "model": "my-custom-model",
+        "modelOverrides": {},
+    })
+    .to_string();
+    assert!(
+        !syncable_payload_is_empty(&legacy),
+        "a legacy custom base_url is still real content"
+    );
+}
+
+/// The union must keep the server's active provider when we have a provider
+/// list but no active selection of our own — otherwise our empty id would blank
+/// the server's choice (and, for a providers-without-active device, never
+/// converge). A server id that isn't in the merged list is not adopted.
+#[tokio::test]
+async fn union_keeps_server_active_provider_when_local_has_none() {
+    let local = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {},
+        "preferences": "",
+        "providers": [{
+            "id": "prov-l", "name": "L", "baseUrl": "https://l.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let server = json!({
+        "activeProviderId": "prov-s", "baseUrl": "https://s.example/v1",
+        "model": "m-s", "modelOverrides": {},
+        "preferences": "",
+        "providers": [{
+            "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": server, "revision": 900,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("active-union");
+    let mem = temp_memory("active-union", &db);
+    let cfg = temp_config("active-union");
+    {
+        // The row carries the provider list via its payload; the live config is
+        // left default (the assertion is on what gets pushed).
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 800, 1)",
+            [&local],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "the union must push");
+    let sent: Value = serde_json::from_str(posts[posts.len() - 1]["payload"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(sent["activeProviderId"], "prov-s", "server selection survives");
+    assert_eq!(sent["providers"].as_array().unwrap().len(), 2, "both providers");
+}
+
+/// The union's provider merge is per-id and its active-id adoption never yields
+/// a dangling id — even when the server's active id names a provider that exists
+/// nowhere in the merged list.
+#[test]
+fn union_with_merges_providers_by_id_and_never_dangles_active() {
+    let local = parse_syncable(
+        &json!({
+            "activeProviderId": "", "baseUrl": "", "model": "",
+            "modelOverrides": {}, "preferences": "",
+            "providers": [{
+                "id": "prov-l", "name": "L", "baseUrl": "https://l.example/v1",
+                "defaultModel": null, "catalogId": null,
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Server active id names one of its OWN providers → adopted.
+    let server_ok = parse_syncable(
+        &json!({
+            "activeProviderId": "prov-s", "baseUrl": "", "model": "",
+            "modelOverrides": {}, "preferences": "",
+            "providers": [{
+                "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+                "defaultModel": null, "catalogId": null,
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let merged = local.union_with(&server_ok);
+    assert_eq!(merged.providers.len(), 2, "providers merge per id");
+    assert_eq!(merged.active_provider_id, "prov-s");
+
+    // Server active id names a provider present nowhere → NOT adopted (no
+    // dangling id), our own list preserved.
+    let server_ghost = parse_syncable(
+        &json!({
+            "activeProviderId": "ghost", "baseUrl": "", "model": "",
+            "modelOverrides": {}, "preferences": "",
+            "providers": [{
+                "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+                "defaultModel": null, "catalogId": null,
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let merged = local.union_with(&server_ghost);
+    assert_eq!(merged.active_provider_id, "", "a dangling server id is not adopted");
+}
+
+/// The regression guard for the push's concurrent-edit bail: when the row moved
+/// past the revision the push read, `persist_merged_user_config` must touch
+/// NOTHING — not the row, and (critically) not the live config, whose clobbering
+/// would revert the concurrent edit for good.
+#[tokio::test]
+async fn persist_bails_and_leaves_live_config_untouched_when_the_row_moved() {
+    let db = temp_db("persist-bail");
+    let mem = temp_memory("persist-bail", &db);
+    let cfg = temp_config("persist-bail");
+    {
+        // The live config holds a just-saved edit; the row already moved past the
+        // stale revision (900) the caller will pass as `expect_rev`.
+        let mut c = cfg.get();
+        c.preferences = "KEEP me".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 901, 1)",
+            rusqlite::params![json!({
+                "activeProviderId": "", "baseUrl": "", "model": "",
+                "modelOverrides": {}, "preferences": "KEEP me", "providers": [],
+            })
+            .to_string()],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:1".to_string(); // unused: this path makes no request
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &base,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    // A union that would replace the preference if it were (wrongly) adopted.
+    let merged = parse_syncable(
+        &json!({
+            "activeProviderId": "", "baseUrl": "", "model": "",
+            "modelOverrides": {}, "preferences": "CLOBBER", "providers": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // expect_rev 900 != the row's 901 → the guarded UPDATE affects 0 rows.
+    let persisted = persist_merged_user_config(&ctx, "main", &merged, 902, 900).unwrap();
+
+    assert!(!persisted, "a moved row must not be persisted");
+    let (payload, revision): (String, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT payload, revision FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(revision, 901, "row revision untouched");
+    assert!(payload.contains("KEEP me"), "row payload untouched");
+    assert_eq!(cfg.get().preferences, "KEEP me", "live config NOT clobbered");
+}
+
+/// When the server already holds everything we have, the union adds nothing:
+/// the push must NOT post anything and must clear the local dirty flag (no
+/// churn), while our config still converges on the pull.
+#[tokio::test]
+async fn push_clears_dirty_when_the_server_already_has_our_content() {
+    let local = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Shared", "providers": [],
+    })
+    .to_string();
+    let server = json!({
+        "activeProviderId": "prov-s", "baseUrl": "https://s.example/v1",
+        "model": "m-s", "modelOverrides": {},
+        "preferences": "Shared",
+        "providers": [{
+            "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": server, "revision": 900,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("noop-push");
+    let mem = temp_memory("noop-push", &db);
+    let cfg = temp_config("noop-push");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Shared".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 800, 1)",
+            [&local],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    assert!(
+        srv.posted("user_config").is_empty(),
+        "a subset config must not re-post"
+    );
+    let dirty: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT dirty FROM user_config WHERE id='main'", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(dirty, 0, "nothing pending once the server has our content");
+}
+
+/// The union path works on an ENCRYPTED mirror: the server's ciphertext is
+/// decrypted to compute the union, and what we push goes back out as ciphertext
+/// holding both sides' content.
+#[tokio::test]
+async fn union_push_round_trips_through_encryption() {
+    use crate::crypt;
+
+    let key = [7u8; 32];
+    let local = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Mine", "providers": [],
+    })
+    .to_string();
+    let server_plain = json!({
+        "activeProviderId": "prov-s", "baseUrl": "https://s.example/v1",
+        "model": "m-s", "modelOverrides": {},
+        "preferences": "",
+        "providers": [{
+            "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": crypt::encrypt(&key, &server_plain),
+            "revision": 900, "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("union-enc");
+    let mem = temp_memory("union-enc", &db);
+    let cfg = temp_config("union-enc");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Mine".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 800, 1)",
+            [&local],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: Some(key),
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "the union must be pushed");
+    let sent = posts[posts.len() - 1]["payload"].as_str().unwrap();
+    assert!(crypt::looks_encrypted(sent), "must go out as ciphertext");
+    let plain = crypt::decrypt(&key, sent).expect("decryptable with our key");
+    let merged: Value = serde_json::from_str(&plain).unwrap();
+    assert_eq!(merged["preferences"], "Mine", "our field wins");
+    assert_eq!(merged["providers"][0]["id"], "prov-s", "server field survives");
 }
 
 /// A server payload that looks encrypted is skipped even when a key IS present

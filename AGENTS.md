@@ -522,22 +522,32 @@ and the app is byte-identical to before. Never blocks the UI.
   denominator. **User config** (explicit
   preferences + providers + price/capability overrides) syncs as a single global
   `user_config` row, applied NON-destructively (a pulled row only fills fields
-  this device left empty). Two guards keep local edits from vanishing: the push
-  side refuses to push a row staler than the server's (`fetch_user_config_revision`),
-  and the pull side never records a merged payload that differs from what the
-  remote actually sent as CLEAN — a divergent payload is stored dirty at a
-  revision above the remote's so the next push uploads it (previously such an
-  edit could be absorbed into the row at the remote's revision as "synced" and
-  silently never leave the device). Escalation is gated to where this device
-  plausibly owns unpushed content (fresh row / already-dirty row / empty remote);
-  a clean row vs a non-empty newer remote is left alone (no two-device push/pull
-  fight) — the winner policy is "unpushed local edits win once the pull has
-  seen the server row", and `db::sync_user_config` floors every edit's revision
-  at the pull high-water so a slow-clock device can never wedge its config
-  below the server's revision. A post-pull `reconcile_user_config` re-dirties a
-  row already stuck at the server's revision with a divergent payload
-  (equal-revision rows are invisible to the pull high-water; it never pushes
-  over a payload it cannot decrypt).
+  this device left empty). Because it is ONE row under whole-row LWW, a plain
+  push from a device whose config is empty in some fields would blank those
+  fields on the mirror (a fresh phone blanked a configured desktop's preferences
+  and providers). The invariant that prevents this: **a `user_config` push never
+  drops server content in the fields this device left unset.** The push fetches
+  the server's row and upserts the UNION — our values win the fields we set,
+  the server's fill the ones we left unset; providers and override entries merge
+  PER KEY (`SyncableConfig::union_with`) — at a revision above the server's, and
+  adopts + persists the union locally. It only pushes when we ADD content the
+  server lacks; if the server already holds everything we have it just clears
+  dirty. A genuine conflict on a scalar field (both sides set `preferences`
+  differently) still resolves local-wins on the mirror — the one residual of a
+  single row with no per-field versions; the loser keeps its own copy locally.
+  `syncable_payload_is_empty` ignores the `model` mirror on the default endpoint,
+  so a device that merely picked a model carries nothing portable and can't
+  publish over a configured mirror (a CUSTOM base_url still reads as legacy
+  content). Ciphertext we can't decrypt is never overwritten — a staler local row
+  is refused instead; a non-JSON/legacy plaintext payload holds nothing mergeable
+  to lose, so a newer local row replaces it. `db::sync_user_config` floors every
+  edit's revision at the pull high-water so a slow-clock device can't wedge its
+  config below the server's revision, and the pull side never records a merged
+  payload that differs from what the remote sent as CLEAN. A post-pull
+  `reconcile_user_config` (split out as `reconcile_config_after_pull`) re-arms a
+  row that ADDS content the server lacks, at a revision above the server's, so a
+  stranded richer device heals on the next push; a pure conflict (both sides set
+  a field differently) is left alone rather than fought every tick.
   The reflection watermark
   (`last_reflected_index`) rides on the conversation row and is preserved across
   re-index. The first sync per account (guarded by a per-`user_id` sentinel)
