@@ -190,7 +190,7 @@ impl MockRest {
                     }
                 };
                 let resp = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {status} OK\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{}",
                     resp_body.len(),
                     resp_body
                 );
@@ -831,9 +831,16 @@ async fn config_syncs_preferences_providers_and_overrides() {
     assert_eq!(after.model_overrides.len(), 1);
     // A non-syncable field is untouched by a config pull.
     assert_eq!(after.shell_workspace_dir, "/tmp/ws");
-    // ...and the pulled revision was still absorbed (high-water advances; the row
-    // is recorded at the remote revision) so it isn't re-fetched forever.
-    assert_eq!(rev_of(&db, "SELECT revision FROM user_config WHERE id='main'"), 9_000_000_000_000_i64);
+    // ...and the row was recorded ABOVE the (empty, faster-clock) remote
+    // revision and DIRTY, so the configured device pushes its non-empty config
+    // back and the empty row never freezes it out (the pull high-water still
+    // advances past the remote, so the row is not re-fetched every tick).
+    let (rev, dirty) = (
+        rev_of(&db, "SELECT revision FROM user_config WHERE id='main'"),
+        rev_of(&db, "SELECT dirty FROM user_config WHERE id='main'"),
+    );
+    assert!(rev > 9_000_000_000_000_i64, "must exceed the remote revision");
+    assert_eq!(dirty, 1, "diverged content must be pushed back");
 }
 
 /// A blank device holding a dirty EMPTY user_config row must not push it — that
@@ -1051,6 +1058,585 @@ async fn newer_config_is_still_pushed() {
     // A NEWER config is pushed (guard only blocks staler rows).
     let posts = srv.posted("user_config");
     assert!(!posts.is_empty(), "newer config must be pushed");
+}
+
+/// A pulled user-config row must not ABSORB unpushed local edits. When the live
+/// config differs from what the remote actually sent, the local row is stored
+/// DIRTY at a revision above the remote's so the next push uploads it —
+/// otherwise the edit is marked synced without ever leaving the device
+/// (observed in production: a capability toggle sat "clean" at the remote's
+/// revision while the server kept the old payload forever).
+#[tokio::test]
+async fn pulled_config_does_not_absorb_unpushed_local_edits() {
+    // Live config carries an edit the remote has never seen, and there is no
+    // local row yet (a fresh device, or one whose row is below the remote's).
+    let cfg = temp_config("absorb");
+    {
+        let mut c = cfg.get();
+        let mut overrides = c.model_overrides.clone();
+        overrides.insert(
+            "m-1".into(),
+            crate::config::ModelOverride {
+                output_modalities: Some(vec!["text".into()]),
+                ..Default::default()
+            },
+        );
+        c.model_overrides = overrides;
+        c.preferences = "Talk like me.".into();
+        cfg.set(c).unwrap();
+    }
+    let db = temp_db("absorb");
+    let mem = temp_memory("absorb", &db);
+    let srv = MockRest::spawn();
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    // Remote row (revision 100) WITHOUT the local override/preferences.
+    let row = json!({
+        "id": "main",
+        "payload": json!({
+            "activeProviderId": "", "baseUrl": "", "model": "",
+            "modelOverrides": {}, "preferences": "", "providers": [],
+        }).to_string(),
+        "revision": 100,
+        "deleted_at": Value::Null,
+    });
+    apply_user_config(&ctx, std::slice::from_ref(&row)).unwrap();
+
+    // The row exists at a revision ABOVE the remote's and is DIRTY: the edit
+    // will be pushed on the next tick, not silently marked synced.
+    let (payload, rev, dirty): (String, i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT payload, revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 1);
+    assert!(rev > 100, "revision must exceed the remote's");
+    assert!(payload.contains("outputModalities"), "local edit must survive");
+    assert!(payload.contains("Talk like me"), "local edit must survive");
+}
+
+/// A row stuck at the server's revision with a never-pushed payload (the
+/// absorption bug's residue, equal-revision — invisible to the pull high-water)
+/// is repaired by the post-pull reconcile: it is re-marked dirty at a revision
+/// above the server's so the push guard lets the next push upload it.
+#[tokio::test]
+async fn reconcile_redirties_row_diverged_from_server_at_equal_revision() {
+    let srv = MockRest::spawn();
+    // Server holds the OLD payload at revision 100.
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main",
+            "payload": json!({
+                "activeProviderId": "", "baseUrl": "", "model": "",
+                "modelOverrides": {}, "preferences": "", "providers": [],
+            }).to_string(),
+            "revision": 100,
+        })],
+    );
+    let db = temp_db("reconcile");
+    let mem = temp_memory("reconcile", &db);
+    let cfg = temp_config("reconcile");
+    let client = reqwest::Client::new();
+    // Local row stuck: NEW payload at the SAME revision, clean.
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            rusqlite::params![json!({
+                "activeProviderId": "", "baseUrl": "", "model": "",
+                "modelOverrides": {"m-1": {"outputModalities": ["text"]}},
+                "preferences": "", "providers": [],
+            }).to_string()],
+        )
+        .unwrap();
+    }
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 1);
+    assert!(rev > 100, "revision must exceed the server's so the push guard passes");
+}
+
+/// A row that MATCHES the server is left alone by the reconcile — no spurious
+/// re-dirtying and re-pushing every tick.
+#[tokio::test]
+async fn reconcile_leaves_matching_row_clean() {
+    let payload = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "", "providers": [],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": payload.clone(), "revision": 100,
+        })],
+    );
+    let db = temp_db("reconcile-clean");
+    let mem = temp_memory("reconcile-clean", &db);
+    let cfg = temp_config("reconcile-clean");
+    let client = reqwest::Client::new();
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            [&payload],
+        )
+        .unwrap();
+    }
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 0);
+    assert_eq!(rev, 100);
+}
+
+/// A CLEAN local row at a lower revision vs a non-empty NEWER remote is never
+/// escalated: re-dirtying older content above the remote's revision would start
+/// a push/pull fight between two configured devices every tick (the stale-push
+/// clobber re-entered through the pull side). Neither the pull nor the
+/// reconcile may touch the row, and nothing may be pushed.
+#[tokio::test]
+async fn pulled_newer_configured_row_does_not_fight() {
+    let pa = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Configured on A", "providers": [],
+    })
+    .to_string();
+    let pb = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Configured on B", "providers": [],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": pb.clone(), "revision": 1000,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("fight");
+    let mem = temp_memory("fight", &db);
+    let cfg = temp_config("fight");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Configured on A".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            [&pa],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    // Pull the newer non-empty remote row.
+    let row = json!({
+        "id": "main", "payload": pb.clone(), "revision": 1000,
+        "deleted_at": Value::Null,
+    });
+    apply_user_config(&ctx, std::slice::from_ref(&row)).unwrap();
+    // Reconcile would also see the strictly-newer remote.
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    // The local row is UNTOUCHED (older content is not promoted above the
+    // remote's revision) and nothing was pushed to the mirror.
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(rev, 100);
+    assert_eq!(dirty, 0);
+    assert!(srv.posted("user_config").is_empty(), "nothing may be pushed");
+}
+
+/// Reconcile never pushes (plaintext or re-encrypted) over a server payload it
+/// cannot decrypt — the locked-device contract. A device without the key that
+/// finds an encrypted user_config row leaves the row alone rather than risk
+/// destroying ciphertext.
+#[tokio::test]
+async fn reconcile_skips_undecryptable_server_payload() {
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": "enc:v1:not-a-real-ciphertext", "revision": 100,
+        })],
+    );
+    let db = temp_db("reconcile-enc");
+    let mem = temp_memory("reconcile-enc", &db);
+    let cfg = temp_config("reconcile-enc");
+    let client = reqwest::Client::new();
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            rusqlite::params![json!({
+                "activeProviderId": "", "baseUrl": "", "model": "",
+                "modelOverrides": {}, "preferences": "local", "providers": [],
+            }).to_string()],
+        )
+        .unwrap();
+    }
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None, // no key on this device — must not push over ciphertext
+    };
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 0);
+    assert_eq!(rev, 100);
+    assert!(srv.posted("user_config").is_empty());
+}
+
+/// Winner policy, pinned end-to-end: a stale OFFLINE edit (dirty row at a
+/// lower revision than the server's canonical) is refused by the push's
+/// read-before-write guard, but the pull's Phase 3 then escalates it (dirty row
+/// = unpushed local content, which per the app's documented contract "a genuine
+/// local edit still wins" propagates) and the NEXT push uploads it. The push
+/// guard is a first-line per-tick check; it is deliberately overridden after
+/// the pull has SEEN the server row and the local edit is still unpushed —
+/// otherwise the offline edit would be absorbed and lost instead.
+#[tokio::test]
+async fn stale_dirty_edit_is_escalated_by_pull_and_then_pushed() {
+    let pa = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Offline edit on A", "providers": [],
+    })
+    .to_string();
+    let pb = json!({
+        "activeProviderId": "", "baseUrl": "https://api.fireworks.ai/inference/v1",
+        "model": "m-b", "modelOverrides": {},
+        "preferences": "Canonical from B", "providers": [],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": pb.clone(), "revision": 5000,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("stale-escalate");
+    let mem = temp_memory("stale-escalate", &db);
+    let cfg = temp_config("stale-escalate");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Offline edit on A".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 1)",
+            [&pa],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    // Tick 1: push refuses the stale row (read-before-write)... then the pull
+    // escalates the dirty row above the server's revision.
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    assert!(srv.posted("user_config").is_empty(), "stale push must be refused");
+    let row = json!({
+        "id": "main", "payload": pb.clone(), "revision": 5000,
+        "deleted_at": Value::Null,
+    });
+    apply_user_config(&ctx, std::slice::from_ref(&row)).unwrap();
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 1);
+    assert!(rev > 5000, "escalated above the canonical revision");
+    // Tick 2: the push uploads the offline edit (local wins, per contract).
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "escalated edit must reach the mirror");
+    assert!(posts[posts.len() - 1]["payload"]
+        .as_str()
+        .unwrap()
+        .contains("Offline edit on A"));
+}
+
+/// The non-fight skip leaves a row's revision below the pull high-water; the
+/// NEXT local edit must still land ABOVE the watermark (the highest seen server
+/// revision) so the push guard accepts it — otherwise a slow-clock device
+/// wedges its config edits forever.
+#[tokio::test]
+async fn config_edit_after_non_fight_skip_lands_above_watermark() {
+    let db = temp_db("wm-bump");
+    let cfg = temp_config("wm-bump");
+    // Row sits at 100 (below the pull watermark of 5000 — the non-fight skip
+    // state). A slow-clock device's now() would be < 5000, so bumping from the
+    // row revision alone would produce a refuse-able revision.
+    {
+        let conn = db.0.lock().unwrap();
+        let payload = json!({
+            "activeProviderId": "", "baseUrl": "", "model": "",
+            "modelOverrides": {}, "preferences": "", "providers": [],
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            [&payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state(entity, last_seen_revision) VALUES ('user_config', 5000)",
+            [],
+        )
+        .unwrap();
+    }
+    let mut c = cfg.get();
+    c.preferences = "New edit after the skip".into();
+    cfg.set(c).unwrap();
+    let conn = db.0.lock().unwrap();
+    db::sync_user_config(&conn, &cfg.get()).unwrap();
+    let (rev, dirty): (i64, i64) = {
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 1);
+    assert!(rev > 5000, "edit must land above the pull high-water");
+}
+
+/// The non-fight skip is scoped to Phase 3: when the pull's Phase-2 adoption
+/// fills an EMPTY local field, the live config becomes a hybrid and the
+/// post-pull mirror legitimately dirties the row above the high-water, so the
+/// next push uploads the union (the convergent path the watermark floor makes
+/// clock-independent). Nothing fights: each device converges on the same union.
+#[tokio::test]
+async fn adoption_after_skip_mirrors_union_upward() {
+    // Local has a preference but NO providers; the newer remote has a provider
+    // and its own preference.
+    let pa = json!({
+        "activeProviderId": "", "baseUrl": "", "model": "",
+        "modelOverrides": {}, "preferences": "Local preference", "providers": [],
+    })
+    .to_string();
+    let pb = json!({
+        "activeProviderId": "prov-x", "baseUrl": "https://remote.example/v1",
+        "model": "remote-model", "modelOverrides": {},
+        "preferences": "Remote preference",
+        "providers": [{
+            "id": "prov-x", "name": "Remote", "baseUrl": "https://remote.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": pb.clone(), "revision": 1000,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("union");
+    let mem = temp_memory("union", &db);
+    let cfg = temp_config("union");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Local preference".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            [&pa],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    // Pull: adoption fills the empty providers (hybrid live config); Phase 3
+    // leaves the clean row in place...
+    let row = json!({
+        "id": "main", "payload": pb.clone(), "revision": 1000,
+        "deleted_at": Value::Null,
+    });
+    apply_user_config(&ctx, std::slice::from_ref(&row)).unwrap();
+    assert_eq!(rev_of(&db, "SELECT revision FROM user_config WHERE id='main'"), 100);
+    assert_eq!(cfg.get().providers.len(), 1, "adopted the remote provider");
+    assert_eq!(cfg.get().preferences, "Local preference", "local value kept");
+    // ...then the post-pull mirror folds the hybrid UP (dirty, above the
+    // high-water) so the next push can upload the union.
+    {
+        let conn = db.0.lock().unwrap();
+        db::sync_user_config(&conn, &cfg.get()).unwrap();
+    }
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 1);
+    assert!(rev > 1000, "the union must land above the pull high-water");
+}
+
+/// A server payload that looks encrypted is skipped even when a key IS present
+/// but fails to decrypt it (never push over ciphertext we can't verify).
+#[tokio::test]
+async fn reconcile_skips_undecryptable_payload_even_with_key() {
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": "enc:v1:definitely-not-valid", "revision": 100,
+        })],
+    );
+    let db = temp_db("reconcile-enc-key");
+    let mem = temp_memory("reconcile-enc-key", &db);
+    let cfg = temp_config("reconcile-enc-key");
+    let client = reqwest::Client::new();
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            rusqlite::params![json!({
+                "activeProviderId": "", "baseUrl": "", "model": "",
+                "modelOverrides": {}, "preferences": "local", "providers": [],
+            }).to_string()],
+        )
+        .unwrap();
+    }
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: Some([0u8; 32]), // key present, but the blob isn't decryptable
+    };
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    let (rev, dirty): (i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 0);
+    assert_eq!(rev, 100);
+    assert!(srv.posted("user_config").is_empty());
 }
 
 /// Regression for the reviewer's critical finding: a fresh/second device that

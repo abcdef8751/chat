@@ -514,7 +514,26 @@ and the app is byte-identical to before. Never blocks the UI.
   row written mid-flight isn't dropped); pull fetches `revision > last_seen` and
   applies with last-writer-wins by revision, tombstones (`deleted_at` → local
   hard-delete), and re-orders a conversation's local `index` by `(created_at,
-  id)` for consistent cross-device ordering. The reflection watermark
+  id)` for consistent cross-device ordering. **User config** (explicit
+  preferences + providers + price/capability overrides) syncs as a single global
+  `user_config` row, applied NON-destructively (a pulled row only fills fields
+  this device left empty). Two guards keep local edits from vanishing: the push
+  side refuses to push a row staler than the server's (`fetch_user_config_revision`),
+  and the pull side never records a merged payload that differs from what the
+  remote actually sent as CLEAN — a divergent payload is stored dirty at a
+  revision above the remote's so the next push uploads it (previously such an
+  edit could be absorbed into the row at the remote's revision as "synced" and
+  silently never leave the device). Escalation is gated to where this device
+  plausibly owns unpushed content (fresh row / already-dirty row / empty remote);
+  a clean row vs a non-empty newer remote is left alone (no two-device push/pull
+  fight) — the winner policy is "unpushed local edits win once the pull has
+  seen the server row", and `db::sync_user_config` floors every edit's revision
+  at the pull high-water so a slow-clock device can never wedge its config
+  below the server's revision. A post-pull `reconcile_user_config` re-dirties a
+  row already stuck at the server's revision with a divergent payload
+  (equal-revision rows are invisible to the pull high-water; it never pushes
+  over a payload it cannot decrypt).
+  The reflection watermark
   (`last_reflected_index`) rides on the conversation row and is preserved across
   re-index. The first sync per account (guarded by a per-`user_id` sentinel)
   seeds all pre-existing rows +
