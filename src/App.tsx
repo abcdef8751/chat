@@ -71,6 +71,7 @@ import {
   type SyncStatus,
   type ThinkingOptions,
 } from "./lib/api";
+import { isAndroid, onBack, readAttachmentFromUri } from "./lib/platform";
 import { Composer } from "./components/Composer";
 import { Header } from "./components/Header";
 import { MemoryPage } from "./components/MemoryPage";
@@ -265,6 +266,10 @@ export default function App() {
 
   // Memory tab: reads/edits the Markdown memory files.
   const [memoryOpen, setMemoryOpen] = createSignal(false);
+  // Narrow-viewport memory detail page (the full-screen editor opened from the
+  // memory list). Owned here so the Android hardware-back handler can pop the
+  // detail page before closing the dialog. See MemoryPage.
+  const [memoryDetailOpen, setMemoryDetailOpen] = createSignal(false);
   const [memoryFiles, setMemoryFiles] = createSignal<MemoryFile[]>([]);
   const [memorySelected, setMemorySelected] = createSignal<string | null>(null);
   const [memoryDraft, setMemoryDraft] = createSignal("");
@@ -376,6 +381,43 @@ export default function App() {
     } catch {
       // ignore
     }
+
+    // Android hardware/gesture back: pop exactly one layer per press, in
+    // priority order (memory detail → memory dialog → settings → new chat →
+    // reasoning popup → sidebar drawer). Returning `false` when nothing is open
+    // lets the native side finish the activity, so back exits only on the chat
+    // page. Each close goes through the same setter/handler as its visible
+    // control (e.g. `closeSettings` saves). Inert on desktop, where no `pi-back`
+    // event is ever dispatched.
+    const offBack = onBack(() => {
+      if (memoryOpen() && memoryDetailOpen()) {
+        setMemoryDetailOpen(false);
+        return true;
+      }
+      if (memoryOpen()) {
+        setMemoryOpen(false);
+        return true;
+      }
+      if (settingsOpen()) {
+        void closeSettings();
+        return true;
+      }
+      if (newOpen()) {
+        setNewOpen(false);
+        return true;
+      }
+      if (thinkingOpenId()) {
+        setThinkingOpenId(null);
+        return true;
+      }
+      if (sidebarOpen()) {
+        setSidebarOpen(false);
+        hamburgerEl?.focus();
+        return true;
+      }
+      return false;
+    });
+    onCleanup(offBack);
 
     // Narrow-viewport drawer: Escape closes it and returns focus to the
     // hamburger (no-op on wide viewports where the sidebar is always in flow).
@@ -1232,10 +1274,30 @@ export default function App() {
     return models().find((m) => m.id === id)?.vision ?? null;
   };
 
+  // Resolve picked paths into attachments. On Android the dialog plugin returns
+  // `content://` URIs, which the path-based `readAttachments` (std::fs) cannot
+  // open — so read each through the native ContentResolver bridge instead.
+  // Desktop (and any plain filesystem path) keeps the single batched
+  // `readAttachments` call unchanged.
+  async function readPickedAttachments(paths: string[]): Promise<Attachment[]> {
+    if (!isAndroid && !paths.some((p) => p.startsWith("content://"))) {
+      return readAttachments(paths);
+    }
+    const atts: Attachment[] = [];
+    for (const p of paths) {
+      if (isAndroid || p.startsWith("content://")) {
+        atts.push(await readAttachmentFromUri(p));
+      } else {
+        atts.push(...(await readAttachments([p])));
+      }
+    }
+    return atts;
+  }
+
   async function addAttachmentPaths(paths: string[]) {
     if (paths.length === 0) return;
     try {
-      const atts = await readAttachments(paths);
+      const atts = await readPickedAttachments(paths);
       if (atts.length === 0) return;
       setPendingAttachments((prev) => [...prev, ...atts]);
       const images = atts.filter((a) => a.kind === "image").length;
@@ -1489,7 +1551,7 @@ export default function App() {
   async function addEditAttachmentPaths(paths: string[]) {
     if (paths.length === 0) return;
     try {
-      const atts = await readAttachments(paths);
+      const atts = await readPickedAttachments(paths);
       if (atts.length === 0) return;
       setEditAttachments((prev) => [...prev, ...atts]);
     } catch (e) {
@@ -2133,6 +2195,8 @@ export default function App() {
       <MemoryPage
         memoryOpen={memoryOpen()}
         setMemoryOpen={setMemoryOpen}
+        memoryDetailOpen={memoryDetailOpen()}
+        setMemoryDetailOpen={setMemoryDetailOpen}
         wideViewport={wideViewport()}
         fullscreenInsetStyle={fullscreenInsetStyle}
         memoryFiles={memoryFiles()}
