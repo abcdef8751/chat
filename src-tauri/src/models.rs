@@ -58,6 +58,12 @@ pub struct ModelInfo {
     /// provider isn't in the catalog — the endpoint's own `/models` carries no
     /// capability metadata, so an unknown model must not be warned about.
     pub vision: Option<bool>,
+    /// models.dev `reasoning` flag; `None` when the provider isn't in the catalog.
+    pub reasoning: Option<bool>,
+    /// models.dev coarse `attachment` flag (documents + images).
+    pub attachment: Option<bool>,
+    /// Raw models.dev `modalities` JSON (input/output lists); `None` when unknown.
+    pub modalities: Option<String>,
 }
 
 /// Substrings identifying clearly non-chat models (embeddings, audio,
@@ -130,6 +136,9 @@ fn with_meta(ids: Vec<String>, meta: &HashMap<String, ModelMeta>) -> Vec<ModelIn
             ModelInfo {
                 name: m.and_then(|m| m.name.clone()),
                 vision: m.map(ModelMeta::vision),
+                reasoning: m.and_then(|m| m.reasoning),
+                attachment: m.and_then(|m| m.attachment),
+                modalities: m.and_then(|m| m.modalities.clone()),
                 id,
             }
         })

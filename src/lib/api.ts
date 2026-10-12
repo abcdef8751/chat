@@ -95,6 +95,13 @@ export interface Config {
    * storage, e.g. `/storage/emulated/0/PiChat`). Empty = platform default.
    */
   shellWorkspaceDir: string;
+  /**
+   * "YOLO mode": auto-approve every gated tool call instead of waiting for the
+   * user to approve/deny each one. Off by default (local-only; not synced).
+   * The backend always serializes this; optional here only to avoid churning
+   * every existing `setConfig` call site.
+   */
+  autoApproveTools?: boolean;
 }
 
 export interface Pricing {
@@ -122,6 +129,22 @@ export interface ModelInfo {
    * provider isn't in the catalog, in which case nothing is warned about.
    */
   vision: boolean | null;
+  /**
+   * models.dev `reasoning` flag; `null`/absent when the provider isn't in the
+   * catalog. The backend always serializes these three; optional here only to
+   * avoid churning every existing `ModelInfo` construction.
+   */
+  reasoning?: boolean | null;
+  /**
+   * models.dev coarse `attachment` flag (documents + images). Prefer
+   * `modalities` (input list) when present; this is the fallback.
+   */
+  attachment?: boolean | null;
+  /**
+   * Raw models.dev `modalities` JSON, e.g.
+   * `{"input":["text","image"],"output":["text"]}`. `null` when unknown.
+   */
+  modalities?: string | null;
 }
 
 export interface ThinkingOptions {
@@ -215,6 +238,26 @@ export function addMessage(payload: {
   stopReason?: string | null;
 }): Promise<Message> {
   return invoke<Message>("add_message", payload);
+}
+
+/**
+ * Edit a user message, then discard every message after it in that
+ * conversation so the turn can be re-run from the edit point. The backend
+ * updates the row, deletes later rows by `index`, and reconciles the
+ * compaction/reflection watermarks. The caller re-runs `streamChat` afterwards.
+ */
+export function editUserMessage(
+  conversationId: string,
+  messageId: string,
+  content: string,
+  attachments: Attachment[] | null,
+): Promise<void> {
+  return invoke<void>("edit_user_message", {
+    conversationId,
+    messageId,
+    content,
+    attachments,
+  });
 }
 
 export function renameConversation(conversationId: string, title: string): Promise<void> {

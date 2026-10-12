@@ -113,6 +113,10 @@ pub struct AppConfig {
     /// readout survives restarts (the live value in `SyncState` is in-memory
     /// only and otherwise resets to "never" on each launch).
     pub sync_last_sync_at: Option<i64>,
+    /// "YOLO mode": auto-approve every gated tool call instead of waiting for a
+    /// per-call approve/deny. Off by default. Behavioral/local, so unlike
+    /// `preferences` it is deliberately NOT part of `syncable_payload`.
+    pub auto_approve_tools: bool,
 }
 
 impl Default for AppConfig {
@@ -131,6 +135,7 @@ impl Default for AppConfig {
             shell_workspace_dir: String::new(),
             sync_enabled: false,
             sync_last_sync_at: None,
+            auto_approve_tools: false,
         }
     }
 }
