@@ -14,6 +14,7 @@ import {
   deleteConversation,
   deleteMemoryFile,
   denyTool,
+  editUserMessage,
   getConfig,
   getPricing,
   hasBraveKey,
@@ -81,11 +82,26 @@ import {
   formatCost,
   formatToolArgs,
   groupTurns,
+  parseAttachments,
   parseUsage,
   type LiveTool,
 } from "./lib/turns";
 
 const THEME_KEY = "pi-chat-theme";
+
+// Extensions offered by both the composer and the inline editor's file picker.
+const ATTACHMENT_FILTERS = [
+  {
+    name: "Images & documents",
+    extensions: [
+      "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "pdf",
+      "txt", "md", "json", "csv", "log", "yaml", "yml", "toml",
+      "xml", "html", "css", "js", "ts", "tsx", "jsx", "rs", "py",
+      "go", "java", "c", "cpp", "h",
+    ],
+  },
+  { name: "All files", extensions: ["*"] },
+];
 
 export default function App() {
   const [conversations, setConversations] = createSignal<Conversation[]>([]);
@@ -97,6 +113,24 @@ export default function App() {
   const [liveTools, setLiveTools] = createSignal<LiveTool[]>([]);
   const [nearBottom, setNearBottom] = createSignal(true);
   let messagesScrollEl: HTMLElement | undefined;
+
+  // Inline edit of a user message (Item 13). The edited row lives in the DB;
+  // saving rewrites it, drops later messages, and re-streams a fresh reply.
+  const [editingId, setEditingId] = createSignal<string | null>(null);
+  const [editDraft, setEditDraft] = createSignal("");
+  const [editAttachments, setEditAttachments] = createSignal<Attachment[]>([]);
+
+  // The turn currently streaming, plus a monotonic token so a superseded turn's
+  // late channel events (after Stop / a re-send) are ignored.
+  let streamTurn: {
+    id: string;
+    assistantKey: string;
+    userText: string;
+    userAttachments: Attachment[];
+    tempUserId: string | null;
+    receivedText: boolean;
+  } | null = null;
+  let turnToken = 0;
 
   // Files staged for the next message (picked or dropped).
   const [pendingAttachments, setPendingAttachments] = createSignal<Attachment[]>([]);
@@ -554,6 +588,11 @@ export default function App() {
     const id = activeId();
     setThinkingOpenId(null);
     setNearBottom(true);
+    // Editing a message is scoped to the conversation it lives in; a switch
+    // would otherwise let Save target the wrong conversation.
+    setEditingId(null);
+    setEditDraft("");
+    setEditAttachments([]);
     if (!id) {
       setMessages([]);
       return;
@@ -1220,18 +1259,7 @@ export default function App() {
       const picked = await open({
         multiple: true,
         directory: false,
-        filters: [
-          {
-            name: "Images & documents",
-            extensions: [
-              "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "pdf",
-              "txt", "md", "json", "csv", "log", "yaml", "yml", "toml",
-              "xml", "html", "css", "js", "ts", "tsx", "jsx", "rs", "py",
-              "go", "java", "c", "cpp", "h",
-            ],
-          },
-          { name: "All files", extensions: ["*"] },
-        ],
+        filters: ATTACHMENT_FILTERS,
       });
       if (!picked) return;
       await addAttachmentPaths(Array.isArray(picked) ? picked : [picked]);
@@ -1243,6 +1271,140 @@ export default function App() {
   function removeAttachment(id: string) {
     setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
     setAttachmentWarning(null);
+  }
+
+  /// Append a temp assistant row and stream a reply for `text`/`staged` into
+  /// conversation `id`. Shared by `send()` (which stages a new user row first)
+  /// and the inline editor (which rewrites an existing row). `tempUserId` is the
+  /// staged user row, if any, so a pre-stream failure can roll it back.
+  async function runAssistantTurn(
+    id: string,
+    text: string,
+    staged: Attachment[],
+    tempUserId: string | null,
+  ) {
+    const assistantKey = `tmp-assistant-${tempId++}`;
+    const assistantMsg: Message = {
+      id: assistantKey,
+      conversation_id: id,
+      role: "assistant",
+      index: messages().length,
+      content: "",
+      model: null,
+      provider: null,
+      thinking_level: null,
+      thinking: "",
+      usage: null,
+      stop_reason: null,
+      attachments: null,
+      created_at: Date.now(),
+    };
+    setMessages((prev) => [...prev, assistantMsg]);
+    setNearBottom(true);
+    setStreaming(true);
+    setStreamError(null);
+    setLiveTools([]);
+    setThinkingOpenId(null);
+
+    const token = ++turnToken;
+    streamTurn = {
+      id,
+      assistantKey,
+      userText: text,
+      userAttachments: staged,
+      tempUserId,
+      receivedText: false,
+    };
+
+    const received = { current: false };
+    const channel = new Channel<StreamEvent>();
+    channel.onmessage = (ev) => {
+      // Ignore events from a superseded turn (Stop, then a new send).
+      if (activeId() !== id || token !== turnToken) return;
+      if (ev.type === "delta") {
+        received.current = true;
+        if (streamTurn) streamTurn.receivedText = true;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantKey ? { ...m, content: m.content + ev.text } : m,
+          ),
+        );
+      } else if (ev.type === "thinkingDelta") {
+        received.current = true;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantKey ? { ...m, thinking: (m.thinking ?? "") + ev.text } : m,
+          ),
+        );
+      } else if (ev.type === "toolCall") {
+        received.current = true;
+        // Flush the round's streamed reasoning + preamble text onto this call,
+        // then reset the in-flight message so the next round starts clean. The
+        // final round emits no `toolCall`, so whatever text remains stays as the
+        // answer bubble. `groupTurns` re-emits the flushed preamble before this
+        // call, matching the persisted rows after `done`.
+        const cur = messages().find((m) => m.id === assistantKey);
+        const thinking = cur?.thinking ?? "";
+        const preamble = cur?.content ?? "";
+        const hasPreamble = thinking.trim().length > 0 || preamble.trim().length > 0;
+        if (hasPreamble) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantKey ? { ...m, content: "", thinking: "" } : m,
+            ),
+          );
+        }
+        setLiveTools((prev) => [
+          ...prev,
+          {
+            callId: ev.callId,
+            name: ev.name,
+            arguments: formatToolArgs(ev.arguments),
+            gated: ev.gated,
+            state: ev.gated ? "pending" : "running",
+            thinking: hasPreamble ? thinking : undefined,
+            text: hasPreamble ? preamble : undefined,
+          },
+        ]);
+      } else if (ev.type === "toolResult") {
+        setLiveTools((prev) =>
+          prev.map((t) =>
+            t.callId === ev.callId
+              ? { ...t, state: "done", ok: ev.ok, output: ev.output }
+              : t,
+          ),
+        );
+      } else if (ev.type === "done" || ev.type === "error") {
+        if (ev.type === "error") setStreamError(ev.message);
+        setStreaming(false);
+        setLiveTools([]);
+        streamTurn = null;
+        listMessages(id).then(setMessages);
+        refreshConversations().catch(() => {});
+      }
+    };
+
+    try {
+      await streamChat(id, text, staged, channel);
+    } catch (e) {
+      if (activeId() !== id || token !== turnToken) return;
+      if (!received.current) {
+        // Command errored before streaming began (e.g. missing key/match).
+        setMessages((prev) =>
+          prev.filter(
+            (m) => m.id !== assistantKey && (tempUserId === null || m.id !== tempUserId),
+          ),
+        );
+        if (tempUserId !== null) {
+          setDraft(text);
+          setPendingAttachments(staged);
+        }
+      }
+      setStreaming(false);
+      setLiveTools([]);
+      streamTurn = null;
+      setStreamError(String(e));
+    }
   }
 
   async function send() {
@@ -1273,105 +1435,110 @@ export default function App() {
       attachments: staged.length > 0 ? JSON.stringify(staged) : null,
       created_at: Date.now(),
     };
-    const assistantKey = `tmp-assistant-${tempId++}`;
-    const assistantMsg: Message = {
-      id: assistantKey,
-      conversation_id: id,
-      role: "assistant",
-      index: messages().length + 1,
-      content: "",
-      model: null,
-      provider: null,
-      thinking_level: null,
-      thinking: "",
-      usage: null,
-      stop_reason: null,
-      attachments: null,
-      created_at: Date.now(),
-    };
 
-    setMessages([...messages(), userMsg, assistantMsg]);
-    setNearBottom(true);
+    setMessages((prev) => [...prev, userMsg]);
     setDraft("");
     setPendingAttachments([]);
-    setStreaming(true);
-    setStreamError(null);
-    setLiveTools([]);
-    setThinkingOpenId(null);
-
-    const received = { current: false };
-    const channel = new Channel<StreamEvent>();
-    channel.onmessage = (ev) => {
-      if (activeId() !== id) return;
-      if (ev.type === "delta") {
-        received.current = true;
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantKey ? { ...m, content: m.content + ev.text } : m,
-          ),
-        );
-      } else if (ev.type === "thinkingDelta") {
-        received.current = true;
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantKey ? { ...m, thinking: (m.thinking ?? "") + ev.text } : m,
-          ),
-        );
-      } else if (ev.type === "toolCall") {
-        received.current = true;
-        setLiveTools((prev) => [
-          ...prev,
-          {
-            callId: ev.callId,
-            name: ev.name,
-            arguments: formatToolArgs(ev.arguments),
-            gated: ev.gated,
-            state: ev.gated ? "pending" : "running",
-          },
-        ]);
-      } else if (ev.type === "toolResult") {
-        setLiveTools((prev) =>
-          prev.map((t) =>
-            t.callId === ev.callId
-              ? { ...t, state: "done", ok: ev.ok, output: ev.output }
-              : t,
-          ),
-        );
-      } else if (ev.type === "done" || ev.type === "error") {
-        if (ev.type === "error") setStreamError(ev.message);
-        setStreaming(false);
-        setLiveTools([]);
-        listMessages(id).then(setMessages);
-        refreshConversations().catch(() => {});
-      }
-    };
-
-    try {
-      await streamChat(id, text, staged, channel);
-    } catch (e) {
-      if (activeId() !== id) return;
-      if (!received.current) {
-        // Command errored before streaming began (e.g. missing key/match).
-        setMessages((prev) =>
-          prev.filter((m) => m.id !== assistantKey && m.id !== userMsg.id),
-        );
-        setDraft(text);
-        setPendingAttachments(staged);
-      }
-      setStreaming(false);
-      setLiveTools([]);
-      setStreamError(String(e));
-    }
+    await runAssistantTurn(id, text, staged, userMsg.id);
   }
 
   async function stop() {
     const id = activeId();
     if (!id) return;
+    // Return to an idle state immediately rather than waiting on the stream's
+    // `done` event: clear live activity and re-enable/focus the composer (the
+    // Composer focuses itself when `streaming` drops). The partial assistant
+    // text is already in `messages`, so it stays in the transcript. The stream's
+    // own `done` event then reloads the persisted rows (reconstructing the
+    // timeline) — we do NOT supersede the turn token here, or that reload would
+    // be dropped.
+    const turn = streamTurn;
+    streamTurn = null;
+    setStreaming(false);
+    setLiveTools([]);
+    if (turn && !turn.receivedText && activeId() === turn.id && !draft().trim()) {
+      // Aborted before any assistant text: hand the user's message back so it
+      // can be re-sent.
+      setDraft(turn.userText);
+      if (turn.userAttachments.length > 0) setPendingAttachments(turn.userAttachments);
+    }
     try {
       await stopChat(id);
     } catch {
-      // noop — the stream will settle via its done event
+      // noop — the backend still settles the aborted turn.
     }
+  }
+
+  // --- Inline editing of user messages (Item 13) --------------------------
+
+  function startEditMessage(m: Message) {
+    if (streaming()) return;
+    // Only persisted rows are editable; a `tmp-` row hasn't been written yet.
+    if (m.id.startsWith("tmp-")) return;
+    setEditingId(m.id);
+    setEditDraft(m.content);
+    setEditAttachments(parseAttachments(m));
+  }
+
+  function cancelEditMessage() {
+    setEditingId(null);
+    setEditDraft("");
+    setEditAttachments([]);
+  }
+
+  async function addEditAttachmentPaths(paths: string[]) {
+    if (paths.length === 0) return;
+    try {
+      const atts = await readAttachments(paths);
+      if (atts.length === 0) return;
+      setEditAttachments((prev) => [...prev, ...atts]);
+    } catch (e) {
+      setStreamError(String(e));
+    }
+  }
+
+  async function pickEditAttachments() {
+    try {
+      const picked = await open({
+        multiple: true,
+        directory: false,
+        filters: ATTACHMENT_FILTERS,
+      });
+      if (!picked) return;
+      await addEditAttachmentPaths(Array.isArray(picked) ? picked : [picked]);
+    } catch (e) {
+      setStreamError(String(e));
+    }
+  }
+
+  function removeEditAttachment(id: string) {
+    setEditAttachments((prev) => prev.filter((a) => a.id !== id));
+  }
+
+  async function saveEditMessage() {
+    const id = activeId();
+    const messageId = editingId();
+    if (!id || !messageId || streaming()) return;
+    const text = editDraft().trim();
+    const atts = editAttachments();
+    if (!text && atts.length === 0) return;
+    try {
+      await editUserMessage(id, messageId, text, atts.length > 0 ? atts : null);
+    } catch (e) {
+      setStreamError(String(e));
+      return;
+    }
+    cancelEditMessage();
+    // The edit rewrote the row and deleted everything after it; reload so the
+    // transcript matches, then stream a fresh assistant reply for the edit.
+    try {
+      const rows = await listMessages(id);
+      if (activeId() === id) setMessages(rows);
+    } catch {
+      // The stream's `done` reload below still reconciles state.
+    }
+    if (activeId() !== id) return;
+    await runAssistantTurn(id, text, atts, null);
   }
 
   function approveLiveTool(callId: string) {
@@ -1828,12 +1995,22 @@ export default function App() {
             <MessageList
               turns={turns()}
               empty={messages().length === 0}
+              streaming={streaming()}
               thinkingOpenId={thinkingOpenId()}
               onToggleThought={(id) =>
                 setThinkingOpenId(thinkingOpenId() === id ? null : id)
               }
               onApprove={approveLiveTool}
               onDeny={denyLiveTool}
+              editingId={editingId()}
+              editDraft={editDraft()}
+              setEditDraft={setEditDraft}
+              editAttachments={editAttachments()}
+              onStartEdit={startEditMessage}
+              onCancelEdit={cancelEditMessage}
+              onSaveEdit={() => void saveEditMessage()}
+              onRemoveEditAttachment={removeEditAttachment}
+              onPickEditAttachments={() => void pickEditAttachments()}
             />
           </Show>
 
