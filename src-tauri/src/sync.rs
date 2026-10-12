@@ -526,13 +526,20 @@ pub async fn sync_now(app: AppHandle) -> Result<SyncStatus, String> {
 /// Background scheduler: when sync is enabled + signed in (and not already
 /// syncing) run push then pull every 60 seconds. Never blocks the UI; failures
 /// degrade to `lastError` and retry on the next tick.
+///
+/// Runs one round IMMEDIATELY on startup instead of waiting out the first 60s
+/// sleep: launching the app is the most likely moment for changes made on
+/// another device to be waiting, so the config and chat list should reconcile as
+/// soon as the window opens rather than a minute later. Cheap when inactive —
+/// `do_sync` returns on `!sync_enabled` before it reads the keychain — and the
+/// `syncing` swap-guard keeps it from overlapping a manual "Sync now".
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
             if let Err(e) = do_sync(&app).await {
                 eprintln!("sync: {e}");
             }
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
 }

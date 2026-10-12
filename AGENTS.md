@@ -595,6 +595,9 @@ and the app is byte-identical to before. Never blocks the UI.
   `sync_recovery_code` (see `api.ts`).
   Background scheduler (60s tick) runs push+pull only
   when enabled + signed in; a `syncing` swap-guard prevents overlapping runs.
+  It also runs one round **immediately on startup** (rather than after the first
+  60s wait), so changes made on another device reconcile as the window opens;
+  the call is a no-op when sync is disabled or signed out.
 - **Schema:** `supabase/schema.sql` (run in the Supabase SQL editor) creates
   `conversations`, `messages`, `memory_files` with revision/deleted_at, enables
   RLS, and stores the client revision via a trigger.
