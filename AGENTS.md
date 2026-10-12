@@ -47,17 +47,21 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **145 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **181 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
-`tsc --noEmit`, and `npm run build` are clean.
+`tsc --noEmit`, and `npm run build` are clean. The Android target also
+type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
+`CC_aarch64_linux_android` etc.). The GUI e2e needs a display and is run
+separately.
 
 | Area              | State | Notes                                                                                                     |
 | ----------------- | ----- | --------------------------------------------------------------------------------------------------------- |
 | Stack / scaffold  | ✅    | SolidJS + Tailwind v4 + Kobalte + Tauri v2; SQLite via rusqlite (bundled)                                  |
 | Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, capped tool loop                        |
-| Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; price overrides                  |
-| Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline                                 |
-| Tools             | ✅    | `bash` (one-shot shell), `read_file`/`write_file` (gated), native Brave search tools (ungated)          |
+| Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; per-model price **and capability (modality) overrides** |
+| Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline, **editable user messages** (edit → truncate → re-run) |
+| Tools             | ✅    | `bash` (one-shot shell), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), native Brave search tools (ungated) |
+| UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; memory page list→detail on narrow viewports |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
 | Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
 | Context + price   | ✅    | Context counter, frozen per-turn cost, near-limit note, forced compaction (M7)                            |
@@ -75,7 +79,7 @@ prompt(userMessage)
 ├─ if the request is over 80% of the window: fold older history into the summary first
 ├─ stream deltas ─────────────────────────── emit `delta` / `thinkingDelta` events
 ├─ if assistant emits tool calls:
-│   ├─ gate each call (approve / deny / abort)
+│   ├─ gate each call (approve / deny / abort) — skipped when auto_approve_tools
 │   ├─ execute tool
 │   ├─ on error: return a tool-error result (model self-corrects)
 │   └─ loop back to the LLM (MAX_TOOL_ROUNDS = 8)
@@ -88,6 +92,28 @@ errors keep partial text and mark `stop_reason = "error"`. Within a turn, each
 tool-call round's reasoning is echoed on its assistant tool-call message for the
 following rounds (DeepSeek thinking mode requires it, else HTTP 400); traces are
 **never** replayed across user turns. Toggle: `AppConfig.echo_reasoning_content`.
+
+**Edit → re-run.** `db::edit_user_message` rewrites a `user` row and deletes
+every later row in the conversation (recording per-message tombstones so the
+truncation propagates), then the frontend re-streams. That re-stream passes
+`regenerate: true`, which makes `run_chat_turn` build the turn from `content`
+without inserting a second `user` row and drops the already-persisted copy from
+the in-memory history. `regenerate: false` is the ordinary send path.
+
+**YOLO mode.** `AppConfig.auto_approve_tools` (Settings toggle) auto-approves
+gated tools: the approval wait is skipped and the `ToolCall` event is emitted
+with `gated: false`, so the UI never shows the pending approve/deny row. Local
+data only (not synced).
+
+**`read_file` images.** A raster image (png/jpg/gif/webp/bmp; SVG/ICO excluded;
+capped at `MAX_IMAGE_BYTES`) read by `read_file` is delivered to the model as an
+**image part** when the turn's model is vision-capable — and the vision check is
+override-aware (`resolve_capabilities`: user override → models.dev → text-only
+default). Because async-openai's tool messages are text-only, the image rides a
+synthetic **user** message appended *after* the round's tool results (so parallel
+tool calls stay adjacent to their results); it is request-scoped and never
+persisted. A non-vision model gets a plain text result saying it cannot view
+images.
 
 **Failure-handling contract**
 
@@ -203,14 +229,26 @@ memory_backfill_runs(             -- reduce-pass spend (spans many conversations
 - **Pricing** is resolved lazily and cached: **override → fetched `model_prices` →
   bundled fallback → default**. Cost is frozen on the message at the rates in
   effect, so switching models never re-prices past turns.
-- **Capabilities** ride along in the same cache: `attachment` and `modalities`
-  from models.dev, surfaced on `ModelInfo.vision` via `ModelMeta::vision()`,
-  which prefers the explicit `modalities.input` list and falls back to the
-  coarser `attachment` flag (they agree on ~93% of the catalog; `attachment`
-  also covers models that take documents but not images). The composer warns
-  when an image is attached to a model that cannot see it, rather than letting
-  the provider drop it or reject the turn. `vision` is `None` when the provider
-  isn't in the catalog, so an unknown model is never warned about.
+- **Capabilities** are resolved **user override → models.dev cache → default**
+  (`pricing::resolve_capabilities`): `ModelOverride.{input_modalities,
+  output_modalities, reasoning}` beat the cached `attachment`/`modalities`/
+  `reasoning` from models.dev, which beat the defaults (**text in, text out,
+  reasoning supported**). The override is the *only* way to declare capability
+  for a manually-added provider, which never gets a models.dev entry (see
+  "models.dev lookup" below). `ModelInfo` exposes the raw catalog values
+  (`reasoning`/`attachment`/`modalities`) plus a resolved `vision` bit the
+  composer's image warning uses; the Settings "Capabilities" card edits the
+  override by click-to-toggle. Note `vision` is now always `Some`: the text-only
+  default means an un-annotated custom model is warned about images until you
+  mark it `image`-capable.
+- **models.dev lookup.** The catalog is one public JSON blob
+  (`https://models.dev/api.json`), matched to a provider **by base URL** (exact
+  `api` first, then host). But the fetch is **gated on `catalog_id`**: only a
+  provider added via the "Add provider" catalog picker ever consults models.dev;
+  a manual/custom endpoint lists via its own `GET /models` (which carries no
+  capability metadata), so its models get the defaults above. Cache rows in
+  `model_prices` are keyed by the normalized base-URL string (`provider_key`),
+  not by catalog id.
 
 ---
 
@@ -367,10 +405,12 @@ Introduced through the same loop, so they're visible, gateable, and aborted like
 everything else.
 
 ```rust
-// Approval-gated (local side effects / local data)
+// Approval-gated (local side effects / local data) — ungated when YOLO
+// (`AppConfig.auto_approve_tools`) is on.
 bash(command)                     // runs a fresh `bash -c` per call (one-shot); Android
                                   //   executes inside the user's Termux (see ANDROID_SHELL.md)
-read_file(path)
+read_file(path)                   // text, or an image part when the model is
+                                  //   vision-capable (see "read_file images")
 write_file(path, content)
 
 // Memory — ungated, app-local. All three are in the shared tool list; access
@@ -391,6 +431,8 @@ brave_summarizer(query, count?)
 The tool list is byte-identical for live and reflection turns so the prompt-cache
 prefix matches; `run_tool_loop` refuses disallowed calls by mode instead of
 splitting the list (live: no `write_memory`; reflection: no host/web tools).
+Gating (`tools::is_gated` = bash/read_file/write_file) is bypassed entirely when
+YOLO mode is on.
 
 **Brave integration (native, no node/MCP process):** `tools.rs` `BraveSearch`
 calls `api.search.brave.com` directly over `reqwest` (the same six-tool surface
@@ -476,14 +518,21 @@ and the app is byte-identical to before. Never blocks the UI.
   (`last_reflected_index`) rides on the conversation row and is preserved across
   re-index. The first sync per account (guarded by a per-`user_id` sentinel)
   seeds all pre-existing rows +
-  memory files dirty so enabling backs up full history once. Two cross-device
+  memory files dirty so enabling backs up full history once. Three cross-device
   gotchas are handled explicitly: (1) **imported chats are sync-dirtied** —
   `insert_imported_conversation` writes them with `dirty = 1` (and a duplicate
   re-import re-marks them, so an archive imported *after* the first sync still
   reaches other devices); (2) the first-sync **seed skips empty memory files** —
   a fresh device auto-creates empty `profile.md`/`preferences.md`/`goals.md`
   stubs, and if those were seeded dirty their freshly-bumped revisions would beat
-  the real content on the mirror under LWW and silently drop it on pull.
+  the real content on the mirror under LWW and silently drop it on pull. (3)
+  **message tombstones for edit-time truncation** — `edit_user_message` deletes
+  later rows, so it records a row per deleted id in `sync_tombstones`
+  (which gained a nullable `conversation_id` column for this; the truncated row
+  is gone by push time and the remote `messages` row needs a non-null
+  `conversation_id`). Push emits those as `messages` rows with `deleted_at`, and
+  `clear_message_tombstones` retires them after a successful push. Inherits the
+  same wall-clock-revision clock-skew caveat as conversation tombstones.
 - **Memory files** sync whole-file (identity by path), tracking metadata in the
   `memory_sync` table; a failed apply is left dirty and retried.
 - **Client-side encryption** (`crypt.rs`, opt-in, **off by default** — see
@@ -536,6 +585,7 @@ and the app is byte-identical to before. Never blocks the UI.
 ├─ index.html
 ├─ vite.config.ts      # Vite + vite-plugin-solid + @tailwindcss/vite
 ├─ package.json
+├─ scripts/            # android-debug.sh / android-release.sh (`tauri android build` wrappers)
 ├─ e2e/                # GUI end-to-end harness (mock LLM + tauri-driver/WebKitWebDriver)
 │  ├─ run.sh           # orchestrates mock + vite + tauri-driver + e2e.mjs
 │  ├─ e2e.mjs          # WebDriver client + assertions
@@ -544,15 +594,24 @@ and the app is byte-identical to before. Never blocks the UI.
 ├─ src/
 │  ├─ index.tsx        # entry; imports ./index.css (Tailwind)
 │  ├─ index.css        # Tailwind import + typography + class-based dark variant
-│  ├─ App.tsx          # UI shell (sidebar, dialogs, messages, timeline, theme)
+│  ├─ App.tsx          # thin shell: shared chat/settings state + mounts the surfaces
+│  ├─ components/      # surfaces split out of App.tsx (Sidebar, Header, MessageList,
+│  │                   #   Timeline, Composer, MemoryPage, SettingsDialog)
 │  └─ lib/
 │     ├─ api.ts        # typed invoke wrappers over Tauri commands
+│     ├─ platform.ts   # Android bridge: isAndroid / onBack / exitApp / readAttachmentFromUri
+│     ├─ turns.ts      # pure turn/timeline helpers + types (groupTurns/buildEntries/parsers)
+│     ├─ icons.tsx     # inline SVG icons
 │     └─ Markdown.tsx  # marked + DOMPurify renderer (prose + dark:prose-invert)
 └─ src-tauri/
    ├─ tauri.conf.json  # v2 config (productName, window, devUrl, frontendDist)
    ├─ Cargo.toml       # tauri, serde, rusqlite [bundled], uuid, async-openai, keyring, reqwest, tokio, tokio-stream
    ├─ capabilities/default.json
-   ├─ build.rs
+   ├─ vendor/tauri-runtime-wry/  # vendored+patched crate (see PATCH.md) via [patch.crates-io]
+   ├─ gen/android/     # generated Android project (Kotlin: MainActivity.kt window
+   │                   #   insets/back, FileBridgePlugin.kt content:// resolver,
+   │                   #   KeepAliveService.kt foreground service, RunCommandPlugin.kt Termux bridge)
+   ├─ build.rs         # embeds SUPABASE_URL/PUBLISHABLE_KEY from ../.env (rerun-if-changed)
    └─ src/
       ├─ main.rs       # thin entry -> chat_app_lib::run()
       ├─ lib.rs        # Builder, setup (SQLite + config + Brave + registries + reflection), invoke_handler
@@ -560,12 +619,14 @@ and the app is byte-identical to before. Never blocks the UI.
       ├─ config.rs     # AppConfig, config.json persistence, legacy key migration
       ├─ secrets.rs    # OS-keychain API key storage (keyring crate) + has/set_api_key
       ├─ crypt.rs      # client-side AES-256-GCM + Argon2id key wrapping (cloud sync)
-      ├─ models.rs     # list_models (models.dev catalog, /models fallback), chat filter, per-baseUrl cache
-      ├─ tools.rs      # tool specs, host executor, approval registry, native BraveSearch
+      ├─ models.rs     # list_models (models.dev catalog, /models fallback), chat filter,
+      │                 #   per-baseUrl cache, ModelInfo (override-aware `vision`)
+      ├─ tools.rs      # tool specs, host executor, gating + approval registry
+      │                 #   (YOLO bypass), native BraveSearch
       ├─ shell.rs      # one-shot host shell executor (fresh `bash -c` per call);
       │                 #   Android routes to the Termux bridge (android.rs)
-      ├─ android.rs    # Android: Termux RUN_COMMAND bridge (`run_command` plugin) [mobile];
-      │                 #   also hosts the rustls-platform-verifier JNI init (see below)
+      ├─ android.rs    # Android [mobile]: Termux RUN_COMMAND bridge (`run_command`
+      │                 #   plugin), `content://` file bridge (`file_bridge`), rustls init
       ├─ memory.rs     # Plain-Markdown memory: core files, listing, save/read/write, migration
       ├─ import.rs     # Anthropic-export importer (timestamp-preserving, backfill-only)
       ├─ reflection.rs # Idle memory-consolidation scheduler + per-conversation pass
@@ -573,7 +634,8 @@ and the app is byte-identical to before. Never blocks the UI.
       └─ sync/
          └─ tests.rs   # sync tests (revision, LWW, tombstones, re-index, mock PostgREST)
       ├─ attachments.rs # read paths -> Attachment (image data URL / text / metadata)
-      ├─ pricing.rs    # pricing + models.dev metadata cache; overrides -> cache -> bundled
+      ├─ pricing.rs    # pricing + models.dev metadata cache; overrides -> cache -> bundled;
+      │                 #   resolve_capabilities (modalities/reasoning, override-aware)
       ├─ chat.rs       # stream_chat/stop_chat, raw SSE, run_tool_loop, StreamRegistry, StreamEvent
       └─ chat/
          └─ tests.rs   # chat-loop tests (mock SSE: tools, reasoning, abort, usage)
@@ -586,7 +648,8 @@ and the app is byte-identical to before. Never blocks the UI.
 ### Frontend (SolidJS)
 
 - Use `createSignal` / `createEffect` / `For` / `Show` from `solid-js`. No class components.
-- All Tauri calls go through typed wrappers in `src/lib/api.ts`; components never call `invoke` directly.
+- All Tauri calls go through typed wrappers in `src/lib/api.ts`; components never call `invoke` directly. Android-only hooks live in `src/lib/platform.ts` (`isAndroid`/`onBack`/`exitApp`/`readAttachmentFromUri`).
+- UI surfaces live in `src/components/*` (Sidebar, Header, MessageList, Timeline, Composer, MemoryPage, SettingsDialog); `App.tsx` is a shell that owns shared state and passes it down as props. Put new surface state in the owning component.
 - Style with Tailwind utility classes only (no CSS modules). Tailwind scans `src/**`.
 - Kobalte components are namespaced: `import { Dialog } from "@kobalte/core/dialog"` then `<Dialog.Root>`, `<Dialog.Trigger>`, etc.
 
@@ -650,10 +713,56 @@ and the app is byte-identical to before. Never blocks the UI.
   `MainActivity.onWebViewCreate(webView)` overrides the `WryActivity` hook and
   sets an `OnApplyWindowInsetsListener` that translates the system-bar +
   display-cutout insets into WebView padding — one hook, no Rust/plugin changes.
+- **Android relaunch blank-screen + vendored patch:** after a swipe-away,
+  `prevent_exit()` + `KeepAliveService` keep the process alive with **zero
+  windows**; upstream `tauri-runtime-wry` 2.11.4 never delivers
+  `RunEvent::Resumed` on mobile (the loop drives `ControlFlow::Wait`, so its
+  `StartCause::Poll` arm is dead), so the window-recreate handler in `lib.rs`
+  never ran and the relaunch came back blank until the process was killed. Fixed
+  by **vendoring + patching** the crate (`src-tauri/vendor/tauri-runtime-wry`,
+  upstream PR #15678) via `[patch.crates-io]` — see `PATCH.md` for the exact hunk
+  and removal steps. Device-verification still pending.
+- **Android file pick + hardware back:** `tauri-plugin-dialog` returns
+  `content://` URIs on Android, which `std::fs` cannot read (so attachments were
+  silently dropped). `FileBridgePlugin.kt` resolves a URI via `ContentResolver`
+  and the `read_attachment_from_uri` command builds the `Attachment`. Hardware
+  back goes through `MainActivity`'s `OnBackPressedCallback`, which dispatches a
+  **cancelable** `pi-back` event; `src/lib/platform.ts`'s `onBack` returns `true`
+  to consume it, otherwise the activity finishes (so back exits only on the chat
+  page). Both need a device.
+- **Supabase URL is compile-time, from `.env`.** `build.rs` reads `../.env` and
+  emits `cargo:rustc-env=SUPABASE_URL=…`. It now declares
+  `cargo:rerun-if-changed` on that path: without it, cargo reuses a build-script
+  output produced before `.env` existed (e.g. a `CARGO_TARGET_DIR` shared with a
+  worktree), leaving the `https://localhost.supabase.co` fallback in the binary —
+  which surfaces as an opaque sync request error (now a clear one via
+  `sync::ensure_configured`).
 
 ---
 
 ## Next / open items
+
+**Recent backlog (landed):** a 13-item pass — drawer-open keyboard, memory page
+list→detail on mobile, Enter=newline on Android, live↔persisted timeline
+interleave, YOLO mode, Android file/image picker, touch-reachable chat-list
+actions, Android relaunch fix (vendored patch), `read_file` images, editable +
+resolved model capabilities, hardware back stack, stop→composer, editable
+messages. `App.tsx` was split into `src/components/*` to make that parallelisable.
+
+Residuals/open from that pass:
+
+- **Android behaviors need a device** (picker, hardware back, and the
+  relaunch/recreate fix); the Kotlin isn't compiled off-device.
+- **GUI e2e was not run** (no display in the change window) — the live-interleave
+  DOM stability and the flushed-reasoning popup are the areas worth re-checking.
+- **`stop()` does not restore the draft.** The user row is persisted before
+  streaming starts, so restoring would duplicate it on the next send; the turn
+  stays in the transcript and is editable instead. (Zero-event aborts therefore
+  leave a user turn with no reply.)
+- **`regenerate` dedup** matches the last `user` row by content (robust to a row
+  appended after the edit).
+- **Message-tombstone** propagation shares the wall-clock-revision clock-skew
+  caveat noted above.
 
 **Milestone 7 — context** (done except the optional tail):
 
