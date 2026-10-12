@@ -1,6 +1,8 @@
 import { For, Index, Show } from "solid-js";
+import type { Attachment, Message } from "../lib/api";
 import Markdown from "../lib/Markdown";
-import { DocIcon, MarkAvatar } from "../lib/icons";
+import { DocIcon, MarkAvatar, PaperclipIcon } from "../lib/icons";
+import { isAndroid } from "../lib/platform";
 import { formatBytes, parseAttachments, type Turn } from "../lib/turns";
 import { Timeline } from "./Timeline";
 
@@ -9,10 +11,20 @@ import { Timeline } from "./Timeline";
 export function MessageList(props: {
   turns: Turn[];
   empty: boolean;
+  streaming: boolean;
   thinkingOpenId: string | null;
   onToggleThought: (id: string) => void;
   onApprove: (callId: string) => void;
   onDeny: (callId: string) => void;
+  editingId: string | null;
+  editDraft: string;
+  setEditDraft: (value: string) => void;
+  editAttachments: Attachment[];
+  onStartEdit: (m: Message) => void;
+  onCancelEdit: () => void;
+  onSaveEdit: () => void;
+  onRemoveEditAttachment: (id: string) => void;
+  onPickEditAttachments: () => void;
 }) {
   return (
     <div class="flex min-h-full flex-col justify-end space-y-3">
@@ -30,31 +42,127 @@ export function MessageList(props: {
                 {(u) => (
                   <div class="flex justify-end">
                     <div class="max-w-[80%]">
-                      <div class="rounded-xl bg-neutral-900 px-4 py-2.5 text-sm text-white dark:bg-white dark:text-neutral-900">
-                        <div class="mb-0.5 text-[11px] opacity-60">you</div>
-                        <Show when={parseAttachments(u()).length > 0}>
-                          <div class="mb-2 flex flex-wrap items-end gap-2">
-                            <For each={parseAttachments(u())}>
-                              {(a) =>
-                                a.kind === "image" && a.dataUrl ? (
-                                  <img
-                                    src={a.dataUrl}
-                                    alt={a.name}
-                                    class="max-h-64 max-w-full rounded-lg border border-white/20 dark:border-neutral-900/20"
-                                  />
-                                ) : (
-                                  <div class="flex items-center gap-2 rounded-lg border border-white/25 bg-white/10 px-2.5 py-1.5 text-xs dark:border-neutral-900/20 dark:bg-neutral-900/10">
-                                    <DocIcon />
-                                    <span class="max-w-52 truncate">{a.name}</span>
-                                    <span class="opacity-60">{formatBytes(a.size)}</span>
+                      <Show
+                        when={props.editingId === u().id}
+                        fallback={
+                          <>
+                            <div class="flex items-start justify-end gap-1.5">
+                              <button
+                                onClick={() => props.onStartEdit(u())}
+                                disabled={props.streaming}
+                                title="Edit this message"
+                                aria-label="Edit message"
+                                class="mt-1 shrink-0 rounded-md border border-neutral-300 px-2 py-1 text-[11px] text-neutral-500 transition hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-800"
+                              >
+                                Edit
+                              </button>
+                              <div class="rounded-xl bg-neutral-900 px-4 py-2.5 text-sm text-white dark:bg-white dark:text-neutral-900">
+                                <div class="mb-0.5 text-[11px] opacity-60">you</div>
+                                <Show when={parseAttachments(u()).length > 0}>
+                                  <div class="mb-2 flex flex-wrap items-end gap-2">
+                                    <For each={parseAttachments(u())}>
+                                      {(a) =>
+                                        a.kind === "image" && a.dataUrl ? (
+                                          <img
+                                            src={a.dataUrl}
+                                            alt={a.name}
+                                            class="max-h-64 max-w-full rounded-lg border border-white/20 dark:border-neutral-900/20"
+                                          />
+                                        ) : (
+                                          <div class="flex items-center gap-2 rounded-lg border border-white/25 bg-white/10 px-2.5 py-1.5 text-xs dark:border-neutral-900/20 dark:bg-neutral-900/10">
+                                            <DocIcon />
+                                            <span class="max-w-52 truncate">{a.name}</span>
+                                            <span class="opacity-60">{formatBytes(a.size)}</span>
+                                          </div>
+                                        )
+                                      }
+                                    </For>
                                   </div>
-                                )
+                                </Show>
+                                <div class="whitespace-pre-wrap break-words">{u().content}</div>
+                              </div>
+                            </div>
+                          </>
+                        }
+                      >
+                        <div class="rounded-xl border border-neutral-300 bg-white p-3 text-sm shadow-sm dark:border-neutral-700 dark:bg-neutral-900">
+                          <Show when={props.editAttachments.length > 0}>
+                            <div class="mb-2 flex flex-wrap items-end gap-2">
+                              <For each={props.editAttachments}>
+                                {(a) => (
+                                  <div class="relative">
+                                    <Show
+                                      when={a.kind === "image" && a.dataUrl}
+                                      fallback={
+                                        <div class="flex items-center gap-2 rounded-lg border border-neutral-300 bg-neutral-100 px-2.5 py-1.5 text-xs dark:border-neutral-700 dark:bg-neutral-800">
+                                          <DocIcon />
+                                          <span class="max-w-52 truncate">{a.name}</span>
+                                          <span class="opacity-60">{formatBytes(a.size)}</span>
+                                        </div>
+                                      }
+                                    >
+                                      <img
+                                        src={a.dataUrl ?? ""}
+                                        alt={a.name}
+                                        class="h-16 w-16 rounded-lg border border-neutral-300 object-cover dark:border-neutral-700"
+                                      />
+                                    </Show>
+                                    <button
+                                      onClick={() => props.onRemoveEditAttachment(a.id)}
+                                      title="Remove attachment"
+                                      class="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-neutral-900 text-xs leading-none text-white shadow transition hover:bg-red-600 dark:bg-white dark:text-neutral-900 dark:hover:bg-red-400"
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </Show>
+                          <textarea
+                            ref={(el) => el.focus()}
+                            class="w-full resize-none rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-900 dark:focus:border-neutral-500"
+                            rows={3}
+                            value={props.editDraft}
+                            onInput={(e) => props.setEditDraft(e.currentTarget.value)}
+                            onKeyDown={(e) => {
+                              // Escape cancels; Enter saves on desktop, newlines
+                              // on Android (matching the composer).
+                              if (e.key === "Escape") {
+                                e.preventDefault();
+                                props.onCancelEdit();
+                              } else if (e.key === "Enter" && !e.shiftKey && !isAndroid) {
+                                e.preventDefault();
+                                props.onSaveEdit();
                               }
-                            </For>
+                            }}
+                          />
+                          <div class="mt-2 flex items-center justify-between gap-2">
+                            <button
+                              onClick={props.onPickEditAttachments}
+                              title="Attach files"
+                              aria-label="Attach files"
+                              class="flex h-9 w-9 items-center justify-center rounded-lg border border-neutral-300 text-neutral-500 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-800"
+                            >
+                              <PaperclipIcon />
+                            </button>
+                            <div class="flex gap-2">
+                              <button
+                                onClick={props.onCancelEdit}
+                                class="rounded-lg border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                onClick={props.onSaveEdit}
+                                class="rounded-lg bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                              >
+                                Save
+                              </button>
+                            </div>
                           </div>
-                        </Show>
-                        <div class="whitespace-pre-wrap break-words">{u().content}</div>
-                      </div>
+                        </div>
+                      </Show>
                     </div>
                   </div>
                 )}

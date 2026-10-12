@@ -1,6 +1,7 @@
-import { For, Show } from "solid-js";
+import { createEffect, For, Show } from "solid-js";
 import type { Attachment } from "../lib/api";
 import { DocIcon, PaperclipIcon } from "../lib/icons";
+import { isAndroid } from "../lib/platform";
 import { formatBytes } from "../lib/turns";
 
 /// The composer: staged attachments, the near-limit / vision warnings, the
@@ -17,6 +18,16 @@ export function Composer(props: {
   onSend: () => void;
   onStop: () => void;
 }) {
+  let textareaEl: HTMLTextAreaElement | undefined;
+  // Return focus to the composer once a turn finishes (including after a
+  // Stop), so the chatbox is immediately usable again.
+  let prevStreaming = props.streaming;
+  createEffect(() => {
+    const s = props.streaming;
+    if (prevStreaming && !s) textareaEl?.focus();
+    prevStreaming = s;
+  });
+
   return (
     <footer class="border-t border-neutral-200 p-4 dark:border-neutral-800">
       <Show when={props.pendingAttachments.length > 0}>
@@ -72,6 +83,7 @@ export function Composer(props: {
           <PaperclipIcon />
         </button>
         <textarea
+          ref={(el) => (textareaEl = el)}
           class="min-h-[3rem] flex-1 resize-none rounded-xl border border-neutral-300 px-4 py-3 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-900 dark:focus:border-neutral-500"
           rows={3}
           placeholder={props.streaming ? "Assistant is replying…" : "Message Pi Chat…"}
@@ -79,7 +91,10 @@ export function Composer(props: {
           disabled={props.streaming}
           onInput={(e) => props.setDraft(e.currentTarget.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            // Desktop: Enter sends, Shift+Enter inserts a newline. Android has
+            // no Shift key and on-screen keyboards expect Enter to newline, so
+            // there the Send button is the only send affordance.
+            if (e.key === "Enter" && !e.shiftKey && !isAndroid) {
               e.preventDefault();
               props.onSend();
             }
