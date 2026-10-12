@@ -140,7 +140,8 @@ pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
         ),
         fn_tool(
             "read_file",
-            "Read a file's contents as text.",
+            "Read a file's contents. Text is returned inline; image files are handed to the \
+             model as images when it is vision-capable.",
             json!({
                 "type": "object",
                 "properties": { "path": { "type": "string", "description": "Absolute or relative file path" } },
