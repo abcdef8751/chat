@@ -570,8 +570,12 @@ and the app is byte-identical to before. Never blocks the UI.
   already ran past the server's revision; it re-mirrors the live config first, so a
   local edit that had not been stamped yet cannot be read as a clear.
 
-  Ciphertext we can't decrypt is never overwritten (locked-device contract) and a
-  remote tombstone is never resurrected. The row revision survives as the transport
+  Ciphertext we can't decrypt is never overwritten (locked-device contract). A
+  remote tombstone is a revisioned event, not a permanent ban: it is never ADOPTED
+  (an empty payload would read as "everything cleared") and content OLDER than the
+  delete is suppressed — with its dirty flag cleared, so a suppressed row neither
+  shows as pending nor re-fetches forever — while a local edit made SINCE the delete
+  is strictly newer and republishes. The row revision survives as the transport
   clock only: the pull's `revision > last_seen` filter, and the mirror's floor at
   `max(row, watermark)` so a slow-clock device cannot wedge its config below the
   server's.

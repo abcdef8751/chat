@@ -1373,16 +1373,13 @@ async fn reconcile_leaves_a_blank_device_alone_with_no_server_row() {
     assert!(srv.posted("user_config").is_empty(), "and never publishes");
 }
 
-/// A server-side tombstone is a deliberate delete, not an empty config: it must
-/// neither be adopted (as an empty payload would be) nor resurrected by a push.
+/// A server-side tombstone is a deliberate delete, not an empty config. It must
+/// not be adopted (an empty payload would read as "everything cleared"), and it is
+/// a REVISIONED event: content older than the delete is suppressed — with its dirty
+/// flag cleared, so a suppressed row doesn't sit in `pending` and re-fetch forever —
+/// while an edit made SINCE the delete is strictly newer and republishes.
 #[tokio::test]
-async fn a_tombstoned_server_row_is_never_resurrected() {
-    let local = json!({
-        "v": 2, "preferences": "Local only", "providers": [],
-        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
-        "revs": { "preferences": 500 },
-    })
-    .to_string();
+async fn a_tombstoned_server_row_is_never_adopted_or_resurrected() {
     let srv = MockRest::spawn();
     srv.set_get(
         "user_config",
@@ -1401,7 +1398,12 @@ async fn a_tombstoned_server_row_is_never_resurrected() {
         conn.execute(
             "INSERT INTO user_config(id, payload, revision, dirty)
              VALUES ('main', ?1, 500, 1)",
-            [&local],
+            [&json!({
+                "v": 2, "preferences": "Local only", "providers": [],
+                "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+                "revs": { "preferences": 500 },
+            })
+            .to_string()],
         )
         .unwrap();
     }
@@ -1420,9 +1422,33 @@ async fn a_tombstoned_server_row_is_never_resurrected() {
 
     assert!(
         srv.posted("user_config").is_empty(),
-        "a tombstoned mirror row is never re-created"
+        "content older than the delete is not republished"
     );
     assert_eq!(cfg.get().preferences, "Local only", "and nothing is adopted from it");
+    let dirty: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT dirty FROM user_config WHERE id = 'main'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(dirty, 0, "a suppressed row is not left pending forever");
+
+    // An edit made SINCE the delete is strictly newer, so it republishes (the
+    // tombstone is a revisioned event, not a permanent ban on config sync).
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "UPDATE user_config SET revision = 1000, dirty = 1 WHERE id = 'main'",
+            [],
+        )
+        .unwrap();
+    }
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    assert!(
+        !srv.posted("user_config").is_empty(),
+        "a newer local edit republishes"
+    );
 }
 
 /// A row that MATCHES the server is left alone by the reconcile — no spurious

@@ -1151,8 +1151,24 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
             }
             // No server row → nothing to merge; push ours as-is.
             Ok(RemoteConfig::Absent) => (payload, revision),
-            // The mirror row was DELETED server-side: pushing would resurrect it.
-            Ok(RemoteConfig::Deleted) => continue,
+            // The mirror row was DELETED server-side. That is a revisioned event:
+            // a local edit made SINCE the delete is strictly newer and republishes
+            // ours, while an older row is suppressed — and its dirty flag cleared, so
+            // a suppressed row neither shows as pending forever nor re-fetches (with
+            // no way back) every tick.
+            Ok(RemoteConfig::Deleted(deleted_at)) => {
+                if revision > deleted_at {
+                    (payload, revision)
+                } else {
+                    let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+                    conn.execute(
+                        "UPDATE user_config SET dirty = 0 WHERE id = ?1 AND revision = ?2",
+                        rusqlite::params![id, revision],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    continue;
+                }
+            }
             // Can't confirm the server state → don't risk overwriting it.
             Err(_) => continue,
         };
@@ -1215,10 +1231,15 @@ fn persist_merged_user_config(
         return Ok(false);
     }
     // The same projection the converge path uses, so the two can't disagree.
-    // Best-effort: the row is already written dirty, so a failed config write only
-    // delays the local adoption (the next tick re-pushes and retries it) — it must
-    // not abort the run before the pull has even run.
-    let _ = ctx.config.update(|cfg| project_merged(cfg, merged));
+    //
+    // This must NOT be best-effort. The row above is already dirty, so if the
+    // projection were allowed to fail and the run continued, the POST would publish
+    // `merged` while the live config still lacked the keys we merged in — and the
+    // next tick's mirror-first would then read exactly those keys as deliberate
+    // CLEARS (in the row, absent from the config) and publish *deletions* of the
+    // remote's content. Failing here instead aborts before the POST, leaving the row
+    // dirty for a retry that recomputes the same union.
+    ctx.config.update(|cfg| project_merged(cfg, merged))?;
     Ok(true)
 }
 
@@ -1230,7 +1251,10 @@ fn persist_merged_user_config(
 /// distinguished, and only `Absent` licenses converging against an empty remote.
 enum RemoteConfig {
     Absent,
-    Deleted,
+    /// A tombstone, carrying the revision at which the row was deleted. Like any
+    /// other revision it only outranks OLDER content: a local edit made since the
+    /// delete is strictly newer and republishes, while an older row is suppressed.
+    Deleted(i64),
     Live(i64, String),
 }
 
@@ -1265,7 +1289,9 @@ async fn fetch_user_config_remote(
         return Ok(RemoteConfig::Absent);
     };
     if row.get("deleted_at").and_then(|v| v.as_i64()).is_some() {
-        return Ok(RemoteConfig::Deleted);
+        return Ok(RemoteConfig::Deleted(
+            row.get("revision").and_then(|v| v.as_i64()).unwrap_or(0),
+        ));
     }
     match (
         row.get("revision").and_then(|v| v.as_i64()),
@@ -1326,8 +1352,10 @@ async fn reconcile_user_config(ctx: &SyncCtx<'_>, token: &str) -> Result<(), Str
             };
             (remote, server_rev)
         }
-        // A tombstone is a deliberate server-side delete: never resurrect it.
-        RemoteConfig::Deleted => return Ok(()),
+        // A tombstone is a deliberate server-side delete: never adopt it (an empty
+        // remote would read as "everything cleared") and never resurrect it here.
+        // The push decides whether our content outranks it.
+        RemoteConfig::Deleted(_) => return Ok(()),
         // No row yet: converge against an EMPTY remote anyway. That is what mirrors
         // a config which predates its row (an install upgraded to sync, or a first
         // run) and arms it dirty for the push — otherwise the row is only ever
