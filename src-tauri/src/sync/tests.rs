@@ -2509,12 +2509,15 @@ async fn a_cleared_field_is_refilled_from_the_canonical_config() {
     );
 }
 
-/// The converge path must not write a row that moved under it: a Settings save
-/// landing between the merge's read and its write owns the row (dirty, and it will
-/// push), and projecting the stale merge would revert it in memory as well.
+/// The converge path must not apply a merge to a row that moved under it — and
+/// must not touch the LIVE config either, which is the half that lost an edit: a
+/// Settings save landing between the merge and the write owns the row (dirty, and
+/// it will push), so projecting the stale merge over it would revert the edit in
+/// memory as well.
 #[test]
-fn write_converged_row_bails_when_the_row_moved() {
+fn apply_converged_row_bails_when_the_row_moved() {
     let db = temp_db("converge-guard");
+    let cfg = temp_config("converge-guard");
     let merged = parse_syncable(
         &json!({
             "v": 2, "preferences": "Merged", "providers": [],
@@ -2524,7 +2527,6 @@ fn write_converged_row_bails_when_the_row_moved() {
         .to_string(),
     )
     .unwrap();
-    let merged_json = serde_json::to_string(&merged).unwrap();
     let conn = db.0.lock().unwrap();
     // The concurrent edit bumped the row past what the merge was computed against.
     conn.execute(
@@ -2534,8 +2536,8 @@ fn write_converged_row_bails_when_the_row_moved() {
     .unwrap();
 
     assert!(
-        !write_converged_row(&conn, "main", &merged_json, 500, false, 600).unwrap(),
-        "a moved row must not be written"
+        !apply_converged_row(&conn, &cfg, "main", &merged, 500, false, 600).unwrap(),
+        "a moved row must not be applied"
     );
     let (payload, rev, dirty): (String, i64, i64) = conn
         .query_row(
@@ -2546,9 +2548,13 @@ fn write_converged_row_bails_when_the_row_moved() {
         .unwrap();
     assert_eq!((rev, dirty), (700, 1), "the edit keeps its revision and dirty flag");
     assert!(payload.contains("Edited"), "the edit survives: {payload}");
+    assert!(
+        cfg.get().preferences.is_empty(),
+        "and the stale merge is NOT projected over the live config"
+    );
 
-    // …and it writes normally once the revision matches.
-    assert!(write_converged_row(&conn, "main", &merged_json, 700, false, 600).unwrap());
+    // …and it applies normally once the revision matches.
+    assert!(apply_converged_row(&conn, &cfg, "main", &merged, 700, false, 600).unwrap());
     let (rev, dirty): (i64, i64) = conn
         .query_row(
             "SELECT revision, dirty FROM user_config WHERE id = 'main'",
@@ -2557,6 +2563,7 @@ fn write_converged_row_bails_when_the_row_moved() {
         )
         .unwrap();
     assert_eq!((rev, dirty), (700, 0), "absorbed clean, never lowering our revision");
+    assert_eq!(cfg.get().preferences, "Merged", "the merged value reaches the config");
 }
 
 /// The migration is what makes a v1 payload comparable per key: keys it CARRIES

@@ -103,7 +103,6 @@ pub fn add_provider(
     api_key: Option<String>,
     catalog_id: Option<String>,
 ) -> Result<ProviderInfo, String> {
-    let mut cfg = config.get();
     let name = name.trim().to_string();
     let base_url = normalize_base_url(&base_url);
     if name.is_empty() {
@@ -127,15 +126,19 @@ pub fn add_provider(
         // catalog; a manual add keeps this None so models.dev is never auto-used.
         catalog_id: normalize_catalog_id(&catalog_id),
     };
-    cfg.providers.push(provider.clone());
-    // First provider becomes the active one.
-    if cfg.active_provider_id().is_empty() || cfg.providers.len() == 1 {
-        sync_active(&mut cfg, &id);
-    }
-    // Hold the row lock across the config write + mirror so an edit can't be
-    // caught half-applied by the sync engine (`db -> config` is the only order).
+    // The db lock FIRST, and the mutation as a read-modify-write inside it: a config
+    // read taken before the lock would apply this edit to a stale snapshot (losing a
+    // concurrent one), and holding the row lock makes the config write + mirror
+    // atomic against the sync engine (`db -> config` is the only nesting order).
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    config.set(cfg)?;
+    config.update(|cfg| {
+        cfg.providers.push(provider.clone());
+        // First provider becomes the active one.
+        if cfg.active_provider_id().is_empty() || cfg.providers.len() == 1 {
+            sync_active(cfg, &id);
+        }
+        true
+    })?;
     // Mirror the provider-list change into the sync row so the next push backs
     // it up (same as set_config does for other config edits).
     crate::db::sync_user_config(&conn, &config.get())?;
@@ -153,26 +156,32 @@ pub fn update_provider(
     base_url: Option<String>,
     api_key: Option<Option<String>>,
 ) -> Result<ProviderInfo, String> {
-    let mut cfg = config.get();
-    let idx = cfg
-        .providers
-        .iter()
-        .position(|p| p.id == id)
-        .ok_or_else(|| format!("provider not found: {id}"))?;
-    if let Some(name) = name {
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            return Err("Provider name cannot be empty.".into());
-        }
-        cfg.providers[idx].name = name;
+    // Validate against a snapshot (cheap, no lock held); the edit itself is applied
+    // as a read-modify-write below, so a concurrent one isn't clobbered by it.
+    let snapshot = config.get();
+    if !snapshot.providers.iter().any(|p| p.id == id) {
+        return Err(format!("provider not found: {id}"));
     }
-    if let Some(url) = base_url {
-        let url = normalize_base_url(&url);
-        if url.is_empty() {
-            return Err("Provider base URL cannot be empty.".into());
+    let name = match name {
+        Some(name) => {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err("Provider name cannot be empty.".into());
+            }
+            Some(name)
         }
-        cfg.providers[idx].base_url = url;
-    }
+        None => None,
+    };
+    let base_url = match base_url {
+        Some(url) => {
+            let url = normalize_base_url(&url);
+            if url.is_empty() {
+                return Err("Provider base URL cannot be empty.".into());
+            }
+            Some(url)
+        }
+        None => None,
+    };
     if let Some(key) = api_key.flatten() {
         let key = key.trim().to_string();
         if key.is_empty() {
@@ -181,15 +190,30 @@ pub fn update_provider(
             crate::secrets::set_provider_key(&id, &key)?;
         }
     }
-    // If this is the active provider, keep the legacy base_url/model mirrors in sync.
-    if cfg.active_provider_id() == id {
-        sync_active(&mut cfg, &id);
-    }
-    let result = info_for(&config.get(), &cfg.providers[idx].clone());
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    config.set(cfg)?;
+    config.update(|cfg| {
+        let Some(idx) = cfg.providers.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        if let Some(name) = &name {
+            cfg.providers[idx].name = name.clone();
+        }
+        if let Some(url) = &base_url {
+            cfg.providers[idx].base_url = url.clone();
+        }
+        // If this is the active provider, keep the legacy base_url/model mirrors in sync.
+        if cfg.active_provider_id() == id {
+            sync_active(cfg, &id);
+        }
+        true
+    })?;
     crate::db::sync_user_config(&conn, &config.get())?;
-    Ok(result)
+    let after = config.get();
+    let provider = after
+        .provider_by_id(&id)
+        .cloned()
+        .unwrap_or_else(|| after.active_provider());
+    Ok(info_for(&after, &provider))
 }
 
 /// Remove a provider (and its keychain key). Removing the active provider falls
@@ -201,22 +225,25 @@ pub fn remove_provider(
     db: tauri::State<'_, crate::db::Db>,
     id: String,
 ) -> Result<Vec<ProviderInfo>, String> {
-    let mut cfg = config.get();
-    let Some(idx) = cfg.providers.iter().position(|p| p.id == id) else {
+    if !config.get().providers.iter().any(|p| p.id == id) {
         return Err(format!("provider not found: {id}"));
-    };
-    cfg.providers.remove(idx);
-    let _ = crate::secrets::delete_provider_key(&id);
-    if cfg.active_provider_id() == id {
-        if let Some(first) = cfg.providers.first() {
-            let first_id = first.id.clone();
-            sync_active(&mut cfg, &first_id);
-        } else {
-            cfg.active_provider_id.clear();
-        }
     }
+    let _ = crate::secrets::delete_provider_key(&id);
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    config.set(cfg)?;
+    config.update(|cfg| {
+        let Some(idx) = cfg.providers.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        cfg.providers.remove(idx);
+        if cfg.active_provider_id() == id {
+            if let Some(first_id) = cfg.providers.first().map(|p| p.id.clone()) {
+                sync_active(cfg, &first_id);
+            } else {
+                cfg.active_provider_id.clear();
+            }
+        }
+        true
+    })?;
     crate::db::sync_user_config(&conn, &config.get())?;
     Ok(list_providers(config))
 }
@@ -228,13 +255,15 @@ pub fn set_active_provider(
     db: tauri::State<'_, crate::db::Db>,
     id: String,
 ) -> Result<ProviderInfo, String> {
-    let mut cfg = config.get();
-    let Some(provider) = cfg.provider_by_id(&id).cloned() else {
+    let snapshot = config.get();
+    let Some(provider) = snapshot.provider_by_id(&id).cloned() else {
         return Err(format!("provider not found: {id}"));
     };
-    sync_active(&mut cfg, &id);
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    config.set(cfg)?;
+    config.update(|cfg| {
+        sync_active(cfg, &id);
+        true
+    })?;
     crate::db::sync_user_config(&conn, &config.get())?;
     Ok(info_for(&config.get(), &provider))
 }

@@ -353,10 +353,12 @@ pub fn set_model_overrides(
     db: tauri::State<'_, crate::db::Db>,
     model_overrides: HashMap<String, ModelOverride>,
 ) -> Result<(), String> {
+    // The db lock first, and the config read inside it: a read taken before the lock
+    // would apply this edit to a stale snapshot and lose a concurrent one.
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut cfg = state.get();
     cfg.model_overrides = model_overrides;
     let cfg2 = cfg.clone();
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
     state.set(cfg)?;
     crate::db::sync_user_config(&conn, &cfg2)
 }

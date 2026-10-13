@@ -502,9 +502,13 @@ pub fn sync_status(app: AppHandle) -> Result<SyncStatus, String> {
 #[tauri::command]
 pub async fn sync_toggle(app: AppHandle, on: bool) -> Result<SyncStatus, String> {
     let config = app.state::<ConfigState>();
-    let mut cfg = config.get();
-    cfg.sync_enabled = on;
-    config.set(cfg)?;
+    // Read-modify-write under the config lock: a blind get/set here would rewrite
+    // the whole config from a stale read and could revert a syncable field the
+    // engine had just projected.
+    config.update(|cfg| {
+        cfg.sync_enabled = on;
+        true
+    })?;
     if on {
         // Enabling triggers an initial full push (no-op if not signed in).
         let app2 = app.clone();
@@ -773,9 +777,12 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     // after a relaunch even though syncs ran in earlier sessions).
     let at = now_ms();
     sync.set_success(at);
-    let mut cfg = app.state::<ConfigState>().get();
-    cfg.sync_last_sync_at = Some(at);
-    let _ = app.state::<ConfigState>().set(cfg);
+    // `update` here too: `set` would rewrite the whole config from a stale read and
+    // could revert a syncable field the engine projected during this run.
+    let _ = app.state::<ConfigState>().update(|cfg| {
+        cfg.sync_last_sync_at = Some(at);
+        true
+    });
     // Broadcast that local data may have changed (a successful pull applied
     // remote rows). Refresh is cheap, so emit unconditionally after a pull —
     // the frontend refreshes the chat list and open conversation on receipt.
@@ -1179,9 +1186,8 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
 /// Adopting the union into the live config in that window would revert the edit
 /// in memory (and then the post-pull mirror would overwrite the row with the
 /// reverted value, losing it for good), so we bail before touching the config.
-/// (A second edit landing between a *successful* UPDATE and the config write is
-/// not covered — that window is synchronous and only reachable from another
-/// Tauri command thread; the row keeps that edit and re-pushes it.)
+/// The row write and the config projection share one critical section, so a
+/// Settings save cannot land between them either.
 fn persist_merged_user_config(
     ctx: &SyncCtx<'_>,
     id: &str,
@@ -1190,25 +1196,24 @@ fn persist_merged_user_config(
     expect_rev: i64,
 ) -> Result<bool, String> {
     let payload = serde_json::to_string(merged).map_err(|e| e.to_string())?;
-    let touched = {
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        conn.execute(
+    // ONE critical section: the guarded row write and the config projection happen
+    // under the db lock — the same lock every edit path takes around its own
+    // (config, row) pair. A Settings save therefore cannot slip between them, and
+    // cannot be reverted by the projection. (`db -> config` is the only order.)
+    let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    let touched = conn
+        .execute(
             "UPDATE user_config SET payload = ?3, revision = ?4, dirty = 1
              WHERE id = ?1 AND revision = ?2",
             rusqlite::params![id, expect_rev, payload, rev],
         )
-        .map_err(|e| e.to_string())?
-    };
+        .map_err(|e| e.to_string())?;
     if touched == 0 {
         // Row moved under us — a concurrent edit owns it now.
         return Ok(false);
     }
-    // Same projection the converge path uses, so the two can't disagree (notably
-    // about blanking the legacy `base_url`/`model` mirrors).
-    let mut cfg = ctx.config.get();
-    project_merged(&mut cfg, merged);
-    // Best-effort: a failed write only delays the local adoption to the pull.
-    let _ = ctx.config.set(cfg);
+    // The same projection the converge path uses, so the two can't disagree.
+    ctx.config.update(|cfg| project_merged(cfg, merged))?;
     Ok(true)
 }
 
@@ -1293,15 +1298,21 @@ async fn reconcile_config_after_pull(ctx: &SyncCtx<'_>, token: &str) -> Result<(
 /// otherwise succeeded — it is simply retried on the next tick. A server payload
 /// we cannot decrypt is never overwritten (the locked-device contract).
 async fn reconcile_user_config(ctx: &SyncCtx<'_>, token: &str) -> Result<(), String> {
-    let Some((server_rev, server_payload)) = fetch_user_config_remote(ctx, token, "main").await?
-    else {
-        return Ok(()); // no server row — nothing to converge with
-    };
-    let Some(server_clear) = decrypt_server_payload(ctx.key, &server_payload) else {
-        return Ok(()); // unreadable (locked) — never overwrite it
-    };
-    let Some(remote) = parse_syncable_at(&server_clear, server_rev) else {
-        return Ok(()); // unparseable remote — leave it alone
+    let (remote, server_rev) = match fetch_user_config_remote(ctx, token, "main").await? {
+        Some((server_rev, server_payload)) => {
+            let Some(server_clear) = decrypt_server_payload(ctx.key, &server_payload) else {
+                return Ok(()); // unreadable (locked) — never overwrite it
+            };
+            let Some(remote) = parse_syncable_at(&server_clear, server_rev) else {
+                return Ok(()); // unparseable remote — leave it alone
+            };
+            (remote, server_rev)
+        }
+        // No server row yet: converge against an EMPTY remote anyway. That is what
+        // mirrors a config which predates its row (an install upgraded to sync, or a
+        // first run) and arms it dirty for the push — otherwise the row is only ever
+        // created by an edit, and pre-existing content would never be backed up.
+        None => (SyncableConfig::new_v2(), 0),
     };
     converge_user_config_row(ctx, "main", &remote, server_rev)?;
     Ok(())
@@ -2611,43 +2622,46 @@ fn converge_user_config_row(
     if !we_add && !they_add {
         return Ok(false); // already converged
     }
-    let payload = serde_json::to_string(&merged).map_err(|e| e.to_string())?;
-    if !write_converged_row(&conn, id, &payload, local_revision, we_add, remote_revision)? {
-        // Defensive: with every writer holding this lock it cannot move, but never
-        // project over a row we did not merge against.
-        return Ok(false);
-    }
-    // Then make the live config agree with the row we just wrote. `update` is a
-    // read-modify-write under the config lock, so it cannot revert an edit either.
-    ctx.config.update(|cfg| project_merged(cfg, &merged))?;
-    Ok(true)
+    apply_converged_row(
+        &conn,
+        ctx.config,
+        id,
+        &merged,
+        local_revision,
+        we_add,
+        remote_revision,
+    )
 }
 
-/// Write the converged row — but only if it is STILL the revision the merge was
-/// computed against. A Settings save or provider edit that landed in the meantime
-/// owns the row now (it is dirty and will push); overwriting it here, or projecting
-/// the stale merge into the live config, would silently lose that edit. Returns
-/// whether the write happened.
-fn write_converged_row(
+/// Apply a converged merge: guard, project into the live config, write the row.
+///
+/// The guard: only proceed if the row is STILL the revision the merge was computed
+/// against. A Settings save or provider edit that landed in the meantime owns the
+/// row (it is dirty and will push), and overwriting it — or projecting the stale
+/// merge into the live config — would silently lose that edit.
+///
+/// The PROJECTION comes before the row write: if the config write fails, the row
+/// must stay untouched, or the next tick's mirror would re-stamp the stale config
+/// over the values we just absorbed. (The reverse order is safe the other way: a
+/// failed row write leaves the config ahead, and the mirror then writes the row
+/// from the config we hold.)
+///
+/// Caller must hold the db lock; every writer of the (config, row) pair holds it,
+/// so within this critical section nothing can move.
+fn apply_converged_row(
     conn: &rusqlite::Connection,
+    config: &crate::config::ConfigState,
     id: &str,
-    payload: &str,
+    merged: &SyncableConfig,
     expect_revision: i64,
     we_add: bool,
     remote_revision: i64,
 ) -> Result<bool, String> {
-    let current: i64 = conn
-        .query_row(
-            "SELECT revision FROM user_config WHERE id = ?1",
-            [id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .unwrap_or(0);
-    if current != expect_revision {
+    if row_revision(conn, id)? != expect_revision {
         return Ok(false);
     }
+    config.update(|cfg| project_merged(cfg, merged))?;
+    let payload = serde_json::to_string(merged).map_err(|e| e.to_string())?;
     let (rev, dirty) = if we_add {
         // Above the remote's revision so the next push lands, and never below the
         // row's own — a fresh bump is lower when the row or the watermark runs
@@ -2671,6 +2685,19 @@ fn write_converged_row(
     )
     .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// Our stored revision for a `user_config` row (0 when we have none).
+fn row_revision(conn: &rusqlite::Connection, id: &str) -> Result<i64, String> {
+    let rev: Option<i64> = conn
+        .query_row(
+            "SELECT revision FROM user_config WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(rev.unwrap_or(0))
 }
 
 /// Parse a `user_config` payload into the syncable subset, or `None` when it
