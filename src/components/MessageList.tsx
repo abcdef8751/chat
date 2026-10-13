@@ -181,8 +181,8 @@ export function MessageList(props: {
 
               <Show when={showAnswer()}>
                 <div class="flex justify-start">
-                  <div class="max-w-[80%]">
-                    <div class="rounded-xl bg-neutral-100 px-4 py-2.5 text-sm dark:bg-neutral-800">
+                  <div class="w-full min-w-0">
+                    <div class="text-sm">
                       <div class="mb-1 flex items-center gap-1.5 text-[11px]">
                         <MarkAvatar class="h-3.5 w-3.5 shrink-0" />
                         <span class="opacity-60">
