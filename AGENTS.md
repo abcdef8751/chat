@@ -439,8 +439,9 @@ brave_news_search(query, count?)
 brave_summarizer(query, count?)
 
 // Web — native HTTP GET, read-only (ungated)
-web_fetch(url)                    // HTML → readable text; refuses non-public
-                                  //   addresses (loopback/private/metadata)
+web_fetch(url, max_chars?, char_start?)   // HTML → readable text; refuses
+                                  //   non-public addresses. max_chars caps the
+                                  //   returned text; char_start offsets into it.
 ```
 
 The tool list is byte-identical for live and reflection turns so the prompt-cache
@@ -460,7 +461,11 @@ Search API key in Settings → keychain.
 **`web_fetch` (native, ungated):** `tools.rs` `execute_web_tool` fetches an
 `http(s)` URL over `reqwest`, converts the HTML to readable text, and truncates
 the result (the body is streamed and capped, so a huge response is not
-buffered). It needs no key and is read-only, so it is ungated like the Brave
+buffered). The model may window the returned text with an optional `max_chars`
+(which can only lower the hard ceiling, never raise it) and a `char_start`
+offset — enough to read just the top of a page, or page through a long one; a
+windowed result reports the range it returned so continuation is unambiguous.
+It needs no key and is read-only, so it is ungated like the Brave
 tools — but it refuses non-public addresses (loopback, RFC1918 private,
 link-local, ULA, CGNAT `100.64/10`, and the cloud metadata endpoints
 `169.254.169.254` / `192.0.0.192` / `100.100.100.200`), resolving hostnames and
