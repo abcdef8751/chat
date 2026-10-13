@@ -262,6 +262,32 @@ impl ConfigState {
         self.data.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
+    /// Like [`get`](Self::get), but `None` when the lock is poisoned. Callers that
+    /// would OVERWRITE or derive state from the result (the sync engine mirrors the
+    /// config into a row) must not treat a defaulted read as the real config — a
+    /// panic elsewhere would otherwise look like "the user cleared everything".
+    pub fn try_get(&self) -> Option<AppConfig> {
+        self.data.lock().ok().map(|d| d.clone())
+    }
+
+    /// Read-modify-write under the lock. The sync engine merges on a background
+    /// thread while Settings writes on the UI thread, so a stale read followed by a
+    /// blind [`set`](Self::set) can revert an edit made in between. `f` returns
+    /// whether it changed anything; the file is only rewritten when it did, and it
+    /// is written BEFORE the in-memory value is published, so a failed write never
+    /// leaves a state we don't hold on disk.
+    pub fn update(&self, f: impl FnOnce(&mut AppConfig) -> bool) -> Result<bool, String> {
+        let mut guard = self.data.lock().map_err(|e| e.to_string())?;
+        let mut cfg = guard.clone();
+        if !f(&mut cfg) {
+            return Ok(false);
+        }
+        let text = serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize: {e}"))?;
+        std::fs::write(&self.path, text).map_err(|e| format!("write config: {e}"))?;
+        *guard = cfg;
+        Ok(true)
+    }
+
     pub fn set(&self, config: AppConfig) -> Result<(), String> {
         {
             *self.data.lock().map_err(|e| e.to_string())? = config.clone();

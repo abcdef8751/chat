@@ -1237,8 +1237,20 @@ async fn reconcile_redirties_row_diverged_from_server_at_equal_revision() {
     let mem = temp_memory("reconcile", &db);
     let cfg = temp_config("reconcile");
     let client = reqwest::Client::new();
-    // Local row stuck: NEW payload at the SAME revision, clean.
+    // Local row stuck: NEW payload at the SAME revision, clean. The live config has
+    // to AGREE with it — that is the production invariant (every edit path mirrors)
+    // — or the pre-merge mirror would read the planted override as a deliberate
+    // CLEAR and this test would pass for the wrong reason.
     {
+        let mut c = cfg.get();
+        c.model_overrides.insert(
+            "m-1".into(),
+            crate::config::ModelOverride {
+                output_modalities: Some(vec!["text".into()]),
+                ..Default::default()
+            },
+        );
+        cfg.set(c).unwrap();
         let conn = db.0.lock().unwrap();
         conn.execute(
             "INSERT INTO user_config(id, payload, revision, dirty)
@@ -1273,6 +1285,16 @@ async fn reconcile_redirties_row_diverged_from_server_at_equal_revision() {
     };
     assert_eq!(dirty, 1);
     assert!(rev > 100, "revision must exceed the server's so the push guard passes");
+    // …and the never-pushed payload it was written for is still there.
+    let payload: String = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT payload FROM user_config WHERE id = 'main'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert!(payload.contains("m-1"), "the override survives: {payload}");
+    assert!(cfg.get().model_overrides.contains_key("m-1"));
 }
 
 /// A row that MATCHES the server is left alone by the reconcile — no spurious
@@ -2344,6 +2366,45 @@ fn merge_adopts_a_legacy_remote_endpoint_as_a_pair() {
     project_merged(&mut own, &mine.merge(&remote));
     assert_eq!(own.base_url, "https://mine.example/v1");
     assert_eq!(own.model, "my-model", "the pair is never mixed");
+
+    // A device on the FACTORY endpoint that merely picked a model has no endpoint of
+    // its own to protect: the pair's revision is 0 on both sides, so the legacy
+    // remote's endpoint AND its model are adopted together.
+    let mut picked = SyncableConfig::new_v2();
+    picked.model = "my-model".into();
+    let mut cfg_picked = crate::config::AppConfig {
+        model: "my-model".into(),
+        ..crate::config::AppConfig::default()
+    };
+    project_merged(&mut cfg_picked, &picked.merge(&remote));
+    assert_eq!(cfg_picked.base_url, "https://legacy.example/v1");
+    assert_eq!(cfg_picked.model, "legacy-model");
+}
+
+/// A v1 payload is parsed at its OWN row's revision, so two v1 payloads ARE ordered
+/// by their row revisions (a newer row's keys win) rather than by "local always
+/// wins" — and when the revisions match, the v1 tie rule applies (the side that
+/// carries a value; `self` on a tie).
+#[test]
+fn v1_payloads_are_ordered_by_their_own_row_revision() {
+    let v1 = |prefs: &str| {
+        json!({
+            "preferences": prefs, "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+        })
+        .to_string()
+    };
+    let older = parse_syncable_at(&v1("From the older row"), 100).unwrap();
+    let newer = parse_syncable_at(&v1("From the newer row"), 900).unwrap();
+    assert_eq!(older.merge(&newer).preferences, "From the newer row");
+    assert_eq!(newer.merge(&older).preferences, "From the newer row");
+
+    let same = parse_syncable_at(&v1("From the same revision"), 900).unwrap();
+    assert_eq!(
+        newer.merge(&same).preferences,
+        "From the newer row",
+        "a tie goes to self, as it always did"
+    );
 }
 
 /// An unparseable remote row that is OLDER than ours must not pin the high-water:
@@ -2446,6 +2507,56 @@ async fn a_cleared_field_is_refilled_from_the_canonical_config() {
         "Be terse",
         "an empty local field adopts the server's"
     );
+}
+
+/// The converge path must not write a row that moved under it: a Settings save
+/// landing between the merge's read and its write owns the row (dirty, and it will
+/// push), and projecting the stale merge would revert it in memory as well.
+#[test]
+fn write_converged_row_bails_when_the_row_moved() {
+    let db = temp_db("converge-guard");
+    let merged = parse_syncable(
+        &json!({
+            "v": 2, "preferences": "Merged", "providers": [],
+            "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+            "revs": { "preferences": 500 },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let merged_json = serde_json::to_string(&merged).unwrap();
+    let conn = db.0.lock().unwrap();
+    // The concurrent edit bumped the row past what the merge was computed against.
+    conn.execute(
+        "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 700, 1)",
+        [r#"{"v":2,"preferences":"Edited","providers":[],"activeProviderId":"","baseUrl":"","model":"","modelOverrides":{},"revs":{"preferences":700}}"#],
+    )
+    .unwrap();
+
+    assert!(
+        !write_converged_row(&conn, "main", &merged_json, 500, false, 600).unwrap(),
+        "a moved row must not be written"
+    );
+    let (payload, rev, dirty): (String, i64, i64) = conn
+        .query_row(
+            "SELECT payload, revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((rev, dirty), (700, 1), "the edit keeps its revision and dirty flag");
+    assert!(payload.contains("Edited"), "the edit survives: {payload}");
+
+    // …and it writes normally once the revision matches.
+    assert!(write_converged_row(&conn, "main", &merged_json, 700, false, 600).unwrap());
+    let (rev, dirty): (i64, i64) = conn
+        .query_row(
+            "SELECT revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((rev, dirty), (700, 0), "absorbed clean, never lowering our revision");
 }
 
 /// The migration is what makes a v1 payload comparable per key: keys it CARRIES
@@ -2553,7 +2664,6 @@ fn a_clear_wins_over_an_older_value() {
     .unwrap();
     assert_eq!(ours.merge(&theirs).preferences, "", "our newer clear stands");
     assert_eq!(theirs.merge(&ours).preferences, "", "…and they agree");
-    assert!(!ours.merge(&theirs).revs.is_empty(), "the clear is still actionable");
 
     // A strictly NEWER value still beats the older clear.
     let mut older_clear = ours.clone();

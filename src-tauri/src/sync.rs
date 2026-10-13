@@ -1200,13 +1200,10 @@ fn persist_merged_user_config(
         // Row moved under us — a concurrent edit owns it now.
         return Ok(false);
     }
+    // Same projection the converge path uses, so the two can't disagree (notably
+    // about blanking the legacy `base_url`/`model` mirrors).
     let mut cfg = ctx.config.get();
-    cfg.preferences = merged.preferences.clone();
-    cfg.providers = merged.providers.clone();
-    cfg.active_provider_id = merged.active_provider_id.clone();
-    cfg.base_url = merged.base_url.clone();
-    cfg.model = merged.model.clone();
-    cfg.model_overrides = merged.model_overrides.clone();
+    project_merged(&mut cfg, merged);
     // Best-effort: a failed write only delays the local adoption to the pull.
     let _ = ctx.config.set(cfg);
     Ok(true)
@@ -2312,8 +2309,10 @@ impl SyncableConfig {
     /// Field-wise merge — the v2 replacement for `union_with`. Per key the side
     /// with the higher revision wins; on a tie (including both-never-set, which is
     /// every key of a v1 payload) it falls back to the v1 value rule, so this is
-    /// behaviour-identical to `union_with` for v1 payloads while giving real
-    /// per-field ordering as soon as revisions exist. A winner whose value is EMPTY
+    /// behaviour-identical to `union_with` for two v1 payloads that share a row
+    /// revision, while giving real per-field ordering as soon as the revisions
+    /// differ (which is the point: a v1 payload is parsed at its OWN row's
+    /// revision, so a newer row's keys win rather than "local always wins"). A winner whose value is EMPTY
     /// is a deliberate clear and is kept — that is what v2 adds.
     fn merge(&self, other: &SyncableConfig) -> SyncableConfig {
         let mut out = SyncableConfig::new_v2();
@@ -2534,17 +2533,33 @@ pub(crate) fn stamp_user_config_payload(
 /// actually win, which is what per-key revisions buy. The one exception is the
 /// legacy `base_url`/`model` mirrors: a payload that doesn't carry them never
 /// blanks them, so a device can't lose its endpoint to an unset remote.
-fn project_merged(cfg: &mut crate::config::AppConfig, merged: &SyncableConfig) {
-    cfg.preferences = merged.preferences.clone();
-    cfg.providers = merged.providers.clone();
-    cfg.active_provider_id = merged.active_provider_id.clone();
-    cfg.model_overrides = merged.model_overrides.clone();
-    if !merged.base_url.is_empty() {
+fn project_merged(cfg: &mut crate::config::AppConfig, merged: &SyncableConfig) -> bool {
+    let mut changed = false;
+    if cfg.preferences != merged.preferences {
+        cfg.preferences = merged.preferences.clone();
+        changed = true;
+    }
+    if cfg.providers != merged.providers {
+        cfg.providers = merged.providers.clone();
+        changed = true;
+    }
+    if cfg.active_provider_id != merged.active_provider_id {
+        cfg.active_provider_id = merged.active_provider_id.clone();
+        changed = true;
+    }
+    if cfg.model_overrides != merged.model_overrides {
+        cfg.model_overrides = merged.model_overrides.clone();
+        changed = true;
+    }
+    if !merged.base_url.is_empty() && cfg.base_url != merged.base_url {
         cfg.base_url = merged.base_url.clone();
+        changed = true;
     }
-    if !merged.model.is_empty() {
+    if !merged.model.is_empty() && cfg.model != merged.model {
         cfg.model = merged.model.clone();
+        changed = true;
     }
+    changed
 }
 
 /// Merge one remote `user_config` payload into our row and adopt the result.
@@ -2563,15 +2578,16 @@ fn converge_user_config_row(
     remote: &SyncableConfig,
     remote_revision: i64,
 ) -> Result<bool, String> {
+    // Fold anything not yet mirrored into the row FIRST: the row is the merge's
+    // local side, so an edit still sitting only in the live config would otherwise
+    // be invisible here and could be read as a clear. Every edit path mirrors, so
+    // this is normally a no-op — it makes the invariant unconditional.
     let (local, local_revision) = {
+        let Some(cfg_now) = ctx.config.try_get() else {
+            return Ok(false); // poisoned lock — never mirror a defaulted read
+        };
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        // Fold any not-yet-mirrored local edit into the row FIRST: the row is the
-        // merge's local side, so an edit still sitting only in the live config
-        // would be invisible here and could be overwritten by the remote. Every
-        // edit path already mirrors (Settings saves, provider edits) and the
-        // post-pull tail mirrors once per run, so this is a no-op in practice — it
-        // just makes the invariant unconditional instead of assumed.
-        db::sync_user_config(&conn, &ctx.config.get())?;
+        db::sync_user_config(&conn, &cfg_now)?;
         let row: Option<(String, i64)> = conn
             .query_row(
                 "SELECT payload, revision FROM user_config WHERE id = ?1",
@@ -2581,10 +2597,7 @@ fn converge_user_config_row(
             .optional()
             .map_err(|e| e.to_string())?;
         match row {
-            Some((payload, rev)) => (
-                parse_syncable_at(&payload, rev).unwrap_or_default(),
-                rev,
-            ),
+            Some((payload, rev)) => (parse_syncable_at(&payload, rev).unwrap_or_default(), rev),
             None => (SyncableConfig::new_v2(), 0),
         }
     };
@@ -2594,20 +2607,63 @@ fn converge_user_config_row(
     if !we_add && !they_add {
         return Ok(false); // already converged
     }
-    // The live config and the row must agree, so project the merged values first.
-    let mut cfg = ctx.config.get();
-    project_merged(&mut cfg, &merged);
-    if ctx.config.set(cfg).is_err() {
-        // Retry next tick rather than mirroring a state we don't hold.
+    let payload = serde_json::to_string(&merged).map_err(|e| e.to_string())?;
+    // The row write and the live-config projection happen TOGETHER, under the db
+    // lock, and only if the row is still the one we merged against: a Settings save
+    // or provider edit on the UI thread arriving in between would otherwise be
+    // reverted by the projection AND cleared from the row. `db -> config` is the
+    // established lock order (no path nests the other way), so this can't deadlock.
+    let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    if !write_converged_row(&conn, id, &payload, local_revision, we_add, remote_revision)? {
+        // An edit owns the row now: it is dirty and will push. Leave the live config
+        // alone rather than projecting a stale merge over it.
         return Ok(false);
     }
-    let payload = serde_json::to_string(&merged).map_err(|e| e.to_string())?;
-    let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    // Then make the live config agree with the row we just wrote, atomically (the
+    // same guard covers an edit landing in this window).
+    ctx.config.update(|cfg| project_merged(cfg, &merged))?;
+    Ok(true)
+}
+
+/// Write the converged row — but only if it is STILL the revision the merge was
+/// computed against. A Settings save or provider edit that landed in the meantime
+/// owns the row now (it is dirty and will push); overwriting it here, or projecting
+/// the stale merge into the live config, would silently lose that edit. Returns
+/// whether the write happened.
+fn write_converged_row(
+    conn: &rusqlite::Connection,
+    id: &str,
+    payload: &str,
+    expect_revision: i64,
+    we_add: bool,
+    remote_revision: i64,
+) -> Result<bool, String> {
+    let current: i64 = conn
+        .query_row(
+            "SELECT revision FROM user_config WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
+    if current != expect_revision {
+        return Ok(false);
+    }
     let (rev, dirty) = if we_add {
-        let bumped = db::bump_revision_c(&conn)?;
-        (bumped.max(remote_revision.saturating_add(1)), 1)
+        // Above the remote's revision so the next push lands, and never below the
+        // row's own — a fresh bump is lower when the row or the watermark runs
+        // ahead of the clock.
+        let bumped = db::bump_revision_c(conn)?;
+        (
+            bumped
+                .max(remote_revision.saturating_add(1))
+                .max(expect_revision),
+            1,
+        )
     } else {
-        (local_revision.max(remote_revision), 0)
+        // We only absorbed: clean at the remote's revision, never lowering ours.
+        (expect_revision.max(remote_revision), 0)
     };
     conn.execute(
         "INSERT INTO user_config(id, payload, revision, dirty) VALUES (?1, ?2, ?3, ?4)
