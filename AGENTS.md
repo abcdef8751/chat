@@ -236,11 +236,16 @@ memory_backfill_runs(             -- reduce-pass spend (spans many conversations
   reasoning supported**). The override is the *only* way to declare capability
   for a manually-added provider, which never gets a models.dev entry (see
   "models.dev lookup" below). `ModelInfo` exposes the raw catalog values
-  (`reasoning`/`attachment`/`modalities`) plus a resolved `vision` bit the
-  composer's image warning uses; the Settings "Capabilities" card edits the
-  override by click-to-toggle. Note `vision` is now always `Some`: the text-only
-  default means an un-annotated custom model is warned about images until you
-  mark it `image`-capable.
+  (`reasoning`/`attachment`/`modalities`) plus a resolved `vision` bit; the
+  composer's image warning re-resolves vision **client-side** from the override
+  plus those raw values (`src/lib/capabilities.ts`, mirroring
+  `resolve_capabilities`) rather than reading the baked-in `vision` bit, which
+  goes stale the moment a capability is toggled in Settings (the model list
+  isn't refetched then — so a model just marked image-capable no longer warns).
+  The Settings "Capabilities" card edits the override by click-to-toggle. A
+  model with no override and no catalog modalities resolves to text-only, so an
+  un-annotated custom model is warned about images until you mark it
+  `image`-capable.
 - **models.dev lookup.** The catalog is one public JSON blob
   (`https://models.dev/api.json`), matched to a provider **by base URL** (exact
   `api` first, then host). But the fetch is **gated on `catalog_id`**: only a

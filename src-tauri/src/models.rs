@@ -132,9 +132,12 @@ impl ModelCache {
 ///
 /// `vision` is resolved through [`crate::pricing::resolve_capabilities`] so a
 /// user's modality override (needed for custom providers, which have no
-/// models.dev data) is honoured by the composer's image warning. The raw
+/// models.dev data) is applied to the canonical bit. The raw
 /// `reasoning`/`attachment`/`modalities` fields are passed through untouched so
-/// the Settings editor can show the underlying catalog values.
+/// the Settings editor can show the underlying catalog values, and the frontend
+/// re-resolves vision from them plus the override for the composer's image
+/// warning (see `src/lib/capabilities.ts`) — the baked-in `vision` bit would go
+/// stale the moment a capability is toggled without a list refresh.
 fn with_meta(
     ids: Vec<String>,
     meta: &HashMap<String, ModelMeta>,

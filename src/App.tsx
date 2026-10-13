@@ -1,4 +1,4 @@
-import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -72,6 +72,7 @@ import {
   type ThinkingOptions,
 } from "./lib/api";
 import { isAndroid, onBack, readAttachmentFromUri } from "./lib/platform";
+import { acceptsImages, resolveInputModalities } from "./lib/capabilities";
 import { Composer } from "./components/Composer";
 import { Header } from "./components/Header";
 import { MemoryPage } from "./components/MemoryPage";
@@ -157,7 +158,6 @@ export default function App() {
   const [autoApproveTools, setAutoApproveTools] = createSignal(false);
   const [thinkingOpts, setThinkingOpts] = createSignal<ThinkingOptions | null>(null);
   const [models, setModels] = createSignal<ModelInfo[]>([]);
-  const [attachmentWarning, setAttachmentWarning] = createSignal<string | null>(null);
   const [modelsLoading, setModelsLoading] = createSignal(false);
   const [settingsError, setSettingsError] = createSignal<string | null>(null);
   const [braveKeyDraft, setBraveKeyDraft] = createSignal("");
@@ -1030,8 +1030,6 @@ export default function App() {
   async function changeModel(id: string) {
     if (!id) return;
     setModel(id);
-    // The warning is about the previous model; re-check against the new one.
-    setAttachmentWarning(null);
     // Adopt the new model's thinking levels; drop a level it doesn't accept.
     const opts = await thinkingOptions(id, headerProviderId()).catch(() => null);
     setThinkingOpts(opts);
@@ -1283,11 +1281,32 @@ export default function App() {
 
   // models.dev knows which models accept image input. Warn rather than let the
   // provider silently drop the image or reject the whole turn.
-  const currentModelVision = () => {
+  //
+  // Resolved client-side (override → models.dev → text-only) rather than read
+  // off `ModelInfo.vision`, because the backend bakes that bit into
+  // `list_models`: it goes stale the moment a capability is toggled in Settings
+  // (the model list isn't refetched then), so a model the user just marked
+  // image-capable kept warning. Returns `null` when the model isn't in the list
+  // and has no override, so an unknown model is never warned about.
+  const currentModelVision = (): boolean | null => {
     const id = model();
     if (!id) return null;
-    return models().find((m) => m.id === id)?.vision ?? null;
+    const overrideInput = modelOverrides()[id]?.inputModalities;
+    const m = models().find((x) => x.id === id);
+    if (!m && overrideInput == null) return null;
+    return acceptsImages(resolveInputModalities(m?.modalities, m?.attachment, overrideInput));
   };
+
+  // Derived, not event-set: so the warning appears the moment an image is
+  // staged and clears on its own when the model is switched or its capability
+  // is toggled in Settings.
+  const attachmentWarning = createMemo<string | null>(() => {
+    const images = pendingAttachments().filter((a) => a.kind === "image").length;
+    if (images === 0 || currentModelVision() !== false) return null;
+    return `${model()} isn't marked as accepting image input, so ${
+      images === 1 ? "this image" : "these images"
+    } may be ignored or rejected. Pick a vision model in the header.`;
+  });
 
   // Resolve picked paths into attachments. On Android the dialog plugin returns
   // `content://` URIs, which the path-based `readAttachments` (std::fs) cannot
@@ -1328,16 +1347,6 @@ export default function App() {
         return;
       }
       setPendingAttachments((prev) => [...prev, ...atts]);
-      const images = atts.filter((a) => a.kind === "image").length;
-      if (images > 0 && currentModelVision() === false) {
-        setAttachmentWarning(
-          `${model()} isn't marked as accepting image input, so ${
-            images === 1 ? "this image" : "these images"
-          } may be ignored or rejected. Pick a vision model in the header.`,
-        );
-      } else {
-        setAttachmentWarning(null);
-      }
     } catch (e) {
       setStreamError(String(e));
     }
@@ -1360,7 +1369,6 @@ export default function App() {
 
   function removeAttachment(id: string) {
     setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
-    setAttachmentWarning(null);
   }
 
   /// Append a temp assistant row and stream a reply for `text`/`staged` into
