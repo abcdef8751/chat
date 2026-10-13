@@ -106,7 +106,7 @@ export function Timeline(props: {
 
   return (
     <div class="flex justify-start">
-      <div class="w-full max-w-[80%]">
+      <div class="w-full min-w-0">
         <button
           onClick={() => setOpen((o) => !o)}
           title="Show activity timeline"

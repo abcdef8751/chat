@@ -41,3 +41,36 @@ body {
 * {
   scrollbar-width: thin;
 }
+
+/* Long, unbroken tokens (inline code, file paths, URLs) must wrap inside the
+   message bubble instead of overflowing and being clipped. `overflow-wrap:
+   anywhere` only breaks a word when it would otherwise overflow, so normal
+   prose is unaffected. Applies to every `.prose` render — live streaming
+   answers, persisted messages and the activity Timeline. */
+.prose {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Fenced code keeps its own layout: never wrap mid-token, scroll horizontally
+   inside its box rather than pushing the bubble wider (typography already sets
+   `overflow-x: auto`, this pins the box to the container width). */
+.prose pre {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+/* Code inside a fenced block must not inherit the wrap above. */
+.prose pre code {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+/* A wide table would otherwise overflow the bubble; let it scroll on its own. */
+.prose table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
