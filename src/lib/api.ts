@@ -436,6 +436,16 @@ export function readAttachments(paths: string[]): Promise<Attachment[]> {
   return invoke<Attachment[]>("read_attachments", { paths });
 }
 
+/**
+ * Open the native file picker. **Android only** — desktop uses the dialog
+ * plugin's `open()` instead. Returns `content://` URIs, which the content-URI
+ * reader (`readAttachmentFromUri`) already handles. An empty array means the
+ * user cancelled.
+ */
+export function pickAttachmentUris(): Promise<string[]> {
+  return invoke<string[]>("pick_attachment_uris");
+}
+
 export function stopChat(conversationId: string): Promise<void> {
   return invoke<void>("stop_chat", { conversationId });
 }

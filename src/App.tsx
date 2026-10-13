@@ -27,6 +27,7 @@ import {
   listProviders,
   memoryExtractionStats,
   memoryReflectionStats,
+  pickAttachmentUris,
   readAttachments,
   reflectNow,
   removeProvider,
@@ -104,6 +105,21 @@ const ATTACHMENT_FILTERS = [
   },
   { name: "All files", extensions: ["*"] },
 ];
+
+/**
+ * Pick attachment paths. Android: native picker bridge (returns `content://`
+ * URIs the content-URI reader already handles). Desktop: the dialog plugin.
+ * `null` = cancelled.
+ */
+async function pickAttachmentPaths(): Promise<string[] | null> {
+  if (isAndroid) {
+    const uris = await pickAttachmentUris();
+    return uris.length > 0 ? uris : null;
+  }
+  const picked = await open({ multiple: true, directory: false, filters: ATTACHMENT_FILTERS });
+  if (!picked) return null;
+  return Array.isArray(picked) ? picked : [picked];
+}
 
 export default function App() {
   const [conversations, setConversations] = createSignal<Conversation[]>([]);
@@ -1352,16 +1368,13 @@ export default function App() {
     }
   }
 
-  // File explorer button: native open dialog via the Tauri dialog plugin.
+  // File explorer button: native picker. Android goes through our own plugin
+  // (see `pickAttachmentPaths`); desktop through the dialog plugin.
   async function pickAttachments() {
     try {
-      const picked = await open({
-        multiple: true,
-        directory: false,
-        filters: ATTACHMENT_FILTERS,
-      });
-      if (!picked) return;
-      await addAttachmentPaths(Array.isArray(picked) ? picked : [picked]);
+      const paths = await pickAttachmentPaths();
+      if (!paths) return;
+      await addAttachmentPaths(paths);
     } catch (e) {
       setStreamError(String(e));
     }
@@ -1587,13 +1600,9 @@ export default function App() {
 
   async function pickEditAttachments() {
     try {
-      const picked = await open({
-        multiple: true,
-        directory: false,
-        filters: ATTACHMENT_FILTERS,
-      });
-      if (!picked) return;
-      await addEditAttachmentPaths(Array.isArray(picked) ? picked : [picked]);
+      const paths = await pickAttachmentPaths();
+      if (!paths) return;
+      await addEditAttachmentPaths(paths);
     } catch (e) {
       setStreamError(String(e));
     }
