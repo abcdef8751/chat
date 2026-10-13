@@ -2282,7 +2282,7 @@ fn mirror_does_not_create_a_row_for_a_blank_config() {
 /// A legacy-only remote (providers empty on both sides) must reach a NORMAL blank
 /// device, whose mirrors are the factory DEFAULTS rather than empty strings. The
 /// `else` branch has to treat "default" as unset for the same reason
-/// `carries_nothing` does — otherwise a blank device could never leave the
+/// `migrate_v1` does — otherwise a blank device could never leave the
 /// factory endpoint. Adopted as a pair: in the legacy shape `base_url` + `model`
 /// together define the one provider.
 #[test]
@@ -2422,11 +2422,171 @@ async fn a_cleared_field_is_refilled_from_the_canonical_config() {
     );
 }
 
+/// The migration is what makes a v1 payload comparable per key: keys it CARRIES
+/// take the row's revision, keys it left empty/default are "never set" (0). That
+/// is the distinction v1 could not express, and it is what stopped a
+/// merely-created blank row from outranking real content.
+#[test]
+fn migrate_v1_stamps_only_the_keys_that_carry_something() {
+    let blank = parse_syncable_at(
+        &json!({
+            "preferences": "", "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+        })
+        .to_string(),
+        700,
+    )
+    .unwrap();
+    assert_eq!(blank.v, 2, "migrated");
+    assert!(!blank.has_content(), "a blank v1 payload has nothing set");
+
+    let prefs = parse_syncable_at(
+        &json!({
+            "preferences": "Talk like me.", "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+        })
+        .to_string(),
+        700,
+    )
+    .unwrap();
+    assert_eq!(prefs.rev(KEY_PREFERENCES), 700);
+    assert_eq!(prefs.rev(KEY_BASE_URL), 0, "an empty key stays never-set");
+    assert!(prefs.has_content());
+
+    // The `model` mirror is not content on its own: stamping it is what let a
+    // model-only device publish over a configured mirror.
+    let model_only = json!({
+        "preferences": "", "providers": [], "activeProviderId": "",
+        "baseUrl": crate::config::DEFAULT_BASE_URL,
+        "model": "some-model", "modelOverrides": {},
+    })
+    .to_string();
+    assert!(
+        syncable_payload_is_empty(&model_only),
+        "a model pick on the default endpoint carries nothing"
+    );
+    // …but a custom base_url IS legacy content, and the model rides with it.
+    let legacy = json!({
+        "preferences": "", "providers": [], "activeProviderId": "",
+        "baseUrl": "https://legacy.example/v1", "model": "some-model",
+        "modelOverrides": {},
+    })
+    .to_string();
+    assert!(!syncable_payload_is_empty(&legacy), "legacy base_url is content");
+}
+
+/// Per-key ordering replaces the whole-row `remote_newer` gate: a field we never
+/// set is adopted EVEN WHEN our row revision is the higher one — the exact state
+/// that wedged the phone.
+#[test]
+fn per_key_revisions_beat_the_row_revision() {
+    let ours = parse_syncable(
+        &json!({
+            "v": 2, "preferences": "", "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+            "revs": {},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let theirs = parse_syncable(
+        &json!({
+            "v": 2, "preferences": "Be terse", "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+            "revs": { "preferences": 500 },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let merged = ours.merge(&theirs);
+    assert_eq!(merged.preferences, "Be terse", "a field we never set is adopted");
+    assert_eq!(merged.rev(KEY_PREFERENCES), 500);
+}
+
+/// A CLEAR is set at a revision with an empty value, so it wins outright instead
+/// of being refilled — the behaviour v1 could not express, and both sides agree.
+#[test]
+fn a_clear_wins_over_an_older_value() {
+    let ours = parse_syncable(
+        &json!({
+            "v": 2, "preferences": "", "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+            "revs": { "preferences": 900 },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let theirs = parse_syncable(
+        &json!({
+            "v": 2, "preferences": "Be terse", "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+            "revs": { "preferences": 500 },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(ours.merge(&theirs).preferences, "", "our newer clear stands");
+    assert_eq!(theirs.merge(&ours).preferences, "", "…and they agree");
+    assert!(!ours.merge(&theirs).revs.is_empty(), "the clear is still actionable");
+
+    // A strictly NEWER value still beats the older clear.
+    let mut older_clear = ours.clone();
+    older_clear.revs.insert(KEY_PREFERENCES.into(), 400);
+    assert_eq!(older_clear.merge(&theirs).preferences, "Be terse");
+}
+
+/// A removal keeps its key's revision while the value goes away (a per-key
+/// tombstone), so a newer removal beats a stale entry on BOTH sides — while a v1
+/// peer, which has no revisions at all, still unions it in.
+#[test]
+fn a_newer_removal_beats_a_stale_provider() {
+    let prov_a = json!({ "id": "prov-a", "name": "A", "baseUrl": "https://a/v1",
+                         "defaultModel": null, "catalogId": null });
+    // We removed `prov-a` at 900; the server still lists it at 500.
+    let ours = parse_syncable(
+        &json!({
+            "v": 2, "preferences": "", "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+            "revs": { "provider:prov-a": 900 },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let theirs = parse_syncable(
+        &json!({
+            "v": 2, "preferences": "", "providers": [prov_a],
+            "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+            "revs": { "provider:prov-a": 500 },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(ours.merge(&theirs).providers.is_empty(), "our removal stands");
+    assert!(
+        theirs.merge(&ours).providers.is_empty(),
+        "…and it converges for them too"
+    );
+
+    let v1_ours = parse_syncable(
+        &json!({
+            "preferences": "", "providers": [], "activeProviderId": "",
+            "baseUrl": "", "model": "", "modelOverrides": {},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        v1_ours.merge(&theirs).providers.len(),
+        1,
+        "a v1 peer still unions the entry in"
+    );
+}
+
 /// The union's provider merge is per-id and its active-id adoption never yields
 /// a dangling id — even when the server's active id names a provider that exists
 /// nowhere in the merged list.
 #[test]
-fn union_with_merges_providers_by_id_and_never_dangles_active() {
+fn merge_merges_providers_by_id_and_never_dangles_active() {
     let local = parse_syncable(
         &json!({
             "activeProviderId": "", "baseUrl": "", "model": "",
@@ -2453,7 +2613,7 @@ fn union_with_merges_providers_by_id_and_never_dangles_active() {
         .to_string(),
     )
     .unwrap();
-    let merged = local.union_with(&server_ok);
+    let merged = local.merge(&server_ok);
     assert_eq!(merged.providers.len(), 2, "providers merge per id");
     assert_eq!(merged.active_provider_id, "prov-s");
 
@@ -2471,7 +2631,7 @@ fn union_with_merges_providers_by_id_and_never_dangles_active() {
         .to_string(),
     )
     .unwrap();
-    let merged = local.union_with(&server_ghost);
+    let merged = local.merge(&server_ghost);
     assert_eq!(merged.active_provider_id, "", "a dangling server id is not adopted");
 }
 

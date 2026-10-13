@@ -1101,7 +1101,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                 };
                 match (parse_syncable(&payload), parse_syncable(&server_clear)) {
                     (Some(local), Some(server)) => {
-                        let merged = local.union_with(&server);
+                        let merged = local.merge(&server);
                         let merged_json =
                             serde_json::to_value(&merged).map_err(|e| e.to_string())?;
                         let server_json =
@@ -1395,17 +1395,20 @@ async fn reconcile_user_config(ctx: &SyncCtx<'_>, token: &str) -> Result<(), Str
 }
 
 /// True when a `user_config` payload carries nothing that could back anything up.
-/// An EMPTY config must never be pushed: `user_config` is a single global row and
-/// a blank device's default (empty) payload would clobber the server's canonical
-/// config under a clock-based revision (any clock skew makes it "newer"). A device
-/// with nothing to sync instead just clears its dirty flag, so the row is not
-/// re-pushed every tick. Once a device pulls and adopts a non-empty config, that
-/// (non-empty) config is what gets pushed.
+/// An EMPTY config must never be published: `user_config` is a single global row
+/// and a blank device's default payload would clobber the server's canonical
+/// config. A device with nothing to say instead just clears its dirty flag, so the
+/// row is not re-pushed every tick.
+///
+/// v2 makes "nothing to say" precise: it means NO KEY HAS EVER BEEN SET (no
+/// revisions at all), which is not the same as "the values happen to be empty". A
+/// device that CLEARED a field has revisions and does have something to publish.
+/// A v1 payload is migrated on parse, so the same test covers both.
 pub(crate) fn syncable_payload_is_empty(payload: &str) -> bool {
-    match serde_json::from_str::<SyncableConfig>(payload) {
-        Ok(sc) => sc.carries_nothing(),
+    match parse_syncable(payload) {
+        Some(sc) => !sc.has_content(),
         // Unparseable — assume non-empty so it is pushed as-is rather than dropped.
-        Err(_) => false,
+        None => false,
     }
 }
 /// Clear the dirty flag (guarded by revision) for the message rows in a batch
@@ -2178,10 +2181,117 @@ struct RemoteUserConfig {
     deleted_at: Option<i64>,
 }
 
+/// Keys in [`SyncableConfig::revs`]. Scalars use their own field name; collection
+/// entries are namespaced so a provider id can never collide with a field name.
+const KEY_PREFERENCES: &str = "preferences";
+const KEY_ACTIVE_PROVIDER: &str = "activeProviderId";
+const KEY_BASE_URL: &str = "baseUrl";
+const KEY_MODEL: &str = "model";
+fn key_provider(id: &str) -> String {
+    format!("provider:{id}")
+}
+fn key_override(model: &str) -> String {
+    format!("override:{model}")
+}
+
+/// `base_url` / `model` count as "unset" when empty OR still the factory default:
+/// a legacy (pre-multi-provider) user whose only content is a CUSTOM base_url must
+/// still read as configured, and a device that merely kept the defaults must not
+/// look like it chose them.
+fn base_url_unset(v: &str) -> bool {
+    v.is_empty() || v == crate::config::DEFAULT_BASE_URL
+}
+fn model_unset(v: &str) -> bool {
+    v.is_empty() || v == crate::config::DEFAULT_MODEL
+}
+
+/// Pick a scalar by per-key revision. With a real order (one side strictly newer)
+/// the newer side wins outright. On a TIE — no ordering information, which is
+/// every key of a v1 payload — fall back to the v1 value rule: the side that
+/// CARRIES a value wins (`self` when both do, i.e. local-wins), so an unset side
+/// can never blank a configured one.
+fn pick<'a>(
+    mine: &'a str,
+    mine_rev: i64,
+    theirs: &'a str,
+    their_rev: i64,
+    unset: impl Fn(&str) -> bool,
+) -> &'a str {
+    if mine_rev > their_rev {
+        return mine;
+    }
+    if their_rev > mine_rev {
+        return theirs;
+    }
+    if unset(mine) && !unset(theirs) {
+        theirs
+    } else {
+        mine
+    }
+}
+
+/// Merge two keyed collections by per-entry revision. An entry from `mine` is kept
+/// unless `theirs` set that key strictly more recently; a `theirs` entry we lack is
+/// taken unless OUR key is strictly newer — which is how a removal wins (a removed
+/// entry keeps its revision while its value goes away, i.e. a per-key tombstone).
+/// On a tie the entry that still exists wins, so a v1 payload (no revisions at all,
+/// both sides 0) unions exactly as it always did.
+fn merge_entries<T: Clone>(
+    mine: &[T],
+    theirs: &[T],
+    key_of: impl Fn(&T) -> String,
+    mine_rev: impl Fn(&str) -> i64,
+    their_rev: impl Fn(&str) -> i64,
+) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for item in mine {
+        let key = key_of(item);
+        if mine_rev(&key) >= their_rev(&key) {
+            kept.push(key);
+            out.push(item.clone());
+        }
+    }
+    for item in theirs {
+        let key = key_of(item);
+        if kept.contains(&key) {
+            continue;
+        }
+        // Ours doesn't hold it: take theirs unless our (tombstoned) key is
+        // strictly newer.
+        if mine_rev(&key) <= their_rev(&key) {
+            out.push(item.clone());
+        }
+    }
+    out
+}
+
 /// The syncable config subset, deserialized from `user_config.payload`.
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// ## v2: per-key revisions
+///
+/// v1 carried values only, which made three different states indistinguishable:
+/// a field the user never set, a field they deliberately CLEARED, and a field the
+/// device merely inherited — all just "empty". With the row revision as the only
+/// ordering signal, "whose config is newer" had to stand in for "whose content is
+/// authoritative", which is wrong every time a row is CREATED rather than edited:
+/// a blank device mirroring its config stamped a fresh revision and could then
+/// never absorb the canonical one, and a cleared field silently came back.
+///
+/// So every key now records the revision at which THIS device last set it:
+///
+///   * key absent from `revs` (or 0) → **never set** → adoptable from the other side;
+///   * `revs[key] > 0` with an empty/absent value → **cleared** at that revision,
+///     and a clear is a real edit that propagates;
+///   * otherwise the value, ordered against the other side by that same revision.
+///
+/// `v` marks the format; a payload without it is v1 and is migrated on read.
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
 struct SyncableConfig {
+    /// Payload format. Absent/1 = the v1 value-only shape.
+    #[serde(default)]
+    v: u8,
     #[serde(default)]
     preferences: String,
     #[serde(default)]
@@ -2194,6 +2304,10 @@ struct SyncableConfig {
     model: String,
     #[serde(default)]
     model_overrides: HashMap<String, crate::config::ModelOverride>,
+    /// Per-key last-set revision (ms): the scalar field names plus
+    /// `provider:<id>` / `override:<model>` for collection entries.
+    #[serde(default)]
+    revs: HashMap<String, i64>,
 }
 
 impl SyncableConfig {
@@ -2210,105 +2324,181 @@ impl SyncableConfig {
         self.active_provider_id.is_empty()
     }
     fn base_url_empty(&self) -> bool {
-        self.base_url.is_empty() || self.base_url == crate::config::DEFAULT_BASE_URL
+        base_url_unset(&self.base_url)
     }
-    fn model_empty(&self) -> bool {
-        self.model.is_empty() || self.model == crate::config::DEFAULT_MODEL
-    }
+    // `model` deliberately has no `*_empty` helper: it is not revision-tracked
+    // (see `migrate_v1`); `merge`'s tie rule uses `model_unset` directly.
     fn overrides_empty(&self) -> bool {
         self.model_overrides.is_empty()
     }
 
-    /// True when this config carries nothing user-owned — the "empty" notion
-    /// `syncable_payload_is_empty` applies to a raw payload. Such a config must
-    /// never be *published* (it would blank a configured mirror) and, just as
-    /// importantly, must never carry a fresh revision that makes it look *newer*
-    /// than real content on another device: a row that was merely CREATED
-    /// (mirroring a blank config) is not an edit, and treating it as one wedges
-    /// the device so it can never absorb the canonical config.
-    ///
-    /// `base_url` only counts as unset when it is empty OR still the factory
-    /// default: a legacy (pre-multi-provider) user whose only content is a CUSTOM
-    /// base_url must still read as non-empty, or their config would never sync.
-    /// `model` is deliberately NOT part of the test — a device whose only
-    /// non-default content is the `model` mirror on the DEFAULT endpoint (it
-    /// merely picked a model, with no provider or preferences bound to it)
-    /// carries nothing transferable and must never publish over a configured
-    /// mirror. That was the exact "empty phone blanked the canonical config"
-    /// clobber.
-    fn carries_nothing(&self) -> bool {
-        self.providers_empty()
-            && self.active_provider_empty()
-            && self.preferences_empty()
-            && self.overrides_empty()
-            && self.base_url_empty()
-    }
-
-    /// Field-wise UNION with the server's payload: OUR value wins wherever we
-    /// set one; the server's fills the fields we left unset. Providers and
-    /// override entries merge PER KEY (id / model), so the result always
-    /// contains every provider and override the server held — pushing it can
-    /// only ADD entries to the mirror. Scalar fields we set (preferences, a
-    /// custom base_url) resolve local-wins, which is the app's documented
-    /// "a genuine local edit still wins" policy; the server's value for such a
-    /// conflict is the one thing a push can replace, and that residual is
-    /// inherent to a single row with no per-field versions.
-    fn union_with(&self, server: &SyncableConfig) -> SyncableConfig {
-        // Providers: union by id, local wins a shared id.
-        let mut providers = self.providers.clone();
-        for p in &server.providers {
-            if !providers.iter().any(|q| q.id == p.id) {
-                providers.push(p.clone());
-            }
-        }
-        // Overrides: union by model key, local wins a shared key.
-        let mut model_overrides = self.model_overrides.clone();
-        for (k, v) in &server.model_overrides {
-            model_overrides.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        // Prefer the server's active id when we have none — but only if it names
-        // a provider that exists in the merged list, so we can never emit a
-        // dangling id. (The union appends every server provider by id, so a
-        // server active id that pointed at one of its own providers is always
-        // valid here.) Decided before `providers` is moved into the struct.
-        let active_provider_id = if self.active_provider_empty()
-            && (server.active_provider_id.is_empty()
-                || providers.iter().any(|p| p.id == server.active_provider_id))
-        {
-            server.active_provider_id.clone()
-        } else {
-            self.active_provider_id.clone()
-        };
+    /// A payload in the current format.
+    fn new_v2() -> Self {
         SyncableConfig {
-            preferences: if self.preferences_empty() {
-                server.preferences.clone()
-            } else {
-                self.preferences.clone()
-            },
-            providers,
-            active_provider_id,
-            base_url: if self.base_url_empty() {
-                server.base_url.clone()
-            } else {
-                self.base_url.clone()
-            },
-            model: if self.model_empty() {
-                server.model.clone()
-            } else {
-                self.model.clone()
-            },
-            model_overrides,
+            v: 2,
+            ..Default::default()
         }
     }
 
-    /// True when WE hold user content the server LACKS (a field we set that the
-    /// server left unset, or a provider / override key it doesn't have). This is
-    /// the ADDITIVE criterion the reconcile uses: a pure conflict (both set the
-    /// same field to different values) is deliberately NOT "adding", so a clean
-    /// row only re-pushes when it would add content — never to fight over a
-    /// value. (An actual local edit is dirty and goes out through the normal
-    /// push, which unions.)
+    /// This device's revision for `key` (0 = never set).
+    fn rev(&self, key: &str) -> i64 {
+        self.revs.get(key).copied().unwrap_or(0)
+    }
+
+    /// Has this device ever SET something? A config that has never been edited
+    /// carries no information and must never be PUBLISHED — publishing it is what
+    /// blanked the configured mirror. A cleared field, by contrast, DOES carry
+    /// information (cleared at revision N) and must be published. This is the v2
+    /// replacement for `carries_nothing`'s value heuristic, and it cannot be fooled
+    /// by a model pick or a factory default.
+    fn has_content(&self) -> bool {
+        self.revs.values().any(|r| *r > 0)
+    }
+
+    /// Migrate a v1 payload in place. v1's only ordering signal was the row's own
+    /// revision, so every key that CARRIES something takes that revision, while
+    /// every empty/default key stays 0 = "never set" and is therefore adoptable.
+    /// Recovering that distinction is the entire point: it is what v1 could not
+    /// express, and what let a merely-created blank row outrank real content.
+    fn migrate_v1(&mut self, row_revision: i64) {
+        if self.v >= 2 || !self.revs.is_empty() {
+            self.v = 2;
+            return;
+        }
+        self.v = 2;
+        if row_revision <= 0 {
+            return;
+        }
+        if !self.preferences_empty() {
+            self.revs.insert(KEY_PREFERENCES.into(), row_revision);
+        }
+        if !self.active_provider_empty() {
+            self.revs.insert(KEY_ACTIVE_PROVIDER.into(), row_revision);
+        }
+        if !self.base_url_empty() {
+            self.revs.insert(KEY_BASE_URL.into(), row_revision);
+        }
+        // `model` is deliberately NOT stamped: v1 excluded it from the emptiness
+        // test, and its rationale still holds — a device whose only non-default
+        // content is the `model` mirror carries nothing transferable (that WAS the
+        // "empty phone blanked the canonical config" clobber). It rides along by
+        // value where the payload is legacy content for some other reason
+        // (a custom base_url), resolved by the tie rule in `merge`.
+        for p in &self.providers {
+            self.revs.insert(key_provider(&p.id), row_revision);
+        }
+        for model in self.model_overrides.keys() {
+            self.revs.insert(key_override(model), row_revision);
+        }
+    }
+
+    /// Field-wise merge — the v2 replacement for `union_with`. Per key the side
+    /// with the higher revision wins; on a tie (including both-never-set, which is
+    /// every key of a v1 payload) it falls back to the v1 value rule, so this is
+    /// behaviour-identical to `union_with` for v1 payloads while giving real
+    /// per-field ordering as soon as revisions exist. A winner whose value is EMPTY
+    /// is a deliberate clear and is kept — that is what v2 adds.
+    fn merge(&self, other: &SyncableConfig) -> SyncableConfig {
+        let mut out = SyncableConfig::new_v2();
+        // Carry the highest revision seen for every key on either side, so the
+        // merged payload stays mergeable with a third device.
+        for (k, r) in self.revs.iter().chain(other.revs.iter()) {
+            let slot = out.revs.entry(k.clone()).or_insert(0);
+            *slot = (*slot).max(*r);
+        }
+        out.preferences = pick(
+            &self.preferences,
+            self.rev(KEY_PREFERENCES),
+            &other.preferences,
+            other.rev(KEY_PREFERENCES),
+            |s| s.trim().is_empty(),
+        )
+        .to_string();
+        out.active_provider_id = pick(
+            &self.active_provider_id,
+            self.rev(KEY_ACTIVE_PROVIDER),
+            &other.active_provider_id,
+            other.rev(KEY_ACTIVE_PROVIDER),
+            |s| s.is_empty(),
+        )
+        .to_string();
+        out.base_url = pick(
+            &self.base_url,
+            self.rev(KEY_BASE_URL),
+            &other.base_url,
+            other.rev(KEY_BASE_URL),
+            base_url_unset,
+        )
+        .to_string();
+        out.model = pick(
+            &self.model,
+            self.rev(KEY_MODEL),
+            &other.model,
+            other.rev(KEY_MODEL),
+            model_unset,
+        )
+        .to_string();
+        // Collections: per-entry winner, with a newer removal beating a stale entry.
+        out.providers = merge_entries(
+            &self.providers,
+            &other.providers,
+            |p| key_provider(&p.id),
+            |k| self.rev(k),
+            |k| other.rev(k),
+        );
+        let mine_overrides: Vec<(String, crate::config::ModelOverride)> = self
+            .model_overrides
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let their_overrides: Vec<(String, crate::config::ModelOverride)> = other
+            .model_overrides
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.model_overrides = merge_entries(
+            &mine_overrides,
+            &their_overrides,
+            |(model, _)| key_override(model),
+            |k| self.rev(k),
+            |k| other.rev(k),
+        )
+        .into_iter()
+        .collect();
+        // Never emit a dangling active id: if the winning id names a provider the
+        // merge dropped (a newer removal won), take the other side's id when it is
+        // valid, else clear it. The revision is kept — the decision was made.
+        if !out.active_provider_id.is_empty()
+            && !out
+                .providers
+                .iter()
+                .any(|p| p.id == out.active_provider_id)
+        {
+            let alt = if out.active_provider_id == self.active_provider_id {
+                &other.active_provider_id
+            } else {
+                &self.active_provider_id
+            };
+            out.active_provider_id = if out.providers.iter().any(|p| p.id == *alt) {
+                alt.clone()
+            } else {
+                String::new()
+            };
+        }
+        out
+    }
+
+    /// True when WE hold something the other side would not already have: a key we
+    /// set more recently than they did. A CLEAR counts — it says "empty at revision
+    /// N", which is information. The reconcile uses this to decide whether the row
+    /// still needs to be pushed; a conflict where they are at or ahead of us is not
+    /// "adding", so two configured devices never fight every tick.
     fn adds_content_over(&self, server: &SyncableConfig) -> bool {
+        if self.has_content() || server.has_content() {
+            return self.revs.iter().any(|(k, r)| *r > 0 && *r > server.rev(k));
+        }
+        // Neither side carries revisions (both v1): fall back to the value rule, so
+        // a v1 device with content it genuinely set still re-pushes.
         (!self.preferences_empty() && server.preferences_empty())
             || (!self.providers_empty() && server.providers_empty())
             || self
@@ -2327,8 +2517,18 @@ impl SyncableConfig {
 
 /// Parse a `user_config` payload into the syncable subset, or `None` when it
 /// isn't valid JSON for it (a legacy/garbage payload we can't safely merge).
+///
+/// A **v1** payload (no `revs`, no `v`) is migrated here: `row_revision` is stamped
+/// on every key it carries, so a v1 payload keeps its relative order. Where only
+/// "has anything been set?" matters, 1 will do — the exact value is irrelevant.
+fn parse_syncable_at(payload: &str, row_revision: i64) -> Option<SyncableConfig> {
+    let mut sc = serde_json::from_str::<SyncableConfig>(payload).ok()?;
+    sc.migrate_v1(row_revision);
+    Some(sc)
+}
+
 fn parse_syncable(payload: &str) -> Option<SyncableConfig> {
-    serde_json::from_str::<SyncableConfig>(payload).ok()
+    parse_syncable_at(payload, 1)
 }
 
 /// The plaintext of a server `user_config` payload: unchanged when it isn't
@@ -2378,7 +2578,7 @@ fn adopt_missing_fields(cfg: &mut crate::config::AppConfig, sc: &SyncableConfig)
         } else {
             // Legacy-only remote (neither side has providers): seed a device
             // whose mirrors are BOTH unset or still the factory defaults. The
-            // default counts as unset here for the same reason `carries_nothing`
+            // default counts as unset here for the same reason `migrate_v1`
             // treats it as empty — otherwise a normal blank device (whose mirrors
             // ARE the defaults) could never absorb a legacy remote's endpoint and
             // would sit on the factory one forever. Adopted as a PAIR: in the
