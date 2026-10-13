@@ -151,7 +151,21 @@ fn web_fetch_tool() -> ChatCompletionTools {
         json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "Absolute http:// or https:// URL to fetch" }
+                "url": { "type": "string", "description": "Absolute http:// or https:// URL to fetch" },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Optional cap on how many characters of converted page text to \
+                                    return (defaults to the built-in maximum). Use a smaller value \
+                                    when only the beginning of a page is needed; it can lower the \
+                                    cap but never raise it above the built-in maximum."
+                },
+                "char_start": {
+                    "type": "integer",
+                    "description": "Optional character offset into the converted page text to start \
+                                    returning from (default 0). Combine with max_chars to page \
+                                    through a long page; an offset past the end returns a \
+                                    'no content' marker rather than an error."
+                }
             },
             "required": ["url"]
         }),
@@ -355,10 +369,12 @@ pub async fn execute_web_tool(call: &ToolCall) -> ToolOutput {
     }
 }
 
-/// `web_fetch(url)` — GET an http(s) URL and return its readable text. HTML is
-/// reduced to plain text best-effort (script/style dropped, tags → spaces, a
-/// handful of common entities decoded, blank-line runs collapsed). The result is
-/// framed as untrusted external data before it reaches the model.
+/// `web_fetch(url, max_chars?, char_start?)` — GET an http(s) URL and return its
+/// readable text. HTML is reduced to plain text best-effort (script/style
+/// dropped, tags → spaces, a handful of common entities decoded, blank-line runs
+/// collapsed). The optional `char_start`/`max_chars` arguments let the model read
+/// a bounded window of a long page. The result is framed as untrusted external
+/// data before it reaches the model.
 async fn web_fetch(call: &ToolCall) -> ToolOutput {
     let Some(raw) = call.arguments.get("url").and_then(Value::as_str) else {
         return ToolOutput::err("web_fetch: missing 'url' argument".into());
@@ -372,17 +388,64 @@ async fn web_fetch(call: &ToolCall) -> ToolOutput {
             "web_fetch: only http/https URLs are supported (got '{url}')"
         ));
     }
-    let out = fetch_url(url, false).await;
+    let max_chars = match parse_max_chars(&call.arguments) {
+        Ok(v) => v,
+        Err(e) => return ToolOutput::err(e),
+    };
+    let char_start = match parse_char_start(&call.arguments) {
+        Ok(v) => v,
+        Err(e) => return ToolOutput::err(e),
+    };
+    let out = fetch_url(url, false, char_start, max_chars).await;
     if out.is_error {
         return out;
     }
-    ToolOutput::ok(format!("{WEB_FETCH_UNTRUSTED_NOTE}\n{}", out.content))
+    web_fetch_untrusted(out.content)
+}
+
+/// Parse the optional `max_chars` argument. Absent → `None` (the built-in hard
+/// ceiling applies). Present must be a positive integer; `0`, a negative, an
+/// explicit `null`, or a non-integer is a caller error.
+fn parse_max_chars(arguments: &Value) -> Result<Option<usize>, String> {
+    match arguments.get("max_chars") {
+        None => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if n > 0 => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
+            _ => Err("web_fetch: 'max_chars' must be a positive integer".into()),
+        },
+    }
+}
+
+/// Parse the optional `char_start` argument. Absent → `0`. Present must be a
+/// non-negative integer; a negative, an explicit `null`, or a non-integer is a
+/// caller error.
+fn parse_char_start(arguments: &Value) -> Result<usize, String> {
+    match arguments.get("char_start") {
+        None => Ok(0),
+        Some(v) => match v.as_u64() {
+            Some(n) => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
+            _ => Err("web_fetch: 'char_start' must be a non-negative integer".into()),
+        },
+    }
+}
+
+/// Frame a successful fetch body as untrusted external data. Kept in one place
+/// so the note is always prepended to the (possibly windowed) body and never
+/// counted against the output window.
+fn web_fetch_untrusted(content: String) -> ToolOutput {
+    ToolOutput::ok(format!("{WEB_FETCH_UNTRUSTED_NOTE}\n{content}"))
 }
 
 /// The actual GET + decode, factored out so tests can hit a loopback mock.
 /// `allow_private` bypasses the SSRF guard (the public tool always passes
-/// `false`); every other caller must leave it off.
-async fn fetch_url(url: &str, allow_private: bool) -> ToolOutput {
+/// `false`); every other caller must leave it off. `char_start`/`max_chars` are
+/// the model-supplied output window (see [`window_web_fetch_text`]).
+async fn fetch_url(
+    url: &str,
+    allow_private: bool,
+    char_start: usize,
+    max_chars: Option<usize>,
+) -> ToolOutput {
     let Some(host) = url_host(url) else {
         return ToolOutput::err(format!("web_fetch: could not parse a host from '{url}'"));
     };
@@ -440,7 +503,45 @@ async fn fetch_url(url: &str, allow_private: bool) -> ToolOutput {
     if text.trim().is_empty() {
         return ToolOutput::ok("web_fetch: (no readable text)".into());
     }
+    let text = window_web_fetch_text(text, char_start, max_chars);
+    // Safety net: the window above already bounds the returned body, so this is
+    // normally a no-op. It still enforces the hard ceiling on the default
+    // (unwindowed) path, exactly as before this feature.
     ToolOutput::ok(truncate(text))
+}
+
+/// Window the converted page text for a `web_fetch` result: skip `char_start`
+/// characters, then return up to `max_chars` (clamped to [`MAX_OUTPUT_CHARS`]).
+///
+/// * No window requested (`char_start == 0` and no `max_chars`) → the text is
+///   returned untouched, so the caller's `truncate()` applies the ceiling
+///   exactly as before this feature existed.
+/// * `char_start` at or past the end → a `…[no content at character N]` marker
+///   (not an error), so "nothing there" is distinguishable from a failure.
+/// * A window that stops before the end → the slice followed by a
+///   `…[showing characters S..E of T]` marker so the model can page onward.
+///
+/// Slicing is char-safe (never splits a codepoint).
+fn window_web_fetch_text(text: String, char_start: usize, max_chars: Option<usize>) -> String {
+    if char_start == 0 && max_chars.is_none() {
+        return text;
+    }
+    let total = text.chars().count();
+    if char_start >= total {
+        return format!("…[no content at character {char_start}]");
+    }
+    let limit = max_chars.unwrap_or(MAX_OUTPUT_CHARS).min(MAX_OUTPUT_CHARS);
+    let end = char_start.saturating_add(limit).min(total);
+    let body: String = text
+        .chars()
+        .skip(char_start)
+        .take(end - char_start)
+        .collect();
+    if end < total {
+        format!("{body}\n…[showing characters {char_start}..{end} of {total}]")
+    } else {
+        body
+    }
 }
 
 /// The host component of an absolute http(s) URL, if it parses.
@@ -1408,7 +1509,7 @@ mod tests {
         );
         let url = format!("http://127.0.0.1:{port}/");
         // allow_private bypasses the loopback guard for this mock.
-        let out = fetch_url(&url, true).await;
+        let out = fetch_url(&url, true, 0, None).await;
         let _ = handle.join();
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("Hello & welcome !"), "{}", out.content);
@@ -1420,7 +1521,7 @@ mod tests {
     async fn fetch_url_reports_http_error_status() {
         let (port, handle) = start_http_mock("404 Not Found", "text/plain", "nope");
         let url = format!("http://127.0.0.1:{port}/missing");
-        let out = fetch_url(&url, true).await;
+        let out = fetch_url(&url, true, 0, None).await;
         let _ = handle.join();
         assert!(out.is_error, "{}", out.content);
         assert!(out.content.contains("404"), "{}", out.content);
@@ -1439,7 +1540,7 @@ mod tests {
             (head, String::new())
         });
         let url = format!("http://127.0.0.1:{port}/");
-        let out = fetch_url(&url, true).await;
+        let out = fetch_url(&url, true, 0, None).await;
         let _ = handle.join();
         assert!(out.is_error, "{}", out.content);
         // reqwest's Display wraps the policy error without its inner text, so
@@ -1464,7 +1565,7 @@ mod tests {
             )
         });
         let url = format!("http://127.0.0.1:{port}/");
-        let out = fetch_url(&url, true).await;
+        let out = fetch_url(&url, true, 0, None).await;
         let _ = handle.join();
         assert!(out.is_error, "{}", out.content);
         assert!(
@@ -1483,7 +1584,7 @@ mod tests {
         body.push_str("TAILMARKER");
         let (port, handle) = start_http_mock("200 OK", "text/html", &body);
         let url = format!("http://127.0.0.1:{port}/");
-        let out = fetch_url(&url, true).await;
+        let out = fetch_url(&url, true, 0, None).await;
         let _ = handle.join();
         assert!(
             !out.content.contains("TAILMARKER"),
@@ -1527,6 +1628,183 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    #[test]
+    fn web_fetch_spec_documents_the_window_params() {
+        let spec = web_fetch_tool();
+        let ChatCompletionTools::Function(f) = spec else {
+            panic!("web_fetch should be a function tool");
+        };
+        let params = f.function.parameters.expect("parameters");
+        assert_eq!(params["properties"]["max_chars"]["type"], "integer");
+        assert_eq!(params["properties"]["char_start"]["type"], "integer");
+        // Neither window argument is required — omitting both is the default.
+        let required = params["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "url");
+    }
+
+    #[tokio::test]
+    async fn fetch_url_honours_max_chars_and_reports_the_range() {
+        // ~3k chars of multi-byte text, so an off-by-one byte slice would panic
+        // on a codepoint boundary rather than silently pass.
+        let raw = format!("<pre>{}</pre>", "é".repeat(3000));
+        let (port, handle) = start_http_mock("200 OK", "text/html", &raw);
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true, 0, Some(500)).await;
+        let _ = handle.join();
+        assert!(!out.is_error, "{}", out.content);
+        let total = html_to_text(&raw).chars().count();
+        assert!(total > 500, "fixture too short: {total}");
+        let marker = format!("…[showing characters 0..500 of {total}]");
+        assert!(out.content.contains(&marker), "{}", out.content);
+        // The marker is on its own line after `\n`.
+        let body_part = out.content.lines().next().unwrap();
+        assert_eq!(body_part.chars().count(), 500, "{}", out.content);
+        // The cap counts characters, never splitting a codepoint.
+        assert!(body_part.chars().all(|c| c == 'é'), "{body_part}");
+    }
+
+    #[tokio::test]
+    async fn fetch_url_without_max_chars_returns_the_full_body() {
+        let raw = format!("<pre>{}</pre>", "é".repeat(3000));
+        let (port, handle) = start_http_mock("200 OK", "text/html", &raw);
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true, 0, None).await;
+        let _ = handle.join();
+        assert!(!out.is_error, "{}", out.content);
+        // Default behaviour is byte-identical to before the window feature: no
+        // range marker and no truncation, because the body fits under the cap.
+        assert_eq!(out.content, html_to_text(&raw));
+        assert!(!out.content.contains("showing characters"), "{}", out.content);
+        assert!(!out.content.contains("truncated"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_bad_max_chars_without_network() {
+        // Rejected before any request, so a loopback URL is fine (it never
+        // reaches the SSRF guard).
+        for bad in [json!(0), json!(-3), json!("lots"), json!(1.5)] {
+            let out = execute_web_tool(&ToolCall {
+                id: "wm".into(),
+                name: "web_fetch".into(),
+                arguments: json!({"url": "http://127.0.0.1:1/", "max_chars": bad}),
+            })
+            .await;
+            assert!(out.is_error, "max_chars {bad} should be rejected");
+            assert!(
+                out.content.contains("'max_chars' must be a positive integer"),
+                "{}",
+                out.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_url_clamps_max_chars_to_the_hard_ceiling() {
+        // A cap above the ceiling is clamped: the body is bounded and the tail
+        // past the ceiling is never returned.
+        let raw = format!("<pre>{}TAIL</pre>", "a".repeat(MAX_OUTPUT_CHARS));
+        let (port, handle) = start_http_mock("200 OK", "text/html", &raw);
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true, 0, Some(usize::MAX)).await;
+        let _ = handle.join();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            !out.content.contains("TAIL"),
+            "cap was raised past the ceiling: {} chars",
+            out.content.chars().count()
+        );
+        assert!(
+            out.content.chars().count() <= MAX_OUTPUT_CHARS + 40,
+            "not bounded: {} chars",
+            out.content.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_frame_keeps_the_untrusted_note_when_truncated() {
+        // `execute_web_tool` refuses loopback, so the loopback mock is reached
+        // through `fetch_url` and framed with the same helper `web_fetch` uses.
+        let raw = format!("<pre>{}</pre>", "b".repeat(2000));
+        let (port, handle) = start_http_mock("200 OK", "text/html", &raw);
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true, 0, Some(100)).await;
+        let _ = handle.join();
+        assert!(!out.is_error, "{}", out.content);
+        let framed = web_fetch_untrusted(out.content);
+        assert!(
+            framed.content.contains("untrusted external"),
+            "{}",
+            framed.content
+        );
+        assert!(
+            framed.content.contains("showing characters 0..100 of 2000"),
+            "{}",
+            framed.content
+        );
+        // Exactly one note, prepended before the (windowed) body.
+        assert_eq!(framed.content.matches("untrusted external").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_url_windows_with_char_start_and_max_chars() {
+        let raw = format!("<pre>{}</pre>", "x".repeat(3000));
+        let converted = html_to_text(&raw);
+        let (port, handle) = start_http_mock("200 OK", "text/html", &raw);
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true, 1000, Some(50)).await;
+        let _ = handle.join();
+        assert!(!out.is_error, "{}", out.content);
+        let expected: String = converted.chars().skip(1000).take(50).collect();
+        let marker = "…[showing characters 1000..1050 of 3000]";
+        assert_eq!(out.content, format!("{expected}\n{marker}"));
+    }
+
+    #[tokio::test]
+    async fn fetch_url_char_start_alone_reads_to_the_end() {
+        let raw = format!("<pre>{}</pre>", "y".repeat(3000));
+        let converted = html_to_text(&raw);
+        let (port, handle) = start_http_mock("200 OK", "text/html", &raw);
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true, 2500, None).await;
+        let _ = handle.join();
+        assert!(!out.is_error, "{}", out.content);
+        // No `max_chars` → everything from the offset to the end, and no marker
+        // because the window reaches the end of the text.
+        let expected: String = converted.chars().skip(2500).collect();
+        assert_eq!(out.content, expected);
+    }
+
+    #[tokio::test]
+    async fn fetch_url_char_start_past_the_end_yields_a_marker() {
+        let raw = format!("<pre>{}</pre>", "z".repeat(100));
+        let (port, handle) = start_http_mock("200 OK", "text/html", &raw);
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true, 999, None).await;
+        let _ = handle.join();
+        // Past the end is not an error — it is a clear (empty) result.
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "…[no content at character 999]");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_bad_char_start_without_network() {
+        for bad in [json!(-1), json!("start"), json!(2.5)] {
+            let out = execute_web_tool(&ToolCall {
+                id: "ws".into(),
+                name: "web_fetch".into(),
+                arguments: json!({"url": "http://127.0.0.1:1/", "char_start": bad}),
+            })
+            .await;
+            assert!(out.is_error, "char_start {bad} should be rejected");
+            assert!(
+                out.content.contains("'char_start' must be a non-negative integer"),
+                "{}",
+                out.content
+            );
+        }
     }
 
     #[test]
