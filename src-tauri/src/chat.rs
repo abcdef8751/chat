@@ -306,12 +306,20 @@ fn apply_chunk(
         for tc in tcs {
             let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
             let slot = calls.entry(index).or_insert((None, None, String::new()));
+            // Some gateways (e.g. InferX) repeat the whole `tool_calls` array on
+            // every fragment chunk with `id`/`function.name` blanked to empty
+            // strings, only carrying new text in `arguments`. Adopt metadata only
+            // when non-empty (first delta wins); always append argument text.
             if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                slot.0 = Some(id.to_string());
+                if !id.is_empty() {
+                    slot.0 = Some(id.to_string());
+                }
             }
             if let Some(f) = tc.get("function") {
                 if let Some(name) = f.get("name").and_then(Value::as_str) {
-                    slot.1 = Some(name.to_string());
+                    if !name.is_empty() {
+                        slot.1 = Some(name.to_string());
+                    }
                 }
                 if let Some(args) = f.get("arguments").and_then(Value::as_str) {
                     slot.2.push_str(args);

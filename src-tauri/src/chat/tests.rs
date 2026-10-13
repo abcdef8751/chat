@@ -233,6 +233,16 @@
         )
     }
 
+    /// InferX-style tool-call delta: restates the whole `tool_calls` array on
+    /// every fragment chunk, blanking `id`/`function.name` to **explicit empty
+    /// strings** rather than omitting them (which is what OpenAI's spec does).
+    /// The first chunk alone carries the real id/name.
+    fn tool_frag_inferx(index: u32, id: &str, name: &str, args: &str) -> String {
+        format!(
+            r#"{{"id":"1","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{index},"id":"{id}","type":"function","function":{{"name":"{name}","arguments":"{args}"}}}}]}},"finish_reason":null}}]}}"#
+        )
+    }
+
     async fn wait_for_event(
         events: &Arc<Mutex<Vec<StreamEvent>>>,
         pred: impl Fn(&StreamEvent) -> bool,
@@ -394,6 +404,59 @@
         assert_eq!(acc.tool_calls[0].id, "call_1");
         assert_eq!(acc.tool_calls[0].name, "bash");
         assert_eq!(acc.tool_calls[0].arguments["command"], "ls");
+        let _ = handle.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_keeps_id_name_across_blank_repeat_chunks() {
+        // Some gateways (InferX) restate the tool_calls array on every fragment
+        // chunk with id/name blanked to "" rather than omitted; the metadata
+        // from the first chunk must survive while arguments still accumulate.
+        // Regression for the persisted `{"id":"","name":""}` rows that produced
+        // "unknown tool: " in live chats.
+        let (port, handle) = start_mock(
+            vec![vec![
+                tool_frag_inferx(0, "call_9", "bash", r#"{\"command\":\"ls\""#),
+                tool_frag_inferx(0, "", "", r#",\"--color\":\"never\"}"#),
+                finish_chunk("tool_calls"),
+            ]],
+            0,
+        );
+        let acc = complete_once(port).await;
+        assert!(!acc.failed);
+        assert!(acc.text.is_empty());
+        assert_eq!(acc.finish.as_deref(), Some("tool_calls"));
+        assert_eq!(acc.tool_calls.len(), 1);
+        assert_eq!(acc.tool_calls[0].id, "call_9");
+        assert_eq!(acc.tool_calls[0].name, "bash");
+        assert_eq!(acc.tool_calls[0].arguments["command"], "ls");
+        assert_eq!(acc.tool_calls[0].arguments["--color"], "never");
+        let _ = handle.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_synthesizes_id_when_absent_across_gateway_repeats() {
+        // A gateway that never sends an id at all (null in every chunk, here
+        // followed by an InferX-style "" repeat) must still produce the
+        // synthesized `call_{idx}` id, and the name from the first chunk must
+        // survive the blank repeats.
+        let (port, handle) = start_mock(
+            vec![vec![
+                tool_frag(0, "", "bash", r#"{\"command\":\"ls\""#),
+                tool_frag(0, "", "", r#",\"--all\":true}"#),
+                tool_frag_inferx(0, "", "", ""),
+                finish_chunk("tool_calls"),
+            ]],
+            0,
+        );
+        let acc = complete_once(port).await;
+        assert!(!acc.failed);
+        assert_eq!(acc.finish.as_deref(), Some("tool_calls"));
+        assert_eq!(acc.tool_calls.len(), 1);
+        assert_eq!(acc.tool_calls[0].id, "call_0");
+        assert_eq!(acc.tool_calls[0].name, "bash");
+        assert_eq!(acc.tool_calls[0].arguments["command"], "ls");
+        assert_eq!(acc.tool_calls[0].arguments["--all"], true);
         let _ = handle.join();
     }
 
@@ -1252,6 +1315,81 @@
 
         let guard = events.lock().unwrap();
         assert!(guard.iter().any(|e| matches!(e, StreamEvent::ToolResult { ok: false, .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_executes_tool_despite_blank_repeat_chunks() {
+        // End-to-end regression for the InferX wire shape: round 1 streams a
+        // bash call whose id/name appear only on the first chunk ("" on the
+        // repeats). The tool must still execute and round 2 must persist —
+        // previously this landed as `{"id":"","name":""}` → "unknown tool: ".
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag_inferx(0, "call_7", "bash", ""),
+                    tool_frag_inferx(0, "", "", r#"{\"command\":\"echo inferx-ran\"}"#),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("Ran it"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("inferx"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let mcp = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
+        let cid2 = cid.clone();
+        let memory = temp_memory("inferx");
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink, cid2, "run ls".into(), Vec::new(),
+            false,
+            )
+            .await
+        });
+
+        wait_for_event(&events2, |e| matches!(e, StreamEvent::ToolCall { gated: true, .. }), 5000)
+            .await;
+        let call_id = {
+            let guard = events2.lock().unwrap();
+            guard
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::ToolCall { call_id, gated: true, .. } => Some(call_id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        while !approvals.resolve(&call_id, true) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        task.await.unwrap().unwrap();
+        let _ = handle.join();
+
+        let rows = msgs(&db, &cid);
+        assert_eq!(rows.len(), 4);
+        // The persisted assistant tool-call row must carry the real id and name.
+        let tcv: Value = serde_json::from_str(&rows[1].content).unwrap();
+        assert_eq!(tcv["tool_calls"][0]["name"], "bash");
+        assert_eq!(tcv["tool_calls"][0]["id"], "call_7");
+        // The tool result must be a successful real execution, not an error.
+        let tr: Value = serde_json::from_str(&rows[2].content).unwrap();
+        assert_eq!(tr["error"], false);
+        assert_eq!(tr["name"], "bash");
+        assert_eq!(tr["output"], "inferx-ran");
+        assert_eq!(rows[3].content, "Ran it");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
