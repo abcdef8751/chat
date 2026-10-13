@@ -10,6 +10,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 
 class MainActivity : TauriActivity() {
   // Latest system-bar insets (status bar + nav bar + display cutout), in **dp**
@@ -28,6 +29,16 @@ class MainActivity : TauriActivity() {
   // `pi-back` event when the hardware/gesture back is pressed.
   @Volatile
   private var appWebView: WebView? = null
+
+  // Our own document picker (see PickerPlugin.kt). Registered here — a field
+  // initializer is the documented, legal registration point (before STARTED) —
+  // because `tauri-plugin-dialog`'s own launcher stays bound to the *destroyed*
+  // Activity after an Activity recreation, which happens on every relaunch here.
+  // `onCreate` re-points the plugin at this launcher on each creation.
+  private val pickerLauncher =
+    registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+      PickerPlugin.onActivityResult(result.resultCode, result.data)
+    }
 
   // Convert physical px (what getInsets/setPadding use) to dp (what CSS px
   // means), so the values this app injects as `px` in its styles scale right.
@@ -71,6 +82,12 @@ class MainActivity : TauriActivity() {
     // the web layer rather than relying on WebView padding (see onWebViewCreate).
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    // Hand this activity's picker launcher to the static plugin. Doing it here
+    // (rather than once in the plugin) is the whole fix: `onCreate` runs again
+    // for every recreated Activity, so the launcher is always bound to the live
+    // one — `tauri-plugin-dialog` keeps its own launcher bound to the first
+    // Activity and fails after a recreation.
+    PickerPlugin.setLauncher { intent -> pickerLauncher.launch(intent) }
     // Register Android's system trust store with rustls-platform-verifier
     // (called on the main thread, single time). Without this, reqwest 0.13's
     // first HTTPS request SIGABRTs the process:
