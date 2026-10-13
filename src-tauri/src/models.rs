@@ -54,9 +54,12 @@ pub struct ModelInfo {
     pub id: String,
     /// Human-readable name from models.dev, when known.
     pub name: Option<String>,
-    /// Whether models.dev says the model accepts image input. `None` when the
-    /// provider isn't in the catalog — the endpoint's own `/models` carries no
-    /// capability metadata, so an unknown model must not be warned about.
+    /// Whether the model can accept image input, resolved from the user's override
+    /// (override → models.dev → text-only), so effectively never `None`. The
+    /// composer re-resolves this client-side from the raw fields below
+    /// (`src/lib/capabilities.ts`, mirroring `pricing::resolve_capabilities`)
+    /// because this bit is baked at list-fetch time and goes stale the moment a
+    /// capability is toggled in Settings — the list isn't refetched then.
     pub vision: Option<bool>,
     /// models.dev `reasoning` flag; `None` when the provider isn't in the catalog.
     pub reasoning: Option<bool>,

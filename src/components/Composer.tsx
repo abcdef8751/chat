@@ -69,7 +69,12 @@ export function Composer(props: {
         </p>
       </Show>
       <Show when={props.attachmentWarning}>
-        <p class="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+        {/* Derived from the staged attachments and the current model, so it can
+            appear or clear without any input event — announce that. */}
+        <p
+          aria-live="polite"
+          class="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300"
+        >
           {props.attachmentWarning}
         </p>
       </Show>

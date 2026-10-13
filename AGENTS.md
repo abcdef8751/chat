@@ -244,8 +244,8 @@ memory_backfill_runs(             -- reduce-pass spend (spans many conversations
   isn't refetched then — so a model just marked image-capable no longer warns).
   The Settings "Capabilities" card edits the override by click-to-toggle. A
   model with no override and no catalog modalities resolves to text-only, so an
-  un-annotated custom model is warned about images until you mark it
-  `image`-capable.
+  un-annotated custom model is warned about images — as long as it is in the model
+  list at all — until you mark it `image`-capable.
 - **models.dev lookup.** The catalog is one public JSON blob
   (`https://models.dev/api.json`), matched to a provider **by base URL** (exact
   `api` first, then host). But the fetch is **gated on `catalog_id`**: only a

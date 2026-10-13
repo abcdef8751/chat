@@ -135,8 +135,11 @@ export interface ModelInfo {
   id: string;
   name: string | null;
   /**
-   * Whether models.dev says the model accepts image input. `null` when the
-   * provider isn't in the catalog, in which case nothing is warned about.
+   * Whether the model can accept image input, resolved from the user's override
+   * (override → models.dev → text-only, so always set in practice). The composer
+   * re-resolves it client-side from the raw fields below — see
+   * `src/lib/capabilities.ts` — because it is baked at list-fetch time and would go
+   * stale when a capability is toggled in Settings.
    */
   vision: boolean | null;
   /**
