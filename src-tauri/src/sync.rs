@@ -1103,7 +1103,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
         // overrides merge per key); a scalar conflict on a field we set still
         // resolves local-wins, which is the app's documented policy.
         let (push_payload, push_rev) = match fetch_user_config_remote(ctx, token, &id).await {
-            Ok(Some((server_rev, server_raw))) => {
+            Ok(RemoteConfig::Live(server_rev, server_raw)) => {
                 // A payload we cannot read (locked device) must not be
                 // overwritten — same rule as the reconcile.
                 let Some(server_clear) = decrypt_server_payload(ctx.key, &server_raw) else {
@@ -1150,7 +1150,9 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                 }
             }
             // No server row → nothing to merge; push ours as-is.
-            Ok(None) => (payload, revision),
+            Ok(RemoteConfig::Absent) => (payload, revision),
+            // The mirror row was DELETED server-side: pushing would resurrect it.
+            Ok(RemoteConfig::Deleted) => continue,
             // Can't confirm the server state → don't risk overwriting it.
             Err(_) => continue,
         };
@@ -1213,19 +1215,31 @@ fn persist_merged_user_config(
         return Ok(false);
     }
     // The same projection the converge path uses, so the two can't disagree.
-    ctx.config.update(|cfg| project_merged(cfg, merged))?;
+    // Best-effort: the row is already written dirty, so a failed config write only
+    // delays the local adoption (the next tick re-pushes and retries it) — it must
+    // not abort the run before the pull has even run.
+    let _ = ctx.config.update(|cfg| project_merged(cfg, merged));
     Ok(true)
 }
 
-/// Fetch the server's `user_config` row (revision + payload) for `id`, or
-/// `None` when the row doesn't exist on the server (including a tombstoned
-/// row — a manual server-side delete reads as "no row", matching the pull's
-/// `remote_live` handling, so the reconcile never resurrects it).
+/// What the server holds for a `user_config` row.
+///
+/// A tombstone is NOT the same as no row: it is a deliberate server-side delete,
+/// and treating it as "no row" would re-create it — the push would upsert it
+/// clean, and a converge would arm the local row to push it back. So the two are
+/// distinguished, and only `Absent` licenses converging against an empty remote.
+enum RemoteConfig {
+    Absent,
+    Deleted,
+    Live(i64, String),
+}
+
+/// Fetch the server's `user_config` row for `id`.
 async fn fetch_user_config_remote(
     ctx: &SyncCtx<'_>,
     token: &str,
     id: &str,
-) -> Result<Option<(i64, String)>, String> {
+) -> Result<RemoteConfig, String> {
     let url = format!(
         "{}/rest/v1/user_config?id=eq.{}&select=revision,payload,deleted_at",
         ctx.base_url, id
@@ -1247,15 +1261,19 @@ async fn fetch_user_config_remote(
         .map_err(|e| format!("read server user_config body: {e}"))?;
     let rows: Vec<Value> = serde_json::from_str(&text)
         .map_err(|e| format!("read server user_config parse: {e}"))?;
-    Ok(rows
-        .first()
-        .filter(|r| r.get("deleted_at").and_then(|v| v.as_i64()).is_none())
-        .and_then(|r| {
-            Some((
-                r.get("revision")?.as_i64()?,
-                r.get("payload")?.as_str()?.to_string(),
-            ))
-        }))
+    let Some(row) = rows.first() else {
+        return Ok(RemoteConfig::Absent);
+    };
+    if row.get("deleted_at").and_then(|v| v.as_i64()).is_some() {
+        return Ok(RemoteConfig::Deleted);
+    }
+    match (
+        row.get("revision").and_then(|v| v.as_i64()),
+        row.get("payload").and_then(|v| v.as_str()),
+    ) {
+        (Some(revision), Some(payload)) => Ok(RemoteConfig::Live(revision, payload.to_string())),
+        _ => Ok(RemoteConfig::Absent),
+    }
 }
 
 /// Mirror the live config into the sync row and reconcile it against the server
@@ -1299,7 +1317,7 @@ async fn reconcile_config_after_pull(ctx: &SyncCtx<'_>, token: &str) -> Result<(
 /// we cannot decrypt is never overwritten (the locked-device contract).
 async fn reconcile_user_config(ctx: &SyncCtx<'_>, token: &str) -> Result<(), String> {
     let (remote, server_rev) = match fetch_user_config_remote(ctx, token, "main").await? {
-        Some((server_rev, server_payload)) => {
+        RemoteConfig::Live(server_rev, server_payload) => {
             let Some(server_clear) = decrypt_server_payload(ctx.key, &server_payload) else {
                 return Ok(()); // unreadable (locked) — never overwrite it
             };
@@ -1308,11 +1326,13 @@ async fn reconcile_user_config(ctx: &SyncCtx<'_>, token: &str) -> Result<(), Str
             };
             (remote, server_rev)
         }
-        // No server row yet: converge against an EMPTY remote anyway. That is what
-        // mirrors a config which predates its row (an install upgraded to sync, or a
-        // first run) and arms it dirty for the push — otherwise the row is only ever
+        // A tombstone is a deliberate server-side delete: never resurrect it.
+        RemoteConfig::Deleted => return Ok(()),
+        // No row yet: converge against an EMPTY remote anyway. That is what mirrors
+        // a config which predates its row (an install upgraded to sync, or a first
+        // run) and arms it dirty for the push — otherwise the row is only ever
         // created by an edit, and pre-existing content would never be backed up.
-        None => (SyncableConfig::new_v2(), 0),
+        RemoteConfig::Absent => (SyncableConfig::new_v2(), 0),
     };
     converge_user_config_row(ctx, "main", &remote, server_rev)?;
     Ok(())

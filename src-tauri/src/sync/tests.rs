@@ -1297,6 +1297,134 @@ async fn reconcile_redirties_row_diverged_from_server_at_equal_revision() {
     assert!(cfg.get().model_overrides.contains_key("m-1"));
 }
 
+/// A config that predates its row — nothing has ever edited it *through* the sync
+/// path, so no row exists — is still backed up: the reconcile converges against an
+/// empty remote, which mirrors the config into the row and arms it for the push.
+/// (Without that, only a later edit would ever create the row.)
+#[tokio::test]
+async fn reconcile_backs_up_a_config_that_predates_its_row() {
+    let srv = MockRest::spawn();
+    let db = temp_db("predates-row");
+    let mem = temp_memory("predates-row", &db);
+    let cfg = temp_config("predates-row");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Configured before sync existed".into();
+        cfg.set(c).unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    reconcile_config_after_pull(&ctx, "tok").await.unwrap();
+
+    let (payload, dirty): (String, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT payload, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(dirty, 1, "armed so the next push backs it up");
+    assert!(payload.contains("Configured before sync existed"));
+
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    assert!(
+        !srv.posted("user_config").is_empty(),
+        "the pre-existing config reaches the mirror"
+    );
+}
+
+/// …but a device with nothing to say still says nothing: no row is created, and
+/// nothing is published.
+#[tokio::test]
+async fn reconcile_leaves_a_blank_device_alone_with_no_server_row() {
+    let srv = MockRest::spawn();
+    let db = temp_db("blank-no-row");
+    let mem = temp_memory("blank-no-row", &db);
+    let cfg = temp_config("blank-no-row");
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    reconcile_config_after_pull(&ctx, "tok").await.unwrap();
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    let count: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM user_config", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count, 0, "a blank config never creates a row");
+    assert!(srv.posted("user_config").is_empty(), "and never publishes");
+}
+
+/// A server-side tombstone is a deliberate delete, not an empty config: it must
+/// neither be adopted (as an empty payload would be) nor resurrected by a push.
+#[tokio::test]
+async fn a_tombstoned_server_row_is_never_resurrected() {
+    let local = json!({
+        "v": 2, "preferences": "Local only", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 500 },
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": "{}", "revision": 900, "deleted_at": 900,
+        })],
+    );
+    let db = temp_db("tombstone");
+    let mem = temp_memory("tombstone", &db);
+    let cfg = temp_config("tombstone");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Local only".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 500, 1)",
+            [&local],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    reconcile_config_after_pull(&ctx, "tok").await.unwrap();
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    assert!(
+        srv.posted("user_config").is_empty(),
+        "a tombstoned mirror row is never re-created"
+    );
+    assert_eq!(cfg.get().preferences, "Local only", "and nothing is adopted from it");
+}
+
 /// A row that MATCHES the server is left alone by the reconcile — no spurious
 /// re-dirtying and re-pushing every tick.
 #[tokio::test]

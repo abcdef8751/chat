@@ -355,12 +355,14 @@ pub fn set_model_overrides(
 ) -> Result<(), String> {
     // The db lock first, and the config read inside it: a read taken before the lock
     // would apply this edit to a stale snapshot and lose a concurrent one.
+    // The db lock first, and the edit as a read-modify-write: a read taken before
+    // the lock (or a blind `set` from one) could lose a concurrent config change.
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let mut cfg = state.get();
-    cfg.model_overrides = model_overrides;
-    let cfg2 = cfg.clone();
-    state.set(cfg)?;
-    crate::db::sync_user_config(&conn, &cfg2)
+    state.update(|cfg| {
+        cfg.model_overrides = model_overrides;
+        true
+    })?;
+    crate::db::sync_user_config(&conn, &state.get())
 }
 
 #[cfg(test)]

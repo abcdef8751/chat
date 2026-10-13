@@ -191,7 +191,7 @@ pub fn update_provider(
         }
     }
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    config.update(|cfg| {
+    if !config.update(|cfg| {
         let Some(idx) = cfg.providers.iter().position(|p| p.id == id) else {
             return false;
         };
@@ -206,7 +206,10 @@ pub fn update_provider(
             sync_active(cfg, &id);
         }
         true
-    })?;
+    })? {
+        // The provider vanished between the snapshot check and the lock.
+        return Err(format!("provider not found: {id}"));
+    }
     crate::db::sync_user_config(&conn, &config.get())?;
     let after = config.get();
     let provider = after
@@ -230,7 +233,7 @@ pub fn remove_provider(
     }
     let _ = crate::secrets::delete_provider_key(&id);
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    config.update(|cfg| {
+    if !config.update(|cfg| {
         let Some(idx) = cfg.providers.iter().position(|p| p.id == id) else {
             return false;
         };
@@ -243,7 +246,9 @@ pub fn remove_provider(
             }
         }
         true
-    })?;
+    })? {
+        return Err(format!("provider not found: {id}"));
+    }
     crate::db::sync_user_config(&conn, &config.get())?;
     Ok(list_providers(config))
 }
@@ -260,10 +265,15 @@ pub fn set_active_provider(
         return Err(format!("provider not found: {id}"));
     };
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    config.update(|cfg| {
+    if !config.update(|cfg| {
+        if cfg.provider_by_id(&id).is_none() {
+            return false;
+        }
         sync_active(cfg, &id);
         true
-    })?;
+    })? {
+        return Err(format!("provider not found: {id}"));
+    }
     crate::db::sync_user_config(&conn, &config.get())?;
     Ok(info_for(&config.get(), &provider))
 }
