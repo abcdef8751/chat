@@ -21,12 +21,14 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
-    // Android-only native bridges: the host-shell bridge (Termux RUN_COMMAND)
-    // and the content-URI file bridge (ContentResolver).
+    // Android-only native bridges: the host-shell bridge (Termux RUN_COMMAND),
+    // the content-URI file bridge (ContentResolver), and the app-owned file
+    // picker (whose launcher survives Activity recreation; see PickerPlugin.kt).
     #[cfg(target_os = "android")]
     let builder = builder
         .plugin(crate::android::plugin())
-        .plugin(crate::android::file_plugin());
+        .plugin(crate::android::file_plugin())
+        .plugin(crate::android::picker_plugin());
     // Linux: "close to tray". Clicking the X hides the window instead of quitting,
     // so the process (and its background sync/reflection schedulers) keep running.
     // The tray menu is the only reliable reopen path on Linux (tray click events
@@ -159,6 +161,7 @@ pub fn run() {
             pricing::thinking_options,
             attachments::read_attachments,
             read_attachment_from_uri,
+            pick_attachment_uris,
             db::edit_user_message,
             import::import_conversations,
             sync::sync_sign_in,
@@ -247,4 +250,20 @@ async fn read_attachment_from_uri(
 async fn read_attachment_from_uri(uri: String) -> Result<attachments::Attachment, String> {
     let _ = uri;
     Err("read_attachment_from_uri is only available on Android".into())
+}
+
+/// Open the Android document picker and return the selected `content://` URIs
+/// (empty when the user cancelled). Android only — desktop keeps using
+/// `tauri-plugin-dialog` via the `open()` call in the frontend; the stub keeps
+/// the command registered (and the invoke handler stable) on other platforms.
+#[cfg(target_os = "android")]
+#[tauri::command]
+async fn pick_attachment_uris(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    crate::android::pick_attachment_uris(&app).await
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+async fn pick_attachment_uris() -> Result<Vec<String>, String> {
+    Err("pick_attachment_uris is only available on Android".into())
 }

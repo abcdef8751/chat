@@ -123,6 +123,40 @@ pub fn file_plugin() -> TauriPlugin<tauri::Wry> {
         .build()
 }
 
+// --- Native file picker (`tauri-plugin-dialog`'s Android launcher is bound to
+// the first Activity and breaks after any recreation; see PickerPlugin.kt) ---
+
+/// Managed state: the Android plugin handle for the app-owned file picker.
+pub struct PickerHandle(pub PluginHandle<tauri::Wry>);
+
+/// Register Kotlin's `PickerPlugin` (the app-owned `ActivityResultLauncher` for
+/// `ACTION_OPEN_DOCUMENT`) and store its handle for [`pick_attachment_uris`].
+pub fn picker_plugin() -> TauriPlugin<tauri::Wry> {
+    // Third distinct plugin name (`run_command` / `file_bridge` / `picker`):
+    // the Kotlin PluginManager routes commands by plugin name.
+    Builder::new("picker")
+        .setup(move |app, api| {
+            let handle = api.register_android_plugin("com.rp.chat", "PickerPlugin")?;
+            app.manage(PickerHandle(handle));
+            Ok(())
+        })
+        .build()
+}
+
+/// Open the native document picker and return the selected `content://` URIs,
+/// or an empty vec when the user cancelled. The URIs are then read through the
+/// `FileBridgePlugin` content-URI reader (`read_attachment_from_uri`).
+pub async fn pick_attachment_uris(app: &AppHandle) -> Result<Vec<String>, String> {
+    let handle = app.state::<PickerHandle>();
+    // Kotlin resolves a JSON array of URI strings, or JSON `null` on cancel.
+    let uris: Option<Vec<String>> = handle
+        .0
+        .run_mobile_plugin_async("pickFiles", json!({}))
+        .await
+        .map_err(|e| format!("pick_attachment_uris: {e}"))?;
+    Ok(uris.unwrap_or_default())
+}
+
 /// Read an Android `content://` URI into the same [`Attachment`] shape the
 /// path-based `attachments::read_attachment` produces: raster images carry a
 /// base64 data URL, text-like files carry their decoded contents, anything else
