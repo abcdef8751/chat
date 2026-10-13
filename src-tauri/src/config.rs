@@ -330,10 +330,15 @@ pub fn set_config(
     config: AppConfig,
 ) -> Result<(), String> {
     let cfg = config.clone();
+    // The db lock is taken FIRST and held across both halves: the sync engine
+    // merges against the row on a background thread and projects the result into
+    // the config, so an edit that updated the config and only then the row could be
+    // reverted in that window. Holding the row lock makes each edit atomic
+    // (`db -> config` is the only nesting order).
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
     state.set(config)?;
     // Mirror the syncable subset (preferences/providers/overrides) into the sync
     // row so the next push backs it up; a no-op when nothing syncable changed.
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
     crate::db::sync_user_config(&conn, &cfg)
 }
 
@@ -351,8 +356,8 @@ pub fn set_model_overrides(
     let mut cfg = state.get();
     cfg.model_overrides = model_overrides;
     let cfg2 = cfg.clone();
-    state.set(cfg)?;
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    state.set(cfg)?;
     crate::db::sync_user_config(&conn, &cfg2)
 }
 
@@ -389,6 +394,35 @@ mod tests {
         let reloaded = ConfigState::load(path.clone()).unwrap();
         assert_eq!(reloaded.get().model, "m");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_is_a_read_modify_write() {
+        let state = ConfigState::load(temp_path("update-rmw")).unwrap();
+        // Two successive partial updates must not lose each other: `update` holds the
+        // lock across the read and the write, which is what lets the sync engine
+        // project its merge without reverting a Settings edit made in between.
+        assert!(state
+            .update(|cfg| {
+                cfg.preferences = "A".into();
+                true
+            })
+            .unwrap());
+        assert!(state
+            .update(|cfg| {
+                cfg.auto_approve_tools = true;
+                true
+            })
+            .unwrap());
+        let after = state.get();
+        assert_eq!(after.preferences, "A", "the first update survives");
+        assert!(after.auto_approve_tools, "…and the second lands");
+
+        // A no-op reports false and leaves the file alone.
+        assert!(!state.update(|_| false).unwrap());
+
+        // `try_get` sees the same value (and never defaults away a live config).
+        assert_eq!(state.try_get().unwrap().preferences, "A");
     }
 
     #[test]

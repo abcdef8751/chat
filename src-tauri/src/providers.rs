@@ -132,10 +132,12 @@ pub fn add_provider(
     if cfg.active_provider_id().is_empty() || cfg.providers.len() == 1 {
         sync_active(&mut cfg, &id);
     }
+    // Hold the row lock across the config write + mirror so an edit can't be
+    // caught half-applied by the sync engine (`db -> config` is the only order).
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
     config.set(cfg)?;
     // Mirror the provider-list change into the sync row so the next push backs
     // it up (same as set_config does for other config edits).
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
     crate::db::sync_user_config(&conn, &config.get())?;
     Ok(info_for(&config.get(), &provider))
 }
@@ -184,8 +186,8 @@ pub fn update_provider(
         sync_active(&mut cfg, &id);
     }
     let result = info_for(&config.get(), &cfg.providers[idx].clone());
-    config.set(cfg)?;
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    config.set(cfg)?;
     crate::db::sync_user_config(&conn, &config.get())?;
     Ok(result)
 }
@@ -213,8 +215,8 @@ pub fn remove_provider(
             cfg.active_provider_id.clear();
         }
     }
-    config.set(cfg)?;
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    config.set(cfg)?;
     crate::db::sync_user_config(&conn, &config.get())?;
     Ok(list_providers(config))
 }
@@ -231,8 +233,8 @@ pub fn set_active_provider(
         return Err(format!("provider not found: {id}"));
     };
     sync_active(&mut cfg, &id);
-    config.set(cfg)?;
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    config.set(cfg)?;
     crate::db::sync_user_config(&conn, &config.get())?;
     Ok(info_for(&config.get(), &provider))
 }

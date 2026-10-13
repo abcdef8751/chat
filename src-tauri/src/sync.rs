@@ -744,9 +744,12 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     let at = now_ms();
     sync.set_success(at);
     {
-        let mut cfg = app.state::<ConfigState>().get();
-        cfg.sync_last_sync_at = Some(at);
-        let _ = app.state::<ConfigState>().set(cfg);
+        // `update` (read-modify-write under the config lock) so this can't clobber
+        // a syncable field the engine wrote from a stale read.
+        let _ = app.state::<ConfigState>().update(|cfg| {
+            cfg.sync_last_sync_at = Some(at);
+            true
+        });
     }
     sync.set_phase("pull");
     // Progress (pulled / pull_total) is updated per page inside `pull`.
@@ -1269,11 +1272,10 @@ async fn fetch_user_config_remote(
 /// pull high-water). It is best-effort — a hiccup must not fail a sync that
 /// otherwise succeeded, so it repeats on the next tick.
 async fn reconcile_config_after_pull(ctx: &SyncCtx<'_>, token: &str) -> Result<(), String> {
-    let cfg_after = ctx.config.get();
-    {
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        db::sync_user_config(&conn, &cfg_after)?;
-    }
+    // The row is mirrored by `converge_user_config_row` itself, under the db lock.
+    // Mirroring again here would be a second, unprotected read of the config — and
+    // a poisoned lock would read as defaults and wipe the row. Best-effort: a
+    // failure is retried on the next tick.
     let _ = reconcile_user_config(ctx, token).await;
     Ok(())
 }
@@ -2578,28 +2580,30 @@ fn converge_user_config_row(
     remote: &SyncableConfig,
     remote_revision: i64,
 ) -> Result<bool, String> {
+    // ONE critical section from here to the end, under the db lock: every edit path
+    // takes that same lock around its own (config, row) pair (see `set_config`), so
+    // nothing can interleave and revert either half — reading the config here and
+    // writing it back under the same lock is what makes the guard below sufficient.
+    // Lock order is `db -> config` (no path nests the other way).
+    let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
     // Fold anything not yet mirrored into the row FIRST: the row is the merge's
     // local side, so an edit still sitting only in the live config would otherwise
-    // be invisible here and could be read as a clear. Every edit path mirrors, so
-    // this is normally a no-op — it makes the invariant unconditional.
-    let (local, local_revision) = {
-        let Some(cfg_now) = ctx.config.try_get() else {
-            return Ok(false); // poisoned lock — never mirror a defaulted read
-        };
-        let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        db::sync_user_config(&conn, &cfg_now)?;
-        let row: Option<(String, i64)> = conn
-            .query_row(
-                "SELECT payload, revision FROM user_config WHERE id = ?1",
-                [id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        match row {
-            Some((payload, rev)) => (parse_syncable_at(&payload, rev).unwrap_or_default(), rev),
-            None => (SyncableConfig::new_v2(), 0),
-        }
+    // be invisible here and could be read as a clear.
+    let Some(cfg_now) = ctx.config.try_get() else {
+        return Ok(false); // poisoned lock — never mirror a defaulted read
+    };
+    db::sync_user_config(&conn, &cfg_now)?;
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT payload, revision FROM user_config WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (local, local_revision) = match row {
+        Some((payload, rev)) => (parse_syncable_at(&payload, rev).unwrap_or_default(), rev),
+        None => (SyncableConfig::new_v2(), 0),
     };
     let merged = local.merge(remote);
     let we_add = local.adds_content_over(remote);
@@ -2608,19 +2612,13 @@ fn converge_user_config_row(
         return Ok(false); // already converged
     }
     let payload = serde_json::to_string(&merged).map_err(|e| e.to_string())?;
-    // The row write and the live-config projection happen TOGETHER, under the db
-    // lock, and only if the row is still the one we merged against: a Settings save
-    // or provider edit on the UI thread arriving in between would otherwise be
-    // reverted by the projection AND cleared from the row. `db -> config` is the
-    // established lock order (no path nests the other way), so this can't deadlock.
-    let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
     if !write_converged_row(&conn, id, &payload, local_revision, we_add, remote_revision)? {
-        // An edit owns the row now: it is dirty and will push. Leave the live config
-        // alone rather than projecting a stale merge over it.
+        // Defensive: with every writer holding this lock it cannot move, but never
+        // project over a row we did not merge against.
         return Ok(false);
     }
-    // Then make the live config agree with the row we just wrote, atomically (the
-    // same guard covers an edit landing in this window).
+    // Then make the live config agree with the row we just wrote. `update` is a
+    // read-modify-write under the config lock, so it cannot revert an edit either.
     ctx.config.update(|cfg| project_merged(cfg, &merged))?;
     Ok(true)
 }
