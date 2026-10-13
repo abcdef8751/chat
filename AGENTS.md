@@ -836,6 +836,15 @@ and the app is byte-identical to before. Never blocks the UI.
   by **vendoring + patching** the crate (`src-tauri/vendor/tauri-runtime-wry`,
   upstream PR #15678) via `[patch.crates-io]` — see `PATCH.md` for the exact hunk
   and removal steps. Device-verification still pending.
+  **Do NOT bump `tauri` past 2.11.x without re-solving this.** Upstream 2.12.x
+  *does* carry the Android plugin-launcher fix (tauri#15506 — the "unregistered
+  ActivityResultLauncher" file-picker break, fixed by PRs #15798 + #15949), but it
+  also moves to tao 0.36 / wry 0.57, where `tauri-runtime-wry`'s mobile
+  `Event::Resumed | Event::Suspended` arm is **gone**, so this patch no longer has
+  a site to apply to — and tauri#15671 (blank relaunch) is **still open / unmerged**
+  (#15678). Bumping today would trade the picker fix for a regression of the
+  blank-screen bug. Revisit once #15678 (or an equivalent tao 0.36 fix) lands, then
+  re-vendor or drop per `PATCH.md`.
 - **Android file pick + hardware back:** `tauri-plugin-dialog` returns
   `content://` URIs on Android, which `std::fs` cannot read (so attachments were
   silently dropped). `FileBridgePlugin.kt` resolves a URI via `ContentResolver`
@@ -867,6 +876,12 @@ Residuals/open from that pass:
 
 - **Android behaviors need a device** (picker, hardware back, and the
   relaunch/recreate fix); the Kotlin isn't compiled off-device.
+- **Deferred: bump `tauri` 2.11.x → 2.12.x** — it carries the upstream Android
+  plugin-launcher fix for the "file picker silently stops working after a
+  swipe-away/relaunch" bug (tauri#15506), but 2.12 also moves to tao 0.36 / wry
+  0.57, where the vendored `tauri-runtime-wry` patch no longer applies and
+  tauri#15671 (blank relaunch) is still open. Bumping now would regress the
+  launch bug. See the vendored-patch gotcha for the full condition.
 - **GUI e2e was not run** (no display in the change window) — the live-interleave
   DOM stability and the flushed-reasoning popup are the areas worth re-checking.
 - **`stop()` does not restore the draft.** The user row is persisted before
