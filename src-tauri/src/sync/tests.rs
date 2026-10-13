@@ -1378,13 +1378,27 @@ async fn reconcile_leaves_a_blank_device_alone_with_no_server_row() {
 /// a REVISIONED event: content older than the delete is suppressed — with its dirty
 /// flag cleared, so a suppressed row doesn't sit in `pending` and re-fetch forever —
 /// while an edit made SINCE the delete is strictly newer and republishes.
+///
+/// The newer edit goes through the REAL path (`db::sync_user_config`), so this also
+/// pins the interaction with the revision floor: the pull advances the high-water to
+/// the tombstone's revision, and the edit must still land above it.
 #[tokio::test]
 async fn a_tombstoned_server_row_is_never_adopted_or_resurrected() {
+    let local = json!({
+        "v": 2, "preferences": "Local only", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 500 },
+    })
+    .to_string();
+    // Far in the future, so `after > TOMB` below can only pass if the edit really
+    // went through the revision FLOOR (a plain wall-clock bump lands around now,
+    // ~1.7e12, which would clear revision 900 by itself and prove nothing).
+    const TOMB: i64 = 4_100_000_000_000;
     let srv = MockRest::spawn();
     srv.set_get(
         "user_config",
         vec![json!({
-            "id": "main", "payload": "{}", "revision": 900, "deleted_at": 900,
+            "id": "main", "payload": "{}", "revision": TOMB, "deleted_at": TOMB,
         })],
     );
     let db = temp_db("tombstone");
@@ -1397,13 +1411,8 @@ async fn a_tombstoned_server_row_is_never_adopted_or_resurrected() {
         let conn = db.0.lock().unwrap();
         conn.execute(
             "INSERT INTO user_config(id, payload, revision, dirty)
-             VALUES ('main', ?1, 500, 1)",
-            [&json!({
-                "v": 2, "preferences": "Local only", "providers": [],
-                "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
-                "revs": { "preferences": 500 },
-            })
-            .to_string()],
+             VALUES ('main', ?1, 500, 0)",
+            [&local],
         )
         .unwrap();
     }
@@ -1417,6 +1426,13 @@ async fn a_tombstoned_server_row_is_never_adopted_or_resurrected() {
         config: &cfg,
         key: None,
     };
+    // The pull sees the tombstone (it is a row like any other for the high-water).
+    pull(&ctx, "user", "tok", None).await.unwrap();
+    assert_eq!(
+        last_seen(&db, "user_config"),
+        TOMB,
+        "the high-water reaches the delete"
+    );
     reconcile_config_after_pull(&ctx, "tok").await.unwrap();
     push(&ctx, "tok", &SyncState::new()).await.unwrap();
 
@@ -1434,21 +1450,243 @@ async fn a_tombstoned_server_row_is_never_adopted_or_resurrected() {
     };
     assert_eq!(dirty, 0, "a suppressed row is not left pending forever");
 
-    // An edit made SINCE the delete is strictly newer, so it republishes (the
-    // tombstone is a revisioned event, not a permanent ban on config sync).
+    // A genuine edit after the delete: `sync_user_config` floors its revision at the
+    // pull high-water, so it lands ABOVE the tombstone and republishes.
+    {
+        let conn = db.0.lock().unwrap();
+        let mut c = cfg.get();
+        c.preferences = "Edited after the delete".into();
+        cfg.set(c).unwrap();
+        db::sync_user_config(&conn, &cfg.get()).unwrap();
+    }
+    let after: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT revision FROM user_config WHERE id = 'main'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert!(
+        after > TOMB,
+        "the edit is floored above the tombstone, not merely above `now`: {after}"
+    );
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    let posts = srv.posted("user_config");
+    assert!(!posts.is_empty(), "a newer local edit republishes");
+    let sent: Value = serde_json::from_str(posts[posts.len() - 1]["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(sent["preferences"], "Edited after the delete");
+}
+
+/// A failed config write must leave the row exactly as it was: the row and the live
+/// config must never disagree about what this device holds, because the mirror reads
+/// a key present only in the row as a deliberate CLEAR (and would then push its
+/// deletion). `apply_converged_row` rolls the row back instead.
+#[tokio::test]
+async fn a_failed_projection_rolls_the_row_back() {
+    // Point the config at a directory, so every write to it fails.
+    let mut path = std::env::temp_dir();
+    path.push(format!("pi-chat-cfg-dir-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::ConfigState::load(path.clone()).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let local = json!({
+        "v": 2, "preferences": "", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": {},
+    })
+    .to_string();
+    let remote = json!({
+        "v": 2, "preferences": "From the server", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 5000 },
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": remote, "revision": 5000,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("projection-fail");
+    let mem = temp_memory("projection-fail", &db);
     {
         let conn = db.0.lock().unwrap();
         conn.execute(
-            "UPDATE user_config SET revision = 1000, dirty = 1 WHERE id = 'main'",
-            [],
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 0)",
+            [&local],
         )
         .unwrap();
     }
-    push(&ctx, "tok", &SyncState::new()).await.unwrap();
-    assert!(
-        !srv.posted("user_config").is_empty(),
-        "a newer local edit republishes"
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    // The merge would adopt the server's preference and arm the row — but the
+    // projection cannot be written, so nothing may change.
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    let (payload, rev, dirty): (String, i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT payload, revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!((rev, dirty), (100, 0), "the row is put back exactly as it was");
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap(),
+        serde_json::from_str::<Value>(&local).unwrap(),
+        "…payload included"
     );
+    assert!(cfg.get().preferences.is_empty(), "and the config was never changed");
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// A prior row that was DIRTY must come back dirty: a failed projection must not
+/// silently clear a pending edit. (The live config has to AGREE with the planted
+/// row, as it does in production — otherwise the pre-merge mirror reads the row's
+/// extra keys as deliberate clears.)
+#[tokio::test]
+async fn a_failed_projection_restores_the_prior_dirty_state() {
+    let mut path = std::env::temp_dir();
+    path.push(format!("pi-chat-cfg-dir-dirty-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::ConfigState::load(path.clone()).unwrap();
+    let prior = json!({
+        "v": 2, "preferences": "A pending edit", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 100 },
+    })
+    .to_string();
+    {
+        let mut c = cfg.get();
+        c.preferences = "A pending edit".into();
+        cfg.set(c).unwrap();
+    }
+    // Now every config write fails.
+    let _ = std::fs::remove_file(&path);
+    std::fs::create_dir(&path).unwrap();
+
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main",
+            "payload": json!({
+                "v": 2, "preferences": "From the server", "providers": [],
+                "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+                "revs": { "preferences": 5000 },
+            })
+            .to_string(),
+            "revision": 5000,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("projection-fail-dirty");
+    let mem = temp_memory("projection-fail-dirty", &db);
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty)
+             VALUES ('main', ?1, 100, 1)",
+            [&prior],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    let (payload, rev, dirty): (String, i64, i64) = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT payload, revision, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!((rev, dirty), (100, 1), "the pending edit is still pending");
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap(),
+        serde_json::from_str::<Value>(&prior).unwrap()
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// With no prior row, a failed projection must remove the row it just inserted —
+/// otherwise the row would hold the server's values while the config holds none.
+#[tokio::test]
+async fn a_failed_projection_removes_the_inserted_row() {
+    let mut path = std::env::temp_dir();
+    path.push(format!("pi-chat-cfg-dir-insert-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&path);
+    // A blank device: no row, and (before we break the path) a default config.
+    let cfg = crate::config::ConfigState::load(path.clone()).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main",
+            "payload": json!({
+                "v": 2, "preferences": "From the server", "providers": [],
+                "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+                "revs": { "preferences": 5000 },
+            })
+            .to_string(),
+            "revision": 5000,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("projection-fail-insert");
+    let mem = temp_memory("projection-fail-insert", &db);
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    reconcile_user_config(&ctx, "tok").await.unwrap();
+
+    let count: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM user_config", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count, 0, "the rolled-back insert is gone again");
+
+    let _ = std::fs::remove_dir_all(&path);
 }
 
 /// A row that MATCHES the server is left alone by the reconcile — no spurious

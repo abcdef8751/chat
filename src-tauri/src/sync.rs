@@ -1214,11 +1214,19 @@ fn persist_merged_user_config(
     expect_rev: i64,
 ) -> Result<bool, String> {
     let payload = serde_json::to_string(merged).map_err(|e| e.to_string())?;
-    // ONE critical section: the guarded row write and the config projection happen
-    // under the db lock — the same lock every edit path takes around its own
+    // ONE critical section: the guarded row write, the projection, and any rollback
+    // happen under the db lock — the same lock every edit path takes around its own
     // (config, row) pair. A Settings save therefore cannot slip between them, and
     // cannot be reverted by the projection. (`db -> config` is the only order.)
     let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
+    let prior: Option<(String, i64, i64)> = conn
+        .query_row(
+            "SELECT payload, revision, dirty FROM user_config WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
     let touched = conn
         .execute(
             "UPDATE user_config SET payload = ?3, revision = ?4, dirty = 1
@@ -1230,16 +1238,16 @@ fn persist_merged_user_config(
         // Row moved under us — a concurrent edit owns it now.
         return Ok(false);
     }
-    // The same projection the converge path uses, so the two can't disagree.
-    //
-    // This must NOT be best-effort. The row above is already dirty, so if the
-    // projection were allowed to fail and the run continued, the POST would publish
-    // `merged` while the live config still lacked the keys we merged in — and the
-    // next tick's mirror-first would then read exactly those keys as deliberate
-    // CLEARS (in the row, absent from the config) and publish *deletions* of the
-    // remote's content. Failing here instead aborts before the POST, leaving the row
-    // dirty for a retry that recomputes the same union.
-    ctx.config.update(|cfg| project_merged(cfg, merged))?;
+    // Project, exactly as the converge path does — and roll the row back if that
+    // write fails. This must NOT be best-effort either: the row above is already
+    // dirty, so a projection that failed while the run continued would POST `merged`
+    // while the live config still lacked its keys, and the next tick's mirror-first
+    // would read exactly those keys as deliberate CLEARS and publish *deletions* of
+    // the remote's content. Rolling back makes it a clean retry instead (no POST).
+    if ctx.config.update(|cfg| project_merged(cfg, merged)).is_err() {
+        restore_user_config_row(&conn, id, prior)?;
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -1289,8 +1297,12 @@ async fn fetch_user_config_remote(
         return Ok(RemoteConfig::Absent);
     };
     if row.get("deleted_at").and_then(|v| v.as_i64()).is_some() {
+        // Fail CLOSED when the revision is unreadable: a tombstone we cannot order
+        // against must suppress our content rather than license a resurrection.
         return Ok(RemoteConfig::Deleted(
-            row.get("revision").and_then(|v| v.as_i64()).unwrap_or(0),
+            row.get("revision")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(i64::MAX),
         ));
     }
     match (
@@ -2681,6 +2693,32 @@ fn converge_user_config_row(
     )
 }
 
+/// Put a `user_config` row back exactly as it was — or remove it when there was
+/// none — after a projection failure. Leaving the row ahead of the live config is
+/// what turns a failed config write into a *pushed deletion*: the next mirror would
+/// read the row's extra keys as deliberate clears. (If this compensating write
+/// itself fails the divergence is unavoidable — that is a broken DB.)
+fn restore_user_config_row(
+    conn: &rusqlite::Connection,
+    id: &str,
+    prior: Option<(String, i64, i64)>,
+) -> Result<(), String> {
+    match prior {
+        Some((payload, revision, dirty)) => {
+            conn.execute(
+                "UPDATE user_config SET payload = ?2, revision = ?3, dirty = ?4 WHERE id = ?1",
+                rusqlite::params![id, payload, revision, dirty],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        None => {
+            conn.execute("DELETE FROM user_config WHERE id = ?1", [id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// Apply a converged merge: guard, project into the live config, write the row.
 ///
 /// The guard: only proceed if the row is STILL the revision the merge was computed
@@ -2705,10 +2743,20 @@ fn apply_converged_row(
     we_add: bool,
     remote_revision: i64,
 ) -> Result<bool, String> {
-    if row_revision(conn, id)? != expect_revision {
-        return Ok(false);
+    // The row we are about to replace, so a failed projection can be rolled back:
+    // the config and the row must never disagree about what this device holds (the
+    // mirror would otherwise read the row's extra keys as deliberate clears).
+    let prior: Option<(String, i64, i64)> = conn
+        .query_row(
+            "SELECT payload, revision, dirty FROM user_config WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if prior.as_ref().map(|(_, rev, _)| *rev).unwrap_or(0) != expect_revision {
+        return Ok(false); // an edit owns the row now
     }
-    config.update(|cfg| project_merged(cfg, merged))?;
     let payload = serde_json::to_string(merged).map_err(|e| e.to_string())?;
     let (rev, dirty) = if we_add {
         // Above the remote's revision so the next push lands, and never below the
@@ -2732,20 +2780,14 @@ fn apply_converged_row(
         rusqlite::params![id, payload, rev, dirty],
     )
     .map_err(|e| e.to_string())?;
+    // Project into the live config. If that write fails, put the row back exactly as
+    // it was and report "nothing happened": the tick is simply retried, and neither
+    // half is left holding something the other doesn't.
+    if config.update(|cfg| project_merged(cfg, merged)).is_err() {
+        restore_user_config_row(conn, id, prior)?;
+        return Ok(false);
+    }
     Ok(true)
-}
-
-/// Our stored revision for a `user_config` row (0 when we have none).
-fn row_revision(conn: &rusqlite::Connection, id: &str) -> Result<i64, String> {
-    let rev: Option<i64> = conn
-        .query_row(
-            "SELECT revision FROM user_config WHERE id = ?1",
-            [id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    Ok(rev.unwrap_or(0))
 }
 
 /// Parse a `user_config` payload into the syncable subset, or `None` when it
