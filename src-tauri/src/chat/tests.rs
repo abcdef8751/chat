@@ -1601,7 +1601,10 @@ async fn web_fetch_is_refused_in_reflection_mode() {
         vec![
             vec![
                 tool_frag(0, "c1", "web_fetch", ""),
-                tool_frag(0, "", "", r#"{\"url\":\"https://example.com\"}"#),
+                // A loopback URL: if the reflection gate ever regressed, the
+                // fetch would fail fast against the SSRF guard instead of
+                // reaching example.com over the network.
+                tool_frag(0, "", "", r#"{\"url\":\"http://127.0.0.1:1/\"}"#),
                 finish_chunk("tool_calls"),
             ],
             vec![delta_chunk("done"), finish_chunk("stop")],
@@ -1647,6 +1650,68 @@ async fn web_fetch_is_refused_in_reflection_mode() {
         StreamEvent::ToolResult { ok: false, output, .. }
             if output.contains("not available during memory consolidation")
     )));
+}
+
+/// In a live turn `web_fetch` is routed to `execute_web_tool`, not the host
+/// fallback. A malformed URL exercises the routing with no network at all: the
+/// host executor would answer `unknown tool: web_fetch`, so a `web_fetch:`
+/// error proves the web-tool route was taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_fetch_in_live_mode_routes_to_web_tool() {
+    let (port, handle) = start_mock(
+        vec![
+            vec![
+                tool_frag(0, "c1", "web_fetch", ""),
+                tool_frag(0, "", "", r#"{\"url\":\"ftp://example.com\"}"#),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("done"), finish_chunk("stop")],
+        ],
+        0,
+    );
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let mcp = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    let memory = temp_memory("webfetch-live-route");
+    let approvals = tools::ApprovalRegistry::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
+    let tools_list = tools::tool_specs(false);
+    run_tool_loop(
+        &cfg,
+        "test-key",
+        &mcp,
+        &shell,
+        &memory,
+        &approvals,
+        "conv_live_route",
+        messages,
+        &tools_list,
+        flag,
+        &sink,
+        None,
+        ToolMode::Live,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    let guard = events.lock().unwrap();
+    assert!(
+        guard.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolResult { ok: false, output, .. }
+                if output.starts_with("web_fetch:")
+                    && !output.contains("unknown tool: web_fetch")
+        )),
+        "web_fetch was not routed to the web tool"
+    );
 }
 
 /// Extraction advertises no tools at all — it is pure summarization — so any
