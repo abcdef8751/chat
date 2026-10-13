@@ -121,12 +121,45 @@ fn memory_write_tool() -> ChatCompletionTools {
     )
 }
 
+fn memory_str_replace_tool() -> ChatCompletionTools {
+    fn_tool(
+        "memory_str_replace",
+        "Make a small targeted edit to an existing memory file: replace `old_string` with \
+         `new_string`. Fails unless `old_string` matches the file's contents exactly once, \
+         so read the file first and include enough context to make the match unique.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Memory file name, e.g. profile.md" },
+                "old_string": { "type": "string", "description": "Exact text to replace; must occur exactly once" },
+                "new_string": { "type": "string", "description": "Text to replace it with" }
+            },
+            "required": ["path", "old_string", "new_string"]
+        }),
+    )
+}
+
+fn web_fetch_tool() -> ChatCompletionTools {
+    fn_tool(
+        "web_fetch",
+        "Fetch a URL over HTTP(S) and return its readable text (HTML is converted to plain \
+         text). Read-only; no API key required.",
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Absolute http:// or https:// URL to fetch" }
+            },
+            "required": ["url"]
+        }),
+    )
+}
+
 /// OpenAI `tools` array for a request. When `brave` is true the full native
 /// Brave tool surface is appended (`brave_web_search`, `brave_local_search`,
 /// `brave_image_search`, `brave_video_search`, `brave_news_search`,
 /// `brave_summarizer`). The list is **identical for live and reflection turns**
-/// (so the prompt-cache prefix matches); `write_memory` is present in both but
-/// refused during live turns by `run_tool_loop`'s `memory_only` mode.
+/// (so the prompt-cache prefix matches); the memory tools are present in both
+/// and access is enforced by mode at dispatch.
 pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
     let mut tools = vec![
         fn_tool(
@@ -163,6 +196,8 @@ pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
         memory_save_tool(),
         memory_read_tool(),
         memory_write_tool(),
+        memory_str_replace_tool(),
+        web_fetch_tool(),
     ];
     if brave {
         tools.extend(brave_tools());
@@ -292,6 +327,165 @@ pub async fn execute_host_tool(call: &ToolCall, shell: &crate::shell::ShellExecu
         }
         other => ToolOutput::err(format!("unknown tool: {other}")),
     }
+}
+
+/// Hard cap on the raw response body read by `web_fetch`, before any parsing.
+const WEB_FETCH_MAX_BYTES: usize = 2_000_000;
+/// Short per-request timeout so a slow host can't hang the turn.
+const WEB_FETCH_TIMEOUT_SECS: u64 = 30;
+
+/// Execute a read-only web tool (currently only `web_fetch`). Like the Brave
+/// tools it is **ungated** and needs no API key: it works with or without one.
+/// Errors come back as `ToolOutput::err` text so the model can self-correct.
+pub async fn execute_web_tool(call: &ToolCall) -> ToolOutput {
+    match call.name.as_str() {
+        "web_fetch" => web_fetch(call).await,
+        other => ToolOutput::err(format!("unknown web tool: {other}")),
+    }
+}
+
+/// `web_fetch(url)` — GET an http(s) URL and return its readable text. HTML is
+/// reduced to plain text best-effort (script/style dropped, tags → spaces, a
+/// handful of common entities decoded, blank-line runs collapsed).
+async fn web_fetch(call: &ToolCall) -> ToolOutput {
+    let Some(raw) = call.arguments.get("url").and_then(Value::as_str) else {
+        return ToolOutput::err("web_fetch: missing 'url' argument".into());
+    };
+    let url = raw.trim();
+    if url.is_empty() {
+        return ToolOutput::err("web_fetch: 'url' must not be empty".into());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return ToolOutput::err(format!(
+            "web_fetch: only http/https URLs are supported (got '{url}')"
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_default();
+    let resp = match client
+        .get(url)
+        .header("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ToolOutput::err(format!("web_fetch: {e}")),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return ToolOutput::err(format!("web_fetch: HTTP {status} for {url}"));
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return ToolOutput::err(format!("web_fetch: {e}")),
+    };
+    // Cap before decoding/parsing so a huge response can't blow up memory.
+    let capped = &bytes[..bytes.len().min(WEB_FETCH_MAX_BYTES)];
+    let body = String::from_utf8_lossy(capped);
+    let text = html_to_text(&body);
+    if text.trim().is_empty() {
+        return ToolOutput::ok("web_fetch: (no readable text)".into());
+    }
+    ToolOutput::ok(truncate(text))
+}
+
+/// Best-effort HTML → readable text. Drops `<script>`/`<style>` contents
+/// (case-insensitively), replaces tags with spaces, decodes the common
+/// entities, and collapses whitespace/blank-line runs.
+fn html_to_text(html: &str) -> String {
+    let stripped = strip_blocks(html, "script");
+    let stripped = strip_blocks(&stripped, "style");
+    let mut text = String::with_capacity(stripped.len());
+    let mut in_tag = false;
+    for ch in stripped.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if in_tag => {}
+            _ => text.push(ch),
+        }
+    }
+    collapse_whitespace(&decode_entities(&text))
+}
+
+/// Remove every `<tag ...>…</tag>` block, contents included (case-insensitive).
+fn strip_blocks(input: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}");
+    // `to_ascii_lowercase` preserves byte length and char boundaries, so byte
+    // offsets into `lower` are valid indices into `input`.
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        if lower[i..].starts_with(&open) {
+            match lower[i..].find(&close) {
+                Some(rel) => {
+                    let after = i + rel + close.len();
+                    match lower[after..].find('>') {
+                        Some(gt) => i = after + gt + 1,
+                        None => break,
+                    }
+                }
+                None => break,
+            }
+        } else {
+            let ch = input[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Decode a handful of common HTML entities. `&amp;` is decoded last so an
+/// escaped entity (`&amp;lt;`) does not become a real tag character.
+fn decode_entities(s: &str) -> String {
+    s.replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Collapse runs of spaces/tabs to one and runs of blank lines to one, trimming
+/// leading/trailing blank lines.
+fn collapse_whitespace(s: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in s.lines() {
+        let mut collapsed = String::new();
+        for ch in line.chars() {
+            if ch.is_whitespace() {
+                if !collapsed.ends_with(' ') {
+                    collapsed.push(' ');
+                }
+            } else {
+                collapsed.push(ch);
+            }
+        }
+        let collapsed = collapsed.trim().to_string();
+        if collapsed.is_empty() {
+            if lines.last().map(|l: &String| l.is_empty()).unwrap_or(true) {
+                continue;
+            }
+            lines.push(String::new());
+        } else {
+            lines.push(collapsed);
+        }
+    }
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 /// Whether the Brave Search API key is stored, i.e. the native Brave tools can
@@ -654,6 +848,64 @@ mod tests {
         assert!(out.content.contains("missing"));
     }
 
+    #[tokio::test]
+    async fn web_fetch_rejects_bad_requests_without_network() {
+        // Missing arg.
+        let out = execute_web_tool(&ToolCall {
+            id: "w1".into(),
+            name: "web_fetch".into(),
+            arguments: json!({}),
+        })
+        .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("missing 'url'"));
+
+        // Empty arg.
+        let out = execute_web_tool(&ToolCall {
+            id: "w2".into(),
+            name: "web_fetch".into(),
+            arguments: json!({"url": "   "}),
+        })
+        .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("must not be empty"));
+
+        // Non-http(s) scheme (no network access — rejected before any request).
+        for url in ["ftp://example.com/x", "file:///etc/passwd", "example.com"] {
+            let out = execute_web_tool(&ToolCall {
+                id: "w3".into(),
+                name: "web_fetch".into(),
+                arguments: json!({"url": url}),
+            })
+            .await;
+            assert!(out.is_error, "{url} should be rejected");
+            assert!(out.content.contains("http/https"), "{}", out.content);
+        }
+
+        // Unknown web tool.
+        let out = execute_web_tool(&ToolCall {
+            id: "w4".into(),
+            name: "web_other".into(),
+            arguments: json!({"url": "https://example.com"}),
+        })
+        .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("unknown web tool"));
+    }
+
+    #[test]
+    fn html_to_text_drops_scripts_and_decodes_entities() {
+        let html = "<html><head><style>body{}</style></head><body>\
+                    <script>var x = 1 < 2;</script>\
+                    <p>Hello &amp; welcome &lt;friend&gt;</p>\
+                    <p>Second&nbsp;line</p></body></html>";
+        let text = html_to_text(html);
+        assert!(!text.contains("var x"));
+        assert!(!text.contains("body{}"));
+        assert!(text.contains("Hello & welcome <friend>"));
+        assert!(text.contains("Second line"));
+    }
+
     #[test]
     fn approval_registry_resolves_once() {
         let reg = ApprovalRegistry::default();
@@ -666,18 +918,22 @@ mod tests {
     #[test]
     fn tool_specs_shape() {
         let with = tool_specs(true);
-        // 6 host/memory tools + 6 native Brave tools.
-        assert_eq!(with.len(), 12);
+        // 8 host/memory tools + 6 native Brave tools.
+        assert_eq!(with.len(), 14);
         let without = tool_specs(false);
-        assert_eq!(without.len(), 6);
+        assert_eq!(without.len(), 8);
         // The list is identical for live and reflection (cache alignment);
-        // `write_memory` is present but gated by mode at execution time.
-        assert!(without.iter().any(|t| tool_name(t) == "write_memory"));
+        // access is enforced by mode at execution time, not by the list.
+        for name in ["write_memory", "memory_str_replace", "web_fetch"] {
+            assert!(without.iter().any(|t| tool_name(t) == name), "missing {name}");
+        }
         assert!(is_gated("bash"));
         assert!(!is_gated("brave_web_search"));
         assert!(!is_gated("save_memory"));
         assert!(!is_gated("read_memory"));
         assert!(!is_gated("write_memory"));
+        assert!(!is_gated("memory_str_replace"));
+        assert!(!is_gated("web_fetch"));
         // Brave's full tool surface is exposed when a key is configured.
         for name in [
             "brave_web_search",

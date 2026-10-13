@@ -4,8 +4,9 @@
 //! data dir. There is no frontmatter, no categories, and no generated index:
 //! a small fixed set of **core** files is injected into every system prompt in
 //! full, and every other file is listed by name + first line so the model can
-//! `read_memory` on demand. Live turns may `save_memory` (append to an inbox);
-//! the idle reflection pass curates with `write_memory` (full-file replace).
+//! `read_memory` on demand. Live turns and the idle reflection pass share the
+//! same memory tools: `save_memory` (append), `read_memory`, `write_memory`
+//! (full-file replace), and `memory_str_replace` (single targeted edit).
 
 use std::path::PathBuf;
 
@@ -196,6 +197,42 @@ impl MemoryState {
         Ok(())
     }
 
+    /// Targeted single-occurrence edit: replace `old_string` with `new_string`
+    /// in the named file. Fails (leaving the file untouched) unless `old_string`
+    /// occurs exactly once, so a model mistake can never partially apply.
+    pub(crate) fn str_replace(
+        &self,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+    ) -> Result<(), String> {
+        let name = normalize_name(path)?;
+        if old_string.is_empty() {
+            return Err("memory_str_replace: 'old_string' must not be empty".into());
+        }
+        let existing = match std::fs::read_to_string(self.path_for(&name)) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("read {name}: {e}")),
+        };
+        let count = existing.matches(old_string).count();
+        if count == 0 {
+            return Err(format!(
+                "memory_str_replace: 'old_string' not found in {name}"
+            ));
+        }
+        if count > 1 {
+            return Err(format!(
+                "memory_str_replace: 'old_string' occurs {count} times in {name}; include more \
+                 surrounding context so it matches exactly once"
+            ));
+        }
+        let updated = existing.replacen(old_string, new_string, 1);
+        self.write_file_raw(&name, &updated)?;
+        self.mark_dirty(&name);
+        Ok(())
+    }
+
     /// Write a file as part of a sync pull (whole-file replace) WITHOUT marking
     /// it dirty — the merge is originating-from-cloud, so it must not be pushed
     /// straight back. The caller advances the `memory_sync` revision instead.
@@ -214,6 +251,10 @@ impl MemoryState {
              - `read_memory(path)` reads a file's full contents.\n\
              - `save_memory(content, path)` appends a statement to the named file.\n\
              - `write_memory(path, content)` replaces a file (use to merge/dedupe).\n\
+             - `memory_str_replace(path, old_string, new_string)` makes a small targeted edit; it \
+             fails unless `old_string` matches the file's contents exactly once.\n\
+             Before using `save_memory`, `write_memory`, or `memory_str_replace`, call \
+             `read_memory(path)` and base the edit on the file's current contents.\n\
              The system starts with the core files below; grow it by creating new files when a \
              subject warrants one. Route facts by topic: identity/background → profile.md, \
              preferences → preferences.md, goals → goals.md. Create a new file only for a \
@@ -359,6 +400,23 @@ pub async fn execute_tool(call: &ToolCall, memory: &MemoryState) -> ToolOutput {
                     Err(e) => ToolOutput::err(e),
                 },
                 _ => ToolOutput::err("write_memory: missing 'path' or 'content' argument".into()),
+            }
+        }
+        "memory_str_replace" => {
+            let path = call.arguments.get("path").and_then(Value::as_str);
+            let old_string = call.arguments.get("old_string").and_then(Value::as_str);
+            let new_string = call.arguments.get("new_string").and_then(Value::as_str);
+            match (path, old_string, new_string) {
+                (Some(path), Some(old_string), Some(new_string)) => {
+                    match memory.str_replace(path, old_string, new_string) {
+                        Ok(()) => ToolOutput::ok(format!("Edited {path}.")),
+                        Err(e) => ToolOutput::err(e),
+                    }
+                }
+                _ => ToolOutput::err(
+                    "memory_str_replace: missing 'path', 'old_string', or 'new_string' argument"
+                        .into(),
+                ),
             }
         }
         other => ToolOutput::err(format!("unknown memory tool: {other}")),
@@ -605,5 +663,81 @@ mod tests {
         let out = execute_tool(&write, &s).await;
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(s.read("profile.md").unwrap(), "## Identity\n\nName is Ravi.\n");
+    }
+
+    fn replace_call(path: Value, old: Value, new: Value) -> ToolCall {
+        ToolCall {
+            id: "t".into(),
+            name: "memory_str_replace".into(),
+            arguments: serde_json::json!({
+                "path": path,
+                "old_string": old,
+                "new_string": new,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_str_replace_unique_match_edits_in_place() {
+        let s = state("str-replace-unique");
+        s.write("profile.md", "- Likes tea.\n- Likes coffee.\n").unwrap();
+        let call = replace_call(
+            "profile.md".into(),
+            "Likes tea.".into(),
+            "Loves tea.".into(),
+        );
+        let out = execute_tool(&call, &s).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("profile.md"));
+        // Only the single match changed; the rest of the file is intact.
+        assert_eq!(
+            s.read("profile.md").unwrap(),
+            "- Loves tea.\n- Likes coffee.\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_str_replace_no_match_errors_and_leaves_file_untouched() {
+        let s = state("str-replace-zero");
+        s.write("profile.md", "- Likes tea.\n").unwrap();
+        let call = replace_call(
+            "profile.md".into(),
+            "Likes coffee.".into(),
+            "Loves coffee.".into(),
+        );
+        let out = execute_tool(&call, &s).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("not found"), "{}", out.content);
+        assert_eq!(s.read("profile.md").unwrap(), "- Likes tea.\n");
+    }
+
+    #[tokio::test]
+    async fn memory_str_replace_multiple_matches_errors_and_leaves_file_untouched() {
+        let s = state("str-replace-multi");
+        s.write("profile.md", "- likes tea.\n- likes tea.\n").unwrap();
+        let call = replace_call("profile.md".into(), "likes tea.".into(), "hates tea.".into());
+        let out = execute_tool(&call, &s).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("occurs 2 times"), "{}", out.content);
+        assert_eq!(s.read("profile.md").unwrap(), "- likes tea.\n- likes tea.\n");
+    }
+
+    #[tokio::test]
+    async fn memory_str_replace_missing_args_errors() {
+        let s = state("str-replace-missing");
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"path": "profile.md"}),
+            serde_json::json!({"path": "profile.md", "old_string": "x"}),
+        ] {
+            let call = ToolCall {
+                id: "t".into(),
+                name: "memory_str_replace".into(),
+                arguments: args,
+            };
+            let out = execute_tool(&call, &s).await;
+            assert!(out.is_error);
+            assert!(out.content.contains("missing"), "{}", out.content);
+        }
     }
 }
