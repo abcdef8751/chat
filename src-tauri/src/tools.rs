@@ -510,12 +510,21 @@ async fn fetch_url(
     ToolOutput::ok(truncate(text))
 }
 
+/// Upper bound on the `…[showing characters S..E of T]` continuation marker:
+/// the literal text plus three 20-digit `usize` numbers (the three fixed parts
+/// total well under 128). A windowed body is capped below the hard ceiling by
+/// this much so the appended marker can never push the result back over
+/// [`MAX_OUTPUT_CHARS`] and get re-cut by the caller's `truncate()` — which
+/// would eat exactly the marker that makes continuation unambiguous.
+const WINDOW_MARKER_RESERVE: usize = 128;
+
 /// Window the converted page text for a `web_fetch` result: skip `char_start`
-/// characters, then return up to `max_chars` (clamped to [`MAX_OUTPUT_CHARS`]).
+/// characters, then return up to `max_chars` (clamped to
+/// `MAX_OUTPUT_CHARS - WINDOW_MARKER_RESERVE` so the marker always fits).
 ///
 /// * No window requested (`char_start == 0` and no `max_chars`) → the text is
 ///   returned untouched, so the caller's `truncate()` applies the ceiling
-///   exactly as before this feature existed.
+///   exactly as before this feature existed (no reserve is taken).
 /// * `char_start` at or past the end → a `…[no content at character N]` marker
 ///   (not an error), so "nothing there" is distinguishable from a failure.
 /// * A window that stops before the end → the slice followed by a
@@ -530,7 +539,10 @@ fn window_web_fetch_text(text: String, char_start: usize, max_chars: Option<usiz
     if char_start >= total {
         return format!("…[no content at character {char_start}]");
     }
-    let limit = max_chars.unwrap_or(MAX_OUTPUT_CHARS).min(MAX_OUTPUT_CHARS);
+    // Reserve room for the continuation marker regardless of the requested cap,
+    // so the caller's `truncate()` is a no-op for every windowed result.
+    let ceiling = MAX_OUTPUT_CHARS.saturating_sub(WINDOW_MARKER_RESERVE);
+    let limit = max_chars.unwrap_or(ceiling).min(ceiling);
     let end = char_start.saturating_add(limit).min(total);
     let body: String = text
         .chars()
@@ -1685,7 +1697,7 @@ mod tests {
     async fn web_fetch_rejects_bad_max_chars_without_network() {
         // Rejected before any request, so a loopback URL is fine (it never
         // reaches the SSRF guard).
-        for bad in [json!(0), json!(-3), json!("lots"), json!(1.5)] {
+        for bad in [json!(0), json!(-3), json!("lots"), json!(1.5), json!(null)] {
             let out = execute_web_tool(&ToolCall {
                 id: "wm".into(),
                 name: "web_fetch".into(),
@@ -1703,24 +1715,73 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_url_clamps_max_chars_to_the_hard_ceiling() {
-        // A cap above the ceiling is clamped: the body is bounded and the tail
-        // past the ceiling is never returned.
+        // A cap above the ceiling is clamped below it, leaving room for the
+        // continuation marker so the caller's `truncate()` cannot re-cut the
+        // marker off the tail (the bug this guards). The old assertions here
+        // were vacuous: `truncate`'s own marker also satisfies `!contains(TAIL)`
+        // and `<= MAX + 40`, so assert the intact range marker instead.
         let raw = format!("<pre>{}TAIL</pre>", "a".repeat(MAX_OUTPUT_CHARS));
         let (port, handle) = start_http_mock("200 OK", "text/html", &raw);
         let url = format!("http://127.0.0.1:{port}/");
         let out = fetch_url(&url, true, 0, Some(usize::MAX)).await;
         let _ = handle.join();
         assert!(!out.is_error, "{}", out.content);
+        let total = html_to_text(&raw).chars().count();
+        let end = MAX_OUTPUT_CHARS - WINDOW_MARKER_RESERVE;
+        let chars: Vec<char> = out.content.chars().collect();
+        let tail: String = chars[chars.len().saturating_sub(80)..].iter().collect();
         assert!(
-            !out.content.contains("TAIL"),
-            "cap was raised past the ceiling: {} chars",
-            out.content.chars().count()
+            out.content
+                .ends_with(&format!("…[showing characters 0..{end} of {total}]")),
+            "intact range marker not at the end: {tail:?}"
         );
+        assert!(!out.content.contains("TAIL"), "cap was raised past the ceiling");
         assert!(
-            out.content.chars().count() <= MAX_OUTPUT_CHARS + 40,
+            out.content.chars().count() <= MAX_OUTPUT_CHARS,
             "not bounded: {} chars",
             out.content.chars().count()
         );
+    }
+
+    #[test]
+    fn window_web_fetch_text_reserves_room_for_the_marker() {
+        // Pure: a maximally long body with the largest possible `max_chars`
+        // must still leave room for the marker and stay inside the ceiling.
+        let total = MAX_OUTPUT_CHARS * 2;
+        let body = "a".repeat(total);
+        let out = window_web_fetch_text(body, 0, Some(usize::MAX));
+        let end = MAX_OUTPUT_CHARS - WINDOW_MARKER_RESERVE;
+        assert!(
+            out.chars().count() <= MAX_OUTPUT_CHARS,
+            "not bounded: {} chars",
+            out.chars().count()
+        );
+        assert!(
+            out.ends_with(&format!("…[showing characters 0..{end} of {total}]")),
+            "missing/garbled range marker"
+        );
+    }
+
+    #[test]
+    fn window_web_fetch_text_boundaries() {
+        // Minimal window: one char plus the marker.
+        let out = window_web_fetch_text("abcdef".into(), 0, Some(1));
+        assert_eq!(out, "a\n…[showing characters 0..1 of 6]");
+        // `char_start` at the end exactly → the no-content marker.
+        let out = window_web_fetch_text("abcdef".into(), 6, None);
+        assert_eq!(out, "…[no content at character 6]");
+        // One char before the end → the single tail char, no marker.
+        let out = window_web_fetch_text("abcdef".into(), 5, None);
+        assert_eq!(out, "f");
+        // `max_chars` past the remaining text → the whole remainder, no marker.
+        let out = window_web_fetch_text("abcdef".into(), 2, Some(999));
+        assert_eq!(out, "cdef");
+        // `char_start: 0` combined with `max_chars` → correct range marker.
+        let out = window_web_fetch_text("abcdef".into(), 0, Some(3));
+        assert_eq!(out, "abc\n…[showing characters 0..3 of 6]");
+        // `char_start` alone that reaches the end → no marker.
+        let out = window_web_fetch_text("abcdef".into(), 3, None);
+        assert_eq!(out, "def");
     }
 
     #[tokio::test]
@@ -1791,7 +1852,7 @@ mod tests {
 
     #[tokio::test]
     async fn web_fetch_rejects_bad_char_start_without_network() {
-        for bad in [json!(-1), json!("start"), json!(2.5)] {
+        for bad in [json!(-1), json!("start"), json!(2.5), json!(null)] {
             let out = execute_web_tool(&ToolCall {
                 id: "ws".into(),
                 name: "web_fetch".into(),
