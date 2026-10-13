@@ -34,7 +34,8 @@ in `src-tauri`; the UI is a Solid SPA.
   Markdown files for memory. No microservices.
 - **No agent framework.** The core loop is simple and implemented directly in
   Rust. pi is a *pattern reference only* — we don't import or vendor it. We reuse
-  `async-openai` for LLM types and call Brave Search natively over `reqwest`.
+  `async-openai` for LLM types, and call Brave Search + `web_fetch` natively over
+  `reqwest`.
 - **The model decides; the user controls.** Tools and memory writes are surfaced,
   gateable, and auditable.
 - **Separate storage size from injected context size.** We can store a lot; we
@@ -47,7 +48,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **181 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **238 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -60,7 +61,7 @@ separately.
 | Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, capped tool loop                        |
 | Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; per-model price **and capability (modality) overrides** |
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline, **editable user messages** (edit → truncate → re-run) |
-| Tools             | ✅    | `bash` (one-shot shell), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), native Brave search tools (ungated) |
+| Tools             | ✅    | `bash` (one-shot shell), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` (ungated) |
 | UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; memory page list→detail on narrow viewports |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
 | Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
@@ -268,14 +269,18 @@ topic files.
   read on demand.
 - **Tools:** `save_memory(content, path)` appends to the named file (path
   required, file created if missing); `read_memory(path)`; `write_memory(path,
-  content)` replaces a file for curation. No `importance`/`category`.
+  content)` replaces a file for curation; `memory_str_replace(path, old_string,
+  new_string)` replaces a single unique occurrence (errors — leaving the file
+  untouched — on zero or multiple matches). No `importance`/`category`. The
+  shared memory instruction tells the model to `read_memory` the relevant file
+  before editing it.
 - **Live vs idle:** the tool list is identical for live, reflection, and
   extraction turns (so the prompt-cache prefix matches). `run_tool_loop`'s
-  `ToolMode` enforces access by mode: `Live` may `save_memory`/`read_memory` but
-  **not** `write_memory`; `Reflection` may use all three memory tools but is
-  refused host/web tools; `Extract` advertises no tools and refuses any call.
-  This keeps the chatting model from clobbering curated files without splitting
-  the tool list.
+  `ToolMode` enforces access by mode: `Live` and `Reflection` may use all four
+  memory tools; `Reflection` is refused host/web tools; `Extract` advertises no
+  tools and refuses any call. (Live memory writes were once blocked to keep the
+  chatting model from clobbering curated files; the list stays unified, so
+  access is enforced by mode at dispatch rather than by splitting the list.)
 - **Idle reflection** (`reflection.rs`): a background scheduler (`spawn`, ~1 min
   tick) reflects one due conversation per tick once it has been idle ≥
   `memory_reflection_idle_minutes` (default 30, toggle in Settings). It rebuilds
@@ -418,11 +423,12 @@ read_file(path)                   // text, or an image part when the model is
                                   //   vision-capable (see "read_file images")
 write_file(path, content)
 
-// Memory — ungated, app-local. All three are in the shared tool list; access
-// is enforced by mode (write_memory is refused during live turns).
+// Memory — ungated, app-local. All four are in the shared tool list; access
+// is enforced by mode.
 save_memory(content, path)        // append; path required
 read_memory(path)
 write_memory(path, content)       // replace (curation)
+memory_str_replace(path, old_string, new_string)   // replace one unique occurrence
 
 // Web search — native Brave Search API, read-only (ungated)
 brave_web_search(query, count?)
@@ -431,11 +437,15 @@ brave_image_search(query, count?)
 brave_video_search(query, count?)
 brave_news_search(query, count?)
 brave_summarizer(query, count?)
+
+// Web — native HTTP GET, read-only (ungated)
+web_fetch(url)                    // HTML → readable text; refuses non-public
+                                  //   addresses (loopback/private/metadata)
 ```
 
 The tool list is byte-identical for live and reflection turns so the prompt-cache
 prefix matches; `run_tool_loop` refuses disallowed calls by mode instead of
-splitting the list (live: no `write_memory`; reflection: no host/web tools).
+splitting the list (reflection: no host/web tools; extract: none).
 Gating (`tools::is_gated` = bash/read_file/write_file) is bypassed entirely when
 YOLO mode is on.
 
@@ -446,6 +456,15 @@ keychain (`secrets::brave_key`). Because there's no child process, config file,
 or node runtime, it works identically on desktop and Android. The Brave tools
 are offered only when a key is stored (`brave_available()`). Setup: add a Brave
 Search API key in Settings → keychain.
+
+**`web_fetch` (native, ungated):** `tools.rs` `execute_web_tool` fetches an
+`http(s)` URL over `reqwest`, converts the HTML to readable text, and truncates
+the result. It needs no key and is read-only, so it is ungated like the Brave
+tools — but it refuses non-public addresses (loopback, private / link-local /
+ULA ranges, and the cloud metadata endpoints) and re-checks every redirect, so a
+model-chosen URL cannot be used to probe the local network. Only the requested
+URL's own bytes are returned; the result text is framed as untrusted external
+data, because a prompt-injected page must not be treated as instructions.
 
 ---
 
