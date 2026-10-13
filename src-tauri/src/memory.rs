@@ -723,6 +723,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_str_replace_empty_old_string_errors_and_leaves_file_untouched() {
+        let s = state("str-replace-empty");
+        s.write("profile.md", "- Likes tea.\n").unwrap();
+        let call = replace_call("profile.md".into(), "".into(), "CLOBBERED".into());
+        let out = execute_tool(&call, &s).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("must not be empty"), "{}", out.content);
+        assert_eq!(s.read("profile.md").unwrap(), "- Likes tea.\n");
+    }
+
+    #[tokio::test]
     async fn memory_str_replace_missing_args_errors() {
         let s = state("str-replace-missing");
         for args in [
