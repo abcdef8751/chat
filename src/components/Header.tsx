@@ -72,6 +72,20 @@ export function Header(props: {
     }
   });
 
+  // Full context/cost breakdown, shared by the wide inline meter and the
+  // phone-sized compact meter (as their `title`). Kept in one place so the two
+  // never drift.
+  const contextTitle = () =>
+    `Context: ${Math.min(props.contextTokens, props.contextWindow).toLocaleString()} / ${props.contextWindow.toLocaleString()} tokens\nInput / output: ${
+      props.pricing?.inputPerMillion ?? "—"
+    } / ${props.pricing?.outputPerMillion ?? "—"} USD per 1M\nCache read / write: ${
+      props.pricing?.cacheReadPerMillion ?? "—"
+    } / ${props.pricing?.cacheWritePerMillion ?? "—"} USD per 1M${
+      props.pricing?.overridden ? "\n(using your overrides)" : ""
+    }${props.reflectionLabel ? `\nBackground maintenance: ${props.reflectionLabel}` : ""}${
+      props.compacted ? "\nOlder messages are compacted into a summary." : ""
+    }`;
+
   return (
     <header class="flex items-center justify-between gap-3 border-b border-neutral-200 px-4 py-3 sm:px-6 dark:border-neutral-800">
       <div class="flex min-w-0 items-center gap-2">
@@ -92,15 +106,7 @@ export function Header(props: {
         <Show when={props.activeId}>
           <div
             class="hidden items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-neutral-500 sm:flex dark:text-neutral-400"
-            title={`Context: ${Math.min(props.contextTokens, props.contextWindow).toLocaleString()} / ${props.contextWindow.toLocaleString()} tokens\nInput / output: ${
-              props.pricing?.inputPerMillion ?? "—"
-            } / ${props.pricing?.outputPerMillion ?? "—"} USD per 1M\nCache read / write: ${
-              props.pricing?.cacheReadPerMillion ?? "—"
-            } / ${props.pricing?.cacheWritePerMillion ?? "—"} USD per 1M${
-              props.pricing?.overridden ? "\n(using your overrides)" : ""
-            }${props.reflectionLabel ? `\nBackground maintenance: ${props.reflectionLabel}` : ""}${
-              props.compacted ? "\nOlder messages are compacted into a summary." : ""
-            }`}
+            title={contextTitle()}
           >
             <span class={props.contextClass}>
               {formatTokens(Math.min(props.contextTokens, props.contextWindow))} /{" "}
@@ -110,6 +116,27 @@ export function Header(props: {
             <span>{props.costLabel}</span>
             <Show when={props.compacted}>
               <span class="rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
+                compacted
+              </span>
+            </Show>
+          </div>
+          {/* Phones (below `sm`) hide the full meter above, so surface a compact
+              version here instead: context tokens / window (still color-coded by
+              `contextClass`) plus cost. The shared `title` keeps the full
+              breakdown reachable. `sm:hidden` means the wide layout is untouched. */}
+          <div
+            class="flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-1 text-[11px] text-neutral-500 sm:hidden dark:text-neutral-400"
+            title={contextTitle()}
+          >
+            <span class={props.contextClass}>
+              {formatTokens(Math.min(props.contextTokens, props.contextWindow))}
+            </span>
+            <span class="text-neutral-400 dark:text-neutral-600">/</span>
+            <span>{formatTokens(props.contextWindow)}</span>
+            <span class="text-neutral-300 dark:text-neutral-600">·</span>
+            <span>{props.costLabel}</span>
+            <Show when={props.compacted}>
+              <span class="rounded bg-neutral-100 px-1 py-0.5 text-[10px] text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
                 compacted
               </span>
             </Show>
