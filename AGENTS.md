@@ -893,6 +893,13 @@ Residuals/open from that pass:
   0.57, where the vendored `tauri-runtime-wry` patch no longer applies and
   tauri#15671 (blank relaunch) is still open. Bumping now would regress the
   launch bug. See the vendored-patch gotcha for the full condition.
+- **Android: the Memory "Import file…" picker still uses
+  `tauri-plugin-dialog`** (`importChats` in `App.tsx`), so it inherits the same
+  "unregistered ActivityResultLauncher" break after an Activity recreation — and
+  a `content://` URI can't be read by `std::fs` anyway (`import.rs` takes a path).
+  Route it through the `picker` plugin and copy/stream the file to a real path
+  when it's next touched. The two *attachment* pickers were fixed in-app via the
+  `picker` bridge (see the Android file-pick gotcha).
 - **GUI e2e was not run** (no display in the change window) — the live-interleave
   DOM stability and the flushed-reasoning popup are the areas worth re-checking.
 - **`stop()` does not restore the draft.** The user row is persisted before
