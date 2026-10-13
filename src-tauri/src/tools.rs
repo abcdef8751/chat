@@ -650,45 +650,36 @@ fn strip_blocks(input: &str, tag: &str) -> String {
     out
 }
 
-/// Decode common HTML entities (best-effort, no HTML crate). Runs to a fixed
-/// point so double-escapes resolve (`&amp;quot;` → `&quot;` → `"`); named and
-/// numeric (`&#NNN;` / `&#xHH;`) references are both handled.
+/// Decode common HTML entities (best-effort, no HTML crate). A **single**
+/// left-to-right pass, matching what a browser's tokenizer does: each reference
+/// is decoded exactly once, and the scan advances past it, so text produced by
+/// a decode is never re-decoded. Hence `&amp;lt;` → `&lt;` and `&amp;amp;` →
+/// `&amp;` (not `<`/`&`). Named and numeric (`&#NNN;` / `&#xHH;`) references
+/// are both handled.
 fn decode_entities(s: &str) -> String {
-    let mut current = s.to_string();
-    // A handful of passes is plenty for nested escaping; stop as soon as the
-    // string is stable (the common case is one pass).
-    for _ in 0..4 {
-        let next = decode_entities_once(&current);
-        if next == current {
-            break;
-        }
-        current = next;
-    }
-    current
-}
-
-/// One decoding pass. Longest plausible entity is bounded so a stray `&` does
-/// not scan the rest of the document looking for a `;`.
-fn decode_entities_once(s: &str) -> String {
     const MAX_ENTITY_LEN: usize = 32;
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let tail = &rest[amp..];
+        // Longest plausible entity is bounded so a stray `&` does not scan the
+        // rest of the document looking for a `;`.
         let semi = tail[1..].find(';').map(|p| p + 1);
-        if let Some(end) = semi {
-            if end <= MAX_ENTITY_LEN {
-                if let Some(decoded) = decode_one_entity(&tail[..=end]) {
-                    out.push_str(&decoded);
-                    rest = &tail[end + 1..];
-                    continue;
-                }
+        let decoded = semi
+            .filter(|end| *end <= MAX_ENTITY_LEN)
+            .and_then(|end| decode_one_entity(&tail[..=end]).map(|d| (d, end)));
+        match decoded {
+            Some((decoded, end)) => {
+                out.push_str(&decoded);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                // Not a recognised reference: keep the `&` and carry on.
+                out.push('&');
+                rest = &tail[1..];
             }
         }
-        // Not a recognised reference: keep the `&` and carry on.
-        out.push('&');
-        rest = &tail[1..];
     }
     out.push_str(rest);
     out
@@ -1329,15 +1320,20 @@ mod tests {
     }
 
     #[test]
-    fn decode_entities_handles_numeric_and_double_escapes() {
+    fn decode_entities_handles_numeric_and_single_pass_semantics() {
         // Numeric decimal + hex references.
         assert_eq!(decode_entities("A &#65; B &#x42; C"), "A A B B C");
         assert_eq!(decode_entities("&#x1F600;"), "\u{1F600}");
+        assert_eq!(decode_entities("&#8217;"), "\u{2019}");
+        assert_eq!(decode_entities("&#x27;"), "'");
+        assert_eq!(decode_entities("&#160;"), "\u{a0}");
         // Named entities.
         assert_eq!(decode_entities("&lt;b&gt; &amp; &quot;x&quot;"), "<b> & \"x\"");
-        // Order-safety: a double escape resolves to the decoded character.
-        assert_eq!(decode_entities("&amp;quot;"), "\"");
-        assert_eq!(decode_entities("&amp;amp;"), "&");
+        // Exactly one decode per reference (HTML semantics): a double escape
+        // stays escaped in its inner form rather than resolving fully.
+        assert_eq!(decode_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_entities("&amp;amp;"), "&amp;");
+        assert_eq!(decode_entities("&amp;quot;"), "&quot;");
         // A stray ampersand is left alone.
         assert_eq!(decode_entities("AT&T & nope"), "AT&T & nope");
     }
