@@ -521,12 +521,14 @@ and the app is byte-identical to before. Never blocks the UI.
   UI turns into a bar; a server without the count leaves pull `↓N` without a
   denominator. **User config** (explicit
   preferences + providers + price/capability overrides) syncs as a single global
-  `user_config` row, applied NON-destructively (a pulled row only fills fields
-  this device left empty). Because it is ONE row under whole-row LWW, a plain
-  push from a device whose config is empty in some fields would blank those
-  fields on the mirror (a fresh phone blanked a configured desktop's preferences
-  and providers). The invariant that prevents this: **a `user_config` push never
-  drops server content in the fields this device left unset.** The push fetches
+  `user_config` row, applied NON-destructively. Because it is ONE row under
+  whole-row LWW, a plain push from a device whose config is empty in some fields
+  would blank those fields on the mirror (a fresh phone blanked a configured
+  desktop's preferences and providers). Two invariants prevent that, one per
+  direction: **a push never drops server content in the fields this device left
+  unset**, and **absorption is additive** — a pulled row only fills fields this
+  device left empty, never overwrites one it set, so it is safe whatever the two
+  revisions say. The push fetches
   the server's row and upserts the UNION — our values win the fields we set,
   the server's fill the ones we left unset; providers and override entries merge
   PER KEY (`SyncableConfig::union_with`) — at a revision above the server's, and
@@ -544,10 +546,27 @@ and the app is byte-identical to before. Never blocks the UI.
   edit's revision at the pull high-water so a slow-clock device can't wedge its
   config below the server's revision, and the pull side never records a merged
   payload that differs from what the remote sent as CLEAN. A post-pull
-  `reconcile_user_config` (split out as `reconcile_config_after_pull`) re-arms a
-  row that ADDS content the server lacks, at a revision above the server's, so a
-  stranded richer device heals on the next push; a pure conflict (both sides set
-  a field differently) is left alone rather than fought every tick.
+  `reconcile_user_config` (split out as `reconcile_config_after_pull`) re-reads
+  the row BY ID — ignoring the high-water — and converges it in BOTH directions:
+  it ABSORBS the fields we lack (`adopt_missing_fields`, the same helper the pull
+  uses) and re-arms a row that ADDS content the server lacks, at a revision above
+  the server's, so a stranded device heals on the next push. A pure conflict
+  (both sides set a field differently) is left alone rather than fought every
+  tick. Absorption is deliberately NOT gated on revision order, and
+  `db::sync_user_config` never CREATES a row for a payload carrying nothing
+  syncable: a revision is an edit claim, and a row that was merely created — a
+  blank device mirroring its (empty) config, with no edit behind it — must not
+  count as newer. Gating absorption on the revision is what wedged a real
+  device: its blank row was stamped above the server's revision, the pull then
+  refused the canonical config as "older" and advanced the high-water past the
+  row, so it was never re-fetched — blank forever while the server stayed
+  populated. Absorbing is keyed on EMPTINESS, so clearing a syncable field is not
+  a way to remove it from other devices: the canonical value comes back on the
+  next tick. That matches the write path, whose union already refilled an empty
+  local field, so both directions now agree; removing a value fleet-wide needs the
+  per-field versions noted below. (An EXISTING non-empty row is still rewritten
+  when the user clears their config — that is a real edit, and the empty-guard
+  keeps it local.)
   The reflection watermark
   (`last_reflected_index`) rides on the conversation row and is preserved across
   re-index. The first sync per account (guarded by a per-`user_id` sentinel)

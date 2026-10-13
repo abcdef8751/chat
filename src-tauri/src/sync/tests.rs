@@ -2069,6 +2069,359 @@ async fn union_keeps_server_active_provider_when_local_has_none() {
     assert_eq!(sent["providers"].as_array().unwrap().len(), 2, "both providers");
 }
 
+/// Regression for the phone wedge, part 1: absorption is ADDITIVE, so it must not
+/// be gated on revision order. A blank row that merely got CREATED at a revision
+/// above the server's used to parse the canonical config, refuse it as "older"
+/// and discard it — permanently, since the high-water then advanced past the row.
+#[tokio::test]
+async fn pull_absorbs_a_blank_row_that_runs_ahead_of_the_server() {
+    let blank = json!({
+        "activeProviderId": "", "baseUrl": "https://api.fireworks.ai/inference/v1",
+        "model": "deepseek-v4-flash-0731", "modelOverrides": {},
+        "preferences": "", "providers": [],
+    })
+    .to_string();
+    let canonical = json!({
+        "activeProviderId": "prov-s", "baseUrl": "https://s.example/v1",
+        "model": "m-s", "modelOverrides": {},
+        "preferences": "Talk like me.\n",
+        "providers": [{
+            "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let db = temp_db("absorb-ahead");
+    let mem = temp_memory("absorb-ahead", &db);
+    let cfg = temp_config("absorb-ahead");
+    {
+        let conn = db.0.lock().unwrap();
+        // Local row is NEWER than the server's revision, but carries nothing.
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 1000, 0)",
+            [&blank],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:1".to_string(); // unused: no request on this path
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &base,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    apply_user_config(
+        &ctx,
+        &[json!({
+            "id": "main", "payload": canonical, "revision": 900,
+            "deleted_at": Value::Null,
+        })],
+    )
+    .unwrap();
+
+    let live = cfg.get();
+    assert_eq!(
+        live.preferences, "Talk like me.\n",
+        "a NEWER blank row must still absorb the canonical config"
+    );
+    assert_eq!(live.providers.len(), 1);
+    assert_eq!(live.active_provider_id, "prov-s");
+}
+
+/// Regression for the phone wedge, part 2 — the exact production shape: the blank
+/// row sits ABOVE the server's revision AND the high-water has already passed the
+/// server row, so the pull can never fetch it again. Only the reconcile can heal
+/// it, because it re-reads the row by id. The live config ends up canonical, the
+/// row mirrors it, the follow-up push adds nothing (the server already has it),
+/// and the next tick is a no-op.
+#[tokio::test]
+async fn reconcile_absorbs_the_canonical_config_into_a_wedged_blank_row() {
+    let blank = json!({
+        "activeProviderId": "", "baseUrl": "https://api.fireworks.ai/inference/v1",
+        "model": "deepseek-v4-flash-0731", "modelOverrides": {},
+        "preferences": "", "providers": [],
+    })
+    .to_string();
+    let canonical = json!({
+        "activeProviderId": "prov-s", "baseUrl": "https://s.example/v1",
+        "model": "m-s", "modelOverrides": {},
+        "preferences": "Talk like me.\n",
+        "providers": [{
+            "id": "prov-s", "name": "S", "baseUrl": "https://s.example/v1",
+            "defaultModel": null, "catalogId": null,
+        }],
+    })
+    .to_string();
+    let srv = MockRest::spawn();
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main", "payload": canonical, "revision": 900,
+            "deleted_at": Value::Null,
+        })],
+    );
+    let db = temp_db("wedged-blank");
+    let mem = temp_memory("wedged-blank", &db);
+    let cfg = temp_config("wedged-blank");
+    {
+        // In production the row and the live config AGREE — both are this
+        // device's blank config, with `model` as its one non-default pick. (That
+        // matters: the post-pull mirror only dirties the row when they diverge,
+        // and the reconcile then defers to the push.)
+        let mut c = cfg.get();
+        c.model = "deepseek-v4-flash-0731".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 1000, 0)",
+            [&blank],
+        )
+        .unwrap();
+        // The pull already saw this row and advanced past it.
+        conn.execute(
+            "INSERT INTO sync_state(entity, last_seen_revision) VALUES ('user_config', 900)",
+            [],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+
+    // The pull fetches nothing — the high-water already passed the row…
+    assert_eq!(pull(&ctx, "user", "tok", None).await.unwrap(), 0);
+    assert!(
+        cfg.get().preferences.is_empty(),
+        "…so the pull alone cannot heal it"
+    );
+
+    // …the reconcile re-reads the row by id and absorbs it.
+    reconcile_config_after_pull(&ctx, "tok").await.unwrap();
+    let live = cfg.get();
+    assert_eq!(live.preferences, "Talk like me.\n");
+    assert_eq!(live.providers.len(), 1);
+    assert_eq!(live.active_provider_id, "prov-s");
+    let mirrored: String = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT payload FROM user_config WHERE id = 'main'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(
+        mirrored.contains("Talk like me."),
+        "the row mirrors the absorbed config: {mirrored}"
+    );
+
+    // The follow-up push adds nothing (the server already holds all of it)…
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    assert!(
+        srv.posted("user_config").is_empty(),
+        "nothing to add — the server is already canonical"
+    );
+    // …and the next tick is a no-op: converged.
+    reconcile_config_after_pull(&ctx, "tok").await.unwrap();
+    let dirty: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT dirty FROM user_config WHERE id = 'main'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(dirty, 0, "converged — the state settles");
+}
+
+/// A blank config must not CREATE the `user_config` row: a revision is an edit
+/// claim, and a merely-created row would look newer than real content elsewhere
+/// (the wedge above). Clearing an EXISTING config is still recorded — that is a
+/// genuine edit, and the push's empty-guard keeps it from being published.
+#[test]
+fn mirror_does_not_create_a_row_for_a_blank_config() {
+    let db = temp_db("blank-mirror");
+    let conn = db.0.lock().unwrap();
+
+    // Fresh install: no row, and the default config carries nothing.
+    db::sync_user_config(&conn, &crate::config::AppConfig::default()).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM user_config", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0, "a blank config must not create a row");
+
+    // An existing row that carries content IS rewritten when the config clears.
+    conn.execute(
+        "INSERT INTO user_config(id, payload, revision, dirty)
+         VALUES ('main', ?1, 500, 0)",
+        [r#"{"preferences":"Keep me","providers":[],"activeProviderId":"","baseUrl":"","model":"","modelOverrides":{}}"#],
+    )
+    .unwrap();
+    db::sync_user_config(&conn, &crate::config::AppConfig::default()).unwrap();
+    let (payload, dirty): (String, i64) = conn
+        .query_row(
+            "SELECT payload, dirty FROM user_config WHERE id = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(!payload.contains("Keep me"), "the clear is recorded: {payload}");
+    assert_eq!(dirty, 1);
+}
+
+/// A legacy-only remote (providers empty on both sides) must reach a NORMAL blank
+/// device, whose mirrors are the factory DEFAULTS rather than empty strings. The
+/// `else` branch has to treat "default" as unset for the same reason
+/// `carries_nothing` does — otherwise a blank device could never leave the
+/// factory endpoint. Adopted as a pair: in the legacy shape `base_url` + `model`
+/// together define the one provider.
+#[test]
+fn absorb_fills_factory_default_mirrors_from_a_legacy_remote() {
+    let sc = parse_syncable(
+        &json!({
+            "activeProviderId": "", "baseUrl": "https://legacy.example/v1",
+            "model": "legacy-model", "modelOverrides": {},
+            "preferences": "", "providers": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut fresh = crate::config::AppConfig::default();
+    assert_eq!(fresh.base_url, crate::config::DEFAULT_BASE_URL);
+    assert!(adopt_missing_fields(&mut fresh, &sc));
+    assert_eq!(fresh.base_url, "https://legacy.example/v1");
+    assert_eq!(fresh.model, "legacy-model");
+
+    // A device that set its OWN endpoint keeps it — the pair isn't mixed.
+    let mut own = crate::config::AppConfig::default();
+    own.base_url = "https://mine.example/v1".into();
+    assert!(!adopt_missing_fields(&mut own, &sc));
+    assert_eq!(own.base_url, "https://mine.example/v1");
+
+    // Boundary of the pair rule: a device on the factory endpoint that picked a
+    // model DELIBERATELY keeps both. (Adopting the remote's endpoint while
+    // keeping its model was the old per-field rule's only unique coverage, and
+    // that combination is the incoherent one this rejects.)
+    let mut picked_model = crate::config::AppConfig::default();
+    picked_model.model = "my-model".into();
+    assert!(!adopt_missing_fields(&mut picked_model, &sc));
+    assert_eq!(picked_model.model, "my-model");
+    assert_eq!(picked_model.base_url, crate::config::DEFAULT_BASE_URL);
+}
+
+/// An unparseable remote row that is OLDER than ours must not pin the high-water:
+/// we could neither absorb it nor lose to it, so refusing to advance would just
+/// re-fetch it — and re-render the UI — every tick. (A *newer* bad row still
+/// blocks, so we never eclipse one we'd have had to apply.)
+#[tokio::test]
+async fn unparseable_older_row_does_not_pin_the_watermark() {
+    let db = temp_db("unparseable-older");
+    let mem = temp_memory("unparseable-older", &db);
+    let cfg = temp_config("unparseable-older");
+    {
+        let mut c = cfg.get();
+        c.preferences = "Mine".into();
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 1000, 0)",
+            [cfg.get().syncable_payload().to_string()],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:1".to_string(); // unused: no request on this path
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &base,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    apply_user_config(
+        &ctx,
+        &[json!({
+            "id": "main", "payload": "{ not the syncable shape",
+            "revision": 900, "deleted_at": Value::Null,
+        })],
+    )
+    .unwrap();
+
+    assert_eq!(last_seen(&db, "user_config"), 900);
+    assert_eq!(cfg.get().preferences, "Mine", "our config is untouched");
+}
+
+/// Pins the documented consequence of absorbing on emptiness: clearing a field is
+/// NOT a way to remove it fleet-wide — the canonical value comes back. That is the
+/// contract the write-side union already had (an empty local field always adopts
+/// the server's), so both directions now agree; removing a value needs the
+/// per-field versions noted in AGENTS.md.
+#[tokio::test]
+async fn a_cleared_field_is_refilled_from_the_canonical_config() {
+    let db = temp_db("cleared-field");
+    let mem = temp_memory("cleared-field", &db);
+    let cfg = temp_config("cleared-field");
+    {
+        // `preferences` cleared, but an override keeps the payload non-empty — so
+        // the write-side union would refill it on push anyway.
+        let mut c = cfg.get();
+        c.preferences = String::new();
+        c.model_overrides
+            .insert("m".into(), crate::config::ModelOverride::default());
+        cfg.set(c).unwrap();
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, 1000, 0)",
+            [cfg.get().syncable_payload().to_string()],
+        )
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:1".to_string(); // unused: no request on this path
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &base,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    apply_user_config(
+        &ctx,
+        &[json!({
+            "id": "main",
+            "payload": json!({
+                "activeProviderId": "", "baseUrl": "", "model": "",
+                "modelOverrides": {}, "preferences": "Be terse", "providers": [],
+            })
+            .to_string(),
+            "revision": 900,
+            "deleted_at": Value::Null,
+        })],
+    )
+    .unwrap();
+
+    assert_eq!(
+        cfg.get().preferences,
+        "Be terse",
+        "an empty local field adopts the server's"
+    );
+}
+
 /// The union's provider merge is per-id and its active-id adoption never yields
 /// a dangling id — even when the server's active id names a provider that exists
 /// nowhere in the merged list.

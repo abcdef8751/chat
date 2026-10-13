@@ -954,6 +954,19 @@ pub fn sync_user_config(conn: &Connection, cfg: &crate::config::AppConfig) -> Re
             return Ok(()); // unchanged — keep the stored revision and clean state
         }
     }
+    // A config carrying nothing user-owned never CREATES a row: that would stamp
+    // a fresh revision on an empty payload, and a revision is an edit claim. A
+    // row that was merely created — not edited — must never look newer than real
+    // content on another device. That is exactly how the phone wedged itself: its
+    // blank row was created above the server's revision, the pull's revision gate
+    // then refused to absorb the canonical config, and the high-water had already
+    // passed the row so it was never re-fetched. Leaving no row keeps a blank
+    // device absorb-only, which is its correct state. An EXISTING non-empty row
+    // is still updated when the user clears their config — that IS a real edit
+    // (the push's empty-guard then keeps it from being published).
+    if existing.is_none() && crate::sync::syncable_payload_is_empty(&payload.to_string()) {
+        return Ok(());
+    }
     // The revision floor is the row's own OR the pull high-water, whichever is
     // higher. `apply_user_config`'s non-fight path can leave a row strictly
     // below the watermark (a seen-but-not-adopted remote row advances the
