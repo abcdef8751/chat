@@ -459,12 +459,22 @@ Search API key in Settings → keychain.
 
 **`web_fetch` (native, ungated):** `tools.rs` `execute_web_tool` fetches an
 `http(s)` URL over `reqwest`, converts the HTML to readable text, and truncates
-the result. It needs no key and is read-only, so it is ungated like the Brave
-tools — but it refuses non-public addresses (loopback, private / link-local /
-ULA ranges, and the cloud metadata endpoints) and re-checks every redirect, so a
-model-chosen URL cannot be used to probe the local network. Only the requested
-URL's own bytes are returned; the result text is framed as untrusted external
-data, because a prompt-injected page must not be treated as instructions.
+the result (the body is streamed and capped, so a huge response is not
+buffered). It needs no key and is read-only, so it is ungated like the Brave
+tools — but it refuses non-public addresses (loopback, RFC1918 private,
+link-local, ULA, CGNAT `100.64/10`, and the cloud metadata endpoints
+`169.254.169.254` / `192.0.0.192` / `100.100.100.200`), resolving hostnames and
+refusing if any resolved address is non-public. Each redirect is re-checked for
+scheme and a non-public literal host (max 5 hops). The result text is framed as
+untrusted external data, because a prompt-injected page must not be treated as
+instructions.
+
+**Residual `web_fetch` risks (documented, not closed):** a redirect to a
+public-looking name that resolves to a private address (DNS rebinding) is not
+caught, and the untrusted framing is only an instruction — it is not
+enforcement, so a prompt-injected page can still drive the ungated
+`write_memory`/`memory_str_replace` into the synced memory files. Gate
+`web_fetch` (or the memory writes) behind approval if a hard boundary is wanted.
 
 ---
 
