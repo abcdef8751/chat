@@ -521,52 +521,60 @@ and the app is byte-identical to before. Never blocks the UI.
   UI turns into a bar; a server without the count leaves pull `↓N` without a
   denominator. **User config** (explicit
   preferences + providers + price/capability overrides) syncs as a single global
-  `user_config` row, applied NON-destructively. Because it is ONE row under
-  whole-row LWW, a plain push from a device whose config is empty in some fields
-  would blank those fields on the mirror (a fresh phone blanked a configured
-  desktop's preferences and providers). Two invariants prevent that, one per
-  direction: **a push never drops server content in the fields this device left
-  unset**, and **absorption is additive** — a pulled row only fills fields this
-  device left empty, never overwrites one it set, so it is safe whatever the two
-  revisions say. The push fetches
-  the server's row and upserts the UNION — our values win the fields we set,
-  the server's fill the ones we left unset; providers and override entries merge
-  PER KEY (`SyncableConfig::union_with`) — at a revision above the server's, and
-  adopts + persists the union locally. It only pushes when we ADD content the
-  server lacks; if the server already holds everything we have it just clears
-  dirty. A genuine conflict on a scalar field (both sides set `preferences`
-  differently) still resolves local-wins on the mirror — the one residual of a
-  single row with no per-field versions; the loser keeps its own copy locally.
-  `syncable_payload_is_empty` ignores the `model` mirror on the default endpoint,
-  so a device that merely picked a model carries nothing portable and can't
-  publish over a configured mirror (a CUSTOM base_url still reads as legacy
-  content). Ciphertext we can't decrypt is never overwritten — a staler local row
-  is refused instead; a non-JSON/legacy plaintext payload holds nothing mergeable
-  to lose, so a newer local row replaces it. `db::sync_user_config` floors every
-  edit's revision at the pull high-water so a slow-clock device can't wedge its
-  config below the server's revision, and the pull side never records a merged
-  payload that differs from what the remote sent as CLEAN. A post-pull
-  `reconcile_user_config` (split out as `reconcile_config_after_pull`) re-reads
-  the row BY ID — ignoring the high-water — and converges it in BOTH directions:
-  it ABSORBS the fields we lack (`adopt_missing_fields`, the same helper the pull
-  uses) and re-arms a row that ADDS content the server lacks, at a revision above
-  the server's, so a stranded device heals on the next push. A pure conflict
-  (both sides set a field differently) is left alone rather than fought every
-  tick. Absorption is deliberately NOT gated on revision order, and
-  `db::sync_user_config` never CREATES a row for a payload carrying nothing
-  syncable: a revision is an edit claim, and a row that was merely created — a
-  blank device mirroring its (empty) config, with no edit behind it — must not
-  count as newer. Gating absorption on the revision is what wedged a real
-  device: its blank row was stamped above the server's revision, the pull then
-  refused the canonical config as "older" and advanced the high-water past the
-  row, so it was never re-fetched — blank forever while the server stayed
-  populated. Absorbing is keyed on EMPTINESS, so clearing a syncable field is not
-  a way to remove it from other devices: the canonical value comes back on the
-  next tick. That matches the write path, whose union already refilled an empty
-  local field, so both directions now agree; removing a value fleet-wide needs the
-  per-field versions noted below. (An EXISTING non-empty row is still rewritten
-  when the user clears their config — that is a real edit, and the empty-guard
-  keeps it local.)
+  `user_config` row. It is the one place a single row's whole-row LWW was not
+  enough: a row mixes fields edited independently, so the row revision had to
+  stand in for "whose content is authoritative" — wrong every time a row is
+  CREATED rather than edited — and three different states (never set, deliberately
+  cleared, merely inherited) were all just "empty". So the payload carries
+  **per-key revisions** and merging is per key.
+
+  **v2 payload.** `{ v: 2, preferences, providers, activeProviderId, baseUrl,
+  model, modelOverrides, revs }`, where `revs` maps a key to the revision at which
+  THIS device last set it — scalars by field name, collection entries as
+  `provider:<id>` / `override:<model>`. Therefore: a key **absent from `revs`** (or
+  0) was **never set** and is adoptable from the other side; `revs[key] > 0` with an
+  **empty/absent value** is a **clear**, which is a real edit that propagates; and
+  otherwise the value is ordered against the other side by that revision. A key
+  present in `revs` whose value is gone is a per-key TOMBSTONE — how a removed
+  provider is carried. `v` marks the format: a payload without it is **v1** (the
+  value-only shape) and is migrated ON READ (`migrate_v1`), which stamps the row's
+  own revision on the keys it carries and leaves its empty/default keys at 0 — the
+  distinction v1 could not express. `model` is deliberately never stamped (it is
+  not content on its own) and is ordered by `KEY_BASE_URL`, so the legacy
+  `base_url` + `model` pair is never mixed.
+
+  **Merge** (`SyncableConfig::merge` / `merge_entries`) is per-key
+  last-writer-wins: the higher revision wins, and a tie falls back to the v1 value
+  rule (the side that CARRIES a value wins; `self` on a tie), which keeps it
+  behaviour-identical to the old `union_with` for v1 payloads. Two consequences
+  worth knowing: a conflicting key **converges on the NEWER value** on both sides
+  rather than resolving local-wins (the devices agree instead of each keeping its
+  own copy), and a clear now survives instead of being refilled.
+
+  **Who does what.** `db::sync_user_config` mirrors the live config into the row on
+  every edit (Settings saves, provider edits), stamping a fresh revision on each
+  CHANGED key — diffing values rather than tracking edit provenance is what keeps
+  "cleared" (a change) apart from "never set" (no key at all). It never creates a
+  row for a config that has never been edited, so a blank device cannot publish:
+  that is now a property of the payload rather than an empty-guard special case.
+  The PUSH fetches the server row, merges, and pushes only when the result differs
+  from it (our newer keys, or keys it lacks), at a revision above the server's — so
+  a push can never drop a key it left unset. The PULL merges each incoming row per
+  key and adopts the result (`converge_user_config_row`), projecting the merged
+  values into the live config AND writing the row: dirty if we still hold something
+  newer (the next push publishes it), clean at the remote's revision if we only
+  absorbed. There is **no row-revision gate** anywhere — that gate is what let a
+  blank-but-newer row refuse the canonical config forever. The post-pull
+  `reconcile_user_config` (called from `reconcile_config_after_pull`) re-reads the
+  row BY ID, ignoring the high-water, so it can still heal a device whose watermark
+  already ran past the server's revision; it re-mirrors the live config first, so a
+  local edit that had not been stamped yet cannot be read as a clear.
+
+  Ciphertext we can't decrypt is never overwritten (locked-device contract) and a
+  remote tombstone is never resurrected. The row revision survives as the transport
+  clock only: the pull's `revision > last_seen` filter, and the mirror's floor at
+  `max(row, watermark)` so a slow-clock device cannot wedge its config below the
+  server's.
   The reflection watermark
   (`last_reflected_index`) rides on the conversation row and is preserved across
   re-index. The first sync per account (guarded by a per-`user_id` sentinel)

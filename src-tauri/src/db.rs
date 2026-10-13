@@ -925,17 +925,21 @@ pub fn mark_memory_dirty(conn: &Connection, path: &str) -> Result<(), String> {
 /// Mirror the syncable subset of `AppConfig` (explicit preferences + provider
 /// list + per-model price/context overrides) into the `user_config` row so the
 /// next push backs it up. No-op when nothing changed, so calling this on every
-/// sync run or Settings save stays cheap and never churns the revision. API keys
-/// are not part of the payload (they live in the keychain), so this cannot leak
-/// a secret.
+/// sync run or Settings save stays cheap and never churns a revision. API keys are
+/// not part of the payload (they live in the keychain), so this cannot leak a
+/// secret.
 ///
-/// The new revision is bumped above BOTH the global monotonic counter and the
-/// newest revision this device has applied/pulled for the row, so a genuine
-/// local edit always beats anything previously synced: a pulled config from a
-/// faster-clock (or higher-revision test) device must never cause a real newer
-/// local edit to be judged "local wins, nothing to push".
+/// The payload shape and its per-key revisions are
+/// `sync::stamp_user_config_payload`'s job; this owns the row — read it, let sync
+/// diff the new config against it, write the result dirty at a revision above both
+/// the global monotonic counter and the newest revision this device has applied or
+/// pulled for the row. So a genuine local edit always beats anything previously
+/// synced, whatever the two clocks say.
+///
+/// A config that has never been edited yields no keys to stamp, so it never
+/// creates a row and never publishes: a blank device cannot blank the mirror. That
+/// is now a consequence of the payload format rather than a special case.
 pub fn sync_user_config(conn: &Connection, cfg: &crate::config::AppConfig) -> Result<(), String> {
-    let payload = cfg.syncable_payload();
     let existing: Option<(String, i64)> = conn
         .query_row(
             "SELECT payload, revision FROM user_config WHERE id = 'main'",
@@ -944,38 +948,11 @@ pub fn sync_user_config(conn: &Connection, cfg: &crate::config::AppConfig) -> Re
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    // Semantic (not byte) comparison: `model_overrides` is a HashMap whose JSON
-    // key order can differ across restarts, so string equality would spuriously
-    // mark an unchanged config dirty and bump/re-push it.
-    if let Some((existing_payload, _)) = &existing {
-        if serde_json::from_str::<serde_json::Value>(existing_payload).ok()
-            == Some(payload.clone())
-        {
-            return Ok(()); // unchanged — keep the stored revision and clean state
-        }
-    }
-    // A config carrying nothing user-owned never CREATES a row: that would stamp
-    // a fresh revision on an empty payload, and a revision is an edit claim. A
-    // row that was merely created — not edited — must never look newer than real
-    // content on another device. That is exactly how the phone wedged itself: its
-    // blank row was created above the server's revision, the pull's revision gate
-    // then refused to absorb the canonical config, and the high-water had already
-    // passed the row so it was never re-fetched. Leaving no row keeps a blank
-    // device absorb-only, which is its correct state. An EXISTING non-empty row
-    // is still updated when the user clears their config — that IS a real edit
-    // (the push's empty-guard then keeps it from being published).
-    if existing.is_none() && crate::sync::syncable_payload_is_empty(&payload.to_string()) {
-        return Ok(());
-    }
     // The revision floor is the row's own OR the pull high-water, whichever is
-    // higher. `apply_user_config`'s non-fight path can leave a row strictly
-    // below the watermark (a seen-but-not-adopted remote row advances the
-    // watermark but not the row). Bumping from the row's revision alone would
-    // then stamp a slow-clock edit BELOW the server's revision and the push's
-    // read-before-write guard would refuse it forever — a sticky non-sync
-    // wedge. Flooring at the watermark lands every edit above the highest
-    // SEEN server revision, so the push always accepts it. (Owned by sync;
-    // only ever read here, under the caller's lock.)
+    // higher: `converge_user_config_row` can leave a row strictly below the
+    // watermark (a seen-but-not-contributed remote row advances the watermark but
+    // not the row), and stamping from the row alone would then put a slow-clock
+    // edit BELOW the server's revision — a sticky non-sync wedge.
     let wm: i64 = conn
         .query_row(
             "SELECT last_seen_revision FROM sync_state WHERE entity = 'user_config'",
@@ -983,21 +960,26 @@ pub fn sync_user_config(conn: &Connection, cfg: &crate::config::AppConfig) -> Re
             |r| r.get(0),
         )
         .unwrap_or(0);
-    let base = existing
-        .as_ref()
-        .map(|(_, r)| *r)
-        .unwrap_or(0)
-        .max(wm);
-    let global = bump_revision_c(conn)?;
-    let rev = if global > base { global } else { base + 1 };
+    let base = existing.as_ref().map(|(_, rev)| *rev).unwrap_or(0).max(wm);
+    let stamped = crate::sync::stamp_user_config_payload(
+        existing
+            .as_ref()
+            .map(|(payload, rev)| (payload.as_str(), *rev)),
+        cfg,
+        || {
+            let global = bump_revision_c(conn)?;
+            Ok(if global > base { global } else { base + 1 })
+        },
+    )?;
+    let Some((rev, payload)) = stamped else {
+        return Ok(()); // unchanged — keep the stored revision and its clean state
+    };
+    let payload = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT INTO user_config(id, payload, revision, dirty)
-         VALUES ('main', ?1, ?2, 1)
+        "INSERT INTO user_config(id, payload, revision, dirty) VALUES ('main', ?1, ?2, 1)
          ON CONFLICT(id) DO UPDATE SET
-           payload = excluded.payload,
-           revision = excluded.revision,
-           dirty = 1",
-        params![payload.to_string(), rev],
+           payload = excluded.payload, revision = excluded.revision, dirty = 1",
+        params![payload, rev],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

@@ -14,7 +14,7 @@ pub const DEFAULT_MODEL: &str = "accounts/fireworks/models/llama-v3p1-8b-instruc
 pub const LEGACY_PROVIDER_ID: &str = "legacy";
 
 /// Per-model override for pricing/context values that `/models` doesn't carry.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelOverride {
     pub context_window: Option<u64>,
@@ -35,7 +35,7 @@ pub struct ModelOverride {
 /// One OpenAI-compatible provider: its own base URL and (optionally) a favorite
 /// default model. The per-provider API key never lives here — it is stored in
 /// the OS keychain under a per-provider account (see `secrets` / `providers`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Provider {
     /// Stable unique id (uuid), never changes after creation.
@@ -212,15 +212,11 @@ impl AppConfig {
             .unwrap_or_else(|| self.active_provider())
     }
 
-    /// The JSON subset of this config that is syncable across devices:
-    /// explicit user preferences, the provider list (ids/names/base URLs only —
-    /// API keys live in the keychain and are never included), the active
-    /// provider id, the per-model price/context overrides, plus the legacy
-    /// `base_url` / `model` mirrors that still define the effective provider on
-    /// pre-multi-provider configs (where `providers` is empty and
-    /// `active_provider()` synthesizes one from `base_url`). LWW by revision
-    /// treats this whole blob as one unit, so the payload must not drift from
-    /// what [`db::sync_user_config`] writes.
+    /// The legacy VALUE-ONLY view of the syncable subset — no per-key revisions.
+    /// The sync engine builds current payloads directly
+    /// (`sync::stamp_user_config_payload`), so this survives only as the shape
+    /// reference the sync tests build their fixtures from.
+    #[cfg(test)]
     pub fn syncable_payload(&self) -> serde_json::Value {
         serde_json::json!({
             "preferences": self.preferences,

@@ -1328,35 +1328,40 @@ async fn reconcile_leaves_matching_row_clean() {
     assert_eq!(rev, 100);
 }
 
-/// A CLEAN local row at a lower revision vs a non-empty NEWER remote is never
-/// escalated: re-dirtying older content above the remote's revision would start
-/// a push/pull fight between two configured devices every tick (the stale-push
-/// clobber re-entered through the pull side). Neither the pull nor the
-/// reconcile may touch the row, and nothing may be pushed.
+/// A strictly-newer remote value WINS the conflicting key and is adopted, with
+/// nothing pushed — the device converges instead of sitting on its older value
+/// forever, and there is no fight because it contributes nothing the remote lacks.
 #[tokio::test]
-async fn pulled_newer_configured_row_does_not_fight() {
-    let pa = json!({
-        "activeProviderId": "", "baseUrl": "", "model": "",
-        "modelOverrides": {}, "preferences": "Configured on A", "providers": [],
+async fn a_newer_remote_value_wins_a_conflict_without_a_push() {
+    let prov_b = json!({ "id": "prov-b", "name": "PROV-B", "baseUrl": "https://b.example/v1",
+                         "defaultModel": null, "catalogId": null });
+    let local = json!({
+        "v": 2, "preferences": "Configured on A", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 100 },
     })
     .to_string();
-    let pb = json!({
-        "activeProviderId": "", "baseUrl": "", "model": "",
-        "modelOverrides": {}, "preferences": "Configured on B", "providers": [],
+    let remote = json!({
+        "v": 2, "preferences": "Canonical from B", "providers": [prov_b],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 5000, "provider:prov-b": 5000 },
     })
     .to_string();
     let srv = MockRest::spawn();
     srv.set_get(
         "user_config",
         vec![json!({
-            "id": "main", "payload": pb.clone(), "revision": 1000,
+            "id": "main", "payload": remote, "revision": 5000,
             "deleted_at": Value::Null,
         })],
     );
-    let db = temp_db("fight");
-    let mem = temp_memory("fight", &db);
-    let cfg = temp_config("fight");
+    let db = temp_db("newer-value");
+    let mem = temp_memory("newer-value", &db);
+    let cfg = temp_config("newer-value");
     {
+        // Production invariant: the live config and the row agree, because
+        // every edit path mirrors. A fixture that disagrees would make the
+        // pre-merge mirror read the planted row as a deliberate CLEAR.
         let mut c = cfg.get();
         c.preferences = "Configured on A".into();
         cfg.set(c).unwrap();
@@ -1364,7 +1369,7 @@ async fn pulled_newer_configured_row_does_not_fight() {
         conn.execute(
             "INSERT INTO user_config(id, payload, revision, dirty)
              VALUES ('main', ?1, 100, 0)",
-            [&pa],
+            [&local],
         )
         .unwrap();
     }
@@ -1378,17 +1383,23 @@ async fn pulled_newer_configured_row_does_not_fight() {
         config: &cfg,
         key: None,
     };
-    // Pull the newer non-empty remote row.
-    let row = json!({
-        "id": "main", "payload": pb.clone(), "revision": 1000,
-        "deleted_at": Value::Null,
-    });
-    apply_user_config(&ctx, std::slice::from_ref(&row)).unwrap();
-    // Reconcile would also see the strictly-newer remote.
+    apply_user_config(
+        &ctx,
+        &[json!({
+            "id": "main", "payload": remote, "revision": 5000,
+            "deleted_at": Value::Null,
+        })],
+    )
+    .unwrap();
     reconcile_user_config(&ctx, "tok").await.unwrap();
 
-    // The local row is UNTOUCHED (older content is not promoted above the
-    // remote's revision) and nothing was pushed to the mirror.
+    // Converged on the newer values…
+    let live = cfg.get();
+    assert_eq!(live.preferences, "Canonical from B");
+    assert_eq!(live.providers.len(), 1);
+    // …we contributed nothing, so nothing is pushed and the row is clean AT the
+    // remote's revision.
+    assert!(srv.posted("user_config").is_empty(), "nothing may be pushed");
     let (rev, dirty): (i64, i64) = {
         let conn = db.0.lock().unwrap();
         conn.query_row(
@@ -1398,9 +1409,7 @@ async fn pulled_newer_configured_row_does_not_fight() {
         )
         .unwrap()
     };
-    assert_eq!(rev, 100);
-    assert_eq!(dirty, 0);
-    assert!(srv.posted("user_config").is_empty(), "nothing may be pushed");
+    assert_eq!((rev, dirty), (5000, 0));
 }
 
 /// Reconcile never pushes (plaintext or re-encrypted) over a server payload it
@@ -1457,43 +1466,47 @@ async fn reconcile_skips_undecryptable_server_payload() {
     assert!(srv.posted("user_config").is_empty());
 }
 
-/// Winner policy, pinned end-to-end: a stale OFFLINE edit (dirty row at a lower
-/// revision than the server's canonical) goes out as a UNION — our values win
-/// the fields we set, the server's content survives everywhere else — so the
-/// edit propagates without ever dropping the canonical, and the union lands at
-/// a revision above the server's so it isn't refused as stale. Only an
-/// UNMERGEABLE server payload (legacy/garbage text, or ciphertext we can't
-/// read) falls back to refusing a stale push.
+/// v2 policy, pinned end-to-end: a stale OFFLINE edit still goes out, but what it
+/// contributes is decided PER KEY by revision. A key only it has is added; a key
+/// BOTH sides set resolves to the NEWER revision — that is what a per-key version
+/// means. The push lands above the server's revision, so it is never refused as
+/// stale. (The old whole-row rule was "a local edit always wins", which clobbered
+/// the other device's newer value rather than converging with it.)
 #[tokio::test]
-async fn stale_dirty_edit_is_pushed_as_a_union() {
-    let pa = json!({
-        "activeProviderId": "", "baseUrl": "", "model": "",
-        "modelOverrides": {}, "preferences": "Offline edit on A", "providers": [],
+async fn a_stale_dirty_edit_pushes_what_it_alone_has() {
+    let prov_a = json!({ "id": "prov-a", "name": "PROV-A", "baseUrl": "https://a.example/v1",
+                         "defaultModel": null, "catalogId": null });
+    let prov_b = json!({ "id": "prov-b", "name": "PROV-B", "baseUrl": "https://b.example/v1",
+                         "defaultModel": null, "catalogId": null });
+    // Ours: a provider only we have, plus a preference set at 100.
+    let local = json!({
+        "v": 2, "preferences": "Offline edit on A", "providers": [prov_a],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 100, "provider:prov-a": 100 },
     })
     .to_string();
-    // The canonical holds a provider we do NOT have — it must survive the push.
-    let pb = json!({
-        "activeProviderId": "prov-b", "baseUrl": "https://b.example/v1",
-        "model": "m-b", "modelOverrides": {},
-        "preferences": "Canonical from B",
-        "providers": [{
-            "id": "prov-b", "name": "B", "baseUrl": "https://b.example/v1",
-            "defaultModel": null, "catalogId": null,
-        }],
+    // The canonical: its own provider, and the same preference set LATER (5000).
+    let server = json!({
+        "v": 2, "preferences": "Canonical from B", "providers": [prov_b],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 5000, "provider:prov-b": 5000 },
     })
     .to_string();
     let srv = MockRest::spawn();
     srv.set_get(
         "user_config",
         vec![json!({
-            "id": "main", "payload": pb.clone(), "revision": 5000,
+            "id": "main", "payload": server, "revision": 5000,
             "deleted_at": Value::Null,
         })],
     );
-    let db = temp_db("stale-union");
-    let mem = temp_memory("stale-union", &db);
-    let cfg = temp_config("stale-union");
+    let db = temp_db("stale-edit");
+    let mem = temp_memory("stale-edit", &db);
+    let cfg = temp_config("stale-edit");
     {
+        // Production invariant: the live config and the row agree, because
+        // every edit path mirrors. A fixture that disagrees would make the
+        // pre-merge mirror read the planted row as a deliberate CLEAR.
         let mut c = cfg.get();
         c.preferences = "Offline edit on A".into();
         cfg.set(c).unwrap();
@@ -1501,7 +1514,7 @@ async fn stale_dirty_edit_is_pushed_as_a_union() {
         conn.execute(
             "INSERT INTO user_config(id, payload, revision, dirty)
              VALUES ('main', ?1, 100, 1)",
-            [&pa],
+            [&local],
         )
         .unwrap();
     }
@@ -1515,26 +1528,30 @@ async fn stale_dirty_edit_is_pushed_as_a_union() {
         config: &cfg,
         key: None,
     };
-    // The stale dirty edit goes out IMMEDIATELY as a union (never dropped).
     push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
     let posts = srv.posted("user_config");
-    assert!(!posts.is_empty(), "the union push must go out");
+    assert!(!posts.is_empty(), "the provider only we have must go out");
     let sent = &posts[posts.len() - 1];
     let payload: Value = serde_json::from_str(sent["payload"].as_str().unwrap()).unwrap();
-    assert_eq!(payload["preferences"], "Offline edit on A", "local edit wins");
-    assert_eq!(payload["providers"][0]["id"], "prov-b", "server content survives");
+    assert_eq!(
+        payload["preferences"], "Canonical from B",
+        "the NEWER value wins the conflicting key"
+    );
+    let ids: Vec<String> = payload["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ids.contains(&"prov-a".to_string()) && ids.contains(&"prov-b".to_string()),
+        "both providers survive: {ids:?}"
+    );
     assert!(
         sent["revision"].as_i64().unwrap() > 5000,
-        "union must land above the canonical revision"
+        "the push lands above the canonical revision"
     );
-    // The union was persisted locally too (we adopted the server's provider).
-    let local: String = {
-        let conn = db.0.lock().unwrap();
-        conn.query_row("SELECT payload FROM user_config WHERE id = 'main'", [], |r| r.get(0))
-            .unwrap()
-    };
-    assert!(local.contains("prov-b"), "union persisted locally");
-    assert_eq!(cfg.get().providers.len(), 1, "live config adopted the provider");
 }
 
 /// The non-fight skip leaves a row's revision below the pull high-water; the
@@ -1584,50 +1601,49 @@ async fn config_edit_after_non_fight_skip_lands_above_watermark() {
     assert!(rev > 5000, "edit must land above the pull high-water");
 }
 
-/// The non-fight skip is scoped to Phase 3: when the pull's Phase-2 adoption
-/// fills an EMPTY local field, the live config becomes a hybrid and the
-/// post-pull mirror legitimately dirties the row above the high-water, so the
-/// next push uploads the union (the convergent path the watermark floor makes
-/// clock-independent). Nothing fights: each device converges on the same union.
+/// Absorption is per key: a remote key we never set is adopted even while our own
+/// NEWER key is kept — the "hybrid" the post-pull mirror then folds upward into a
+/// dirty row so the next push carries both.
 #[tokio::test]
-async fn adoption_after_skip_mirrors_union_upward() {
-    // Local has a preference but NO providers; the newer remote has a provider
-    // and its own preference.
-    let pa = json!({
-        "activeProviderId": "", "baseUrl": "", "model": "",
-        "modelOverrides": {}, "preferences": "Local preference", "providers": [],
+async fn absorbing_a_remote_key_keeps_our_newer_one() {
+    let prov_b = json!({ "id": "prov-b", "name": "PROV-B", "baseUrl": "https://b.example/v1",
+                         "defaultModel": null, "catalogId": null });
+    let local = json!({
+        "v": 2, "preferences": "Local preference", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 9000 },
     })
     .to_string();
-    let pb = json!({
-        "activeProviderId": "prov-x", "baseUrl": "https://remote.example/v1",
-        "model": "remote-model", "modelOverrides": {},
-        "preferences": "Remote preference",
-        "providers": [{
-            "id": "prov-x", "name": "Remote", "baseUrl": "https://remote.example/v1",
-            "defaultModel": null, "catalogId": null,
-        }],
+    let remote = json!({
+        "v": 2, "preferences": "", "providers": [prov_b],
+        "activeProviderId": "prov-b", "baseUrl": "https://b.example/v1",
+        "model": "m-b", "modelOverrides": {},
+        "revs": { "provider:prov-b": 500, "activeProviderId": 500, "baseUrl": 500 },
     })
     .to_string();
     let srv = MockRest::spawn();
     srv.set_get(
         "user_config",
         vec![json!({
-            "id": "main", "payload": pb.clone(), "revision": 1000,
+            "id": "main", "payload": remote, "revision": 500,
             "deleted_at": Value::Null,
         })],
     );
-    let db = temp_db("union");
-    let mem = temp_memory("union", &db);
-    let cfg = temp_config("union");
+    let db = temp_db("per-key-absorb");
+    let mem = temp_memory("per-key-absorb", &db);
+    let cfg = temp_config("per-key-absorb");
     {
+        // Production invariant: the live config and the row agree, because
+        // every edit path mirrors. A fixture that disagrees would make the
+        // pre-merge mirror read the planted row as a deliberate CLEAR.
         let mut c = cfg.get();
         c.preferences = "Local preference".into();
         cfg.set(c).unwrap();
         let conn = db.0.lock().unwrap();
         conn.execute(
             "INSERT INTO user_config(id, payload, revision, dirty)
-             VALUES ('main', ?1, 100, 0)",
-            [&pa],
+             VALUES ('main', ?1, 9000, 0)",
+            [&local],
         )
         .unwrap();
     }
@@ -1641,22 +1657,23 @@ async fn adoption_after_skip_mirrors_union_upward() {
         config: &cfg,
         key: None,
     };
-    // Pull: adoption fills the empty providers (hybrid live config); Phase 3
-    // leaves the clean row in place...
-    let row = json!({
-        "id": "main", "payload": pb.clone(), "revision": 1000,
-        "deleted_at": Value::Null,
-    });
-    apply_user_config(&ctx, std::slice::from_ref(&row)).unwrap();
-    assert_eq!(rev_of(&db, "SELECT revision FROM user_config WHERE id='main'"), 100);
-    assert_eq!(cfg.get().providers.len(), 1, "adopted the remote provider");
-    assert_eq!(cfg.get().preferences, "Local preference", "local value kept");
-    // ...then the post-pull mirror folds the hybrid UP (dirty, above the
-    // high-water) so the next push can upload the union.
-    {
-        let conn = db.0.lock().unwrap();
-        db::sync_user_config(&conn, &cfg.get()).unwrap();
-    }
+    apply_user_config(
+        &ctx,
+        &[json!({
+            "id": "main", "payload": remote, "revision": 500,
+            "deleted_at": Value::Null,
+        })],
+    )
+    .unwrap();
+
+    let live = cfg.get();
+    assert_eq!(live.providers.len(), 1, "the remote's provider is adopted");
+    assert_eq!(
+        live.preferences, "Local preference",
+        "our strictly-newer key is kept"
+    );
+    // We still hold something the remote lacks, so the row is re-armed dirty above
+    // the remote's revision for the next push.
     let (rev, dirty): (i64, i64) = {
         let conn = db.0.lock().unwrap();
         conn.query_row(
@@ -1667,7 +1684,7 @@ async fn adoption_after_skip_mirrors_union_upward() {
         .unwrap()
     };
     assert_eq!(dirty, 1);
-    assert!(rev > 1000, "the union must land above the pull high-water");
+    assert!(rev > 500, "re-armed above the remote's revision");
 }
 
 /// End-to-end guard for the combined post-pull config tail
@@ -1907,19 +1924,22 @@ async fn stranded_richer_row_heals_and_pushes_the_union() {
     assert_eq!(rev_after, rev, "no further escalation once the server has our content");
 }
 
-/// A pure CONFLICT (both sides set the same field to different values) is not
-/// "adding content" — the reconcile must leave a clean row alone rather than
-/// start a per-tick push/pull fight.
+/// A pure conflict (both sides set the same key, different values) converges on
+/// the NEWER one — and does NOT push, so two configured devices can never start a
+/// per-tick fight over it. (The old rule left both sides on their own value
+/// forever, which is divergence, not convergence.)
 #[tokio::test]
-async fn reconcile_does_not_fight_a_pure_conflict() {
+async fn a_pure_conflict_converges_on_the_newer_value() {
     let local = json!({
-        "activeProviderId": "", "baseUrl": "", "model": "",
-        "modelOverrides": {}, "preferences": "Value A", "providers": [],
+        "v": 2, "preferences": "Value A", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 100 },
     })
     .to_string();
     let server = json!({
-        "activeProviderId": "", "baseUrl": "", "model": "",
-        "modelOverrides": {}, "preferences": "Value B", "providers": [],
+        "v": 2, "preferences": "Value B", "providers": [],
+        "activeProviderId": "", "baseUrl": "", "model": "", "modelOverrides": {},
+        "revs": { "preferences": 5000 },
     })
     .to_string();
     let srv = MockRest::spawn();
@@ -1934,6 +1954,9 @@ async fn reconcile_does_not_fight_a_pure_conflict() {
     let mem = temp_memory("conflict", &db);
     let cfg = temp_config("conflict");
     {
+        // Production invariant: the live config and the row agree, because
+        // every edit path mirrors. A fixture that disagrees would make the
+        // pre-merge mirror read the planted row as a deliberate CLEAR.
         let mut c = cfg.get();
         c.preferences = "Value A".into();
         cfg.set(c).unwrap();
@@ -1957,6 +1980,7 @@ async fn reconcile_does_not_fight_a_pure_conflict() {
     };
     reconcile_user_config(&ctx, "tok").await.unwrap();
 
+    assert_eq!(cfg.get().preferences, "Value B", "the newer value wins");
     let (rev, dirty): (i64, i64) = {
         let conn = db.0.lock().unwrap();
         conn.query_row(
@@ -1966,8 +1990,11 @@ async fn reconcile_does_not_fight_a_pure_conflict() {
         )
         .unwrap()
     };
-    assert_eq!((rev, dirty), (100, 0), "a pure conflict is left alone");
-    assert!(srv.posted("user_config").is_empty());
+    assert_eq!((rev, dirty), (5000, 0), "clean at the remote's revision");
+    assert!(
+        srv.posted("user_config").is_empty(),
+        "no fight — we add nothing"
+    );
 }
 
 /// The empty-guard ignores the `model` mirror on the default endpoint: a device
@@ -2279,45 +2306,44 @@ fn mirror_does_not_create_a_row_for_a_blank_config() {
     assert_eq!(dirty, 1);
 }
 
-/// A legacy-only remote (providers empty on both sides) must reach a NORMAL blank
-/// device, whose mirrors are the factory DEFAULTS rather than empty strings. The
-/// `else` branch has to treat "default" as unset for the same reason
-/// `migrate_v1` does — otherwise a blank device could never leave the
-/// factory endpoint. Adopted as a pair: in the legacy shape `base_url` + `model`
-/// together define the one provider.
+/// A legacy-only remote (providers empty on both sides) reaches a NORMAL blank
+/// device through the merge: its v1 payload is migrated with its row revision, so
+/// its keys are strictly newer than the device's never-set ones. `base_url` and
+/// `model` move as a PAIR — in the legacy shape they define the one provider — so
+/// a device can never end up with its own endpoint and the remote's model.
 #[test]
-fn absorb_fills_factory_default_mirrors_from_a_legacy_remote() {
-    let sc = parse_syncable(
+fn merge_adopts_a_legacy_remote_endpoint_as_a_pair() {
+    let remote = parse_syncable_at(
         &json!({
             "activeProviderId": "", "baseUrl": "https://legacy.example/v1",
             "model": "legacy-model", "modelOverrides": {},
             "preferences": "", "providers": [],
         })
         .to_string(),
+        500,
     )
     .unwrap();
 
+    // A factory-default device (its mirrors count as unset) adopts the whole pair.
     let mut fresh = crate::config::AppConfig::default();
     assert_eq!(fresh.base_url, crate::config::DEFAULT_BASE_URL);
-    assert!(adopt_missing_fields(&mut fresh, &sc));
+    project_merged(&mut fresh, &SyncableConfig::new_v2().merge(&remote));
     assert_eq!(fresh.base_url, "https://legacy.example/v1");
     assert_eq!(fresh.model, "legacy-model");
 
-    // A device that set its OWN endpoint keeps it — the pair isn't mixed.
-    let mut own = crate::config::AppConfig::default();
-    own.base_url = "https://mine.example/v1".into();
-    assert!(!adopt_missing_fields(&mut own, &sc));
+    // …but a device whose endpoint is NEWER keeps BOTH halves of its own pair.
+    let mut mine = SyncableConfig::new_v2();
+    mine.base_url = "https://mine.example/v1".into();
+    mine.model = "my-model".into();
+    mine.revs.insert(KEY_BASE_URL.into(), 900);
+    let mut own = crate::config::AppConfig {
+        base_url: "https://mine.example/v1".into(),
+        model: "my-model".into(),
+        ..crate::config::AppConfig::default()
+    };
+    project_merged(&mut own, &mine.merge(&remote));
     assert_eq!(own.base_url, "https://mine.example/v1");
-
-    // Boundary of the pair rule: a device on the factory endpoint that picked a
-    // model DELIBERATELY keeps both. (Adopting the remote's endpoint while
-    // keeping its model was the old per-field rule's only unique coverage, and
-    // that combination is the incoherent one this rejects.)
-    let mut picked_model = crate::config::AppConfig::default();
-    picked_model.model = "my-model".into();
-    assert!(!adopt_missing_fields(&mut picked_model, &sc));
-    assert_eq!(picked_model.model, "my-model");
-    assert_eq!(picked_model.base_url, crate::config::DEFAULT_BASE_URL);
+    assert_eq!(own.model, "my-model", "the pair is never mixed");
 }
 
 /// An unparseable remote row that is OLDER than ours must not pin the high-water:
