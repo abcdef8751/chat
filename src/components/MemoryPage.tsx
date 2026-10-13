@@ -161,7 +161,11 @@ export function MemoryPage(props: {
           onInput={(e) => props.setMemoryDraft(e.currentTarget.value)}
         />
       </Show>
-      <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
+      {/* `shrink-0` keeps this control row at its natural height, so a short
+          editor pane squeezes the textarea/preview (`min-h-0 flex-1` above)
+          instead of compressing or displacing the Edit/Preview/Save + Delete
+          buttons. */}
+      <div class="mt-3 flex shrink-0 flex-wrap items-center justify-between gap-3">
         <Show
           when={props.memoryConfirmDelete === props.selectedMemoryFile?.name}
           fallback={
@@ -226,8 +230,16 @@ export function MemoryPage(props: {
             // On narrow (mobile) viewports — the same `lg` threshold that turns
             // the chat list into a drawer — expand to cover the whole viewport
             // so these pages don't render as a cramped centered card.
+            //
+            // Wide: a bounded 70vh flex column. `overflow-y-auto` makes the
+            // dialog itself the last-resort scroll container so a very short
+            // window scrolls the body instead of letting children spill past
+            // the rounded card (the two-pane region below keeps a floor, so it
+            // normally fills the space and only the footer/card scroll into
+            // view on a cramped window). `overflow-y-auto` also implies
+            // horizontal clipping, so nothing can poke out sideways either.
             props.wideViewport
-              ? "fixed left-1/2 top-1/2 z-50 flex h-[70vh] w-full max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900"
+              ? "fixed left-1/2 top-1/2 z-50 flex h-[70vh] w-full max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-y-auto rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900"
               : "fixed inset-0 z-50 flex h-full w-full flex-col overflow-y-auto bg-white p-5 focus:outline-none dark:bg-neutral-900"
           }
           style={props.fullscreenInsetStyle()}
@@ -251,14 +263,26 @@ export function MemoryPage(props: {
             are set in Settings and kept separate.
           </Dialog.Description>
 
-          {/* Wide viewports: the classic two-pane list + editor. */}
+          {/* Wide viewports: the classic two-pane list + editor.
+              This row is the only growing/scrolling region of the dialog:
+              - `flex-1` claims whatever height the header/description/card/
+                footer leave.
+              - `min-h-36` (not `min-h-0`) replaces the flex default of
+                `min-height: auto`, so a file list or editor full of text can't
+                inflate the row past the dialog; instead the two panes scroll
+                internally. Unlike `min-h-0` it keeps a usable floor, so the
+                row can never collapse to nothing (which used to push the
+                editor's Edit/Preview/Save row out over the Imported-chats
+                card below).
+              - `overflow-hidden` clips the panes so nothing can spill past the
+                row, whatever the panes hold. */}
           <Show when={props.wideViewport}>
-            <div class="mt-4 flex min-h-0 flex-1 gap-4">
-              <div class="flex w-44 shrink-0 flex-col gap-1 overflow-y-auto">
+            <div class="mt-4 flex min-h-36 flex-1 gap-4 overflow-hidden">
+              <div class="flex min-h-0 w-44 shrink-0 flex-col gap-1 overflow-y-auto">
                 {fileList()}
               </div>
 
-              <div class="flex min-w-0 flex-1 flex-col">
+              <div class="flex min-h-0 min-w-0 flex-1 flex-col">
                 <Show
                   when={props.selectedMemoryFile}
                   fallback={
