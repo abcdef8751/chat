@@ -1174,8 +1174,9 @@ fn read_file_image(path: &str, cfg: &AppConfig, db: Option<&db::Db>) -> Dispatch
     }
 }
 
-/// Execute one model-requested tool. Memory tools are handled in-process; host
-/// tools run with per-call approval (gating is handled by the caller). `read_file`
+/// Execute one model-requested tool. Memory tools are handled in-process, the
+/// read-only `web_fetch` runs without approval, and host tools run with per-call
+/// approval (gating is handled by the caller). `read_file`
 /// on an image path is intercepted here so the turn's model capability (`cfg`)
 /// and the DB metadata cache decide whether the image can be delivered.
 async fn dispatch_tool(
@@ -1197,9 +1198,12 @@ async fn dispatch_tool(
         brave.call_tool(&call.name, &call.arguments).await
     } else if matches!(
         call.name.as_str(),
-        "save_memory" | "read_memory" | "write_memory"
+        "save_memory" | "read_memory" | "write_memory" | "memory_str_replace"
     ) {
         crate::memory::execute_tool(call, memory).await
+    } else if call.name == "web_fetch" {
+        // Read-only and ungated, like the Brave tools, and needs no API key.
+        tools::execute_web_tool(call).await
     } else {
         tools::execute_host_tool(call, shell).await
     };
@@ -1211,10 +1215,10 @@ async fn dispatch_tool(
 /// enforced at dispatch instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ToolMode {
-    /// A live chat turn: memory reads/appends plus host and web tools, but no
-    /// `write_memory` — the chatting model must not clobber curated files.
+    /// A live chat turn: all memory tools (`save_memory`, `read_memory`,
+    /// `write_memory`, `memory_str_replace`) plus host and web tools.
     Live,
-    /// Memory consolidation: all three memory tools, no host/web tools.
+    /// Memory consolidation: all memory tools, no host/web tools.
     Reflection,
     /// Memory extraction (the map half of a backfill): no tools are advertised
     /// at all, because extraction is pure summarization. The gate below is a
@@ -1378,21 +1382,17 @@ pub(crate) async fn run_tool_loop(
 
                 let is_memory_tool = matches!(
                     call.name.as_str(),
-                    "save_memory" | "read_memory" | "write_memory"
+                    "save_memory" | "read_memory" | "write_memory" | "memory_str_replace"
                 );
                 // Live, reflection and extraction share one tool list (cache
                 // alignment), so access is enforced here by mode: live turns
-                // may not rewrite memory, reflection turns may not touch
-                // host/web tools, and extraction turns may only read.
+                // may use every memory tool plus host/web tools, reflection
+                // turns may not touch host/web tools, and extraction turns may
+                // run no tools at all.
                 let refused = match mode {
-                    ToolMode::Live if call.name == "write_memory" => Some(
-                        "write_memory is only available during memory consolidation; use \
-                         save_memory to add a fact."
-                            .to_string(),
-                    ),
                     ToolMode::Reflection if !is_memory_tool => Some(format!(
                         "{} is not available during memory consolidation; use save_memory, \
-                         read_memory, or write_memory.",
+                         read_memory, write_memory, or memory_str_replace.",
                         call.name
                     )),
                     // Extraction advertises no tools, so a hallucinated call is

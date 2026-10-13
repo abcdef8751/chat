@@ -1510,10 +1510,11 @@ async fn tool_loop_without_persistence_runs_memory_tool() {
         .any(|e| matches!(e, StreamEvent::ToolResult { ok: true, .. })));
 }
 
-/// `write_memory` is in the shared tool list but only usable during reflection:
-/// a live turn must refuse it and leave the file untouched.
+/// `write_memory` is usable during both a live chat turn and a reflection pass:
+/// the live turn must no longer be refused (the chatting model shares the same
+/// memory tools), and it must actually replace the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_memory_is_refused_live_and_allowed_in_reflection() {
+async fn write_memory_is_allowed_live_and_in_reflection() {
     async fn run(mode: ToolMode, memory: &crate::memory::MemoryState) -> Arc<Mutex<Vec<StreamEvent>>> {
         let (port, handle) = start_mock(
             vec![
@@ -1565,16 +1566,19 @@ async fn write_memory_is_refused_live_and_allowed_in_reflection() {
         events
     }
 
-    // Live: refused, file stays empty.
+    // Live: allowed now — the file is replaced, no refusal.
     let live_memory = temp_memory("wm-live");
     let live_events = run(ToolMode::Live, &live_memory).await;
-    assert!(live_memory.read("profile.md").unwrap().is_empty());
+    assert_eq!(live_memory.read("profile.md").unwrap(), "REWRITTEN");
     {
         let guard = live_events.lock().unwrap();
-        assert!(guard.iter().any(|e| matches!(
+        assert!(guard
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolResult { ok: true, .. })));
+        assert!(!guard.iter().any(|e| matches!(
             e,
             StreamEvent::ToolResult { ok: false, output, .. }
-                if output.contains("only available during memory consolidation")
+                if output.contains("memory consolidation")
         )));
     }
 
@@ -1586,6 +1590,63 @@ async fn write_memory_is_refused_live_and_allowed_in_reflection() {
     assert!(guard
         .iter()
         .any(|e| matches!(e, StreamEvent::ToolResult { ok: true, .. })));
+}
+
+/// `web_fetch` is not a memory tool, so the reflection pass's
+/// `ToolMode::Reflection` gate refuses it before dispatch — no network request
+/// is ever made during consolidation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_fetch_is_refused_in_reflection_mode() {
+    let (port, handle) = start_mock(
+        vec![
+            vec![
+                tool_frag(0, "c1", "web_fetch", ""),
+                tool_frag(0, "", "", r#"{\"url\":\"https://example.com\"}"#),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("done"), finish_chunk("stop")],
+        ],
+        0,
+    );
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let mcp = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    let memory = temp_memory("webfetch-reflect");
+    let approvals = tools::ApprovalRegistry::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
+    let tools_list = tools::tool_specs(false);
+    run_tool_loop(
+        &cfg,
+        "test-key",
+        &mcp,
+        &shell,
+        &memory,
+        &approvals,
+        "conv_reflect",
+        messages,
+        &tools_list,
+        flag,
+        &sink,
+        None,
+        ToolMode::Reflection,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    let guard = events.lock().unwrap();
+    assert!(guard.iter().any(|e| matches!(
+        e,
+        StreamEvent::ToolResult { ok: false, output, .. }
+            if output.contains("not available during memory consolidation")
+    )));
 }
 
 /// Extraction advertises no tools at all — it is pure summarization — so any
