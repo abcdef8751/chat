@@ -9,37 +9,8 @@ import type {
   SyncStatus,
 } from "../lib/api";
 import { BackArrowIcon } from "../lib/icons";
+import { parseModalities, resolveInputModalities } from "../lib/capabilities";
 import { formatTokens } from "../lib/turns";
-
-/// Parsed subset of models.dev's `modalities` JSON, e.g.
-/// `{"input":["text","image"],"output":["text"]}`. Each field is `null` when its
-/// array is absent; the whole result is `null` when the JSON is missing,
-/// invalid, or carries neither list.
-interface ModelModalities {
-  input: string[] | null;
-  output: string[] | null;
-}
-
-/// Defensive parse of `ModelInfo.modalities`. Never throws: absent / empty /
-/// null / malformed input, or a value without an `input`/`output` array, all
-/// collapse to `null` so callers can fall back to the coarse `attachment` flag.
-function parseModalities(raw: string | null | undefined): ModelModalities | null {
-  if (!raw) return null;
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!value || typeof value !== "object") return null;
-  const obj = value as Record<string, unknown>;
-  const list = (x: unknown): string[] | null =>
-    Array.isArray(x) ? x.filter((m): m is string => typeof m === "string") : null;
-  const input = list(obj.input);
-  const output = list(obj.output);
-  if (input === null && output === null) return null;
-  return { input, output };
-}
 
 /// Friendly badge text for a models.dev modality token.
 function modalityLabel(modality: string): string {
@@ -490,9 +461,7 @@ export function SettingsDialog(props: {
                   // `resolve_capabilities`, so a custom provider with no catalog
                   // entry can still be declared here.
                   const inputModalities = (): string[] =>
-                    over().inputModalities ??
-                    parsed()?.input ??
-                    (m().attachment ? ["text", "image"] : ["text"]);
+                    resolveInputModalities(m().modalities, m().attachment, over().inputModalities);
                   const outputModalities = (): string[] =>
                     over().outputModalities ?? parsed()?.output ?? ["text"];
                   const reasoningSupported = (): boolean =>
