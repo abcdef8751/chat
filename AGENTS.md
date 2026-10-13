@@ -469,12 +469,19 @@ scheme and a non-public literal host (max 5 hops). The result text is framed as
 untrusted external data, because a prompt-injected page must not be treated as
 instructions.
 
-**Residual `web_fetch` risks (documented, not closed):** a redirect to a
-public-looking name that resolves to a private address (DNS rebinding) is not
-caught, and the untrusted framing is only an instruction — it is not
-enforcement, so a prompt-injected page can still drive the ungated
-`write_memory`/`memory_str_replace` into the synced memory files. Gate
-`web_fetch` (or the memory writes) behind approval if a hard boundary is wanted.
+**Residual `web_fetch` risks — consciously accepted (personal, local-first
+tool):** a redirect to a public-looking name that resolves to a private address
+(DNS rebinding) is not caught, and the untrusted-content framing is an
+instruction, not enforcement — a prompt-injected page could still drive the
+ungated `write_memory`/`memory_str_replace` into the synced memory files. Both
+are judged unlikely and low-impact enough to accept, rather than pay for
+IP-pinning / egress control or add approval prompts. The sharper un-gated edge is
+outbound data smuggled in tool *arguments* (a `web_fetch` URL or a search query),
+which stays bounded because `read_file` and the keychain are gated. Note also
+that un-gating `write_memory` means an ordinary (non-injected) live turn may
+overwrite curated files by accident — the trade that removed the old
+"consolidation-only" gate. Revisit (gate `web_fetch`/the memory writes, or pin
+the validated IP) if this ever ships to a wider audience.
 
 ---
 
