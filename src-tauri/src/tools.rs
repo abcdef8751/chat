@@ -391,11 +391,17 @@ async fn fetch_url(url: &str, allow_private: bool) -> ToolOutput {
             return ToolOutput::err(e);
         }
     }
-    let client = reqwest::Client::builder()
+    // Never fall back to `Client::default()` on a build error: the default
+    // client follows redirects without any literal check and has no timeout,
+    // which would silently disable exactly the guards this code adds.
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
         .redirect(web_fetch_redirect_policy())
         .build()
-        .unwrap_or_default();
+    {
+        Ok(client) => client,
+        Err(e) => return ToolOutput::err(format!("web_fetch: {e}")),
+    };
     let resp = match client
         .get(url)
         .header("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8")
@@ -453,7 +459,11 @@ fn url_host(url: &str) -> Option<String> {
 /// connects. The initial request's `lookup_host` check covers the common case.
 fn web_fetch_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= WEB_FETCH_MAX_REDIRECTS {
+        // `attempt.previous()` includes the initial URL as its first entry
+        // (`reqwest`'s own `Policy::limited` compares with `>` for the same
+        // reason), so `>=` would refuse one hop early. With `>` exactly
+        // WEB_FETCH_MAX_REDIRECTS redirects are followed.
+        if attempt.previous().len() > WEB_FETCH_MAX_REDIRECTS {
             return attempt.error("web_fetch: too many redirects");
         }
         let url = attempt.url();
@@ -477,7 +487,11 @@ async fn ensure_public_host(host: &str) -> Result<(), String> {
     if is_blocked_host_literal(host) {
         return Err(blocked_host_error(host));
     }
-    if host.parse::<IpAddr>().is_ok() {
+    // `Url::host_str()` keeps the brackets on an IPv6 literal
+    // (`[2606:4700::1111]`), but `IpAddr::from_str` wants them gone — without
+    // this a *public* IPv6 literal would fall through to `lookup_host`, which
+    // cannot resolve a bracketed address, and every such fetch would fail.
+    if strip_ipv6_brackets(host).parse::<IpAddr>().is_ok() {
         return Ok(());
     }
     match tokio::net::lookup_host((host, 0)).await {
@@ -511,10 +525,7 @@ fn blocked_host_error(host: &str) -> String {
 /// compared case-insensitively; brackets are stripped from IPv6 literals.
 fn is_blocked_host_literal(host: &str) -> bool {
     let host = host.trim();
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    let host = strip_ipv6_brackets(host);
     let lower = host.to_ascii_lowercase();
     if lower == "localhost" || lower.ends_with(".localhost") {
         return true;
@@ -526,6 +537,14 @@ fn is_blocked_host_literal(host: &str) -> bool {
         Ok(ip) => is_blocked_ip(&ip),
         Err(_) => false,
     }
+}
+
+/// Strip a single pair of surrounding brackets from an IPv6 host literal, so
+/// both `[::1]` (as `Url::host_str` returns it) and `::1` parse as an `IpAddr`.
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 /// The shared address-range check used for both literals and resolved addresses.
@@ -547,9 +566,18 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 }
 
 /// IPv4 ranges refused by `web_fetch`: loopback (127/8), private (10/8,
-/// 172.16/12, 192.168/16), link-local (169.254/16), and `0.0.0.0/8`.
+/// 172.16/12, 192.168/16), link-local (169.254/16), `0.0.0.0/8`, CGNAT
+/// (100.64/10 — also covers Alibaba Cloud's `100.100.100.200` metadata
+/// address), and `192.0.0.0/24` (Oracle Cloud's `192.0.0.192` metadata
+/// address). IPv4-mapped IPv6 (`::ffff:…`) is routed through here too.
 fn is_blocked_v4(ip: &Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.octets()[0] == 0
+    let o = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || o[0] == 0
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
 }
 
 /// Best-effort HTML → readable text. Drops `<script>`/`<style>` contents
@@ -1242,6 +1270,13 @@ mod tests {
             "169.254.169.254",
             "0.0.0.0",
             "0.1.2.3",
+            // CGNAT 100.64/10 — incl. Alibaba Cloud's metadata address.
+            "100.64.0.1",
+            "100.64.100.200",
+            "100.127.255.255",
+            "100.100.100.200",
+            // 192.0.0.0/24 — incl. Oracle Cloud's metadata address.
+            "192.0.0.192",
             // IPv6 loopback / unspecified / ULA / link-local / IPv4-mapped.
             "::1",
             "[::1]",
@@ -1251,14 +1286,21 @@ mod tests {
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            // IPv4-mapped forms inherit the new v4 ranges.
+            "::ffff:100.100.100.200",
+            "::ffff:192.0.0.192",
         ] {
             assert!(is_blocked_host_literal(host), "{host} should be blocked");
         }
 
         for host in [
             "93.184.216.34", // example.com — public
+            "1.1.1.1",
             "8.8.8.8",
+            "100.63.255.255", // just below 100.64.0.0/10
+            "100.128.0.0",    // just above 100.127.255.255
             "172.32.0.1", // just outside 172.16.0.0/12
+            "192.0.1.1",  // just outside 192.0.0.0/24
             "2606:4700:4700::1111", // public IPv6
             "example.com",
             "sub.example.com",
@@ -1266,6 +1308,24 @@ mod tests {
         ] {
             assert!(!is_blocked_host_literal(host), "{host} should be allowed");
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_public_host_accepts_public_ipv6_literals_without_dns() {
+        // `Url::host_str()` hands IPv6 literals over WITH their brackets; the
+        // public case must take the no-DNS path instead of trying (and failing)
+        // to resolve `[2606:4700:4700::1111]`.
+        assert!(ensure_public_host("[2606:4700:4700::1111]").await.is_ok());
+        assert!(ensure_public_host("2606:4700:4700::1111").await.is_ok());
+        assert!(ensure_public_host("1.1.1.1").await.is_ok());
+        // Blocked literals are refused in both spellings.
+        let err = ensure_public_host("[::1]").await.unwrap_err();
+        assert!(
+            err.contains("refusing to fetch non-public address"),
+            "{err}"
+        );
+        assert!(ensure_public_host("::1").await.is_err());
+        assert!(ensure_public_host("127.0.0.1").await.is_err());
     }
 
     #[test]
@@ -1305,12 +1365,27 @@ mod tests {
         content_type: &str,
         body: &str,
     ) -> (u16, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
         let status = status.to_string();
         let content_type = content_type.to_string();
         let body = body.to_string();
+        start_http_mock_response(move |_port| {
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            (head, body.clone())
+        })
+    }
+
+    /// Bind a one-shot loopback HTTP server. `respond` receives the bound port
+    /// (so a response can reference its own URL, e.g. in a `Location` header)
+    /// and returns the raw response head plus body to write.
+    fn start_http_mock_response(
+        respond: impl FnOnce(u16) -> (String, String) + Send + 'static,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = match listener.accept() {
                 Ok(x) => x,
@@ -1318,10 +1393,7 @@ mod tests {
             };
             let mut buf = [0u8; 2048];
             let _ = stream.read(&mut buf);
-            let head = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
+            let (head, body) = respond(port);
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(body.as_bytes());
             let _ = stream.flush();
@@ -1356,6 +1428,78 @@ mod tests {
         let _ = handle.join();
         assert!(out.is_error, "{}", out.content);
         assert!(out.content.contains("404"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn fetch_url_refuses_a_redirect_to_a_loopback_literal() {
+        // The mock 302s back to itself. `allow_private` lets the *initial*
+        // loopback request through, but the redirect policy's literal check is
+        // independent of it and still refuses the hop.
+        let (port, handle) = start_http_mock_response(|port| {
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            (head, String::new())
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true).await;
+        let _ = handle.join();
+        assert!(out.is_error, "{}", out.content);
+        // reqwest's Display wraps the policy error without its inner text, so
+        // the observable signal is "error following redirect" (a followed
+        // redirect would instead fail with a send/connect error, since the
+        // one-shot mock accepts no second connection).
+        assert!(
+            out.content.contains("error following redirect"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_url_refuses_a_redirect_to_a_non_http_scheme() {
+        let (port, handle) = start_http_mock_response(|_| {
+            (
+                "HTTP/1.1 302 Found\r\nLocation: ftp://127.0.0.1/pub/\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                String::new(),
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true).await;
+        let _ = handle.join();
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("error following redirect"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_url_caps_the_streamed_body() {
+        // The mock serves `WEB_FETCH_MAX_BYTES` of padding plus a marker past
+        // the cap. Only the padding is read, and whitespace collapses away — so
+        // the marker can only appear if the byte cap were ignored.
+        let mut body = " ".repeat(WEB_FETCH_MAX_BYTES);
+        body.push_str("TAILMARKER");
+        let (port, handle) = start_http_mock("200 OK", "text/html", &body);
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = fetch_url(&url, true).await;
+        let _ = handle.join();
+        assert!(
+            !out.content.contains("TAILMARKER"),
+            "bytes past the cap were read: {}",
+            out.content.chars().take(80).collect::<String>()
+        );
+        assert!(
+            out.content.chars().count() <= MAX_OUTPUT_CHARS,
+            "output not bounded: {} chars",
+            out.content.chars().count()
+        );
+        assert!(out.content.contains("no readable text"), "{}", out.content);
     }
 
     #[tokio::test]
