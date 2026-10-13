@@ -723,7 +723,8 @@ and the app is byte-identical to before. Never blocks the UI.
    ├─ capabilities/default.json
    ├─ vendor/tauri-runtime-wry/  # vendored+patched crate (see PATCH.md) via [patch.crates-io]
    ├─ gen/android/     # generated Android project (Kotlin: MainActivity.kt window
-   │                   #   insets/back, FileBridgePlugin.kt content:// resolver,
+   │                   #   insets/back + picker launcher, PickerPlugin.kt system
+   │                   #   file picker, FileBridgePlugin.kt content:// resolver,
    │                   #   KeepAliveService.kt foreground service, RunCommandPlugin.kt Termux bridge)
    ├─ build.rs         # embeds SUPABASE_URL/PUBLISHABLE_KEY from ../.env (rerun-if-changed)
    └─ src/
@@ -845,14 +846,24 @@ and the app is byte-identical to before. Never blocks the UI.
   (#15678). Bumping today would trade the picker fix for a regression of the
   blank-screen bug. Revisit once #15678 (or an equivalent tao 0.36 fix) lands, then
   re-vendor or drop per `PATCH.md`.
-- **Android file pick + hardware back:** `tauri-plugin-dialog` returns
-  `content://` URIs on Android, which `std::fs` cannot read (so attachments were
-  silently dropped). `FileBridgePlugin.kt` resolves a URI via `ContentResolver`
-  and the `read_attachment_from_uri` command builds the `Attachment`. Hardware
-  back goes through `MainActivity`'s `OnBackPressedCallback`, which dispatches a
-  **cancelable** `pi-back` event; `src/lib/platform.ts`'s `onBack` returns `true`
-  to consume it, otherwise the activity finishes (so back exits only on the chat
-  page). Both need a device.
+- **Android file pick + hardware back:** attachments are picked by our own
+  **`picker` plugin** (`PickerPlugin.kt`), not `tauri-plugin-dialog`: Tauri's
+  `PluginManager` binds the dialog plugin's `ActivityResultLauncher` to the first
+  Activity and never rebinds it, so any Activity recreation (which this app hits
+  on every swipe-away → icon relaunch, since `prevent_exit()` +
+  `KeepAliveService` keep the process alive) makes every later `showFilePicker`
+  fail with "Attempting to launch an unregistered ActivityResultLauncher" until
+  the process is killed (tauri#15506 — see the deferred-bump note in this list).
+  `PickerPlugin` registers its launcher in `MainActivity.onCreate` — re-run on
+  every creation, the one moment registering is legal — and
+  `pick_attachment_uris` launches it over the mobile bridge; the returned
+  `content://` URIs go through the existing content-URI reader
+  (`FileBridgePlugin` / `read_attachment_from_uri`, which builds the
+  `Attachment`). Desktop still uses the dialog plugin. Hardware back goes through
+  `MainActivity`'s `OnBackPressedCallback`, which dispatches a **cancelable**
+  `pi-back` event; `src/lib/platform.ts`'s `onBack` returns `true` to consume it,
+  otherwise the activity finishes (so back exits only on the chat page). Both
+  need a device.
 - **Supabase URL is compile-time, from `.env`.** `build.rs` reads `../.env` and
   emits `cargo:rustc-env=SUPABASE_URL=…`. It now declares
   `cargo:rerun-if-changed` on that path: without it, cargo reuses a build-script
