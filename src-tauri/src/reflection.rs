@@ -135,7 +135,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
         crate::pricing::cached_model_name(&db, &turn_cfg.base_url, &turn_cfg.model)
             .unwrap_or_else(|| turn_cfg.model.clone());
     let system_prompt =
-        chat::build_system_prompt(&base_prompt, &model_label, &cfg.preferences, &memory);
+        chat::build_system_prompt(&base_prompt, &model_label, &cfg.preferences, &memory, Some(conversation.created_at));
 
     // Use the same compaction-aware context as a live turn (system prompt →
     // summary → verbatim tail), so the shared prefix stays cacheable and the pass
@@ -1131,11 +1131,14 @@ async fn run_reduce_pass(
     let before = snapshot_files(&memory);
     let model_label = crate::pricing::cached_model_name(&db, &turn_cfg.base_url, &turn_cfg.model)
         .unwrap_or_else(|| turn_cfg.model.clone());
+    // Backfill reduce aggregates many conversations, so there is no single
+    // start date to report — pass None consistently.
     let system_prompt = chat::build_system_prompt(
         chat::DEFAULT_SYSTEM_PROMPT,
         &model_label,
         &cfg.preferences,
         &memory,
+        None,
     );
 
     let mut body = String::from("Memory extractions from past conversations, oldest first:\n");

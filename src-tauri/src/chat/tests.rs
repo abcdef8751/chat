@@ -1908,7 +1908,7 @@ fn build_system_prompt_orders_preferences_base_model_and_memory() {
     memory
         .write("preferences.md", "User prefers dark mode.")
         .unwrap();
-    let prompt = build_system_prompt("BASE", "DeepSeek V4 Pro", "Talk like a pirate.", &memory);
+    let prompt = build_system_prompt("BASE", "DeepSeek V4 Pro", "Talk like a pirate.", &memory, None);
     assert!(prompt.starts_with("Explicit user preferences"));
     assert!(prompt.contains("Talk like a pirate."));
     assert!(prompt.contains("BASE"));
@@ -1924,7 +1924,7 @@ fn build_system_prompt_orders_preferences_base_model_and_memory() {
 #[test]
 fn build_system_prompt_omits_empty_preferences() {
     let memory = temp_memory("prompt-empty");
-    let prompt = build_system_prompt("BASE", "mock", "   ", &memory);
+    let prompt = build_system_prompt("BASE", "mock", "   ", &memory, None);
     assert!(prompt.starts_with("BASE"));
     assert!(!prompt.contains("Explicit user preferences (set directly"));
 }
@@ -2944,4 +2944,237 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         );
         assert!(!bodies.lock().unwrap()[1].contains("image_url"));
         let _ = std::fs::remove_file(&svg);
+    }
+
+    #[test]
+    fn build_system_prompt_includes_device_sentence_and_start_date() {
+        let memory = temp_memory("prompt-device-date");
+        let prompt_no_date = build_system_prompt("BASE", "mock", "", &memory, None);
+        assert!(
+            prompt_no_date.contains("own device"),
+            "system prompt must state tools run on user's own device"
+        );
+        assert!(
+            prompt_no_date.contains("not on a remote server")
+                || prompt_no_date.contains("not on a server"),
+            "device sentence must mention not on a server"
+        );
+        // With a start date.
+        let ms = 1_789_646_269_072; // 2026-09-17
+        let prompt_with_date =
+            build_system_prompt("BASE", "mock", "", &memory, Some(ms));
+        assert!(
+            prompt_with_date.contains("This conversation started on 2026-09-17 (UTC)."),
+            "start date line missing or wrong: {prompt_with_date}"
+        );
+        // Ensure ordering still holds: base before model, device after model, memory last.
+        assert!(prompt_with_date.find("BASE").unwrap() < prompt_with_date.find("running as the model").unwrap());
+        assert!(prompt_with_date.find("running as the model").unwrap() < prompt_with_date.find("own device").unwrap());
+        assert!(prompt_with_date.find("own device").unwrap() < prompt_with_date.find("Long-term memory").unwrap());
+    }
+
+    #[test]
+    fn format_date_produces_expected_utc_date() {
+        assert_eq!(format_date(0), "1970-01-01");
+        assert_eq!(format_date(1_789_646_269_072), "2026-09-17");
+        // Test the exact start-date formatting used in the system prompt.
+        assert_eq!(format_date(1_760_000_000_000), "2025-10-08");
+    }
+
+    #[test]
+    fn should_add_time_note_triggers_correctly() {
+        // No prior user => first message needs note.
+        assert!(should_add_time_note(&[], 1_000_000));
+        // Recent user (2 min ago) => no note.
+        let recent = crate::db::MessageRow {
+            id: "u1".into(),
+            conversation_id: "c".into(),
+            role: "user".into(),
+            index: 0,
+            content: "hi".into(),
+            model: None,
+            provider: None,
+            thinking_level: None,
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+            attachments: None,
+            created_at: 1_000_000,
+        };
+        assert!(!should_add_time_note(&[recent.clone()], 1_000_000 + 2 * 60 * 1000));
+        // Exactly 5 min => trigger.
+        assert!(should_add_time_note(&[recent.clone()], 1_000_000 + 5 * 60 * 1000));
+        // >5 min => trigger.
+        assert!(should_add_time_note(&[recent], 1_000_000 + 6 * 60 * 1000));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_base64_with_low_reported_context_does_not_compact() {
+        // Window 30k => threshold 24k. Estimate with large base64 ~28k > threshold,
+        // reported 5k < threshold => new logic must NOT compact.
+        let (port, bodies, handle) = start_mock_capture(
+            vec![vec![delta_chunk("ok"), finish_chunk("stop"), usage_chunk()]],
+            0,
+        );
+        let db = Arc::new(open_db("large-low"));
+        let cid = insert_conv(&db);
+        // Build history: 40 filler messages (2000 chars each) => ~20k tokens
+        // plus one large image attachment to push estimate over threshold.
+        for i in 0..40 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let content = "x".repeat(2000);
+            if role == "assistant" {
+                // Only the last assistant matters for reported tokens; set low.
+                let usage = if i == 39 {
+                    Some(r#"{"prompt_tokens":1000,"completion_tokens":1000,"context_tokens":5000}"#.to_string())
+                } else {
+                    None
+                };
+                crate::db::insert_message(&db, cid.clone(), role.into(), content, None, None, None, None, usage, None).unwrap();
+            } else if i == 38 {
+                // Second-last user carries the large image.
+                let large_b64 = "A".repeat(50000);
+                let att = crate::attachments::Attachment {
+                    id: "a1".into(),
+                    name: "pic.png".into(),
+                    mime: "image/png".into(),
+                    size: 50000,
+                    kind: "image".into(),
+                    data_url: Some(format!("data:image/png;base64,{large_b64}")),
+                    text: None,
+                };
+                let att_json = serde_json::to_string(&vec![att]).unwrap();
+                crate::db::insert_message_full(&db, cid.clone(), role.into(), content, None, None, None, None, None, None, Some(att_json)).unwrap();
+            } else {
+                crate::db::insert_message(&db, cid.clone(), role.into(), content, None, None, None, None, None, None).unwrap();
+            }
+        }
+        let mut cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        cfg.model_overrides.insert(
+            "mock".into(),
+            crate::config::ModelOverride {
+                context_window: Some(30_000),
+                ..Default::default()
+            },
+        );
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("large-low");
+        let flag = Arc::new(AtomicBool::new(false));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        run_chat_turn(&db, &cfg, "test-key", &brave, &shell, &memory, &approvals, flag, &sink, cid.clone(), "hi".into(), Vec::new(), false).await.unwrap();
+        let _ = handle.join();
+        let caps = bodies.lock().unwrap().clone();
+        // Only the live turn, no summarizer. With old .max() logic this would be 2 (summarizer + live).
+        assert_eq!(caps.len(), 1, "large base64 but low reported context must NOT trigger compaction; got {} requests", caps.len());
+        assert!(caps[0].contains("hi"));
+        assert!(!caps[0].contains("SUMMARY-OF-OLDER"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reported_context_above_threshold_does_compact() {
+        // Window 30k => threshold 24k. History estimate ~15k < threshold, reported 25k > threshold => must compact.
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![delta_chunk("SUMMARY-OF-OLDER"), finish_chunk("stop"), usage_chunk()],
+                vec![delta_chunk("ok"), finish_chunk("stop"), usage_chunk()],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("reported-high"));
+        let cid = insert_conv(&db);
+        for i in 0..60 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let content = "x".repeat(1000);
+            if role == "assistant" {
+                let usage = if i == 59 {
+                    Some(r#"{"prompt_tokens":1000,"completion_tokens":1000,"context_tokens":25000}"#.to_string())
+                } else {
+                    None
+                };
+                crate::db::insert_message(&db, cid.clone(), role.into(), content, None, None, None, None, usage, None).unwrap();
+            } else {
+                crate::db::insert_message(&db, cid.clone(), role.into(), content, None, None, None, None, None, None).unwrap();
+            }
+        }
+        let mut cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        cfg.model_overrides.insert(
+            "mock".into(),
+            crate::config::ModelOverride {
+                context_window: Some(30_000),
+                ..Default::default()
+            },
+        );
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("reported-high");
+        let flag = Arc::new(AtomicBool::new(false));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        run_chat_turn(&db, &cfg, "test-key", &brave, &shell, &memory, &approvals, flag, &sink, cid.clone(), "hi".into(), Vec::new(), false).await.unwrap();
+        let _ = handle.join();
+        let caps = bodies.lock().unwrap().clone();
+        assert_eq!(caps.len(), 2, "reported context above threshold must trigger compaction; got {:?}", caps.len());
+        assert!(caps[0].contains("ANCIENT") || caps[0].contains("x".repeat(10)) || caps[0].contains("SUMMARY") || request_body(&caps[0]).to_string().contains("Fold the exchange"), "first request should be summarizer");
+        assert!(caps[1].contains("SUMMARY-OF-OLDER"), "live turn must carry summary");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_note_appears_for_first_message() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![vec![delta_chunk("hi"), finish_chunk("stop")]],
+            0,
+        );
+        let db = Arc::new(open_db("time-first"));
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("time-first");
+        let flag = Arc::new(AtomicBool::new(false));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        // Empty history => first message must have time note.
+        run_chat_turn(&db, &cfg, "test-key", &brave, &shell, &memory, &approvals, flag, &sink, cid.clone(), "first".into(), Vec::new(), false).await.unwrap();
+        let _ = handle.join();
+        let caps = bodies.lock().unwrap().clone();
+        assert_eq!(caps.len(), 1);
+        assert!(
+            caps[0].contains("Current time:"),
+            "first message must include time note, got: {}", caps[0]
+        );
+        assert!(caps[0].contains("UTC."), "time note must end with UTC.");
+    }
+
+    #[test]
+    fn time_note_absent_from_reflection_build() {
+        let memory = temp_memory("reflection-time-note");
+        let prompt = build_system_prompt("BASE", "mock", "", &memory, Some(0));
+        assert!(!prompt.contains("Current time:"), "system prompt must not contain time note");
+        // Reflection builds context directly without time note.
+        let history = vec![row("a", "user", "hello")];
+        let msgs = build_context(&prompt, None, &history).unwrap();
+        let serialized = serde_json::to_string(&msgs).unwrap();
+        assert!(!serialized.contains("Current time:"), "reflection build must not contain time note");
+        // Also verify the time note helper formats correctly.
+        let note = format_date_time(0);
+        assert_eq!(note, "1970-01-01 00:00");
+        let note_ms = 1_789_646_269_072; // 2026-09-17 11:57 UTC
+        assert!(format_date_time(note_ms).starts_with("2026-09-17 11:57"));
     }

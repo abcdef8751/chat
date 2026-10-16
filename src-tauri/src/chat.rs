@@ -1058,6 +1058,63 @@ async fn compact_now(
     Ok(Some((summary, start)))
 }
 
+/// Format an epoch millisecond timestamp as `YYYY-MM-DD` in UTC (no chrono dep).
+/// Copied civil-from-days logic from `import.rs` / `reflection::format_day`.
+pub(crate) fn format_date(ms: i64) -> String {
+    let days = (ms / 1000).div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Format an epoch millisecond timestamp as `YYYY-MM-DD HH:MM` in UTC for the
+/// time note (no chrono dep).
+pub(crate) fn format_date_time(ms: i64) -> String {
+    let days = (ms / 1000).div_euclid(86_400);
+    let secs = (ms / 1000).rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let hour = secs / 3_600;
+    let minute = (secs % 3_600) / 60;
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
+}
+
+/// Whether a time note should be injected before the new user turn.
+/// Triggers on the first user message (no prior user in history) or when >=5 minutes
+/// have passed since the newest prior user message's `created_at`.
+pub(crate) fn should_add_time_note(history: &[crate::db::MessageRow], now_ms: i64) -> bool {
+    match history.iter().rposition(|m| m.role == "user") {
+        None => true,
+        Some(idx) => now_ms - history[idx].created_at >= 5 * 60 * 1000,
+    }
+}
+
+/// Build the transient time-note system message for the current turn.
+fn time_note_message(now_ms: i64) -> Result<ChatCompletionRequestMessage, String> {
+    let content = format!("Current time: {} UTC.", format_date_time(now_ms));
+    Ok(ChatCompletionRequestSystemMessageArgs::default()
+        .content(content)
+        .build()
+        .map_err(|e| e.to_string())?
+        .into())
+}
+
 /// Base system prompt, with explicit user preferences injected at the top and
 /// the active model named, then the bounded memory block appended. The
 /// preferences field is user-authored in Settings, so it is labelled as
@@ -1068,6 +1125,7 @@ pub(crate) fn build_system_prompt(
     model_label: &str,
     preferences: &str,
     memory: &crate::memory::MemoryState,
+    conversation_started: Option<i64>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !preferences.trim().is_empty() {
@@ -1082,6 +1140,18 @@ pub(crate) fn build_system_prompt(
         parts.push(format!(
             "You are currently running as the model \"{}\".",
             model_label.trim()
+        ));
+    }
+    // Host tools run on the user's own device, not on a server.
+    parts.push(
+        "Host tools (bash, read_file, write_file) execute on the user's own device — the machine \
+         they are sending from — not on a remote server."
+            .to_string(),
+    );
+    if let Some(ms) = conversation_started {
+        parts.push(format!(
+            "This conversation started on {} (UTC).",
+            format_date(ms)
         ));
     }
     let mut prompt = parts.join("\n\n");
@@ -1601,19 +1671,38 @@ pub(crate) async fn run_chat_turn(
     let model_label =
         crate::pricing::cached_model_name(db, &turn_cfg.base_url, &turn_cfg.model)
             .unwrap_or_else(|| turn_cfg.model.clone());
-    let system_prompt = build_system_prompt(&base_prompt, &model_label, &cfg.preferences, memory);
+    let system_prompt = build_system_prompt(
+        &base_prompt,
+        &model_label,
+        &cfg.preferences,
+        memory,
+        Some(conversation.created_at),
+    );
+
+    // Time note (transient, never persisted): inject a system message before the
+    // new user turn when this is the first message or >=5 minutes since the last
+    // user message. It must survive the compaction rebuild below.
+    let now_ms = crate::db::now_ms();
+    let needs_time_note = should_add_time_note(&history, now_ms);
+    let time_note = if needs_time_note {
+        Some(time_note_message(now_ms)?)
+    } else {
+        None
+    };
 
     // Context layout: system prompt → compaction summary (when one exists) →
-    // verbatim history → the new turn. If the request would cross the threshold
-    // of the model's window, force a compaction and rebuild from its result.
+    // verbatim history → [time note] → the new turn. If the request would cross
+    // the threshold of the model's window, force a compaction and rebuild from
+    // its result.
     let (mut summary, mut keep_start) = compacted_history(&conversation, &history);
-    let mut messages = build_messages(
-        &system_prompt,
-        summary.as_deref(),
-        &history[keep_start..],
-        &content,
-        &attachments,
-    )?;
+    let mut messages = {
+        let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
+        if let Some(ref note) = time_note {
+            msgs.push(note.clone());
+        }
+        msgs.push(user_request_message(&content, &attachments)?);
+        msgs
+    };
     // The bundled context-window table applies only to catalog providers, and it
     // is the *conversation's* provider that decides — not the global active one.
     let use_bundled_context = crate::pricing::uses_catalog(&provider);
@@ -1625,8 +1714,12 @@ pub(crate) async fn run_chat_turn(
         use_bundled_context,
     )
     .context_window;
-    let current =
-        estimate_context_tokens(&messages).max(reported_context_tokens(&history).unwrap_or(0));
+    // Use the provider-reported token count when available — it is the concrete API
+    // number and already accounts for images. Fall back to the char estimate only
+    // when no usage exists yet (e.g. the first turn). Using .max() forces
+    // premature compaction when the estimate serializes large base64 image payloads.
+    let current = reported_context_tokens(&history)
+        .unwrap_or_else(|| estimate_context_tokens(&messages));
     if window > 0 && current as f64 >= window as f64 * COMPACTION_THRESHOLD {
         if let Some((new_summary, new_start)) = compact_now(
             db,
@@ -1641,13 +1734,14 @@ pub(crate) async fn run_chat_turn(
         {
             summary = Some(new_summary);
             keep_start = new_start;
-            messages = build_messages(
-                &system_prompt,
-                summary.as_deref(),
-                &history[keep_start..],
-                &content,
-                &attachments,
-            )?;
+            messages = {
+                let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
+                if let Some(ref note) = time_note {
+                    msgs.push(note.clone());
+                }
+                msgs.push(user_request_message(&content, &attachments)?);
+                msgs
+            };
         }
     }
 
