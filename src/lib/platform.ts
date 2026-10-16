@@ -38,9 +38,28 @@ interface AndroidWindow extends Window {
  * True iff the native Android JS interface is present. `PiInsets` is injected
  * via `addJavascriptInterface` in `onWebViewCreate`, so it is absent on
  * desktop (and in a plain browser/dev server).
+ *
+ * Kept as a live `let` binding plus a dynamic helper so the first file-picker
+ * invocation (which may happen before this module loads) always checks the
+ * live window rather than a stale snapshot — fixes the "attachments don't show
+ * the first time" race.
  */
-export const isAndroid: boolean =
+export let isAndroid: boolean =
   typeof window !== "undefined" && !!(window as AndroidWindow).PiInsets;
+
+/** Dynamic check at call time — use this in App.tsx pick/attachment flows. */
+export function isAndroidDevice(): boolean {
+  return typeof window !== "undefined" && !!(window as AndroidWindow).PiInsets;
+}
+
+if (typeof window !== "undefined") {
+  setTimeout(() => {
+    isAndroid = !!(window as AndroidWindow).PiInsets;
+  }, 0);
+  window.addEventListener("pi-insets", () => {
+    isAndroid = !!(window as AndroidWindow).PiInsets;
+  });
+}
 
 /**
  * Subscribe to the native hardware/gesture back press. `cb` returns `true`

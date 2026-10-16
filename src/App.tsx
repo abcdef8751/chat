@@ -72,7 +72,7 @@ import {
   type SyncStatus,
   type ThinkingOptions,
 } from "./lib/api";
-import { isAndroid, onBack, readAttachmentFromUri } from "./lib/platform";
+import { isAndroidDevice, onBack, readAttachmentFromUri } from "./lib/platform";
 import { acceptsImages, resolveInputModalities } from "./lib/capabilities";
 import { Composer } from "./components/Composer";
 import { Header } from "./components/Header";
@@ -112,7 +112,7 @@ const ATTACHMENT_FILTERS = [
  * `null` = cancelled.
  */
 async function pickAttachmentPaths(): Promise<string[] | null> {
-  if (isAndroid) {
+  if (isAndroidDevice()) {
     const uris = await pickAttachmentUris();
     return uris.length > 0 ? uris : null;
   }
@@ -127,6 +127,7 @@ export default function App() {
   const [messages, setMessages] = createSignal<Message[]>([]);
   const [draft, setDraft] = createSignal("");
   const [streaming, setStreaming] = createSignal(false);
+  const [streamingConvId, setStreamingConvId] = createSignal<string | null>(null);
   const [streamError, setStreamError] = createSignal<string | null>(null);
   const [liveTools, setLiveTools] = createSignal<LiveTool[]>([]);
   const [nearBottom, setNearBottom] = createSignal(true);
@@ -667,14 +668,21 @@ export default function App() {
     listMessages(id).then(setMessages);
   });
 
-  // Keep the newest message in view unless the user has scrolled up.
+  // Keep the newest message in view unless the user has scrolled up or is
+  // actively dragging. Without the gesture guard a streamed delta arriving
+  // mid-drag re-pins to the bottom and fights the user's scroll-up.
+  let userInteracting = false;
   createEffect(() => {
     messages();
     liveTools();
-    if (!nearBottom()) return;
+    if (userInteracting || !nearBottom()) return;
     const el = messagesScrollEl;
     if (el) el.scrollTop = el.scrollHeight;
   });
+
+  const updateNearBottom = (el: HTMLElement) => {
+    setNearBottom(el.scrollHeight - el.scrollTop - el.clientHeight <= 80);
+  };
 
   async function createNewChat() {
     const created = await createConversation(draftTitle() || undefined);
@@ -1074,7 +1082,15 @@ export default function App() {
       // stream uses it (the backend defaults to the active provider's model
       // otherwise).
       const conv = activeConversation();
-      if (conv) await setConversationModel(conv.id, id);
+      if (conv) {
+        await setConversationModel(conv.id, id);
+        setConversations((prev) =>
+          prev.map((c) => (c.id === conv.id ? { ...c, model: id } : c)),
+        );
+        setVisibleConversations((prev) =>
+          prev.map((c) => (c.id === conv.id ? { ...c, model: id } : c)),
+        );
+      }
     } catch (e) {
       setSettingsError(String(e));
     }
@@ -1315,13 +1331,21 @@ export default function App() {
 
   // Derived, not event-set: so the warning appears the moment an image is
   // staged and clears on its own when the model is switched or its capability
-  // is toggled in Settings.
+  // is toggled in Settings. Also warns when the active conversation already
+  // contains image attachments (not just pending) and the model can't handle them.
   const attachmentWarning = createMemo<string | null>(() => {
-    const images = pendingAttachments().filter((a) => a.kind === "image").length;
-    if (images === 0 || currentModelVision() !== false) return null;
-    return `${model()} isn't marked as accepting image input, so ${
-      images === 1 ? "this image" : "these images"
-    } may be ignored or rejected. Pick a vision model in the header.`;
+    if (currentModelVision() !== false) return null;
+    const pendingImages = pendingAttachments().filter((a) => a.kind === "image").length;
+    if (pendingImages > 0) {
+      return `${model()} isn't marked as accepting image input, so ${
+        pendingImages === 1 ? "this image" : "these images"
+      } may be ignored or rejected. Pick a vision model in the header.`;
+    }
+    const convoHasImages = messages().some((m) =>
+      parseAttachments(m).some((a) => a.kind === "image"),
+    );
+    if (!convoHasImages) return null;
+    return `${model()} isn't marked as accepting image input, so images in this conversation may be ignored or rejected. Pick a vision model in the header.`;
   });
 
   // Resolve picked paths into attachments. On Android the dialog plugin returns
@@ -1330,7 +1354,7 @@ export default function App() {
   // Desktop (and any plain filesystem path) keeps the single batched
   // `readAttachments` call unchanged.
   async function readPickedAttachments(paths: string[]): Promise<Attachment[]> {
-    if (!isAndroid && !paths.some((p) => p.startsWith("content://"))) {
+    if (!isAndroidDevice() && !paths.some((p) => p.startsWith("content://"))) {
       return readAttachments(paths);
     }
     const atts: Attachment[] = [];
@@ -1338,7 +1362,7 @@ export default function App() {
       // One unreadable item must not drop the whole selection: keep the
       // survivors, matching the desktop `readAttachments` per-file behavior.
       try {
-        if (isAndroid || p.startsWith("content://")) {
+        if (isAndroidDevice() || p.startsWith("content://")) {
           atts.push(await readAttachmentFromUri(p));
         } else {
           atts.push(...(await readAttachments([p])));
@@ -1417,6 +1441,7 @@ export default function App() {
     setMessages((prev) => [...prev, assistantMsg]);
     setNearBottom(true);
     setStreaming(true);
+    setStreamingConvId(id);
     setStreamError(null);
     setLiveTools([]);
     setThinkingOpenId(null);
@@ -1484,6 +1509,7 @@ export default function App() {
       } else if (ev.type === "done" || ev.type === "error") {
         if (ev.type === "error") setStreamError(ev.message);
         setStreaming(false);
+        setStreamingConvId(null);
         setLiveTools([]);
         listMessages(id).then(setMessages);
         refreshConversations().catch(() => {});
@@ -1507,6 +1533,7 @@ export default function App() {
         }
       }
       setStreaming(false);
+      setStreamingConvId(null);
       setLiveTools([]);
       setStreamError(String(e));
     }
@@ -1563,6 +1590,7 @@ export default function App() {
       // noop — the backend still settles the aborted turn.
     }
     setStreaming(false);
+    setStreamingConvId(null);
     setLiveTools([]);
     // The user message is persisted by the backend *before* streaming starts, so
     // it is already in the transcript. Handing the draft back here would
@@ -1655,7 +1683,13 @@ export default function App() {
   }
 
   // Group messages into per-turn timelines, augmented with live tool activity.
-  const turns = () => groupTurns(messages(), liveTools(), streaming());
+  // Only show live tools when this conversation is the streaming one.
+  const turns = () =>
+    groupTurns(
+      messages(),
+      liveTools(),
+      streaming() && streamingConvId() === activeId(),
+    );
 
   const activeTitle = () => {
     const id = activeId();
@@ -1908,7 +1942,9 @@ export default function App() {
     }
     const m = messages().find((x) => x.id === id);
     if (!m?.thinking?.trim()) return null;
-    const live = Boolean(streaming() && m.id.startsWith("tmp-assistant-") && !m.content);
+    const live = Boolean(
+      streaming() && streamingConvId() === activeId() && m.id.startsWith("tmp-assistant-") && !m.content,
+    );
     return { text: m.thinking, live };
   };
 
@@ -2091,9 +2127,16 @@ export default function App() {
 
         <section
           ref={(el) => (messagesScrollEl = el)}
-          onScroll={(e) => {
-            const el = e.currentTarget;
-            setNearBottom(el.scrollHeight - el.scrollTop - el.clientHeight <= 80);
+          onScroll={(e) => updateNearBottom(e.currentTarget)}
+          onTouchStart={() => (userInteracting = true)}
+          onTouchEnd={(e) => {
+            updateNearBottom(e.currentTarget);
+            userInteracting = false;
+          }}
+          onWheel={(e) => {
+            // Wheel-up means the user is deliberately leaving the bottom; stop
+            // auto-following immediately instead of waiting for onScroll.
+            if (e.deltaY < 0) setNearBottom(false);
           }}
           class="flex-1 overflow-y-auto px-6 py-4"
         >
@@ -2108,7 +2151,7 @@ export default function App() {
             <MessageList
               turns={turns()}
               empty={messages().length === 0}
-              streaming={streaming()}
+              streaming={streaming() && streamingConvId() === activeId()}
               thinkingOpenId={thinkingOpenId()}
               onToggleThought={(id) =>
                 setThinkingOpenId(thinkingOpenId() === id ? null : id)
@@ -2139,7 +2182,8 @@ export default function App() {
           onRemoveAttachment={removeAttachment}
           contextNote={contextNote()}
           attachmentWarning={attachmentWarning()}
-          streaming={streaming()}
+          streaming={streaming() && streamingConvId() === activeId()}
+          busy={streaming()}
           onPickAttachments={pickAttachments}
           draft={draft()}
           setDraft={setDraft}
