@@ -50,25 +50,95 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
     @Volatile
     private var pendingInvoke: Invoke? = null
 
+    // Generation counter that increments on every Activity recreation (each
+    // MainActivity.onCreate -> setLauncher call). Together with pendingGeneration
+    // it lets us distinguish:
+    //   - a genuine concurrent double-tap within the SAME Activity instance
+    //     (pendingGeneration == generation => reject as "already picking")
+    //   - a stale orphaned pick from a PREVIOUS Activity instance that never got
+    //     its result (pendingGeneration != generation => safe to clear and allow
+    //     the new pick).
+    //
+    // Why this exists (issue 1 - "already picking" stuck):
+    // Before this fix pendingInvoke was only cleared in onActivityResult and on
+    // launch exception. If the Activity was destroyed/recreated mid-pick (e.g.
+    // swipe-away + relaunch, or config change while the system picker is on top)
+    // the result is never delivered: the old launcher is unregistered/destroyed
+    // and the new Activity's launcher has no pending state. pendingInvoke then
+    // stays set forever and every future tap is rejected as "already picking"
+    // even though no picker is showing. The generation token + setLauncher
+    // clearing below ensures a stale guard cannot permanently block picking,
+    // while a true concurrent double-invoke in the same Activity instance is
+    // still rejected.
+    @Volatile
+    private var generation: Int = 0
+
+    @Volatile
+    private var pendingGeneration: Int = -1
+
     /**
      * Point the picker at the current activity's launcher. Called from
      * `MainActivity.onCreate`, so it re-binds to THIS activity on every
      * creation — which is what keeps the launcher valid across recreation.
      * Main thread only.
+     *
+     * FIX for stuck picker (issue 1):
+     * If a pick was in-flight when the Activity was destroyed, pendingInvoke
+     * would otherwise remain set forever (result never arrives on the old
+     * launcher). We treat any pending pick whose generation != new generation
+     * as orphaned: resolve it as cancelled (empty result -> Rust gets empty vec)
+     * and clear the guard so the next user tap can launch a fresh picker.
+     * This is eager clearing on Activity recreation; pickFiles also has a lazy
+     * clear as a safety net if setLauncher was not called (e.g. same Activity
+     * but result lost for other reasons).
+     *
+     * We resolve with the no-arg `invoke.resolve()` (literal null -> None on
+     * Rust side = cancelled) rather than leaving the JS promise hanging, so the
+     * frontend's await unblocks and can retry. If the old invoke's JS context
+     * is already dead (WebView recreated), resolving is a no-op but still frees
+     * the guard.
      */
     @JvmStatic
     fun setLauncher(l: (Intent) -> Unit) {
+      generation += 1
+      val stale = pendingInvoke
+      if (stale != null) {
+        // Orphaned pick from a previous Activity instance (generation mismatch).
+        // Clear it now; otherwise the next pick would be incorrectly rejected
+        // as "already picking" and the UI would be stuck.
+        Log.w(TAG, "setLauncher: clearing orphaned pick (gen=$pendingGeneration -> $generation)")
+        try {
+          // Resolve as cancelled so Rust's Option<Vec<String>> gets None -> empty vec
+          stale.resolve()
+        } catch (e: Exception) {
+          Log.w(TAG, "setLauncher: failed to resolve orphaned invoke", e)
+        }
+        pendingInvoke = null
+        pendingGeneration = -1
+      }
       launcher = l
+      Log.d(TAG, "setLauncher: generation=$generation")
     }
 
     /**
      * Entry point from `MainActivity`'s `registerForActivityResult` callback.
      * Main thread only.
+     *
+     * Note: we intentionally do NOT check generation here. If the Activity was
+     * recreated while the picker was showing, the system may forward the result
+     * to the new Activity's launcher (via Activity recreation handling). In that
+     * case pendingGeneration (old) != generation (new) but the result still
+     * belongs to the orphaned pick and should be delivered. Since we already
+     * cleared orphaned picks eagerly in setLauncher, this path only runs for
+     * the normal case where the same Activity instance launched and received
+     * the result. If a forwarded result does arrive after eager clearing,
+     * pendingInvoke will be null and we return early (harmless).
      */
     @JvmStatic
     fun onActivityResult(resultCode: Int, data: Intent?) {
       val invoke = pendingInvoke ?: return
       pendingInvoke = null
+      pendingGeneration = -1
 
       if (resultCode != Activity.RESULT_OK || data == null) {
         // Cancelled (back press / dismissed). NOTE: `resolve(null)` would bind
@@ -107,9 +177,30 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.reject("picker: launcher not ready")
       return
     }
-    if (pendingInvoke != null) {
-      invoke.reject("picker: already picking")
-      return
+    val pending = pendingInvoke
+    if (pending != null) {
+      if (pendingGeneration == generation) {
+        // Genuine concurrent double-invoke within the same Activity instance:
+        // the previous pick is still in-flight and its launcher/system picker
+        // is on top. Reject so we don't launch a second picker on top.
+        invoke.reject("picker: already picking")
+        return
+      } else {
+        // Stale orphaned pick that survived setLauncher clearing (e.g.
+        // setLauncher was not re-invoked but result was lost for another
+        // reason - system delivered no result, or Activity destroyed without
+        // onCreate re-running). Treat as orphaned, clear it, and allow the
+        // new pick. This is the lazy safety net for the stuck-picker bug.
+        Log.w(TAG, "pickFiles: clearing stale pending (gen=$pendingGeneration vs $generation)")
+        try {
+          pending.resolve()
+        } catch (e: Exception) {
+          Log.w(TAG, "pickFiles: failed to resolve stale invoke", e)
+        }
+        pendingInvoke = null
+        pendingGeneration = -1
+        // fall through to launch the new pick
+      }
     }
 
     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
@@ -118,12 +209,14 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
     intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
 
     pendingInvoke = invoke
+    pendingGeneration = generation
     try {
       launch(intent)
     } catch (e: Exception) {
       // Launch itself failed (e.g. no documents provider): un-park so the next
       // pick is not rejected as "already picking".
       pendingInvoke = null
+      pendingGeneration = -1
       Log.w(TAG, "pickFiles: launch failed", e)
       invoke.reject("picker: ${e.message}")
     }
