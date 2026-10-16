@@ -1,13 +1,17 @@
 package com.rp.chat
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import android.widget.FrameLayout
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -174,6 +178,9 @@ class MainActivity : TauriActivity() {
     // delivered to the page. This is a best-effort hint (the OS caps how much
     // it honors), so the on-screen hamburger remains the guaranteed fallback.
     excludeLeftEdgeGesture()
+    // Shield the WebView from transient window-focus loss (issue 7). Installed
+    // last so the WebView is already in the hierarchy.
+    installFocusShield(webView)
   }
 
   private fun excludeLeftEdgeGesture() {
@@ -237,6 +244,63 @@ class MainActivity : TauriActivity() {
           null
         )
       }
+    }
+  }
+
+  /**
+   * Wrap the WebView in a [FocusShieldLayout].
+   *
+   * Issue 7. Chromium's WebView hides the soft keyboard the moment it observes
+   * `onWindowFocusChanged(false)` — verified on-device: the hide lands ~6 ms
+   * after `MainActivity handleWindowFocusChanged: 0`, before any app code runs.
+   * An IME that presents its language picker as a *focus-stealing dialog*
+   * (FUTO's is a TYPE_APPLICATION_ATTACHED_DIALOG) therefore gets that dialog
+   * torn down the instant it opens, because the host window loses focus. Native
+   * apps are unaffected — Samsung Settings keeps the keyboard up through the very
+   * same dialog — so the fix is to stop the WebView from ever seeing the
+   * transient focus loss.
+   */
+  private fun installFocusShield(webView: WebView, attempt: Int = 0) {
+    val parent = webView.parent as? ViewGroup
+    if (parent == null) {
+      // Tauri may add the WebView to the content view just after this hook.
+      if (attempt < 5) webView.post { installFocusShield(webView, attempt + 1) }
+      return
+    }
+    if (parent is FocusShieldLayout) return // already installed
+    val lp = webView.layoutParams
+    val index = parent.indexOfChild(webView)
+    parent.removeViewAt(index)
+    val shield = FocusShieldLayout(this)
+    shield.layoutParams = lp
+    // The WebView keeps filling the shield, which in turn keeps the WebView's
+    // original layout params, so the visual result is unchanged.
+    shield.addView(
+      webView,
+      ViewGroup.LayoutParams.MATCH_PARENT,
+      ViewGroup.LayoutParams.MATCH_PARENT,
+    )
+    parent.addView(shield, index)
+  }
+
+  /**
+   * A FrameLayout that keeps a transient window-focus LOSS from reaching its
+   * children.
+   *
+   * While the activity's window is still visible, focus moving to another window
+   * means an IME's own dialog stole it (nothing else legitimately takes focus
+   * from a foreground activity). Forwarding that loss makes Chromium hide the
+   * keyboard, which in turn destroys the IME's dialog — the language list never
+   * gets a chance to render. Once the window is no longer visible (home/recents)
+   * the loss is reported as usual, so backgrounding behaviour is unchanged.
+   */
+  private class FocusShieldLayout(context: Context) : FrameLayout(context) {
+    override fun dispatchWindowFocusChanged(hasFocus: Boolean) {
+      // `windowVisibility` (public API) is the visibility of this view's window.
+      // `View.getWindow()` is a hidden method and is unavailable to the Kotlin
+      // compiler, so it cannot be used here.
+      val windowVisible = windowVisibility == View.VISIBLE
+      super.dispatchWindowFocusChanged(hasFocus || windowVisible)
     }
   }
 
