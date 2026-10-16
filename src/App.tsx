@@ -1452,7 +1452,23 @@ export default function App() {
     const channel = new Channel<StreamEvent>();
     channel.onmessage = (ev) => {
       // Ignore events from a superseded turn (Stop, then a new send).
-      if (activeId() !== id || token !== turnToken) return;
+      if (token !== turnToken) return;
+      // Terminal events must ALWAYS be handled, even if the user switched to a
+      // different conversation mid-turn. Dropping them left `streaming` set
+      // forever, which disabled the composer in every chat. Only the visible
+      // transcript needs refreshing.
+      if (ev.type === "done" || ev.type === "error") {
+        if (ev.type === "error") setStreamError(ev.message);
+        setStreaming(false);
+        setStreamingConvId(null);
+        setLiveTools([]);
+        if (activeId() === id) listMessages(id).then(setMessages);
+        refreshConversations().catch(() => {});
+        return;
+      }
+      // Everything below touches the on-screen transcript / live tool list, so
+      // it only applies while this conversation is the one being viewed.
+      if (activeId() !== id) return;
       if (ev.type === "delta") {
         received.current = true;
         setMessages((prev) =>
@@ -1506,21 +1522,14 @@ export default function App() {
               : t,
           ),
         );
-      } else if (ev.type === "done" || ev.type === "error") {
-        if (ev.type === "error") setStreamError(ev.message);
-        setStreaming(false);
-        setStreamingConvId(null);
-        setLiveTools([]);
-        listMessages(id).then(setMessages);
-        refreshConversations().catch(() => {});
       }
     };
 
     try {
       await streamChat(id, text, staged, channel, regenerate);
     } catch (e) {
-      if (activeId() !== id || token !== turnToken) return;
-      if (!received.current) {
+      if (token !== turnToken) return;
+      if (activeId() === id && !received.current) {
         // Command errored before streaming began (e.g. missing key/match).
         setMessages((prev) =>
           prev.filter(
