@@ -237,6 +237,7 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
       // pick is not rejected as "already picking".
       pendingInvoke = null
       pendingGeneration = -1
+      pendingSince = 0L
       Log.w(TAG, "pickFiles: launch failed", e)
       invoke.reject("picker: ${e.message}")
     }

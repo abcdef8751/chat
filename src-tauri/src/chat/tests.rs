@@ -2982,6 +2982,37 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
     }
 
     #[test]
+    fn estimate_context_tokens_ignores_base64_payloads() {
+        use crate::attachments::Attachment;
+        let plain = estimate_context_tokens(&[user_request_message("hi", &[]).unwrap()]);
+        let image = Attachment {
+            id: "a".into(),
+            name: "shot.png".into(),
+            mime: "image/png".into(),
+            size: 600_000,
+            kind: "image".into(),
+            data_url: Some(format!("data:image/png;base64,{}", "A".repeat(600_000))),
+            ..Default::default()
+        };
+        let with_image =
+            estimate_context_tokens(&[user_request_message("hi", &[image]).unwrap()]);
+        // A 600 kB base64 payload is ~150k characters. Charging that as text (the
+        // old behaviour) is what compacted conversations merely *containing* a
+        // pasted screenshot — history replays every image on every turn. It must
+        // count as roughly one image instead.
+        assert!(
+            with_image < plain + 10_000,
+            "base64 payload leaked into the estimate: plain={plain} with_image={with_image}"
+        );
+        assert!(with_image >= plain + IMAGE_TOKENS - 50);
+        // The trigger adds only the not-yet-sent turn to the reported count.
+        assert_eq!(
+            estimate_turn_tokens("hi", &[]),
+            "hi".len() as u64 / CHARS_PER_TOKEN + 8
+        );
+    }
+
+    #[test]
     fn should_add_time_note_triggers_correctly() {
         // No prior user => first message needs note.
         assert!(should_add_time_note(&[], 1_000_000));

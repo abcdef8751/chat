@@ -916,6 +916,23 @@ fn estimate_context_tokens(messages: &[ChatCompletionRequestMessage]) -> u64 {
     text_len as u64 / CHARS_PER_TOKEN + images * IMAGE_TOKENS
 }
 
+/// Estimated tokens contributed by the not-yet-sent user turn: its text plus
+/// each attachment (images at a fixed cost, other files by decoded size). Added
+/// to the provider's concrete count for everything already sent, so the whole
+/// history is measured the way the provider actually bills it rather than by a
+/// fixed per-image constant applied to every replayed image.
+fn estimate_turn_tokens(content: &str, attachments: &[crate::attachments::Attachment]) -> u64 {
+    let mut tokens = content.len() as u64 / CHARS_PER_TOKEN + 8;
+    for a in attachments {
+        if a.kind == "image" {
+            tokens += IMAGE_TOKENS;
+        } else {
+            tokens += a.size / CHARS_PER_TOKEN;
+        }
+    }
+    tokens
+}
+
 /// The context size the provider last reported for this conversation (the newest
 /// assistant turn's `context_tokens`, else its prompt+completion). Mirrors the
 /// frontend meter, and is more accurate than the char estimate when present.
@@ -1744,13 +1761,16 @@ pub(crate) async fn run_chat_turn(
         use_bundled_context,
     )
     .context_window;
-    // Belt-and-braces: the char estimate covers the *new* turn (which the
-    // provider cannot have reported yet) while the reported value is the
-    // concrete API number for the previous request. `estimate_context_tokens`
-    // no longer charges a data URL's byte length as tokens, so keeping `.max()`
-    // does not re-introduce the premature compaction it used to cause.
-    let current = estimate_context_tokens(&messages)
-        .max(reported_context_tokens(&history).unwrap_or(0));
+    // Prefer the provider's concrete count for everything already sent and add
+    // only the *new* turn, which it cannot have reported yet. Falling back to the
+    // whole-request estimate on the first turn. Measuring the growth rather than
+    // taking a `.max()` keeps the fixed per-image constant from overriding a real
+    // API number on an image-heavy conversation (which is what made compaction
+    // fire early), while still accounting for a large new turn.
+    let current = match reported_context_tokens(&history) {
+        Some(reported) => reported + estimate_turn_tokens(&content, &attachments),
+        None => estimate_context_tokens(&messages),
+    };
     if window > 0 && current as f64 >= window as f64 * COMPACTION_THRESHOLD {
         if let Some((new_summary, new_start)) = compact_now(
             db,

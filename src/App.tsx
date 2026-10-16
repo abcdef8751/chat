@@ -1458,7 +1458,7 @@ export default function App() {
       // forever, which disabled the composer in every chat. Only the visible
       // transcript needs refreshing.
       if (ev.type === "done" || ev.type === "error") {
-        if (ev.type === "error") setStreamError(ev.message);
+        if (ev.type === "error" && activeId() === id) setStreamError(ev.message);
         setStreaming(false);
         setStreamingConvId(null);
         setLiveTools([]);
@@ -1466,12 +1466,13 @@ export default function App() {
         refreshConversations().catch(() => {});
         return;
       }
-      // Deltas and text only make sense for the conversation on screen, but tool
-      // activity must always be recorded: a gated tool call started while the
-      // user is looking at another chat would otherwise never surface an
-      // approve/deny row, wedging the turn (the backend awaits the approval with
-      // no timeout). `turns()` still only renders live tools for this chat.
-      if (activeId() !== id && ev.type !== "toolCall" && ev.type !== "toolResult") return;
+      // Everything below mutates the on-screen transcript / live tool list, so it
+      // only applies while this conversation is the one being viewed. Tool
+      // events are included deliberately: on return to a chat the backend has
+      // usually already persisted the completed tool rounds, and `turns()` gates
+      // live entries on a `tmp-assistant-` row that a reload drops — so recording
+      // them for an off-screen chat would show data the UI cannot render.
+      if (activeId() !== id) return;
       if (ev.type === "delta") {
         received.current = true;
         setMessages((prev) =>
