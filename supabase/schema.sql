@@ -85,6 +85,9 @@ create table if not exists user_config (
 );
 
 -- Row level security: a client (anon key) may only ever touch its own rows.
+-- `(select auth.uid())` (not the bare call) is deliberate: PostgreSQL hoists the
+-- subquery to a one-time initplan instead of re-evaluating auth.uid() for every
+-- row the policy touches, which matters on the large `messages` table.
 alter table conversations enable row level security;
 alter table messages enable row level security;
 alter table memory_files enable row level security;
@@ -92,19 +95,19 @@ alter table user_config enable row level security;
 
 drop policy if exists "owner rw" on conversations;
 create policy "owner rw" on conversations
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);
 
 drop policy if exists "owner rw" on messages;
 create policy "owner rw" on messages
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);
 
 drop policy if exists "owner rw" on memory_files;
 create policy "owner rw" on memory_files
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);
 
 drop policy if exists "owner rw" on user_config;
 create policy "owner rw" on user_config
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);
 
 -- Store the client-provided revision verbatim on every insert/update, and only
 -- ever move it forward. This is what makes client-side LWW work: the receiving
@@ -152,7 +155,20 @@ create trigger trg_user_config_revision
 
 -- Convenience indexes for the pull query shapes.
 create index if not exists messages_conv_idx on messages(conversation_id);
-create index if not exists messages_revision_idx on messages(revision);
-create index if not exists conversations_revision_idx on conversations(revision);
-create index if not exists memory_files_revision_idx on memory_files(revision);
-create index if not exists user_config_revision_idx on user_config(revision);
+
+-- The pull filters `user_id = auth.uid() AND revision > <watermark>` and orders
+-- by revision. With only a `revision` index the RLS ownership check is applied
+-- to each candidate row the index returns — a heap fetch per row into a wide
+-- table (messages carries content/thinking/usage/attachments inline). A count or
+-- a large scan then exceeds the statement timeout (Postgres 57014). A composite
+-- (user_id, revision) index makes ownership a bound index condition and lets
+-- both the ordered page query and the count run as an index range scan. These
+-- replace the old revision-only indexes, which no longer have a query to serve.
+drop index if exists conversations_revision_idx;
+drop index if exists messages_revision_idx;
+drop index if exists memory_files_revision_idx;
+drop index if exists user_config_revision_idx;
+create index if not exists conversations_user_revision_idx on conversations(user_id, revision);
+create index if not exists messages_user_revision_idx on messages(user_id, revision);
+create index if not exists memory_files_user_revision_idx on memory_files(user_id, revision);
+create index if not exists user_config_user_revision_idx on user_config(user_id, revision);

@@ -86,7 +86,7 @@ pub struct SyncStatus {
     pub pushed: u64,
     pub pulled: u64,
     // Total remote rows the ongoing pull knows it must fetch, learned from
-    // PostgREST `Prefer: count=exact` on each table's first page. 0 = unknown
+    // PostgREST `Prefer: count=estimated` on each table's first page. 0 = unknown
     // (server didn't report a count), in which case the UI shows an
     // indeterminate bar. The push-side analogue is `pending`.
     pub pull_total: u64,
@@ -1714,8 +1714,8 @@ async fn pull(
 
     // Conversations.
     // `want_count` is true for each table's first page only: with
-    // `Prefer: count=exact` PostgREST reports the remote total in the
-    // Content-Range header, which is what turns the UI into a real progress
+    // `Prefer: count=estimated` PostgREST reports the remote total in the
+    // Content-Range header, which is what turns the UI into a progress
     // bar. Later pages skip it (and servers that don't support it simply never
     // contribute a total, leaving the bar indeterminate).
     let mut want_count = true;
@@ -1884,13 +1884,18 @@ async fn get_table(
         .get(&url)
         .header("apikey", ctx.anon)
         .header(AUTHORIZATION, format!("Bearer {token}"));
-    // First page of a table: ask PostgREST for the exact remote row count so
-    // the frontend can render real pull progress (pulled / total). The count
-    // comes back in the Content-Range header (`0-999/1042`). Servers without
-    // `count=exact` support (or the mock in tests, unless asked) simply omit
-    // it, and `remote_total` stays `None` → indeterminate progress.
+    // First page of a table: ask PostgREST for the remote row count so the
+    // frontend can render pull progress (pulled / total) from the Content-Range
+    // header (`0-999/1042`). Deliberately NOT `count=exact`: that runs an
+    // unbounded COUNT over the whole filtered set, and on a large `messages`
+    // table under RLS it scans/heap-fetches the entire post-watermark slice —
+    // exceeding Supabase's statement timeout (Postgres 57014 → HTTP 500) and
+    // wedging every pull at its first page. `count=estimated` is exact up to
+    // `db-max-rows` and the planner's estimate beyond it, so the bar stays
+    // useful without the expensive scan. Servers that don't support it simply
+    // omit Content-Range → `remote_total` stays `None` → indeterminate progress.
     if want_count {
-        req = req.header("Prefer", "count=exact");
+        req = req.header("Prefer", "count=estimated");
     }
     let resp = req.send().await.map_err(|e| format!("pull {table}: {e}"))?;
     if !resp.status().is_success() {

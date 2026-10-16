@@ -146,11 +146,12 @@ impl MockRest {
                         clen = v.parse().unwrap_or(0);
                     }
                 }
-                // Mimic PostgREST: when asked for an exact count, report the
-                // remote row total in the Content-Range header (`0-9/10`).
+                // Mimic PostgREST: when asked for a count, report the remote
+                // row total in the Content-Range header (`0-9/10`). The client
+                // requests `count=estimated`; the mock is exact either way.
                 let prefer_count = headers
                     .iter()
-                    .any(|(k, v)| k == "prefer" && v.contains("count=exact"));
+                    .any(|(k, v)| k == "prefer" && v.contains("count=estimated"));
                 while buf.len() < header_end + clen {
                     match sock.read(&mut tmp) {
                         Ok(0) | Err(_) => break,
