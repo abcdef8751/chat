@@ -1105,8 +1105,9 @@ async fn compact_now(
     Ok(Some((summary, start)))
 }
 
-/// Format an epoch millisecond timestamp as `YYYY-MM-DD` in UTC (no chrono dep).
-/// Copied civil-from-days logic from `import.rs` / `reflection::format_day`.
+/// Format an epoch millisecond timestamp as `YYYY-MM-DD` in UTC. Hand-rolled
+/// civil-from-days logic copied from `import.rs` / `reflection::format_day`
+/// (chrono is used only for the device's local UTC offset).
 pub(crate) fn format_date(ms: i64) -> String {
     let days = (ms / 1000).div_euclid(86_400);
     let z = days + 719_468;
@@ -1123,7 +1124,7 @@ pub(crate) fn format_date(ms: i64) -> String {
 }
 
 /// Format an epoch millisecond timestamp as `YYYY-MM-DD HH:MM` in UTC for the
-/// time note (no chrono dep).
+/// clock note.
 pub(crate) fn format_date_time(ms: i64) -> String {
     let days = (ms / 1000).div_euclid(86_400);
     let secs = (ms / 1000).rem_euclid(86_400);
@@ -1142,19 +1143,115 @@ pub(crate) fn format_date_time(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
 }
 
-/// Whether a time note should be injected before the new user turn.
-/// Triggers on the first user message (no prior user in history) or when >=5 minutes
-/// have passed since the newest prior user message's `created_at`.
-pub(crate) fn should_add_time_note(history: &[crate::db::MessageRow], now_ms: i64) -> bool {
-    match history.iter().rposition(|m| m.role == "user") {
-        None => true,
-        Some(idx) => now_ms - history[idx].created_at >= 5 * 60 * 1000,
+/// UTC weekday name for an epoch millisecond timestamp (1970-01-01, day 0, was
+/// a Thursday). Hand-rolled to pair with `format_date`.
+pub(crate) fn weekday_name(ms: i64) -> &'static str {
+    const NAMES: [&str; 7] = [
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    ];
+    let days = (ms / 1000).div_euclid(86_400);
+    // 1970-01-01 is a Thursday, i.e. index 4 in `NAMES`.
+    NAMES[(days + 4).rem_euclid(7) as usize]
+}
+
+/// The device's current UTC offset in minutes east of UTC, read from the OS
+/// local timezone (DST-aware for the present instant).
+pub(crate) fn local_utc_offset_minutes() -> i32 {
+    chrono::Local::now().offset().local_minus_utc() / 60
+}
+
+/// Render a minute offset as `+HH:MM` / `-HH:MM` (also handles half-hour zones).
+pub(crate) fn format_utc_offset(minutes: i32) -> String {
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let m = minutes.unsigned_abs();
+    format!("{sign}{:02}:{:02}", m / 60, m % 60)
+}
+
+/// How often the clock is refreshed in the model's context.
+const CLOCK_UPDATE_INTERVAL_MS: i64 = 5 * 60 * 1000;
+
+/// What the transient clock note before the new user turn should carry. Every
+/// note carries the date + weekday + time; only the first also carries the
+/// offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeNoteKind {
+    /// First note of the conversation: the only one carrying the UTC offset.
+    Initial,
+    /// Any later refresh: >=5 minutes since the last update, or a new UTC date.
+    Update,
+}
+
+/// Decide what --- if anything --- the clock note before the new user turn
+/// should carry.
+///
+/// The update schedule is *replayed* from the transcript rather than read back
+/// from stored state, because the notes are transient and never persisted: a
+/// note was shown before the first user message, and again before any later
+/// user message that arrived at least 5 minutes after the previous note or on a
+/// new UTC date. Replaying --- instead of measuring from
+/// the last user message --- makes the decision turn on the time since the
+/// **last clock update**, so a burst of messages more frequent than the interval
+/// still refreshes the clock once per interval rather than never.
+pub(crate) fn time_note_kind(
+    history: &[crate::db::MessageRow],
+    now_ms: i64,
+) -> Option<TimeNoteKind> {
+    let mut last_update: Option<i64> = None;
+    for m in history.iter().filter(|m| m.role == "user") {
+        last_update = Some(match last_update {
+            None => m.created_at,
+            Some(prev) => {
+                let elapsed = m.created_at - prev;
+                if m.created_at > prev
+                    && (elapsed >= CLOCK_UPDATE_INTERVAL_MS
+                        || format_date(m.created_at) != format_date(prev))
+                {
+                    m.created_at
+                } else {
+                    prev
+                }
+            }
+        });
+    }
+    // The replay only ever moves the watermark forwards; the live check below
+    // needs no such guard because `now_ms` is the present instant.
+    match last_update {
+        None => Some(TimeNoteKind::Initial),
+        Some(prev) => {
+            let new_date = format_date(now_ms) != format_date(prev);
+            if new_date || now_ms - prev >= CLOCK_UPDATE_INTERVAL_MS {
+                Some(TimeNoteKind::Update)
+            } else {
+                None
+            }
+        }
     }
 }
 
-/// Build the transient time-note system message for the current turn.
-fn time_note_message(now_ms: i64) -> Result<ChatCompletionRequestMessage, String> {
-    let content = format!("Current time: {} UTC.", format_date_time(now_ms));
+/// Build the transient clock-note system message for the current turn. It is
+/// injected, never persisted, and the system prompt itself is left untouched.
+pub(crate) fn time_note_message(
+    now_ms: i64,
+    kind: TimeNoteKind,
+) -> Result<ChatCompletionRequestMessage, String> {
+    let content = match kind {
+        // The offset rides only the first note: later notes are UTC times, which
+        // the model can map to local time once it knows the offset.
+        TimeNoteKind::Initial => format!(
+            "Current time: {} UTC ({}). Your local UTC offset is {}.",
+            format_date_time(now_ms),
+            weekday_name(now_ms),
+            format_utc_offset(local_utc_offset_minutes())
+        ),
+        // Every update still carries the date + weekday, not just the time: the
+        // notes are transient and chat history carries no timestamps, so a bare
+        // time would leave the model unable to tell which day it is.
+        TimeNoteKind::Update => format!(
+            "Current time: {} UTC ({}).",
+            format_date_time(now_ms),
+            weekday_name(now_ms)
+        ),
+    };
     Ok(ChatCompletionRequestSystemMessageArgs::default()
         .content(content)
         .build()
@@ -1197,8 +1294,9 @@ pub(crate) fn build_system_prompt(
     );
     if let Some(ms) = conversation_started {
         parts.push(format!(
-            "This conversation started on {} (UTC).",
-            format_date(ms)
+            "This conversation started on {} ({}) UTC.",
+            format_date(ms),
+            weekday_name(ms)
         ));
     }
     let mut prompt = parts.join("\n\n");
@@ -1726,15 +1824,14 @@ pub(crate) async fn run_chat_turn(
         Some(conversation.created_at),
     );
 
-    // Time note (transient, never persisted): inject a system message before the
-    // new user turn when this is the first message or >=5 minutes since the last
-    // user message. It must survive the compaction rebuild below.
+    // Clock note (transient, never persisted): inject a system message before the
+    // new user turn when this is the first message, when >=5 minutes have passed
+    // since the last clock update, or when the UTC date has rolled over. It must
+    // survive the compaction rebuild below.
     let now_ms = crate::db::now_ms();
-    let needs_time_note = should_add_time_note(&history, now_ms);
-    let time_note = if needs_time_note {
-        Some(time_note_message(now_ms)?)
-    } else {
-        None
+    let time_note = match time_note_kind(&history, now_ms) {
+        Some(kind) => Some(time_note_message(now_ms, kind)?),
+        None => None,
     };
 
     // Context layout: system prompt → compaction summary (when one exists) →

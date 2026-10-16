@@ -33,6 +33,10 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
+# The live clock note states the device's local UTC offset. chrono resolves the
+# OS local timezone (DST-aware) and is already in the tree transitively (via
+# serde_with), so this only promotes it to a direct dependency.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Android-only: rustls-platform-verifier needs a JNI env + Context to reach the
 # OS trust store (see crate::android::init_rustls). `jni` 0.22 matches the

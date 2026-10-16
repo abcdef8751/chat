@@ -3175,6 +3175,7 @@ dependencies = [
  "argon2",
  "async-openai",
  "base64 0.22.1",
+ "chrono",
  "jni 0.22.4",
  "keyring",
  "rand 0.8.8",
