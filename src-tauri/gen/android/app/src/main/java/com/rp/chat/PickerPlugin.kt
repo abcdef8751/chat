@@ -2,6 +2,7 @@ package com.rp.chat
 
 import android.app.Activity
 import android.content.Intent
+import android.os.SystemClock
 import android.util.Log
 import app.tauri.annotation.Command
 import app.tauri.annotation.TauriPlugin
@@ -76,6 +77,19 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
     @Volatile
     private var pendingGeneration: Int = -1
 
+    // `elapsedRealtime` stamp of the in-flight pick. The generation token alone
+    // cannot express "orphaned but no recreation" — setLauncher increments the
+    // generation AND clears pendingInvoke, so `pendingGeneration != generation`
+    // is unreachable while pendingInvoke is set. This timestamp gives the guard
+    // an independent liveness signal so a same-instance lost result cannot wedge
+    // the picker forever.
+    @Volatile
+    private var pendingSince: Long = 0L
+
+    // A pending pick older than this is treated as orphaned. Comfortably longer
+    // than any real picker interaction, so it never races a live pick.
+    private const val PICK_STALE_MS = 120_000L
+
     /**
      * Point the picker at the current activity's launcher. Called from
      * `MainActivity.onCreate`, so it re-binds to THIS activity on every
@@ -115,6 +129,7 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
         }
         pendingInvoke = null
         pendingGeneration = -1
+        pendingSince = 0L
       }
       launcher = l
       Log.d(TAG, "setLauncher: generation=$generation")
@@ -139,6 +154,7 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
       val invoke = pendingInvoke ?: return
       pendingInvoke = null
       pendingGeneration = -1
+      pendingSince = 0L
 
       if (resultCode != Activity.RESULT_OK || data == null) {
         // Cancelled (back press / dismissed). NOTE: `resolve(null)` would bind
@@ -179,28 +195,31 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
     }
     val pending = pendingInvoke
     if (pending != null) {
-      if (pendingGeneration == generation) {
+      val now = SystemClock.elapsedRealtime()
+      val stale = pendingGeneration != generation || now - pendingSince > PICK_STALE_MS
+      if (!stale) {
         // Genuine concurrent double-invoke within the same Activity instance:
         // the previous pick is still in-flight and its launcher/system picker
         // is on top. Reject so we don't launch a second picker on top.
         invoke.reject("picker: already picking")
         return
-      } else {
-        // Stale orphaned pick that survived setLauncher clearing (e.g.
-        // setLauncher was not re-invoked but result was lost for another
-        // reason - system delivered no result, or Activity destroyed without
-        // onCreate re-running). Treat as orphaned, clear it, and allow the
-        // new pick. This is the lazy safety net for the stuck-picker bug.
-        Log.w(TAG, "pickFiles: clearing stale pending (gen=$pendingGeneration vs $generation)")
-        try {
-          pending.resolve()
-        } catch (e: Exception) {
-          Log.w(TAG, "pickFiles: failed to resolve stale invoke", e)
-        }
-        pendingInvoke = null
-        pendingGeneration = -1
-        // fall through to launch the new pick
       }
+      // Orphaned pick: either a recreation setLauncher missed, or the result was
+      // never delivered within the same Activity instance (no generation change,
+      // hence the age check). Clear it and fall through to launch a fresh pick,
+      // so this guard can never wedge permanently.
+      Log.w(
+        TAG,
+        "pickFiles: clearing stale pending (gen=$pendingGeneration vs $generation, age=${now - pendingSince}ms)",
+      )
+      try {
+        pending.resolve()
+      } catch (e: Exception) {
+        Log.w(TAG, "pickFiles: failed to resolve stale invoke", e)
+      }
+      pendingInvoke = null
+      pendingGeneration = -1
+      pendingSince = 0L
     }
 
     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
@@ -210,6 +229,7 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
 
     pendingInvoke = invoke
     pendingGeneration = generation
+    pendingSince = SystemClock.elapsedRealtime()
     try {
       launch(intent)
     } catch (e: Exception) {

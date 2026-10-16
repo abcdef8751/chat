@@ -25,23 +25,6 @@ class MainActivity : TauriActivity() {
   @Volatile
   private var rightInset = 0
 
-  // ---- IME language-switcher fix (issue 7) state ----
-  // When the IME's language/long-press selector is shown, some keyboards
-  // briefly report isVisible(IME)==false while the keyboard is still
-  // logically present. Our old applyInsets immediately shrank bottomInset
-  // to the nav-bar height, causing the web flex layout to relayout and the
-  // focused input to lose focus, which dismisses the keyboard entirely so
-  // the language can't be changed.
-  //
-  // We track visibility transitions and ignore a single transient "hidden"
-  // after a visible state if the previous bottomInset was keyboard-sized.
-  // A real dismiss will produce at least 2 consecutive hidden dispatches,
-  // so the second one collapses the inset as expected. This is a best-effort
-  // heuristic; device verification is required because IME behavior varies by
-  // keyboard app and Android version.
-  private var wasImeVisible = false
-  private var consecutiveImeHidden = 0
-
   // The live WebView, captured in onWebViewCreate. Used to dispatch the
   // `pi-back` event when the hardware/gesture back is pressed.
   @Volatile
@@ -179,38 +162,10 @@ class MainActivity : TauriActivity() {
     appWebView = webView
     webView.addJavascriptInterface(InsetsBridge(), "PiInsets")
     webView.addJavascriptInterface(BackBridge(), "PiBack")
-    // FIX for issue 7 (IME language switcher dismisses keyboard):
-    // Previously we returned WindowInsets.CONSUMED on API 30+, which tells the
-    // system/WebView that we have fully handled the insets and they should not
-    // be propagated to children. Consuming insets is known to cause WebView
-    // focus loss during IME transitions: when the language picker (or other
-    // IME overlay) triggers a WindowInsets dispatch with isVisible(IME)==false,
-    // the consumed insets path causes the WebView to think the IME is gone and
-    // it drops focus from the input, dismissing the keyboard. By returning the
-    // original un-consumed insets, we let the platform/WebView retain its
-    // default focus-preservation logic while still updating our own bottomInset
-    // bookkeeping for the web layout.
-    //
-    // We also only push the pi-insets event to JS when values actually changed,
-    // to avoid relayout churn from redundant dispatches that could also nudge
-    // focus away. applyInsets now returns a Boolean (changed) instead of the
-    // WindowInsets to consume.
-    //
-    // NOTE: This is a well-reasoned best guess without a device in this
-    // environment. IME reporting varies by keyboard app (Gboard, Samsung, etc.)
-    // and Android version. Device verification is required; if consuming is
-    // still needed for status-bar drawing on some OEMs, we may need a more
-    // targeted fix (e.g. only avoid consuming the IME type, or use
-    // WindowInsetsController behavior).
     webView.setOnApplyWindowInsetsListener { _, insets ->
-      val changed = applyInsets(insets)
-      if (changed) {
-        pushInsets(webView)
-      }
-      // Do NOT return CONSUMED; return the original insets so the WebView and
-      // system can keep their default handling (especially focus preservation).
-      // This is the key change for the language-switcher bug.
-      insets
+      val result = applyInsets(insets)
+      pushInsets(webView)
+      result
     }
     // The app opens its chat-list drawer with a left-edge swipe, but Android's
     // gesture-navigation back gesture also starts at the left edge and would
@@ -232,89 +187,44 @@ class MainActivity : TauriActivity() {
     )
   }
 
-  /**
-   * Update cached insets from the current WindowInsets and return whether
-   * anything actually changed. Caller decides whether to push to JS and what
-   * WindowInsets to propagate (we now propagate original, not CONSUMED).
-   *
-   * Reasoning for bottomInset (issue 7):
-   * On API 30+ we read both systemBars+cutout (for top/nav) and IME (keyboard).
-   * When isVisible(IME) is true, ime.bottom is the keyboard height and already
-   * includes the nav bar beneath it. When false, we normally use bars.bottom
-   * (nav bar only) — this is the collapsed state. However, showing the IME's
-   * language/long-press picker causes a transient dispatch where isVisible goes
-   * false for a single frame even though the keyboard is still logically up.
-   * If we immediately collapse bottomInset, the web root's bottom padding
-   * shrinks, the composer jumps, and the input loses focus -> keyboard
-   * dismisses. We guard against this by requiring 2 consecutive hidden
-   * dispatches before collapsing; a real dismiss (back press, tap outside)
-   * quickly produces a second hidden, while the transient picker flicker is
-   * a single-frame false between visible frames.
-   *
-   * We also only return "changed" when values differ, so pushInsets (which
-   * triggers a JS relayout) does not run on redundant dispatches.
-   */
-  private fun applyInsets(insets: WindowInsets): Boolean {
+  private fun applyInsets(insets: WindowInsets): WindowInsets {
     @Suppress("DEPRECATION")
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
       val bars = insets.getInsets(
         WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()
       )
-      val newTop = dp(bars.top)
+      topInset = dp(bars.top)
+      // Bottom: use the IME (soft keyboard) inset when it is visible and taller
+      // than the nav bar, so the whole app (messages + composer) is raised above
+      // the keyboard instead of the keyboard drawing on top of it. The frontend
+      // root already reserves `bottomInset` as CSS px, so growing this value is
+      // all that is needed — the web layer re-lays out the flex column for us.
       val ime = insets.getInsets(WindowInsets.Type.ime())
-      val imeVisible = insets.isVisible(WindowInsets.Type.ime())
-      val newBottom: Int
-      if (imeVisible) {
-        consecutiveImeHidden = 0
+      // `isVisible(t)` is a method on the root insets (API 30+); the WindowInsets
+      // returned by getInsets has no no-arg `isVisible` property.
+      if (insets.isVisible(WindowInsets.Type.ime())) {
         // Keyboard is showing — reserve its full height (which includes the nav
         // bar beneath it, so there's no need to add bars.bottom as well).
-        newBottom = dp(ime.bottom)
+        bottomInset = dp(ime.bottom)
       } else {
-        consecutiveImeHidden += 1
-        // Heuristic for transient IME hide (language switcher):
-        // If we were visible just before and this is the first hidden frame,
-        // and the previous bottomInset looks keyboard-sized (significantly
-        // larger than the nav bar), keep the old height for this frame.
-        // A genuine dismiss will keep imeVisible==false and we collapse on
-        // the second consecutive hidden.
-        val prevWasKeyboard = bottomInset > dp(bars.bottom) + 40
-        if (consecutiveImeHidden == 1 && wasImeVisible && prevWasKeyboard) {
-          Log.d("MainActivity", "applyInsets: ignoring transient IME hide (bottom $bottomInset -> ${dp(bars.bottom)}, keeping)")
-          newBottom = bottomInset
-        } else {
-          newBottom = dp(bars.bottom)
-        }
+        bottomInset = dp(bars.bottom)
       }
-      wasImeVisible = imeVisible
-      val newLeft = dp(bars.left)
-      val newRight = dp(bars.right)
-      val changed = newTop != topInset || newBottom != bottomInset || newLeft != leftInset || newRight != rightInset
-      topInset = newTop
-      bottomInset = newBottom
-      leftInset = newLeft
-      rightInset = newRight
-      // Previously this returned WindowInsets.CONSUMED on this branch, which
-      // is API 30+ only and signals that no child should see the insets.
-      // That consumption is suspected to break WebView focus retention during
-      // transient IME visibility toggles (language switcher). We now propagate
-      // the original insets and let the system/WebView handle them; our own
-      // bookkeeping above is sufficient for the web layout.
-      return changed
+      leftInset = dp(bars.left)
+      rightInset = dp(bars.right)
+      // `WindowInsets.CONSUMED` is API 30+ — only return it on this branch.
+      return WindowInsets.CONSUMED
     }
     // Legacy branch (< API 30). With `android:windowSoftInputMode="adjustResize"`
     // (set in the manifest) the activity is resized to sit above the IME, so the
     // IME height is already folded into `systemWindowInsetBottom` here — no
     // separate IME query is needed on these old versions.
-    val newTop = dp(insets.systemWindowInsetTop)
-    val newBottom = dp(insets.systemWindowInsetBottom)
-    val newLeft = dp(insets.systemWindowInsetLeft)
-    val newRight = dp(insets.systemWindowInsetRight)
-    val changed = newTop != topInset || newBottom != bottomInset || newLeft != leftInset || newRight != rightInset
-    topInset = newTop
-    bottomInset = newBottom
-    leftInset = newLeft
-    rightInset = newRight
-    return changed
+    topInset = dp(insets.systemWindowInsetTop)
+    bottomInset = dp(insets.systemWindowInsetBottom)
+    leftInset = dp(insets.systemWindowInsetLeft)
+    rightInset = dp(insets.systemWindowInsetRight)
+    // On < API 30 there is no `CONSUMED` constant; returning the original (not
+    // consumed) is correct since the WebView has no inset-aware children.
+    return insets
   }
 
   private fun pushInsets(webView: WebView) {

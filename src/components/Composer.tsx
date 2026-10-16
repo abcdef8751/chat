@@ -31,7 +31,7 @@ export function Composer(props: {
   let prevStreaming = props.streaming;
   createEffect(() => {
     const s = props.streaming;
-    if (prevStreaming && !s && !isAndroid) textareaEl?.focus();
+    if (prevStreaming && !s && !isAndroid && !busy()) textareaEl?.focus();
     prevStreaming = s;
   });
 

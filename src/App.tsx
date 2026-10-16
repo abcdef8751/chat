@@ -1466,9 +1466,12 @@ export default function App() {
         refreshConversations().catch(() => {});
         return;
       }
-      // Everything below touches the on-screen transcript / live tool list, so
-      // it only applies while this conversation is the one being viewed.
-      if (activeId() !== id) return;
+      // Deltas and text only make sense for the conversation on screen, but tool
+      // activity must always be recorded: a gated tool call started while the
+      // user is looking at another chat would otherwise never surface an
+      // approve/deny row, wedging the turn (the backend awaits the approval with
+      // no timeout). `turns()` still only renders live tools for this chat.
+      if (activeId() !== id && ev.type !== "toolCall" && ev.type !== "toolResult") return;
       if (ev.type === "delta") {
         received.current = true;
         setMessages((prev) =>
@@ -2138,6 +2141,7 @@ export default function App() {
           ref={(el) => (messagesScrollEl = el)}
           onScroll={(e) => updateNearBottom(e.currentTarget)}
           onTouchStart={() => (userInteracting = true)}
+          onTouchCancel={() => (userInteracting = false)}
           onTouchEnd={(e) => {
             updateNearBottom(e.currentTarget);
             userInteracting = false;

@@ -33,6 +33,9 @@ pub(crate) const COMPACTION_KEEP_TOKENS: u64 = 15_000;
 /// Rough chars-per-token, matching the frontend meter and the backfill sizing.
 /// Only used to pick the verbatim/compacted split and to trigger compaction.
 const CHARS_PER_TOKEN: u64 = 4;
+/// Fixed token cost attributed to each image part by [`estimate_context_tokens`],
+/// in place of the (meaningless) length of its base64 payload.
+const IMAGE_TOKENS: u64 = 1_200;
 
 /// Per-conversation cancellation flags so the UI can abort a running stream.
 #[derive(Default)]
@@ -885,10 +888,32 @@ fn keep_from(history: &[db::MessageRow], keep_tokens: u64) -> usize {
 
 /// Rough token size of a request we are about to send (~4 chars/token over the
 /// serialized messages). Only used to decide whether to compact.
+///
+/// Data-URL payloads (`data:<mime>;base64,…`) are excluded from the character
+/// count and replaced with a fixed per-image cost. A data URL's length tracks
+/// the *encoded file size*, not the tokens a provider charges for an image, and
+/// history replays every image on every turn (`build_history_messages` →
+/// `user_request_message`) — so counting those bytes as text is what made
+/// compaction fire early on any conversation holding a pasted screenshot.
 fn estimate_context_tokens(messages: &[ChatCompletionRequestMessage]) -> u64 {
-    serde_json::to_string(messages)
-        .map(|s| s.len() as u64 / CHARS_PER_TOKEN)
-        .unwrap_or(0)
+    let Ok(json) = serde_json::to_string(messages) else {
+        return 0;
+    };
+    let mut text_len = json.len();
+    let mut images = 0u64;
+    let mut rest = json.as_str();
+    while let Some(pos) = rest.find(";base64,") {
+        let after = &rest[pos + ";base64,".len()..];
+        match after.find('"') {
+            Some(end) => {
+                text_len -= after[..end].len();
+                images += 1;
+                rest = &after[end..];
+            }
+            None => break,
+        }
+    }
+    text_len as u64 / CHARS_PER_TOKEN + images * IMAGE_TOKENS
 }
 
 /// The context size the provider last reported for this conversation (the newest
@@ -1719,12 +1744,13 @@ pub(crate) async fn run_chat_turn(
         use_bundled_context,
     )
     .context_window;
-    // Use the provider-reported token count when available — it is the concrete API
-    // number and already accounts for images. Fall back to the char estimate only
-    // when no usage exists yet (e.g. the first turn). Using .max() forces
-    // premature compaction when the estimate serializes large base64 image payloads.
-    let current = reported_context_tokens(&history)
-        .unwrap_or_else(|| estimate_context_tokens(&messages));
+    // Belt-and-braces: the char estimate covers the *new* turn (which the
+    // provider cannot have reported yet) while the reported value is the
+    // concrete API number for the previous request. `estimate_context_tokens`
+    // no longer charges a data URL's byte length as tokens, so keeping `.max()`
+    // does not re-introduce the premature compaction it used to cause.
+    let current = estimate_context_tokens(&messages)
+        .max(reported_context_tokens(&history).unwrap_or(0));
     if window > 0 && current as f64 >= window as f64 * COMPACTION_THRESHOLD {
         if let Some((new_summary, new_start)) = compact_now(
             db,
