@@ -773,6 +773,11 @@ pub(crate) fn build_history_messages(
 /// Layout is exactly: system prompt → compaction summary (as a system message)
 /// → verbatim history → the new user turn. The leading part is shared with the
 /// reflection pass through [`build_context`].
+///
+/// Since the live turn now interleaves a transient time note, `run_chat_turn`
+/// builds its request inline; this helper remains as the canonical shape the
+/// tests assert against.
+#[cfg(test)]
 fn build_messages(
     system_prompt: &str,
     compaction_summary: Option<&str>,

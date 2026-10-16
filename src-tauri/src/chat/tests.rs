@@ -2978,15 +2978,15 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert_eq!(format_date(0), "1970-01-01");
         assert_eq!(format_date(1_789_646_269_072), "2026-09-17");
         // Test the exact start-date formatting used in the system prompt.
-        assert_eq!(format_date(1_760_000_000_000), "2025-10-08");
+        assert_eq!(format_date(1_760_000_000_000), "2025-10-09");
     }
 
     #[test]
     fn should_add_time_note_triggers_correctly() {
         // No prior user => first message needs note.
         assert!(should_add_time_note(&[], 1_000_000));
-        // Recent user (2 min ago) => no note.
-        let recent = crate::db::MessageRow {
+        // `MessageRow` is not `Clone`, so build a fresh row per case.
+        let mk = |created_at: i64| crate::db::MessageRow {
             id: "u1".into(),
             conversation_id: "c".into(),
             role: "user".into(),
@@ -2999,13 +2999,14 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             usage: None,
             stop_reason: None,
             attachments: None,
-            created_at: 1_000_000,
+            created_at,
         };
-        assert!(!should_add_time_note(&[recent.clone()], 1_000_000 + 2 * 60 * 1000));
+        // Recent user (2 min ago) => no note.
+        assert!(!should_add_time_note(&[mk(1_000_000)], 1_000_000 + 2 * 60 * 1000));
         // Exactly 5 min => trigger.
-        assert!(should_add_time_note(&[recent.clone()], 1_000_000 + 5 * 60 * 1000));
+        assert!(should_add_time_note(&[mk(1_000_000)], 1_000_000 + 5 * 60 * 1000));
         // >5 min => trigger.
-        assert!(should_add_time_note(&[recent], 1_000_000 + 6 * 60 * 1000));
+        assert!(should_add_time_note(&[mk(1_000_000)], 1_000_000 + 6 * 60 * 1000));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3126,7 +3127,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let _ = handle.join();
         let caps = bodies.lock().unwrap().clone();
         assert_eq!(caps.len(), 2, "reported context above threshold must trigger compaction; got {:?}", caps.len());
-        assert!(caps[0].contains("ANCIENT") || caps[0].contains("x".repeat(10)) || caps[0].contains("SUMMARY") || request_body(&caps[0]).to_string().contains("Fold the exchange"), "first request should be summarizer");
+        assert!(caps[0].contains("ANCIENT") || caps[0].contains(&"x".repeat(10)) || caps[0].contains("SUMMARY") || request_body(&caps[0]).to_string().contains("Fold the exchange"), "first request should be summarizer");
         assert!(caps[1].contains("SUMMARY-OF-OLDER"), "live turn must carry summary");
     }
 
