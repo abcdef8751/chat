@@ -2042,9 +2042,9 @@ pub(crate) async fn run_chat_turn(
             content.clone(),
             Some(turn_cfg.model.clone()),
             Some(turn_cfg.base_url.clone()),
-            // Record the level this turn actually runs at, so a later pass (the
-            // per-conversation consolidation) can resolve the conversation's own
-            // level instead of trusting the current global one.
+            // Record the level this turn actually runs at (a snapshot of the
+            // global setting at this moment), so a later pass can replay it
+            // instead of trusting whatever the global level is by then.
             Some(turn_cfg.thinking_level.clone()),
             None,
             None,

@@ -104,6 +104,11 @@ pub(crate) fn conversation_model(
 /// recorded on the conversation's newest message that has one (see the live
 /// turn's inserts in `chat::run_chat_turn`), falling back to the app-wide level.
 ///
+/// This is a **snapshot of the global `cfg.thinking_level` taken when that
+/// chat's last turn ran**, not a stored per-conversation preference: turning the
+/// global level off does not change an existing chat's recorded level until the
+/// user sends another turn in it.
+///
 /// Rows written before the level was recorded carry `None`, so an older chat
 /// behaves exactly as before. A recorded *empty* level is not skipped: it means
 /// "no reasoning for this conversation", which must win over the global setting.
@@ -123,12 +128,14 @@ pub(crate) fn conversation_thinking_level(
 /// config as the fallback for an unset model. `None` when no model is
 /// resolvable, in which case there is nothing to run.
 ///
-/// One function, so the pass and its prefix/model parity regression test go
-/// through the same resolution: drifting back to `active_turn_cfg` or the global
-/// `base_url`/`model` fails the test instead of silently reflecting a chat
-/// against the wrong endpoint. (The backfill's reduce pass deliberately stays on
-/// `active_turn_cfg`: it has no conversation to pin and must keep one model for a
-/// whole run.)
+/// The resolution lives here so the pass and its prefix/model parity regression
+/// test cannot disagree about *what* it resolves; drifting back to
+/// `active_turn_cfg` or the global `base_url`/`model` **inside this function**
+/// fails the test. The test does not police the caller: it drives
+/// `reflection_request` directly, so a `reflect_conversation` that bypassed this
+/// path would go unnoticed (see `reflection_request` for why). (The backfill's
+/// reduce pass deliberately stays on `active_turn_cfg`: it has no conversation
+/// to pin and must keep one model for a whole run.)
 pub(crate) fn reflection_turn_cfg(
     cfg: &AppConfig,
     conversation: &db::Conversation,
@@ -143,13 +150,19 @@ pub(crate) fn reflection_turn_cfg(
 
 /// Build the request a conversation's reflection pass sends: the turn-local
 /// config (the conversation's own provider + model, running at the level the
-/// conversation last recorded) and the messages (the exact live-turn prefix plus
-/// the maintenance tail). `None` when the conversation has no model to run on.
+/// conversation last **recorded** — a snapshot of the global setting at that
+/// turn, not a stored per-chat preference) and the messages (the exact live-turn
+/// prefix plus the maintenance tail). `None` when the conversation has no model
+/// to run on.
 ///
 /// The pass and the prefix/model parity regression test
 /// (`chat::tests::reflection_prefix_matches_a_live_turn_prefix`) both call this,
-/// so the test drives the same path the pass does instead of rebuilding the
-/// request from the helpers itself.
+/// so the test drives the same request-building path the pass does. What it does
+/// **not** cover: `reflect_conversation`'s own glue. It needs an `AppHandle`, so
+/// a unit test cannot run it; the extraction of this helper was the compromise,
+/// and a regression *there* (e.g. `reflect_conversation` resolving its own
+/// `turn_cfg` through `active_turn_cfg` and passing that down) would still pass
+/// the test. Keep the call site thin.
 pub(crate) fn reflection_request(
     db: &db::Db,
     cfg: &AppConfig,
@@ -160,9 +173,10 @@ pub(crate) fn reflection_request(
         return Ok(None);
     };
     let history = db::read_messages(db, &conversation.id)?;
-    // Run at the level this conversation last ran at, not the current global
-    // one: thinking levels are per-model choices, and the chat may have been
-    // recorded under a different setting since.
+    // Replay the level this chat's last turn actually ran at. It is a snapshot
+    // of the global setting at that moment (not a per-chat preference), so it
+    // can legitimately differ from the current global level — and stays stale
+    // until the user sends another turn in this chat.
     turn_cfg.thinking_level = conversation_thinking_level(&history, cfg);
     let system_prompt = chat::conversation_system_prompt(
         db,
@@ -213,8 +227,9 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     }
 
     // The turn-local config (the conversation's own provider + model, at the
-    // level it last ran under) and the request itself. One helper, so the pass
-    // and its regression test cannot drift apart.
+    // level it last recorded) and the request itself, from one helper — the
+    // same helper the parity test drives. The test therefore covers the
+    // resolution and the request, not this call site.
     let Some((turn_cfg, messages)) = reflection_request(&db, &cfg, &conversation, &memory)?
     else {
         return Ok(());

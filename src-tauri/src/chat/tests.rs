@@ -639,11 +639,17 @@
     /// message.
     ///
     /// The reflection side is built by [`crate::reflection::reflection_request`],
-    /// the same helper `reflect_conversation` calls, so a regression at that call
-    /// site (e.g. drifting back to `active_turn_cfg` or the global
+    /// the same helper `reflect_conversation` calls, so a regression **inside
+    /// that helper** (e.g. drifting back to `active_turn_cfg` or the global
     /// `base_url`/`model`) fails here: the fixture pins the conversation to a
     /// provider and model that differ from the active ones, and the request is
     /// issued against the resolved endpoint.
+    ///
+    /// This does **not** run `reflect_conversation` (it needs an `AppHandle`), so
+    /// a regression at the call site — the pass resolving its own `turn_cfg` and
+    /// passing that down instead — would still pass. Extracting the helper was
+    /// the testable compromise; the residual risk is stated rather than implied
+    /// away.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reflection_prefix_matches_a_live_turn_prefix() {
         let (port, bodies, handle) = start_mock_capture(
@@ -822,8 +828,9 @@
     }
 
     /// The level a turn runs at is recorded on the rows it writes, so a later
-    /// consolidation pass can use the conversation's own level rather than the
-    /// current global one.
+    /// consolidation pass can replay the level that turn actually ran at instead
+    /// of the global level as it stands then. It is a snapshot, not a per-chat
+    /// preference: it keeps applying until the user sends another turn here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_records_the_thinking_level_it_ran_at() {
         let (port, bodies, handle) = start_mock_capture(
