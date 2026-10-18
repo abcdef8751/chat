@@ -20,8 +20,14 @@ A general-purpose AI chat app (not a coding agent) with:
 - Optional tools — `bash` (a **one-shot per-call shell**), `read_file`,
   `write_file` (all approval-gated), and Brave's native search tools
   (`brave_web_search`/`local`/`image`/`video`/`news`/`summarizer`, ungated)
-- Reasoning traces from thinking models (inline "Thought" bar → popup)
-- Per-turn **activity timeline** grouping reasoning, preamble text, and tool calls
+- `fetch_image(url)` — the assistant can attach a web image to its reply
+  (ungated; raster-only; persisted on the message, so it survives reload)
+- Reasoning traces from thinking models (inline "Thought" container → popup),
+  interleaved with the answer as it streams
+- Per-turn **transcript blocks**: reasoning container(s) and always-inline tool
+  cards woven between the answer's output segments, in stream order
+- LaTeX math (`$…$` / `$$…$$`) rendered with KaTeX
+- Click any transcript image to expand it centred on screen
 - Plain-Markdown long-term **memory** curated by an idle reflection pass
 - Context + price counters (per-turn cost is frozen at the model that produced
   it), with older history compacted into a summary once a chat nears the window
@@ -52,7 +58,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **267 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **280 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -65,7 +71,7 @@ separately.
 | Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, capped tool loop                        |
 | Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; per-model price **and capability (modality) overrides** |
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline, **editable user messages** (edit → truncate → re-run) |
-| Tools             | ✅    | `bash` (one-shot shell), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` (ungated) |
+| Tools             | ✅    | `bash` (one-shot shell), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` + `fetch_image` (ungated) |
 | UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; memory page list→detail on narrow viewports |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
 | Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
@@ -124,7 +130,9 @@ images.
 
 - Stream error mid-turn → keep partial text, `stop_reason = "error"`, offer retry.
 - Tool error → convert to a tool-error result so the model can self-correct; never throw.
-- Abort → signal, close stream, persist partial; idempotent.
+- Abort → cancels the in-flight request/tool dispatch immediately via a
+  race-free `CancelToken` (`StreamRegistry`), then closes the stream and persists
+  the partial; idempotent.
 - Runaway guard → hard cap on consecutive tool rounds.
 
 ---
@@ -338,6 +346,13 @@ topic files.
   diffs the files, records usage/cost, inserts a `memory` note when files changed,
   and advances `conversations.last_reflected_index`. The model reads non-core
   files on demand via `read_memory` before rewriting them.
+- **Model:** the pass resolves the **conversation's own provider + model**
+  (`reflect_conversation`), not the global `base_url`/`model` mirrors, and the
+  scheduler must not bail out when the *global* model is blank — eligibility is
+  per conversation. The device's configured thinking level is inherited
+  (per-conversation thinking levels are deliberately not stored; rows keep
+  `thinking_level = NULL`). The exception is the backfill's reduce pass, which
+  stays on the active provider's default model for a whole run (`active_turn_cfg`).
 - **Eligibility:** a chat becomes due only when a message is inserted
   (user/assistant/tool). Merely opening a chat does not touch `updated_at`.
 - **Scope:** the Memory tab's **Consolidate this chat** button is per-chat; the
@@ -489,6 +504,14 @@ brave_summarizer(query, count?)
 web_fetch(url, max_chars?, char_start?)   // HTML → readable text; refuses
                                   //   non-public addresses. max_chars caps the
                                   //   returned text; char_start offsets into it.
+
+// Web — native HTTP GET of an image, read-only (ungated)
+fetch_image(url)                  // raster only (png/jpg/gif/webp/bmp; capped at
+                                  //   MAX_IMAGE_BYTES, same SSRF + redirect
+                                  //   guards as web_fetch). Delivered as an image
+                                  //   part when the turn's model is vision-capable
+                                  //   and PERSISTED on the assistant row, so the
+                                  //   attachment is still there after a reload.
 ```
 
 The tool list is byte-identical for live and reflection turns so the prompt-cache
@@ -572,8 +595,9 @@ cargo test --lib -- --ignored live_reasoning_echo
 server (`e2e/mock-llm.mjs`) using `tauri-driver` + `WebKitWebDriver`. It asserts
 the behavior unit tests can't reach: no reply truncation (the mock's final SSE
 event omits its terminating blank line), reasoning-trace clickability / DOM
-stability across streamed updates, auto-scroll, bottom anchoring, the live
-activity timeline + tool approval, and memory consolidation. Screenshots →
+stability across streamed updates, auto-scroll, bottom anchoring, the inline
+transcript (reasoning containers + always-inline tool cards, and the gated
+approval state) and memory consolidation. Screenshots →
 `e2e/screenshots/` (gitignored).
 
 - **Prereq:** `cargo install tauri-driver --version 2.0.6 --locked` (the **2.x**
@@ -581,7 +605,16 @@ activity timeline + tool approval, and memory consolidation. Screenshots →
 - The runner builds the debug binary **only if missing** — after changing Rust
   code, `cargo build` first so the harness picks it up.
 - It launches the app with an **isolated `XDG_DATA_HOME`** (seeded with the mock
-  endpoint) and writes a throwaway keychain key **only if none exists**.
+  endpoint). The mock key is entered by `e2e.mjs` through the Settings dialog
+  **only if the app reports no stored key** — it never overwrites an existing
+  keychain entry. `run.sh` itself writes no secret.
+- **Known blocker (pre-existing, environmental):** the suite stops at its first
+  model assertion when the app's keychain read fails in the harness context — the
+  custom mock provider has no catalog entry, so `list_models` needs a key and
+  returns `Err` without one (`models.rs`), leaving the picker empty
+  (`model picker … : [""]`). This reproduces identically on a checkout *before*
+  the feature work, so it is not a code regression; it needs the harness's key
+  handling to stop depending on an interactive secret service.
 - **Input / clicks:** on this WebKitGTK build, `Element Click` / `Send Keys` /
   W3C Actions return `unsupported operation` (`/usr/bin/WebKitWebDriver` is the
   GTK4 build while the app runs on `webkit2gtk-4.1`). Clicks are dispatched via
@@ -760,7 +793,7 @@ and the app is byte-identical to before. Never blocks the UI.
 │  ├─ index.css        # Tailwind import + typography + class-based dark variant
 │  ├─ App.tsx          # thin shell: shared chat/settings state + mounts the surfaces
 │  ├─ components/      # surfaces split out of App.tsx (Sidebar, Header, MessageList,
-│  │                   #   Timeline, Composer, MemoryPage, SettingsDialog)
+│  │                   #   Timeline, ImageLightbox, Composer, MemoryPage, SettingsDialog)
 │  └─ lib/
 │     ├─ api.ts        # typed invoke wrappers over Tauri commands
 │     ├─ platform.ts   # Android bridge: isAndroid / onBack / exitApp / readAttachmentFromUri
