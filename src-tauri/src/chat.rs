@@ -1834,6 +1834,19 @@ pub(crate) async fn run_tool_loop(
                         })
                     }
                 };
+                // Emit this call's result now, while it is the freshest thing
+                // that happened: a round's calls are dispatched one after
+                // another, so deferring the emit to the persist loop would keep
+                // every card `running` until the slowest call returned (and
+                // until a gated call was approved). Persistence below is still
+                // deferred — one row per call, written once the whole round has
+                // been dispatched — so this moves only the live event.
+                sink.emit(StreamEvent::ToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    ok: !outcome.output.is_error,
+                    output: outcome.output.content.clone(),
+                });
                 outcomes.push(outcome);
             }
 
@@ -1852,12 +1865,6 @@ pub(crate) async fn run_tool_loop(
                     image,
                     attachment,
                 } = dispatched;
-                sink.emit(StreamEvent::ToolResult {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    ok: !output.is_error,
-                    output: output.content.clone(),
-                });
 
                 if let Some(attachment) = attachment {
                     attachments.push(attachment);
