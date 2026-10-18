@@ -64,13 +64,13 @@ function ThoughtGroup(props: {
       </div>
       <Show when={expanded()}>
         <div class="mt-1 space-y-2 border-l-2 border-neutral-200 pl-3 dark:border-neutral-800">
-          <For each={props.entries}>
+          <Index each={props.entries}>
             {(entry) => (
               <div class="whitespace-pre-wrap break-words text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
-                {entry.text}
+                {entry().text}
               </div>
             )}
-          </For>
+          </Index>
         </div>
       </Show>
     </div>
@@ -147,7 +147,9 @@ export function Timeline(props: {
     if (!a) return null;
     const hasText = !!a.content.trim();
     const hasAttachments = parseAttachments(a).length > 0;
-    return hasText || hasAttachments || answerLive() ? a : null;
+    // An aborted/errored turn keeps its annotation even with no text left.
+    const stopped = a.stop_reason === "aborted" || a.stop_reason === "error";
+    return hasText || hasAttachments || stopped || answerLive() ? a : null;
   };
 
   return (
