@@ -633,6 +633,130 @@
         assert!(matches!(guard.last(), Some(StreamEvent::Done { stop_reason }) if stop_reason == "stop"));
     }
 
+    /// Lock the prompt-cache contract (item #2): a consolidation pass sends the
+    /// **byte-identical** leading prefix a live turn sends — system prompt,
+    /// compaction summary, verbatim history — and only appends a trailing system
+    /// message. Both paths share `conversation_system_prompt`, `compacted_history`,
+    /// `build_context` and `chat_tools`, so this test exists to catch a future
+    /// divergence (an argument dropped on one side, the tail inserted early, a
+    /// different tool list).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reflection_prefix_matches_a_live_turn_prefix() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![vec![delta_chunk("ok"), finish_chunk("stop")]],
+            0,
+        );
+        let db = Arc::new(open_db("prefix-parity"));
+        let cid = uuid::Uuid::new_v4().to_string();
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, system_prompt, created_at, updated_at)
+                 VALUES (?1, 'parity', 'BASE PROMPT', 1700000000000, 1700000000000)",
+                [&cid],
+            )
+            .unwrap();
+        }
+        let boundary = db::insert_message(
+            &db, cid.clone(), "user".into(), "hello".into(),
+            None, None, None, None, None, None,
+        )
+        .unwrap();
+        db::insert_message(
+            &db, cid.clone(), "assistant".into(), "hi there".into(),
+            Some("mock".into()), None, None, None, None, Some("stop".into()),
+        )
+        .unwrap();
+        // A `memory` note and a `clock` note are bookkeeping, but both replay as
+        // system messages, so they are part of the prefix too.
+        db::insert_message(
+            &db, cid.clone(), "memory".into(), "Memory consolidated: profile.md".into(),
+            None, None, None, None, None, None,
+        )
+        .unwrap();
+        db::insert_message(
+            &db, cid.clone(), "clock".into(), clock_note_text(db::now_ms()),
+            None, None, None, None, None, None,
+        )
+        .unwrap();
+        db::set_compaction(&db, &cid, "Earlier: the user said hi.", &boundary.id).unwrap();
+
+        let memory = temp_memory("prefix-parity");
+        memory.write("profile.md", "User likes tea.").unwrap();
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            preferences: "Prefers dark mode.".into(),
+            ..Default::default()
+        };
+        let conversation = db::get_conversation(&db, &cid).unwrap().unwrap();
+        let history = db::read_messages(&db, &cid).unwrap();
+        let system_prompt = conversation_system_prompt(
+            &db, &cfg, &conversation, &cfg.base_url, &cfg.model, &memory,
+        );
+
+        // What a live turn shares...
+        let (summary, keep_start) = compacted_history(&conversation, &history);
+        assert!(summary.is_some(), "the fixture must exercise the summary");
+        assert_eq!(keep_start, 1, "the fixture must exercise the verbatim tail");
+        let live_prefix =
+            build_context(&system_prompt, summary.as_deref(), &history[keep_start..]).unwrap();
+        // ...and what consolidation sends.
+        let reflection = crate::reflection::build_reflection_messages(
+            &system_prompt, &conversation, &history, &[],
+        )
+        .unwrap();
+
+        assert_eq!(reflection.len(), live_prefix.len() + 1);
+        // Compared as JSON values (object key order is not part of the request).
+        assert_eq!(
+            serde_json::to_value(&reflection[..live_prefix.len()]).unwrap(),
+            serde_json::to_value(&live_prefix).unwrap(),
+            "reflection prefix diverged from the live-turn prefix"
+        );
+        let tail = serde_json::to_value(&reflection[live_prefix.len()]).unwrap();
+        assert_eq!(tail["role"], "system");
+        assert!(tail["content"]
+            .as_str()
+            .unwrap()
+            .contains("memory maintainer"));
+
+        // Now prove the live path really sends that prefix, by running the turn.
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let sink = TestSink(Arc::new(Mutex::new(Vec::new())));
+        let mcp = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        run_chat_turn(
+            &db, &cfg, "test-key", &mcp, &shell, &memory, &approvals, CancelToken::new(), &sink,
+            cid.clone(), "next".into(), Vec::new(), false,
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        let sent = bodies.lock().unwrap();
+        let body = request_body(&sent[0]);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            serde_json::to_value(&messages[..live_prefix.len()]).unwrap(),
+            serde_json::to_value(&live_prefix).unwrap(),
+            "the live turn did not send the shared prefix"
+        );
+        // The live turn appends the persisted clock note, then the new turn.
+        assert_eq!(messages[live_prefix.len()]["role"], "system");
+        assert!(messages[live_prefix.len()]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Current time:"));
+        assert_eq!(messages[live_prefix.len() + 1]["role"], "user");
+        assert_eq!(messages[live_prefix.len() + 1]["content"], "next");
+        // Same tool list for both paths (one shared builder).
+        assert_eq!(
+            body["tools"],
+            serde_json::to_value(chat_tools()).unwrap()
+        );
+    }
+
     /// The level a turn runs at is recorded on the rows it writes, so a later
     /// consolidation pass can use the conversation's own level rather than the
     /// current global one.

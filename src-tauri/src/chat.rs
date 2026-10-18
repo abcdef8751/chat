@@ -1330,6 +1330,39 @@ pub(crate) fn build_system_prompt(
     prompt
 }
 
+/// The system prompt shared by a live turn and a reflection pass: the
+/// conversation's own base prompt (falling back to the default), the resolved
+/// model label, the explicit preferences, the memory block and the conversation
+/// start date. One function, so the two paths cannot drift apart.
+pub(crate) fn conversation_system_prompt(
+    db: &db::Db,
+    cfg: &AppConfig,
+    conversation: &db::Conversation,
+    base_url: &str,
+    model: &str,
+    memory: &crate::memory::MemoryState,
+) -> String {
+    let base_prompt = conversation
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let model_label = crate::pricing::cached_model_name(db, base_url, model)
+        .unwrap_or_else(|| model.to_string());
+    build_system_prompt(
+        &base_prompt,
+        &model_label,
+        &cfg.preferences,
+        memory,
+        Some(conversation.created_at),
+    )
+}
+
+/// The tool list every turn advertises. Live, reflection and extraction share it
+/// byte-for-byte (prompt-cache alignment), so it is built in one place.
+pub(crate) fn chat_tools() -> Vec<async_openai::types::chat::ChatCompletionTools> {
+    tools::tool_specs(tools::brave_available())
+}
+
 /// Everything a completed tool loop produced.
 pub(crate) struct ToolLoopResult {
     pub usage: Value,
@@ -1941,19 +1974,13 @@ pub(crate) async fn run_chat_turn(
         )?;
     }
 
-    let base_prompt = conversation
-        .system_prompt
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    let model_label =
-        crate::pricing::cached_model_name(db, &turn_cfg.base_url, &turn_cfg.model)
-            .unwrap_or_else(|| turn_cfg.model.clone());
-    let system_prompt = build_system_prompt(
-        &base_prompt,
-        &model_label,
-        &cfg.preferences,
+    let system_prompt = conversation_system_prompt(
+        db,
+        cfg,
+        &conversation,
+        &turn_cfg.base_url,
+        &turn_cfg.model,
         memory,
-        Some(conversation.created_at),
     );
 
     // The note row was written above, before the user turn; the request still
@@ -2016,7 +2043,7 @@ pub(crate) async fn run_chat_turn(
         }
     }
 
-    let tools_list = tools::tool_specs(tools::brave_available());
+    let tools_list = chat_tools();
 
     let mut result = run_tool_loop(
         &turn_cfg,

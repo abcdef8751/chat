@@ -170,33 +170,17 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     // Reuse the SAME leading system prompt as a live chat turn so the shared
     // conversation prefix stays cacheable. The maintenance task goes in a
     // trailing system message — after the prefix, so it doesn't affect caching.
-    let base_prompt = conversation
-        .system_prompt
-        .clone()
-        .unwrap_or_else(|| chat::DEFAULT_SYSTEM_PROMPT.to_string());
-    let model_label =
-        crate::pricing::cached_model_name(&db, &turn_cfg.base_url, &turn_cfg.model)
-            .unwrap_or_else(|| turn_cfg.model.clone());
-    let system_prompt =
-        chat::build_system_prompt(&base_prompt, &model_label, &cfg.preferences, &memory, Some(conversation.created_at));
-
-    // Use the same compaction-aware context as a live turn (system prompt →
-    // summary → verbatim tail), so the shared prefix stays cacheable and the pass
-    // stays bounded on a long, already-compacted conversation. The boundary and
-    // the summary come from the same conversation snapshot as `history`, so an
-    // interleaved compaction write cannot desync them.
-    let (summary, keep_start) = chat::compacted_history(&conversation, &history);
-    let mut messages =
-        chat::build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
-    messages.push(
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content(reflection_tail(&recent))
-            .build()
-            .map_err(|e| e.to_string())?
-            .into(),
+    let system_prompt = chat::conversation_system_prompt(
+        &db,
+        &cfg,
+        &conversation,
+        &turn_cfg.base_url,
+        &turn_cfg.model,
+        &memory,
     );
+    let messages = build_reflection_messages(&system_prompt, &conversation, &history, &recent)?;
 
-    let tools_list = tools::tool_specs(tools::brave_available());
+    let tools_list = chat::chat_tools();
     let token = chat::CancelToken::new();
 
     // Abort the pass if a real chat turn starts on this conversation.
@@ -295,6 +279,36 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
         json!({ "conversationId": conversation_id, "changed": changed }),
     );
     Ok(())
+}
+
+/// Build a reflection pass's request: the **exact** leading prefix a live turn
+/// sends — system prompt → compaction summary → verbatim history, from the same
+/// conversation snapshot — followed by one trailing system message carrying the
+/// maintenance task and the recent consolidation notes.
+///
+/// Only the tail differs from a live turn, which is what keeps the shared prefix
+/// prompt-cacheable; `chat::build_context` and `chat::compacted_history` are the
+/// same calls the live path makes, and `system_prompt` is produced by
+/// `chat::conversation_system_prompt` in both. A regression test pins the byte
+/// equality (see `chat::tests::reflection_prefix_matches_a_live_turn_prefix`).
+pub(crate) fn build_reflection_messages(
+    system_prompt: &str,
+    conversation: &db::Conversation,
+    history: &[db::MessageRow],
+    recent: &[db::ReflectionRecord],
+) -> Result<Vec<ChatCompletionRequestMessage>, String> {
+    // The boundary and the summary come from the same conversation snapshot as
+    // `history`, so an interleaved compaction write cannot desync them.
+    let (summary, keep_start) = chat::compacted_history(conversation, history);
+    let mut messages = chat::build_context(system_prompt, summary.as_deref(), &history[keep_start..])?;
+    messages.push(
+        ChatCompletionRequestSystemMessageArgs::default()
+            .content(reflection_tail(recent))
+            .build()
+            .map_err(|e| e.to_string())?
+            .into(),
+    );
+    Ok(messages)
 }
 
 const REFLECTION_INSTRUCTION: &str = "You are now acting as the long-term memory maintainer. \
@@ -1200,7 +1214,7 @@ async fn run_reduce_pass(
         system_message(consolidate_instruction(memory_through))?,
     ];
 
-    let tools_list = tools::tool_specs(tools::brave_available());
+    let tools_list = chat::chat_tools();
     let token = chat::CancelToken::new();
     let sink = NullSink;
     let result = chat::run_tool_loop(
