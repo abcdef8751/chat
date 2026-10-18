@@ -527,7 +527,7 @@ fn tool_create(db: &db::Db, args: &Value, source: &str) -> ToolOutput {
 fn tool_list(db: &db::Db) -> ToolOutput {
     match db::list_cron_jobs(db) {
         Ok(jobs) => {
-            let items: Vec<Value> = jobs.iter().map(|j| job_json(j)).collect();
+            let items: Vec<Value> = jobs.iter().map(job_json).collect();
             ToolOutput::ok(json!({ "jobs": items }).to_string())
         }
         Err(e) => ToolOutput::err(e),

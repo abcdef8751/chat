@@ -124,8 +124,9 @@ impl StreamRegistry {
     /// This is the *live* registration and deliberately overwrites whatever is
     /// there (the resend path). [`StreamRegistry::try_register_live`] is the
     /// guarded variant the `stream_chat` command uses so a scheduled run is not
-    /// clobbered; this one remains for that contract's unit test and for callers
-    /// that have already established ownership.
+    /// clobbered; this one remains as the explicit-overwrite primitive the
+    /// registry's contract test exercises.
+    #[cfg(test)]
     pub fn register(&self, id: String) -> CancelToken {
         let token = CancelToken::new();
         self.streams
