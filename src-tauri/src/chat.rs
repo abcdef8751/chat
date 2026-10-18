@@ -64,6 +64,13 @@ impl CancelToken {
         self.flag.load(Ordering::SeqCst)
     }
 
+    /// Whether two handles refer to the same turn's cancellation state. Clones
+    /// share it; two tokens from separate [`CancelToken::new`] calls never do.
+    /// [`StreamRegistry`] uses this to remove only its own registration.
+    fn same_turn(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.flag, &other.flag)
+    }
+
     /// Request cancellation. Idempotent: later calls are no-ops, and the flag is
     /// set *before* the wakeup so a waiter that starts during the call observes
     /// it too.
@@ -118,8 +125,21 @@ impl StreamRegistry {
         }
     }
 
-    pub fn remove(&self, id: &str) {
-        self.streams.lock().unwrap().remove(id);
+    /// Drop the conversation's registration, but **only while it still belongs
+    /// to `token`**.
+    ///
+    /// A turn's tail always runs `remove`, and Stop is immediate: the UI unblocks
+    /// and can resend before the old turn's tail executes, registering a *new*
+    /// token for the same conversation. An unconditional remove would then delete
+    /// the new registration — Stop on the new turn would silently no-op and
+    /// `is_streaming` would report `false` while it is still live (which also
+    /// defeats the reflection scheduler's interlock). Removing only our own
+    /// token leaves a subsequent turn's registration untouched.
+    pub fn remove(&self, id: &str, token: &CancelToken) {
+        let mut streams = self.streams.lock().unwrap();
+        if streams.get(id).is_some_and(|current| current.same_turn(token)) {
+            streams.remove(id);
+        }
     }
 
     /// Whether a chat turn is currently streaming for this conversation. Used by
@@ -1404,6 +1424,17 @@ impl DispatchedTool {
     }
 }
 
+/// The result recorded for a tool call the user stopped before it produced
+/// output.
+///
+/// Stop still writes a result row: an assistant `tool_calls` row must be followed
+/// by exactly one result per call, or the next turn replays an invalid request.
+/// The wording is distinct from a real Deny ("The user denied this tool call."),
+/// so the transcript says which one happened.
+fn aborted_tool_output() -> ToolOutput {
+    ToolOutput::err("The user aborted this tool call.".into())
+}
+
 /// Handle a `read_file` call for an image path. Multimodal models get a short
 /// text result plus the image (returned for injection); text-only models get a
 /// result telling them they cannot view it, so they can relay that to the user.
@@ -1701,11 +1732,15 @@ pub(crate) async fn run_tool_loop(
                     .into(),
             );
 
+            // One outcome per requested call, then one `tool` result row per
+            // outcome. The invariant is enforced in this single place: every call
+            // in the assistant `tool_calls` row the loop just persisted gets
+            // exactly one result, on every exit path (Stop mid-round, a cancelled
+            // approval wait, or a failed result insert). History replays that row
+            // verbatim, so a missing result would make the next turn an invalid
+            // request (HTTP 400) and brick the conversation.
             let mut aborted_mid_tools = false;
-            // Images loaded by `read_file` are delivered after every tool result
-            // in the round, so the request never interleaves a user turn between
-            // an assistant `tool_calls` message and its tool responses.
-            let mut injected_images: Vec<ChatCompletionRequestMessage> = Vec::new();
+            let mut outcomes: Vec<DispatchedTool> = Vec::with_capacity(acc.tool_calls.len());
             for call in &acc.tool_calls {
                 // YOLO mode treats a gated call as ungated: it runs immediately
                 // and is announced with `gated: false` so the UI never renders
@@ -1718,6 +1753,15 @@ pub(crate) async fn run_tool_loop(
                     arguments: call.arguments.to_string(),
                     gated: host_gated && !yolo,
                 });
+
+                // Stop reached this call before it was dispatched (an earlier
+                // call's dispatch was cancelled, or the stop landed between the
+                // rounds). It still owes the transcript a result row.
+                if token.is_cancelled() {
+                    aborted_mid_tools = true;
+                    outcomes.push(DispatchedTool::plain(aborted_tool_output()));
+                    continue;
+                }
 
                 let is_memory_tool = matches!(
                     call.name.as_str(),
@@ -1743,23 +1787,28 @@ pub(crate) async fn run_tool_loop(
                     )),
                     _ => None,
                 };
-                let (output, image, attachment) = if let Some(message) = refused {
-                    (ToolOutput::err(message), None, None)
+                let outcome = if let Some(message) = refused {
+                    DispatchedTool::plain(ToolOutput::err(message))
                 } else {
                     // A gated call is auto-approved under YOLO, skipped entirely
                     // otherwise (ungated), or parked on the approval channel.
                     let mut approved = !host_gated || yolo;
+                    // Stop during the approval wait is an abort, not a Deny:
+                    // `stop_chat` cancels *and* denies, so leaving `approved`
+                    // false here would record a denial the user never made.
+                    let mut aborted_wait = false;
                     if host_gated && !yolo {
                         let mut rx = approvals.register(call.id.clone());
-                        // Stop counts as a denial: the wait ends immediately, and
-                        // the call is never dispatched.
                         tokio::select! {
                             biased;
-                            _ = token.cancelled() => {}
+                            _ = token.cancelled() => aborted_wait = true,
                             verdict = &mut rx => approved = verdict.unwrap_or(false),
                         }
                     }
-                    if approved {
+                    if aborted_wait {
+                        aborted_mid_tools = true;
+                        DispatchedTool::plain(aborted_tool_output())
+                    } else if approved {
                         // The dispatch is raced against cancellation so a running
                         // `bash` (60 s) or `web_fetch` (30 s) is dropped at once;
                         // dropping the future reaps the child (`kill_on_drop`).
@@ -1769,30 +1818,40 @@ pub(crate) async fn run_tool_loop(
                             d = dispatch_tool(call, brave, shell, memory, cfg, persist) => Some(d),
                         };
                         match dispatched {
-                            Some(d) => (d.output, d.image, d.attachment),
+                            Some(d) => d,
                             None => {
-                                // Keep the transcript consistent (an assistant
-                                // `tool_calls` row must be followed by a result)
-                                // and let the UI stop showing the call as running.
-                                (
-                                    ToolOutput::err("The user aborted this tool call.".into()),
-                                    None,
-                                    None,
-                                )
+                                // The call ran but was stopped before it produced
+                                // output: keep the transcript consistent and let
+                                // the UI stop showing it as running.
+                                aborted_mid_tools = true;
+                                DispatchedTool::plain(aborted_tool_output())
                             }
                         }
                     } else {
-                        (
-                            ToolOutput {
-                                content: "The user denied this tool call.".into(),
-                                is_error: true,
-                            },
-                            None,
-                            None,
-                        )
+                        DispatchedTool::plain(ToolOutput {
+                            content: "The user denied this tool call.".into(),
+                            is_error: true,
+                        })
                     }
                 };
+                outcomes.push(outcome);
+            }
 
+            // Stop may also land just after the round's last dispatch, in which
+            // case no outcome is aborted but the turn still ends as aborted.
+            aborted_mid_tools |= token.is_cancelled();
+
+            // Images loaded by `read_file` are delivered after every tool result
+            // in the round, so the request never interleaves a user turn between
+            // an assistant `tool_calls` message and its tool responses.
+            let mut injected_images: Vec<ChatCompletionRequestMessage> = Vec::new();
+            let mut persist_error: Option<String> = None;
+            for (call, dispatched) in acc.tool_calls.iter().zip(outcomes) {
+                let DispatchedTool {
+                    output,
+                    image,
+                    attachment,
+                } = dispatched;
                 sink.emit(StreamEvent::ToolResult {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -1805,7 +1864,7 @@ pub(crate) async fn run_tool_loop(
                 }
 
                 if let Some(db) = persist {
-                    db::insert_message(
+                    if let Err(e) = db::insert_message(
                         db,
                         source.to_string(),
                         "tool".into(),
@@ -1816,7 +1875,12 @@ pub(crate) async fn run_tool_loop(
                         None,
                         None,
                         None,
-                    )?;
+                    ) {
+                        // A failed write must not strand the calls after it:
+                        // keep persisting their results, then report the first
+                        // failure once the round's rows are all attempted.
+                        persist_error.get_or_insert(e);
+                    }
                 }
                 messages.push(
                     ChatCompletionRequestToolMessageArgs::default()
@@ -1833,11 +1897,9 @@ pub(crate) async fn run_tool_loop(
                 if let Some(data_url) = image {
                     injected_images.push(image_request_message(call, data_url)?);
                 }
-
-                if token.is_cancelled() {
-                    aborted_mid_tools = true;
-                    break;
-                }
+            }
+            if let Some(e) = persist_error {
+                return Err(e);
             }
 
             if aborted_mid_tools {
@@ -2160,7 +2222,10 @@ pub async fn stream_chat(
         &shell,
         &memory,
         &approvals,
-        token,
+        // A clone shares the same cancellation state; the original is kept so the
+        // tail can remove this turn's registration without touching one a resend
+        // may have installed in the meantime.
+        token.clone(),
         &sink,
         conversation_id.clone(),
         content,
@@ -2169,7 +2234,7 @@ pub async fn stream_chat(
     )
     .await;
 
-    app.state::<StreamRegistry>().remove(&conversation_id);
+    app.state::<StreamRegistry>().remove(&conversation_id, &token);
     approvals.deny_all();
     result
 }

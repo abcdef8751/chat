@@ -636,23 +636,33 @@
     /// Lock the prompt-cache contract (item #2): a consolidation pass sends the
     /// **byte-identical** leading prefix a live turn sends — system prompt,
     /// compaction summary, verbatim history — and only appends a trailing system
-    /// message. Both paths share `conversation_system_prompt`, `compacted_history`,
-    /// `build_context` and `chat_tools`, so this test exists to catch a future
-    /// divergence (an argument dropped on one side, the tail inserted early, a
-    /// different tool list).
+    /// message.
+    ///
+    /// The reflection side is built by [`crate::reflection::reflection_request`],
+    /// the same helper `reflect_conversation` calls, so a regression at that call
+    /// site (e.g. drifting back to `active_turn_cfg` or the global
+    /// `base_url`/`model`) fails here: the fixture pins the conversation to a
+    /// provider and model that differ from the active ones, and the request is
+    /// issued against the resolved endpoint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reflection_prefix_matches_a_live_turn_prefix() {
         let (port, bodies, handle) = start_mock_capture(
-            vec![vec![delta_chunk("ok"), finish_chunk("stop")]],
+            vec![
+                vec![delta_chunk("ok"), finish_chunk("stop")],
+                vec![delta_chunk("ok"), finish_chunk("stop")],
+            ],
             0,
         );
         let db = Arc::new(open_db("prefix-parity"));
         let cid = uuid::Uuid::new_v4().to_string();
+        let mock_url = format!("http://127.0.0.1:{port}/v1");
         {
             let conn = db.0.lock().unwrap();
             conn.execute(
-                "INSERT INTO conversations (id, title, system_prompt, created_at, updated_at)
-                 VALUES (?1, 'parity', 'BASE PROMPT', 1700000000000, 1700000000000)",
+                "INSERT INTO conversations
+                     (id, title, provider_id, model, system_prompt, created_at, updated_at)
+                 VALUES (?1, 'parity', 'p-reflect', 'conv-model', 'BASE PROMPT',
+                         1700000000000, 1700000000000)",
                 [&cid],
             )
             .unwrap();
@@ -683,30 +693,82 @@
 
         let memory = temp_memory("prefix-parity");
         memory.write("profile.md", "User likes tea.").unwrap();
+        // Global config points at a DIFFERENT provider and model. Only the
+        // conversation's own p-reflect/mock-model may be used for the pass.
         let cfg = AppConfig {
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            model: "mock".into(),
+            base_url: "http://active.invalid/v1".into(),
+            model: "global-model".into(),
+            providers: vec![
+                crate::config::Provider {
+                    id: "p-active".into(),
+                    name: "Active".into(),
+                    base_url: "http://active.invalid/v1".into(),
+                    default_model: None,
+                    catalog_id: None,
+                },
+                crate::config::Provider {
+                    id: "p-reflect".into(),
+                    name: "Reflect".into(),
+                    base_url: mock_url.clone(),
+                    default_model: None,
+                    catalog_id: None,
+                },
+            ],
+            active_provider_id: "p-active".into(),
             preferences: "Prefers dark mode.".into(),
             ..Default::default()
         };
         let conversation = db::get_conversation(&db, &cid).unwrap().unwrap();
+
+        // Drive the pass's own resolution + request builder, not a local rebuild.
+        let (turn_cfg, reflection) =
+            crate::reflection::reflection_request(&db, &cfg, &conversation, &memory)
+                .unwrap()
+                .expect("the conversation pins a model");
+        // The request targets the conversation's OWN provider and model...
+        assert_eq!(turn_cfg.base_url, mock_url);
+        assert_eq!(turn_cfg.model, "conv-model");
+        assert_ne!(turn_cfg.base_url, cfg.base_url);
+        assert_ne!(turn_cfg.model, cfg.model);
+
+        // ...and that is what actually goes on the wire (the global base URL is
+        // unroutable, so a drift to it would fail this open outright).
+        let body = completion_body(
+            &turn_cfg.model,
+            &reflection,
+            &chat_tools(),
+            &turn_cfg.thinking_level,
+            None,
+        )
+        .unwrap();
+        let resp = open_completion_stream(&turn_cfg.base_url, "test-key", &body)
+            .await
+            .expect("the reflection request must reach the conversation's provider");
+        drop(resp);
+        {
+            let sent = bodies.lock().unwrap();
+            assert_eq!(sent.len(), 1, "one reflection request expected");
+            let sent_body = request_body(&sent[0]);
+            assert_eq!(sent_body["model"], "conv-model");
+            let sent_msgs = sent_body["messages"].as_array().unwrap();
+            assert_eq!(
+                serde_json::to_value(sent_msgs).unwrap(),
+                serde_json::to_value(&reflection).unwrap(),
+                "the reflection request changed between building and sending"
+            );
+        }
+
         let history = db::read_messages(&db, &cid).unwrap();
         let system_prompt = conversation_system_prompt(
-            &db, &cfg, &conversation, &cfg.base_url, &cfg.model, &memory,
+            &db, &cfg, &conversation, &turn_cfg.base_url, &turn_cfg.model, &memory,
         );
-
         // What a live turn shares...
         let (summary, keep_start) = compacted_history(&conversation, &history);
         assert!(summary.is_some(), "the fixture must exercise the summary");
         assert_eq!(keep_start, 1, "the fixture must exercise the verbatim tail");
         let live_prefix =
             build_context(&system_prompt, summary.as_deref(), &history[keep_start..]).unwrap();
-        // ...and what consolidation sends.
-        let reflection = crate::reflection::build_reflection_messages(
-            &system_prompt, &conversation, &history, &[],
-        )
-        .unwrap();
-
+        // ...and what consolidation sends (from the pass's own builder).
         assert_eq!(reflection.len(), live_prefix.len() + 1);
         // Compared as JSON values (object key order is not part of the request).
         assert_eq!(
@@ -735,7 +797,9 @@
         let _ = handle.join();
 
         let sent = bodies.lock().unwrap();
-        let body = request_body(&sent[0]);
+        assert_eq!(sent.len(), 2);
+        let body = request_body(&sent[1]);
+        assert_eq!(body["model"], "conv-model");
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(
             serde_json::to_value(&messages[..live_prefix.len()]).unwrap(),
@@ -1781,6 +1845,242 @@
             Some(StreamEvent::Done { stop_reason }) if stop_reason == "aborted"
         ));
     }
+
+/// Stop while the loop is parked on a gated approval used to fall through the
+/// `select!` as `approved == false` and record "The user denied this tool
+/// call." — indistinguishable from a real Deny. `stop_chat` cancels *and*
+/// denies, so Stop must be recorded as an abort, not a denial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_during_gated_approval_records_aborted_not_denied() {
+    let (port, handle) = start_mock(
+        vec![vec![
+            tool_frag(0, "call_1", "bash", ""),
+            tool_frag(0, "", "", r#"{\"command\":\"echo hi\"}"#),
+            finish_chunk("tool_calls"),
+        ]],
+        0,
+    );
+    let db = Arc::new(open_db("abort-approval"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let mcp = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    let token = CancelToken::new();
+
+    let (db2, approvals2, cid2, events2) = (
+        db.clone(),
+        approvals.clone(),
+        cid.clone(),
+        events.clone(),
+    );
+    let cancel = token.clone();
+    let memory = temp_memory("abort-approval");
+    let task = tokio::spawn(async move {
+        run_chat_turn(
+            &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, token, &sink, cid2,
+            "run it".into(), Vec::new(), false,
+        )
+        .await
+    });
+
+    // Parked on the approval prompt: stop exactly like `stop_chat` does.
+    wait_for_event(
+        &events2,
+        |e| matches!(e, StreamEvent::ToolCall { gated: true, .. }),
+        5000,
+    )
+    .await;
+    cancel.cancel();
+    approvals.deny_all();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("Stop did not unblock the approval wait");
+    result.unwrap().unwrap();
+    let _ = handle.join();
+
+    let rows = msgs(&db, &cid);
+    let tool_row = rows
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("the aborted call must still be persisted");
+    let v: Value = serde_json::from_str(&tool_row.content).unwrap();
+    assert_eq!(v["tool_call_id"], "call_1");
+    assert_eq!(v["error"], true);
+    assert_eq!(v["output"], "The user aborted this tool call.");
+    assert_ne!(
+        v["output"], "The user denied this tool call.",
+        "Stop must not be recorded as a Deny"
+    );
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.stop_reason.as_deref(), Some("aborted"));
+}
+
+/// Stop in the middle of a round with several tool calls: the calls that were
+/// never reached still get a result row. Replaying such a transcript used to
+/// send `assistant(tool_calls=[3])` followed by fewer than three tool results,
+/// which OpenAI-compatible endpoints reject with HTTP 400 — bricking the
+/// conversation's next turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_mid_multi_call_round_leaves_one_result_per_call() {
+    let (port, handle) = start_mock(
+        vec![vec![
+            tool_frag(0, "call_1", "bash", r#"{\"command\":\"echo one\"}"#),
+            tool_frag(1, "call_2", "bash", r#"{\"command\":\"sleep 20\"}"#),
+            tool_frag(2, "call_3", "bash", r#"{\"command\":\"echo three\"}"#),
+            finish_chunk("tool_calls"),
+        ]],
+        0,
+    );
+    let db = Arc::new(open_db("abort-multi"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        // YOLO, so the calls dispatch directly: the abort lands inside call 2's
+        // dispatch instead of on an approval prompt.
+        auto_approve_tools: true,
+        ..Default::default()
+    };
+    let mcp = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    let token = CancelToken::new();
+
+    let (db2, approvals2, cid2, events2) = (
+        db.clone(),
+        approvals.clone(),
+        cid.clone(),
+        events.clone(),
+    );
+    let cancel = token.clone();
+    let memory = temp_memory("abort-multi");
+    let task = tokio::spawn(async move {
+        run_chat_turn(
+            &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, token, &sink, cid2,
+            "run three".into(), Vec::new(), false,
+        )
+        .await
+    });
+
+    // call 1 completes, call 2 is the `sleep 20`; stop while it runs.
+    wait_for_event(
+        &events2,
+        |e| matches!(e, StreamEvent::ToolCall { call_id, .. } if call_id == "call_2"),
+        5000,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("Stop did not drop the running tool call");
+    result.unwrap().unwrap();
+    let _ = handle.join();
+
+    let rows = msgs(&db, &cid);
+    let call_row = rows
+        .iter()
+        .find(|m| {
+            m.role == "assistant" && serde_json::from_str::<Value>(&m.content)
+                .ok()
+                .and_then(|v| v.get("tool_calls").cloned())
+                .is_some()
+        })
+        .expect("assistant tool_calls row");
+    let call_value: Value = serde_json::from_str(&call_row.content).unwrap();
+    let calls: Vec<String> = call_value["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(calls, vec!["call_1", "call_2", "call_3"]);
+
+    let tool_rows: Vec<Value> = rows
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| serde_json::from_str::<Value>(&m.content).unwrap())
+        .collect();
+    // Exactly one result per requested call, in order.
+    assert_eq!(tool_rows.len(), calls.len());
+    for (row, id) in tool_rows.iter().zip(&calls) {
+        assert_eq!(row["tool_call_id"], id.as_str());
+    }
+    assert_eq!(tool_rows[0]["error"], false);
+    assert_eq!(tool_rows[0]["output"], "one");
+    assert_eq!(tool_rows[1]["output"], "The user aborted this tool call.");
+    assert_eq!(tool_rows[2]["output"], "The user aborted this tool call.");
+    assert_eq!(tool_rows[1]["error"], true);
+    assert_eq!(tool_rows[2]["error"], true);
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.stop_reason.as_deref(), Some("aborted"));
+
+    // The replay shape must be valid: the assistant tool-calls message is
+    // immediately followed by exactly one tool result per call.
+    let history = build_history_messages(&rows).unwrap();
+    let replay: Vec<Value> = history
+        .iter()
+        .map(|m| serde_json::to_value(m).unwrap())
+        .collect();
+    let call_idx = replay
+        .iter()
+        .position(|m| {
+            m["role"] == "assistant" && m.get("tool_calls").is_some()
+        })
+        .expect("replayed assistant tool_calls message");
+    let replayed_ids: Vec<String> = replay[call_idx]["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(replayed_ids, calls);
+    for (offset, id) in replayed_ids.iter().enumerate() {
+        let m = &replay[call_idx + 1 + offset];
+        assert_eq!(m["role"], "tool", "call {id} has no following tool result");
+        assert_eq!(m["tool_call_id"], id.as_str());
+    }
+}
+
+/// Stop-then-resend: the old turn's tail must not remove the *new* turn's
+/// registration. An unconditional remove would make the new turn's Stop a
+/// silent no-op and hide it from `is_streaming` (which the reflection scheduler
+/// relies on).
+#[test]
+fn stream_registry_remove_only_removes_its_own_token() {
+    let registry = StreamRegistry::default();
+    let old = registry.register("c1".into());
+    let new = registry.register("c1".into());
+
+    // The old turn's tail runs after the resend registered a new token.
+    registry.remove("c1", &old);
+    assert!(
+        registry.is_streaming("c1"),
+        "the resend's registration was removed"
+    );
+
+    // Stop therefore still reaches the new turn...
+    registry.cancel("c1");
+    assert!(new.is_cancelled());
+    assert!(!old.is_cancelled());
+
+    // ...and only the turn that owns the registration clears it.
+    registry.remove("c1", &new);
+    assert!(!registry.is_streaming("c1"));
+}
 
 /// The extracted loop used by the reflection pass runs without a DB and still
 /// executes memory tools (writes land in the memory dir, nothing persisted).
