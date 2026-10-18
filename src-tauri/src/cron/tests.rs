@@ -217,6 +217,29 @@ fn cron_state_claims_are_exclusive_and_capped() {
     assert!(state.try_begin("fresh"), "a released slot is reusable");
 }
 
+/// A panic in the run task leaves its `cron_runs` row open. The task's RAII
+/// guard closes it, so the audit trail never shows a run "in progress" forever;
+/// a second sweep is a no-op.
+#[test]
+fn abnormal_exit_closes_an_open_run_row() {
+    let db = open_db("abnormal");
+    insert_conv(&db, "c1");
+    let j = job(&db, "c1", "0 * * * *", 1_000);
+    let run = db::insert_cron_run(&db, &j, 1_000).unwrap();
+
+    assert_eq!(
+        db::finish_open_cron_run(&db, &j.id, "run terminated unexpectedly").unwrap(),
+        1
+    );
+    let rows = db::list_cron_runs(&db, Some(&j.id), 10).unwrap();
+    let row = rows.iter().find(|r| r.id == run).unwrap();
+    assert!(row.finished_at.is_some());
+    assert_eq!(row.stop_reason.as_deref(), Some("error"));
+    assert_eq!(row.error.as_deref(), Some("run terminated unexpectedly"));
+
+    assert_eq!(db::finish_open_cron_run(&db, &j.id, "again").unwrap(), 0);
+}
+
 /// The fired user turn carries the prompt plus an autonomous footer naming the
 /// job, so both the model and a reader know why it appeared.
 #[test]

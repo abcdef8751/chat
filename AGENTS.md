@@ -65,7 +65,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **320 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **321 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -1223,6 +1223,10 @@ is not implemented — host tools operate on real paths with per-call approval.
   user timer / launchd agent on desktop).
 - **No retries.** A failed run is recorded (`cron_runs.error`) and notified; the
   schedule moves on. Transient provider errors therefore cost that slot.
+- **`run_job`/`launch` need an `AppHandle`, so they have no unit test of their
+  own** — the DB bookkeeping, schedule math, tool gating and turn core are tested
+  separately, and the wiring is exercised by running the app. A `tauri::test`
+  harness with a stubbed provider key would close that gap.
 - **Android notifications are deferred** (channel + `POST_NOTIFICATIONS` +
   manifest). The plugin is registered and desktop works today; the in-app
   `cron-updated` badge/refresh path is platform-neutral.

@@ -2190,6 +2190,18 @@ pub fn finish_cron_run(
     Ok(())
 }
 
+/// Close a run row left open by an abnormal exit (a panic in the run task), so
+/// the audit trail never shows a run "in progress" forever.
+pub fn finish_open_cron_run(db: &Db, job_id: &str, error: &str) -> Result<usize, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE cron_runs SET finished_at = ?2, stop_reason = 'error', error = ?3
+         WHERE job_id = ?1 AND finished_at IS NULL",
+        params![job_id, now_ms(), error],
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn list_cron_runs(
     db: &Db,
     job_id: Option<&str>,

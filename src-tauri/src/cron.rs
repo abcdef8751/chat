@@ -202,6 +202,13 @@ impl RunSlot {
 
 impl Drop for RunSlot {
     fn drop(&mut self) {
+        if !self.terminal_emitted {
+            // Abnormal exit (a panic in the task): close any run row this job
+            // left open, so the audit trail does not show "in progress" forever.
+            if let Some(db) = self.app.try_state::<db::Db>() {
+                let _ = db::finish_open_cron_run(&db, &self.job_id, "run terminated unexpectedly");
+            }
+        }
         // A panic unwinds through here: report the run as failed so the client
         // clears its marker instead of waiting forever.
         self.emit_terminal("error");
