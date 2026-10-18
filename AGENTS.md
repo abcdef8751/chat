@@ -514,9 +514,10 @@ device just sees the thread continue.
 - **Scheduler** (`cron.rs`, mirrors `reflection::spawn`): one pass 3 s after
   startup (a slot missed while the app was closed catches up), then every 20 s so
   `* * * * *` jobs feel right. Global kill-switch `AppConfig.cron_enabled`
-  (Settings → Scheduled jobs; local, not synced). Due = `enabled = 1 AND
-  (run_requested = 1 OR next_run_at <= now)`, oldest slot first, capped at 5
-  launches per tick and 3 concurrent runs.
+  (Settings → Scheduled jobs; local, not synced). Due = an enabled job with
+  `next_run_at <= now`, or any job with a queued one-shot `run_requested` (so
+  "Run now" works on a paused job), oldest slot first, capped at 5 launches per
+  tick and 3 concurrent runs.
 - **Interlock:** a conversation is claimed through `StreamRegistry`
   (`try_register`, not `register` — a live turn may start in the window since the
   due check, and replacing its cancel token would make Stop abort the wrong

@@ -1975,14 +1975,15 @@ pub fn get_cron_job(db: &Db, id: &str) -> Result<Option<CronJob>, String> {
     .map_err(|e| e.to_string())
 }
 
-/// Jobs the scheduler should fire now: an explicit one-shot request, or a due
-/// slot. Ordered so the oldest due slot wins when several are pending.
+/// Jobs the scheduler should fire now: an explicit one-shot request (even on a
+/// paused job — "Run now" must work while paused), or an enabled job whose slot
+/// is due. Ordered so the oldest due slot wins when several are pending.
 pub fn due_cron_jobs(db: &Db, now_ms: i64) -> Result<Vec<CronJob>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {CRON_JOB_COLUMNS} FROM cron_jobs
-             WHERE enabled = 1 AND (run_requested = 1 OR next_run_at <= ?1)
+             WHERE (enabled = 1 AND next_run_at <= ?1) OR run_requested = 1
              ORDER BY next_run_at ASC"
         ))
         .map_err(|e| e.to_string())?;

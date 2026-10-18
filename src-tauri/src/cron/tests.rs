@@ -213,3 +213,99 @@ fn cron_tool_names_are_recognized() {
     assert!(!is_cron_tool("bash"));
     assert!(!is_cron_tool("save_memory"));
 }
+
+fn tool_call(name: &str, arguments: Value) -> ToolCall {
+    ToolCall {
+        id: format!("call-{name}"),
+        name: name.into(),
+        arguments,
+    }
+}
+
+/// The agent's cron surface end to end (DB only): create with a preset, list,
+/// pause, queue a manual fire, delete. This also pins the preset→cron
+/// normalization boundary the model relies on.
+#[test]
+fn agent_tools_create_list_update_and_delete() {
+    let db = open_db("agent-tools");
+    insert_conv(&db, "c1");
+
+    let created = execute_tool(
+        &tool_call(
+            "create_cron",
+            json!({
+                "prompt": "Morning briefing",
+                "schedule": "daily@08:30",
+                "tool_policy": "auto-approve",
+            }),
+        ),
+        &db,
+        "c1",
+    );
+    assert!(!created.is_error, "create failed: {}", created.content);
+    let job: Value = serde_json::from_str(&created.content).unwrap();
+    assert_eq!(job["schedule"], "30 8 * * *");
+    assert_eq!(job["toolPolicy"], "autoapprove");
+    assert_eq!(job["conversationId"], "c1");
+    assert_eq!(job["enabled"], true);
+    // The title defaults to the prompt.
+    assert_eq!(job["title"], "Morning briefing");
+    let id = job["id"].as_str().unwrap().to_string();
+
+    let listed = execute_tool(&tool_call("list_crons", json!({})), &db, "c1");
+    let listed: Value = serde_json::from_str(&listed.content).unwrap();
+    assert_eq!(listed["jobs"].as_array().unwrap().len(), 1);
+    assert!(listed["jobs"][0]["nextRun"].as_str().is_some());
+
+    let updated = execute_tool(
+        &tool_call(
+            "update_cron",
+            json!({ "id": id, "enabled": false, "title": "Paused briefing" }),
+        ),
+        &db,
+        "c1",
+    );
+    assert!(!updated.is_error, "update failed: {}", updated.content);
+    let updated: Value = serde_json::from_str(&updated.content).unwrap();
+    assert_eq!(updated["enabled"], false);
+    assert_eq!(updated["title"], "Paused briefing");
+
+    let queued = execute_tool(&tool_call("run_cron_now", json!({ "id": id })), &db, "c1");
+    assert!(!queued.is_error);
+    assert!(
+        db::get_cron_job(&db, &id).unwrap().unwrap().run_requested,
+        "run_cron_now must queue a one-shot fire"
+    );
+
+    let deleted = execute_tool(&tool_call("delete_cron", json!({ "id": id })), &db, "c1");
+    assert!(!deleted.is_error);
+    assert!(db::list_cron_jobs(&db).unwrap().is_empty());
+
+    // Invalid input is reported as a tool error, not a panic.
+    let bad = execute_tool(
+        &tool_call(
+            "create_cron",
+            json!({ "prompt": "x", "schedule": "0 8 * * * 0" }),
+        ),
+        &db,
+        "c1",
+    );
+    assert!(bad.is_error);
+    assert!(bad.content.contains("sub-minute"));
+}
+
+/// `cron_preview` validates for the UI and resolves the next fire; invalid input
+/// comes back as an `error` field rather than an invoke failure.
+#[test]
+fn preview_reports_next_run_and_errors() {
+    let ok = cron_preview("daily@08:30".into());
+    assert!(ok.error.is_none());
+    assert_eq!(ok.schedule, "30 8 * * *");
+    assert_eq!(ok.description, "Daily at 08:30");
+    assert!(ok.next_run_at.is_some());
+    assert!(ok.next_run_at.unwrap() > db::now_ms() - 1000);
+
+    let bad = cron_preview("61 * * * *".into());
+    assert!(bad.error.is_some());
+    assert!(bad.next_run_at.is_none());
+}
