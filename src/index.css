@@ -74,3 +74,32 @@ body {
   max-width: 100%;
   overflow-x: auto;
 }
+
+/* Display math ($$…$$) can be wider than the message bubble. KaTeX renders it
+   as a centred block (`text-align: center` + a full-width block child), and a
+   centred *overflowing* block clips its left edge where it can never be
+   scrolled to. So: left-align the scroll container, turn the formula into a
+   shrink-to-fit inline-block that is at least as wide as the bubble, and centre
+   inside it. Formulas that fit stay centred (min-width: 100%); wider ones start
+   at the left edge and scroll horizontally instead of overflowing. */
+.prose .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.35rem 0;
+  text-align: left;
+}
+
+.prose .katex-display > .katex {
+  display: inline-block;
+  min-width: 100%;
+  text-align: center;
+}
+
+/* Keep KaTeX's own layout out of the prose word-wrapping rules above
+   (`.prose` sets `overflow-wrap: anywhere` for long code/paths/URLs). Math
+   tokens carry their own spacing and must never be broken mid-glyph. */
+.prose .katex {
+  overflow-wrap: normal;
+  word-break: normal;
+}
