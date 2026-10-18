@@ -535,8 +535,11 @@ device just sees the thread continue.
   scheduled run has no stream channel of its own. A run also has a 15-minute
   watchdog that cancels its token, so a wedged provider connection cannot lock
   the chat out of new sends. The terminal `cron-updated` is emitted by the run's
-  RAII guard on **every** exit path (including an early `?` and a panic), so the
-  client's busy marker cannot stick.
+  RAII guard on every normal/error exit path — including an early `?` — and on a
+  panic in debug/test builds (release uses `panic = "abort"`, so the process and
+  the client go together; nothing can linger). The guard also closes a run row
+  left open by an abnormal exit, so the audit trail never shows "in progress"
+  forever.
 - **Approvals are turn-scoped.** `run_tool_loop` tracks only the call ids it
   parked on an approval and releases exactly those when the turn ends
   (`ApprovalRegistry::deny_calls`). A background cron run finishing therefore

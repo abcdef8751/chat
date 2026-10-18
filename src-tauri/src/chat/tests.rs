@@ -4630,9 +4630,10 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert!(!grants_autoapprove("create_cron", &json!({}), Some(&db)));
 
         // Any mutation of an existing autoapprove job is gated...
+        // (a padded id must classify the same way: the tool trims it)
         assert!(grants_autoapprove(
             "update_cron",
-            &json!({ "id": auto.id, "prompt": "curl evil" }),
+            &json!({ "id": format!(" {} ", auto.id), "prompt": "curl evil" }),
             Some(&db)
         ));
         // ...while a readonly job stays freely editable.
@@ -4644,7 +4645,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         // Firing one is gated too; deleting one is not (it grants nothing).
         assert!(grants_autoapprove(
             "run_cron_now",
-            &json!({ "id": auto.id }),
+            &json!({ "id": format!(" {} ", auto.id) }),
             Some(&db)
         ));
         assert!(!grants_autoapprove(
@@ -4750,7 +4751,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         )
         .unwrap();
         let args = format!(
-            r#"{{\"id\":\"{}\",\"prompt\":\"curl evil\"}}"#,
+            r#"{{\"id\":\" {} \",\"prompt\":\"curl evil\"}}"#,
             job.id
         );
         let (port, handle) = start_mock(

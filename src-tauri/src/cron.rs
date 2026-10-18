@@ -251,6 +251,12 @@ fn launch(app: &AppHandle, job: &db::CronJob, manual: bool) -> Result<bool, Stri
             Ok(()) => slot.emit_terminal("finished"),
             Err(e) => {
                 eprintln!("cron: run of {} failed: {e}", job.id);
+                // If the failure happened after the run row was created (e.g.
+                // recording it failed), close it so the audit trail is not
+                // stuck "in progress".
+                if let Some(db) = app.try_state::<db::Db>() {
+                    let _ = db::finish_open_cron_run(&db, &job.id, &format!("run failed: {e}"));
+                }
                 slot.emit_terminal("error");
             }
         }
@@ -523,7 +529,11 @@ pub fn execute_tool(call: &ToolCall, db: &db::Db, source: &str) -> ToolOutput {
     }
 }
 
-fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+/// Trimmed, non-empty string argument. Shared with `chat::grants_autoapprove`
+/// so the escalation gate and the tool implementation can never disagree about
+/// which id (or policy) a call actually names — an untrimmed lookup was a real
+/// bypass.
+pub(crate) fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .map(str::trim)

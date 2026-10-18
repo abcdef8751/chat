@@ -1525,7 +1525,10 @@ fn grants_autoapprove(name: &str, arguments: &Value, db: Option<&db::Db>) -> boo
             .unwrap_or(false)
     };
     let target_is_autoapprove = || {
-        let id = arguments.get("id").and_then(Value::as_str)?;
+        // Must use the SAME argument reader the tool implementation uses: it
+        // trims, so a padded `" <id>"` would otherwise miss this lookup and slip
+        // through as ungated while `update_cron` still found and mutated the job.
+        let id = crate::cron::arg_str(arguments, "id")?;
         let job = db::get_cron_job(db?, id).ok()??;
         Some(job.tool_policy == "autoapprove")
     };
