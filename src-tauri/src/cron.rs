@@ -302,6 +302,8 @@ async fn run_job(
             "Run failed: {}",
             error.as_deref().unwrap_or("unknown error")
         )
+    } else if stop_reason == "aborted" {
+        "Run stopped before it finished.".to_string()
     } else {
         snippet(&reply)
     };
