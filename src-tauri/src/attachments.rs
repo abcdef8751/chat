@@ -213,6 +213,22 @@ pub fn read_image(path: &str) -> Result<(String, String), String> {
     Ok((mime, data_url))
 }
 
+/// Build an image [`Attachment`] from bytes we already hold (a fetched URL, not a
+/// local file), with a fresh id and a ready-to-use data URL. The caller is
+/// responsible for having validated the MIME type and the size cap; keeping the
+/// data-URL shape in one place is why this exists at all.
+pub fn image_attachment(name: String, mime: &str, bytes: &[u8]) -> Attachment {
+    Attachment {
+        id: Uuid::new_v4().to_string(),
+        name,
+        mime: mime.to_string(),
+        size: bytes.len() as u64,
+        kind: "image".into(),
+        data_url: Some(format!("data:{};base64,{}", mime, base64_encode(bytes))),
+        text: None,
+    }
+}
+
 /// Read one file into an [`Attachment`]. Directories and unreadable paths error.
 ///
 /// A raster image larger than [`MAX_IMAGE_BYTES`] is not turned into a data URL;

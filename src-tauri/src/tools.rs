@@ -172,6 +172,27 @@ fn web_fetch_tool() -> ChatCompletionTools {
     )
 }
 
+/// `fetch_image`: load an image from an http(s) URL so it can be attached to the
+/// assistant's reply (and, on a vision model, shown to the model).
+fn fetch_image_tool() -> ChatCompletionTools {
+    fn_tool(
+        "fetch_image",
+        "Download an image from an http(s) URL and attach it to your reply. Use it when \
+         the user asks for a picture (a diagram, a screenshot, a chart, a photo) that you \
+         found or can reference by URL. Only raster formats are accepted (PNG, JPEG, GIF, \
+         WebP, BMP); SVG and ICO are refused, as are non-public addresses (loopback, \
+         private, link-local, and metadata hosts). The image is shown to you when the active \
+         model can view images, and is always attached to your reply for the user.",
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Absolute http:// or https:// URL of a raster image" }
+            },
+            "required": ["url"]
+        }),
+    )
+}
+
 /// OpenAI `tools` array for a request. When `brave` is true the full native
 /// Brave tool surface is appended (`brave_web_search`, `brave_local_search`,
 /// `brave_image_search`, `brave_video_search`, `brave_news_search`,
@@ -216,6 +237,7 @@ pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
         memory_write_tool(),
         memory_str_replace_tool(),
         web_fetch_tool(),
+        fetch_image_tool(),
     ];
     if brave {
         tools.extend(brave_tools());
@@ -691,6 +713,214 @@ fn is_blocked_v4(ip: &Ipv4Addr) -> bool {
         || o[0] == 0
         || (o[0] == 100 && (o[1] & 0xc0) == 64)
         || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+}
+
+/// `fetch_image(url)` — GET an image and return it as an [`Attachment`] ready to
+/// persist on the assistant's reply (and, on a vision model, to show the model).
+/// Errors are pre-formatted tool messages so the model can self-correct.
+///
+/// Ungated like `web_fetch`: it is read-only and needs no key. It reuses the
+/// same SSRF guard, redirect policy and timeout, and caps the body at
+/// [`crate::attachments::MAX_IMAGE_BYTES`] while streaming, so an oversized (or
+/// compression-bomb) image is never fully buffered.
+pub async fn execute_fetch_image(
+    call: &ToolCall,
+) -> Result<crate::attachments::Attachment, String> {
+    let Some(raw) = call.arguments.get("url").and_then(Value::as_str) else {
+        return Err("fetch_image: missing 'url' argument".into());
+    };
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err("fetch_image: 'url' must not be empty".into());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!(
+            "fetch_image: only http/https URLs are supported (got '{url}')"
+        ));
+    }
+    fetch_image_url(url, false).await
+}
+
+/// The GET itself, factored out so tests can hit a loopback mock.
+/// `allow_private` bypasses the SSRF guard (the public tool always passes
+/// `false`); every other caller must leave it off.
+async fn fetch_image_url(
+    url: &str,
+    allow_private: bool,
+) -> Result<crate::attachments::Attachment, String> {
+    let Some(host) = url_host(url) else {
+        return Err(format!("fetch_image: could not parse a host from '{url}'"));
+    };
+    if !allow_private && !test_private_fetch_allowed(url) {
+        ensure_public_host(&host)
+            .await
+            // The guard's messages name `web_fetch`; rebrand for this tool.
+            .map_err(|e| e.replacen("web_fetch:", "fetch_image:", 1))?;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
+        .redirect(web_fetch_redirect_policy())
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => return Err(format!("fetch_image: {e}")),
+    };
+    let resp = client
+        .get(url)
+        .header(
+            "Accept",
+            "image/png,image/jpeg,image/gif,image/webp,image/bmp;q=0.9,image/*;q=0.8,*/*;q=0.1",
+        )
+        .send()
+        .await
+        .map_err(|e| format!("fetch_image: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("fetch_image: HTTP {status} for {url}"));
+    }
+
+    // Decide the type before reading a body we might throw away.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    let url_ext = image_ext_from_url(url);
+    let mime = if content_type.starts_with("image/") {
+        // `is_viewable_image` is the one shared decision: raster `image/*` only,
+        // SVG and ICO excluded (most vision APIs reject them).
+        if !crate::attachments::is_viewable_image("", Some(&content_type)) {
+            return Err(format!(
+                "fetch_image: {url} is a '{content_type}', which cannot be attached; \
+                 only raster images (PNG, JPEG, GIF, WebP, BMP) are supported"
+            ));
+        }
+        content_type
+    } else if crate::attachments::is_raster_image_ext(&url_ext) {
+        // Some hosts serve images as `application/octet-stream`; trust a raster
+        // extension on the URL then, and derive the MIME from it.
+        crate::attachments::mime_for(&url_ext).to_string()
+    } else {
+        return Err(format!(
+            "fetch_image: {url} did not return an image (content type '{}'); only raster \
+             images (PNG, JPEG, GIF, WebP, BMP) are supported",
+            if content_type.is_empty() {
+                "none"
+            } else {
+                &content_type
+            }
+        ));
+    };
+
+    let cap = crate::attachments::MAX_IMAGE_BYTES as usize;
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            return Err(image_too_large());
+        }
+    }
+    // Stream the body, stopping at the cap so a huge response is never buffered.
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("fetch_image: {e}"))?;
+        if bytes.len() > cap.saturating_sub(buf.len()) {
+            return Err(image_too_large());
+        }
+        buf.extend_from_slice(&bytes);
+    }
+    if buf.is_empty() {
+        return Err(format!("fetch_image: {url} returned an empty body"));
+    }
+    Ok(crate::attachments::image_attachment(
+        image_name_from_url(url),
+        &mime,
+        &buf,
+    ))
+}
+
+fn image_too_large() -> String {
+    format!(
+        "fetch_image: the image is too large to attach (the limit is {} bytes)",
+        crate::attachments::MAX_IMAGE_BYTES
+    )
+}
+
+/// Test-only SSRF bypass: exact `host:port` pairs an end-to-end turn test may
+/// fetch from. Never part of a production build.
+///
+/// `fetch_image`'s guard must stay honest, so this is keyed by host *and* port
+/// rather than being a global "allow everything" switch: the refusal tests use a
+/// fixed non-ephemeral port (`1`), which can never collide with a mock server.
+#[cfg(test)]
+static TEST_FETCH_HOSTS: std::sync::Mutex<Vec<(String, u16)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Allow a test to fetch from one private `host:port` (its loopback fixture).
+#[cfg(test)]
+pub(crate) fn allow_private_fetch_for_test(url: &str) {
+    if let Ok(u) = reqwest::Url::parse(url) {
+        if let (Some(host), Some(port)) = (u.host_str(), u.port_or_known_default()) {
+            TEST_FETCH_HOSTS
+                .lock()
+                .unwrap()
+                .push((host.to_string(), port));
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_private_fetch_allowed(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (u.host_str(), u.port_or_known_default()) else {
+        return false;
+    };
+    TEST_FETCH_HOSTS
+        .lock()
+        .map(|hosts| hosts.iter().any(|(h, p)| h == host && *p == port))
+        .unwrap_or(false)
+}
+
+/// Production builds have no test bypass at all: the guard is unconditional.
+#[cfg(not(test))]
+fn test_private_fetch_allowed(_url: &str) -> bool {
+    false
+}
+
+/// Lowercased extension of a URL's path, if it has one.
+fn image_ext_from_url(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            std::path::Path::new(u.path())
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        })
+        .unwrap_or_default()
+}
+
+/// A display name for a fetched image: the last path segment, else the host.
+fn image_name_from_url(url: &str) -> String {
+    if let Ok(u) = reqwest::Url::parse(url) {
+        if let Some(seg) = u
+            .path_segments()
+            .and_then(|mut s| s.rfind(|p: &&str| !p.trim().is_empty()))
+        {
+            return seg.to_string();
+        }
+        if let Some(host) = u.host_str() {
+            return format!("{host}.image");
+        }
+    }
+    "image".to_string()
 }
 
 /// Best-effort HTML → readable text. Drops `<script>`/`<style>` contents
@@ -1285,13 +1515,13 @@ mod tests {
     #[test]
     fn tool_specs_shape() {
         let with = tool_specs(true);
-        // 8 host/memory tools + 6 native Brave tools.
-        assert_eq!(with.len(), 14);
+        // 9 host/memory/web tools + 6 native Brave tools.
+        assert_eq!(with.len(), 15);
         let without = tool_specs(false);
-        assert_eq!(without.len(), 8);
+        assert_eq!(without.len(), 9);
         // The list is identical for live and reflection (cache alignment);
         // access is enforced by mode at execution time, not by the list.
-        for name in ["write_memory", "memory_str_replace", "web_fetch"] {
+        for name in ["write_memory", "memory_str_replace", "web_fetch", "fetch_image"] {
             assert!(without.iter().any(|t| tool_name(t) == name), "missing {name}");
         }
         assert!(is_gated("bash"));
@@ -1301,6 +1531,7 @@ mod tests {
         assert!(!is_gated("write_memory"));
         assert!(!is_gated("memory_str_replace"));
         assert!(!is_gated("web_fetch"));
+        assert!(!is_gated("fetch_image"));
         // Brave's full tool surface is exposed when a key is configured.
         for name in [
             "brave_web_search",
@@ -1640,6 +1871,136 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    // ---------- fetch_image ----------
+
+    /// A raster body on a loopback fixture becomes an image attachment (the
+    /// `allow_private` entry point is the same one `web_fetch`'s tests use).
+    #[tokio::test]
+    async fn fetch_image_builds_an_attachment_from_a_raster_body() {
+        let (port, handle) = start_http_mock("200 OK", "image/png", "PNGDATA");
+        let url = format!("http://127.0.0.1:{port}/cat.png");
+        let att = fetch_image_url(&url, true).await.unwrap();
+        let _ = handle.join();
+        assert_eq!(att.kind, "image");
+        assert_eq!(att.name, "cat.png");
+        assert_eq!(att.mime, "image/png");
+        assert_eq!(att.size, 7);
+        assert_eq!(
+            att.data_url.as_deref(),
+            Some("data:image/png;base64,UE5HREFUQQ==")
+        );
+        assert!(att.text.is_none());
+        assert!(!att.id.is_empty());
+    }
+
+    /// A raster URL whose host does not label the type (`octet-stream`) is still
+    /// accepted, and the MIME is derived from the extension.
+    #[tokio::test]
+    async fn fetch_image_accepts_octet_stream_with_a_raster_url_extension() {
+        let (port, handle) = start_http_mock("200 OK", "application/octet-stream", "PNGDATA");
+        let url = format!("http://127.0.0.1:{port}/diagram.webp");
+        let att = fetch_image_url(&url, true).await.unwrap();
+        let _ = handle.join();
+        assert_eq!(att.mime, "image/webp");
+        assert_eq!(att.name, "diagram.webp");
+    }
+
+    /// A non-image body is refused before it is buffered or attached.
+    #[tokio::test]
+    async fn fetch_image_rejects_a_non_image_content_type() {
+        let (port, handle) = start_http_mock("200 OK", "text/html", "<html>nope</html>");
+        let url = format!("http://127.0.0.1:{port}/page");
+        let err = fetch_image_url(&url, true).await.unwrap_err();
+        let _ = handle.join();
+        assert!(err.contains("did not return an image"), "{err}");
+        assert!(err.contains("text/html"), "{err}");
+    }
+
+    /// SVG/ICO are vector/legacy formats most vision APIs reject, so they are
+    /// refused even though they are `image/*`.
+    #[tokio::test]
+    async fn fetch_image_rejects_svg_and_ico() {
+        for mime in ["image/svg+xml", "image/x-icon"] {
+            let (port, handle) = start_http_mock("200 OK", mime, "<svg/>");
+            let url = format!("http://127.0.0.1:{port}/logo.svg");
+            let err = fetch_image_url(&url, true).await.unwrap_err();
+            let _ = handle.join();
+            assert!(err.contains("cannot be attached"), "{mime}: {err}");
+        }
+    }
+
+    /// An advertised length past the cap is refused without reading the body.
+    #[tokio::test]
+    async fn fetch_image_rejects_an_oversized_content_length() {
+        let (port, handle) = start_http_mock_response(|_| {
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    crate::attachments::MAX_IMAGE_BYTES + 1
+                ),
+                "PNGDATA".to_string(),
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/huge.png");
+        let err = fetch_image_url(&url, true).await.unwrap_err();
+        let _ = handle.join();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    /// The cap is enforced while streaming too (a body with no length header).
+    #[tokio::test]
+    async fn fetch_image_rejects_an_oversized_streamed_body() {
+        let body = "A".repeat(crate::attachments::MAX_IMAGE_BYTES as usize + 64);
+        let (port, handle) = start_http_mock_response(move |_| {
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                body.clone(),
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/huge.png");
+        let err = fetch_image_url(&url, true).await.unwrap_err();
+        let _ = handle.join();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    /// The public entry point keeps the same SSRF guard as `web_fetch`, and
+    /// rejects bad arguments without touching the network.
+    #[tokio::test]
+    async fn fetch_image_refuses_private_hosts_and_bad_urls() {
+        let call = |url: &str| ToolCall {
+            id: "f1".into(),
+            name: "fetch_image".into(),
+            arguments: json!({ "url": url }),
+        };
+
+        let err = execute_fetch_image(&call("http://127.0.0.1:1/x.png"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("refusing to fetch non-public address"), "{err}");
+        assert!(err.starts_with("fetch_image:"), "{err}");
+
+        let err = execute_fetch_image(&call("http://metadata.google.internal/x.png"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("refusing to fetch non-public address"), "{err}");
+
+        let err = execute_fetch_image(&call("ftp://example.com/x.png"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("http/https"), "{err}");
+
+        let err = execute_fetch_image(&ToolCall {
+            id: "f2".into(),
+            name: "fetch_image".into(),
+            arguments: json!({}),
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("missing 'url'"), "{err}");
     }
 
     #[test]

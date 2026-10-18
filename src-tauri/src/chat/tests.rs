@@ -1882,6 +1882,183 @@ async fn web_fetch_in_live_mode_routes_to_web_tool() {
     );
 }
 
+/// `fetch_image` is not a memory tool, so consolidation and extraction refuse it
+/// before dispatch — no network request is ever made during either pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_image_is_refused_in_reflection_and_extraction_modes() {
+    for mode in [ToolMode::Reflection, ToolMode::Extract] {
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag(0, "c1", "fetch_image", ""),
+                    // Loopback: if the gate ever regressed, the SSRF guard would
+                    // fail fast instead of reaching the network.
+                    tool_frag(0, "", "", r#"{\"url\":\"http://127.0.0.1:1/x.png\"}"#),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("done"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let mcp = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("fetchimage-gate");
+        let approvals = tools::ApprovalRegistry::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
+        let tools_list = tools::tool_specs(false);
+        run_tool_loop(
+            &cfg,
+            "test-key",
+            &mcp,
+            &shell,
+            &memory,
+            &approvals,
+            "conv_gate",
+            messages,
+            &tools_list,
+            CancelToken::new(),
+            &sink,
+            None,
+            mode,
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        let guard = events.lock().unwrap();
+        assert!(
+            guard.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolResult { ok: false, output, .. }
+                    if output.contains("not available during memory")
+            )),
+            "{mode:?} did not refuse fetch_image"
+        );
+    }
+}
+
+/// One-shot loopback HTTP fixture serving an image, for the fetch_image path.
+fn start_image_mock(content_type: &str, body: &str) -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let content_type = content_type.to_string();
+    let body = body.to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = match listener.accept() {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+        let _ = read_request(&mut stream);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+    (port, handle)
+}
+
+/// An image fetched by the model is attached to the **assistant's reply**, not
+/// just injected into the request: it is stored on that row's `attachments`, so
+/// it renders in the transcript and survives a reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetched_image_is_attached_to_the_assistant_reply() {
+    let (img_port, img_handle) = start_image_mock("image/png", "PNGDATA");
+    let (port, bodies, handle) = start_mock_capture(
+        vec![
+            vec![
+                tool_frag(0, "call_img", "fetch_image", ""),
+                tool_frag(
+                    0,
+                    "",
+                    "",
+                    &format!(r#"{{\"url\":\"http://127.0.0.1:{img_port}/cat.png\"}}"#),
+                ),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("Here is the cat."), finish_chunk("stop")],
+        ],
+        0,
+    );
+    // Let the tool reach the loopback fixture; the SSRF guard stays on for every
+    // other host (this exemption is compiled out of non-test builds).
+    tools::allow_private_fetch_for_test(&format!("http://127.0.0.1:{img_port}/cat.png"));
+
+    let db = Arc::new(open_db("fetch-image"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let mcp = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    let (db2, approvals2, cid2) = (db.clone(), approvals.clone(), cid.clone());
+    let memory = temp_memory("fetch-image");
+    let task = tokio::spawn(async move {
+        run_chat_turn(
+            &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, CancelToken::new(), &sink,
+            cid2, "show me a cat".into(), Vec::new(), false,
+        )
+        .await
+    });
+    task.await.unwrap().unwrap();
+    let _ = handle.join();
+    let _ = img_handle.join();
+
+    // The model was told what was attached.
+    {
+        let guard = events.lock().unwrap();
+        assert!(
+            guard.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolResult { ok: true, output, .. }
+                    if output.starts_with("fetch_image: attached \"cat.png\" (image/png, 7 bytes)")
+            )),
+            "tool result did not describe the fetched image"
+        );
+    }
+
+    // ...and it is stored on the final assistant row.
+    let rows = msgs(&db, &cid);
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.content, "Here is the cat.");
+    let stored: Vec<crate::attachments::Attachment> =
+        serde_json::from_str(last.attachments.as_deref().expect("attachment json"))
+            .expect("attachment json parses");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].kind, "image");
+    assert_eq!(stored[0].name, "cat.png");
+    assert_eq!(stored[0].mime, "image/png");
+    assert_eq!(stored[0].size, 7);
+    assert_eq!(
+        stored[0].data_url.as_deref(),
+        Some("data:image/png;base64,UE5HREFUQQ==")
+    );
+
+    // A text-only model does not get the image injected as a user part, but the
+    // turn still completes normally.
+    let sent = bodies.lock().unwrap();
+    let final_request = request_body(&sent[1]);
+    let raw = final_request.to_string();
+    assert!(!raw.contains("image_url"), "{raw}");
+}
+
 /// Extraction advertises no tools at all — it is pure summarization — so any
 /// tool call the model emits anyway is refused rather than dispatched. That is
 /// what makes the map phase safe to run concurrently: it cannot write.

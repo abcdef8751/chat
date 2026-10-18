@@ -1338,9 +1338,14 @@ pub(crate) struct ToolLoopResult {
     pub stop_reason: String,
     /// Set when `stop_reason` is `"error"`: the provider's failure text.
     pub error: Option<String>,
+    /// Images fetched during the turn (`fetch_image`), to be stored on the
+    /// assistant row. Populated on the abort/error paths too, so a partial turn
+    /// keeps the images it already attached.
+    pub attachments: Vec<crate::attachments::Attachment>,
 }
 
-/// A dispatched tool outcome, plus an optional image the model should see.
+/// A dispatched tool outcome, plus an optional image the model should see and an
+/// optional attachment to persist on the assistant's reply.
 ///
 /// async-openai 0.41 tool messages are text-only (`ChatCompletionRequestToolMessageContentPart`
 /// has only `Text`), so a `read_file` call that loads an image cannot ride the
@@ -1348,9 +1353,12 @@ pub(crate) struct ToolLoopResult {
 /// loop injects it as a synthetic user `image_url` part after the tool result.
 struct DispatchedTool {
     output: ToolOutput,
-    /// `data:<mime>;base64,…` for an image loaded by `read_file` on a
-    /// multimodal model; `None` for every other call.
+    /// `data:<mime>;base64,…` for an image loaded by `read_file` (or fetched by
+    /// `fetch_image`) on a multimodal model; `None` for every other call.
     image: Option<String>,
+    /// An image downloaded by `fetch_image`, persisted in the assistant row's
+    /// attachment list so it shows in the transcript and survives a reload.
+    attachment: Option<crate::attachments::Attachment>,
 }
 
 impl DispatchedTool {
@@ -1358,6 +1366,7 @@ impl DispatchedTool {
         Self {
             output,
             image: None,
+            attachment: None,
         }
     }
 }
@@ -1401,6 +1410,7 @@ fn read_file_image(path: &str, cfg: &AppConfig, db: Option<&db::Db>) -> Dispatch
                  attached below; describe or analyze it as requested."
             )),
             image: Some(data_url),
+            attachment: None,
         }
     } else {
         DispatchedTool::plain(ToolOutput::ok(format!(
@@ -1411,9 +1421,47 @@ fn read_file_image(path: &str, cfg: &AppConfig, db: Option<&db::Db>) -> Dispatch
     }
 }
 
+/// Wrap a fetched image as a tool outcome. The attachment is always persisted on
+/// the assistant's reply (so the transcript keeps it across a reload); the model
+/// only *sees* it as an image part when the turn's model is vision-capable,
+/// exactly like [`read_file_image`].
+fn fetched_image_result(
+    attachment: crate::attachments::Attachment,
+    cfg: &AppConfig,
+    db: Option<&db::Db>,
+) -> DispatchedTool {
+    let vision = db
+        .map(|db| crate::pricing::capabilities_for(db, cfg, &cfg.model).vision())
+        .unwrap_or(false);
+    let described = format!(
+        "fetch_image: attached \"{}\" ({}, {} bytes).",
+        attachment.name, attachment.mime, attachment.size
+    );
+    let output = if vision {
+        ToolOutput::ok(format!(
+            "{described} The image is attached below; describe or use it as requested."
+        ))
+    } else {
+        ToolOutput::ok(format!(
+            "{described} It is attached to your reply for the user. The active model \
+             (\"{}\") cannot view images, so you cannot describe its contents.",
+            cfg.model
+        ))
+    };
+    DispatchedTool {
+        output,
+        image: if vision {
+            attachment.data_url.clone()
+        } else {
+            None
+        },
+        attachment: Some(attachment),
+    }
+}
+
 /// Execute one model-requested tool. Memory tools are handled in-process, the
-/// read-only `web_fetch` runs without approval, and host tools run with per-call
-/// approval (gating is handled by the caller). `read_file`
+/// read-only `web_fetch`/`fetch_image` run without approval, and host tools run
+/// with per-call approval (gating is handled by the caller). `read_file`
 /// on an image path is intercepted here so the turn's model capability (`cfg`)
 /// and the DB metadata cache decide whether the image can be delivered.
 async fn dispatch_tool(
@@ -1430,6 +1478,12 @@ async fn dispatch_tool(
                 return read_file_image(path, cfg, db);
             }
         }
+    }
+    if call.name == "fetch_image" {
+        return match tools::execute_fetch_image(call).await {
+            Ok(attachment) => fetched_image_result(attachment, cfg, db),
+            Err(e) => DispatchedTool::plain(ToolOutput::err(e)),
+        };
     }
     let output = if call.name.starts_with("brave_") {
         brave.call_tool(&call.name, &call.arguments).await
@@ -1495,6 +1549,10 @@ pub(crate) async fn run_tool_loop(
     // tool-call message of this turn's subsequent requests. Never replays
     // previous turns (build_history_messages stays reasoning-free).
     let mut pending_reasoning: Option<String> = None;
+    // Images fetched by `fetch_image` during this turn. They are persisted on the
+    // final assistant row, so they are collected before the loop can break on an
+    // abort or an error (a partial turn keeps whatever it already produced).
+    let mut attachments: Vec<crate::attachments::Attachment> = Vec::new();
 
     loop {
         let body = completion_body(
@@ -1652,8 +1710,8 @@ pub(crate) async fn run_tool_loop(
                     )),
                     _ => None,
                 };
-                let (output, image) = if let Some(message) = refused {
-                    (ToolOutput::err(message), None)
+                let (output, image, attachment) = if let Some(message) = refused {
+                    (ToolOutput::err(message), None, None)
                 } else {
                     // A gated call is auto-approved under YOLO, skipped entirely
                     // otherwise (ungated), or parked on the approval channel.
@@ -1678,13 +1736,14 @@ pub(crate) async fn run_tool_loop(
                             d = dispatch_tool(call, brave, shell, memory, cfg, persist) => Some(d),
                         };
                         match dispatched {
-                            Some(d) => (d.output, d.image),
+                            Some(d) => (d.output, d.image, d.attachment),
                             None => {
                                 // Keep the transcript consistent (an assistant
                                 // `tool_calls` row must be followed by a result)
                                 // and let the UI stop showing the call as running.
                                 (
                                     ToolOutput::err("The user aborted this tool call.".into()),
+                                    None,
                                     None,
                                 )
                             }
@@ -1696,6 +1755,7 @@ pub(crate) async fn run_tool_loop(
                                 is_error: true,
                             },
                             None,
+                            None,
                         )
                     }
                 };
@@ -1706,6 +1766,10 @@ pub(crate) async fn run_tool_loop(
                     ok: !output.is_error,
                     output: output.content.clone(),
                 });
+
+                if let Some(attachment) = attachment {
+                    attachments.push(attachment);
+                }
 
                 if let Some(db) = persist {
                     db::insert_message(
@@ -1766,6 +1830,7 @@ pub(crate) async fn run_tool_loop(
         thinking: final_thinking,
         stop_reason,
         error: final_error,
+        attachments,
     })
 }
 
@@ -1986,7 +2051,15 @@ pub(crate) async fn run_chat_turn(
         }
     }
 
-    db::insert_message(
+    // Images the assistant fetched during the turn ride its reply, so they show
+    // in the transcript and survive a reload (assistant rows already render
+    // attachments). They are collected regardless of how the turn ended.
+    let attachments_json = if result.attachments.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&result.attachments).map_err(|e| e.to_string())?)
+    };
+    db::insert_message_full(
         db,
         conversation_id.clone(),
         "assistant".into(),
@@ -1997,6 +2070,7 @@ pub(crate) async fn run_chat_turn(
         result.thinking,
         Some(result.usage.to_string()),
         Some(result.stop_reason.clone()),
+        attachments_json,
     )?;
 
     sink.emit(StreamEvent::Done {
