@@ -3,6 +3,7 @@ mod attachments;
 mod android;
 mod chat;
 mod config;
+mod cron;
 mod crypt;
 mod db;
 mod import;
@@ -20,7 +21,9 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init());
     // Android-only native bridges: the host-shell bridge (Termux RUN_COMMAND),
     // the content-URI file bridge (ContentResolver), and the app-owned file
     // picker (whose launcher survives Activity recreation; see PickerPlugin.kt).
