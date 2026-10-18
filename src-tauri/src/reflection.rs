@@ -118,6 +118,65 @@ pub(crate) fn conversation_thinking_level(
         .unwrap_or_else(|| cfg.thinking_level.clone())
 }
 
+/// The turn-local config a conversation's reflection pass runs on: the
+/// conversation's own provider (base URL) and its own model, with the app-wide
+/// config as the fallback for an unset model. `None` when no model is
+/// resolvable, in which case there is nothing to run.
+///
+/// One function, so the pass and its prefix/model parity regression test go
+/// through the same resolution: drifting back to `active_turn_cfg` or the global
+/// `base_url`/`model` fails the test instead of silently reflecting a chat
+/// against the wrong endpoint. (The backfill's reduce pass deliberately stays on
+/// `active_turn_cfg`: it has no conversation to pin and must keep one model for a
+/// whole run.)
+pub(crate) fn reflection_turn_cfg(
+    cfg: &AppConfig,
+    conversation: &db::Conversation,
+) -> Option<AppConfig> {
+    let model = conversation_model(cfg, conversation)?;
+    let provider = cfg.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
+    let mut turn_cfg = cfg.clone();
+    turn_cfg.base_url = provider.base_url;
+    turn_cfg.model = model;
+    Some(turn_cfg)
+}
+
+/// Build the request a conversation's reflection pass sends: the turn-local
+/// config (the conversation's own provider + model, running at the level the
+/// conversation last recorded) and the messages (the exact live-turn prefix plus
+/// the maintenance tail). `None` when the conversation has no model to run on.
+///
+/// The pass and the prefix/model parity regression test
+/// (`chat::tests::reflection_prefix_matches_a_live_turn_prefix`) both call this,
+/// so the test drives the same path the pass does instead of rebuilding the
+/// request from the helpers itself.
+pub(crate) fn reflection_request(
+    db: &db::Db,
+    cfg: &AppConfig,
+    conversation: &db::Conversation,
+    memory: &MemoryState,
+) -> Result<Option<(AppConfig, Vec<ChatCompletionRequestMessage>)>, String> {
+    let Some(mut turn_cfg) = reflection_turn_cfg(cfg, conversation) else {
+        return Ok(None);
+    };
+    let history = db::read_messages(db, &conversation.id)?;
+    // Run at the level this conversation last ran at, not the current global
+    // one: thinking levels are per-model choices, and the chat may have been
+    // recorded under a different setting since.
+    turn_cfg.thinking_level = conversation_thinking_level(&history, cfg);
+    let system_prompt = chat::conversation_system_prompt(
+        db,
+        cfg,
+        conversation,
+        &turn_cfg.base_url,
+        &turn_cfg.model,
+        memory,
+    );
+    let recent = db::recent_reflections(db, 8).unwrap_or_default();
+    let messages = build_reflection_messages(&system_prompt, conversation, &history, &recent)?;
+    Ok(Some((turn_cfg, messages)))
+}
+
 /// Run one reflection pass over a conversation. Public so the "Consolidate now"
 /// button / a test can trigger it directly.
 pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Result<(), String> {
@@ -131,17 +190,12 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     let provider = cfg.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
     // Guard on the actual model the conversation would run on (it may pin one
     // even when the global default is unset).
-    let Some(model) = conversation_model(&cfg, &conversation) else {
+    if conversation_model(&cfg, &conversation).is_none() {
         return Ok(());
-    };
+    }
     let Some(api_key) = crate::providers::resolve(&provider.id)? else {
         return Ok(());
     };
-    // Override the turn-local config so run_tool_loop (which reads cfg.base_url
-    // / cfg.model) targets this conversation's provider + model.
-    let mut turn_cfg = cfg.clone();
-    turn_cfg.base_url = provider.base_url.clone();
-    turn_cfg.model = model.clone();
 
     let memory = app.state::<MemoryState>();
     let brave = app.state::<tools::BraveSearch>();
@@ -158,27 +212,14 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
         return Ok(());
     }
 
-    let history = db::read_messages(&db, conversation_id)?;
-    // Run at the level this conversation last ran at, not the current global
-    // one: thinking levels are per-model choices, and the chat may have been
-    // recorded under a different setting since.
-    turn_cfg.thinking_level = conversation_thinking_level(&history, &cfg);
+    // The turn-local config (the conversation's own provider + model, at the
+    // level it last ran under) and the request itself. One helper, so the pass
+    // and its regression test cannot drift apart.
+    let Some((turn_cfg, messages)) = reflection_request(&db, &cfg, &conversation, &memory)?
+    else {
+        return Ok(());
+    };
     let before = snapshot_files(&memory);
-    // Recent consolidation notes (across chats) so the model doesn't repeat work.
-    let recent = db::recent_reflections(&db, 8).unwrap_or_default();
-
-    // Reuse the SAME leading system prompt as a live chat turn so the shared
-    // conversation prefix stays cacheable. The maintenance task goes in a
-    // trailing system message — after the prefix, so it doesn't affect caching.
-    let system_prompt = chat::conversation_system_prompt(
-        &db,
-        &cfg,
-        &conversation,
-        &turn_cfg.base_url,
-        &turn_cfg.model,
-        &memory,
-    );
-    let messages = build_reflection_messages(&system_prompt, &conversation, &history, &recent)?;
 
     let tools_list = chat::chat_tools();
     let token = chat::CancelToken::new();
