@@ -280,14 +280,14 @@ async function main() {
     listed.includes("mock-model"),
     "model picker lists the mock endpoint model: " + JSON.stringify(listed),
   );
-  const providerLabels = await exec(
-    `const s=document.querySelector('header select[title="Provider"]');
-     return s ? [...s.options].map(o=>o.textContent.trim()) : [];`,
-  );
+  // The header provider <select> only renders while a conversation is active,
+  // so the reliable "key is readable" signal is the Settings provider row: it
+  // is derived from the backend's has_provider_key check ("No key" -> "Key
+  // saved" once the save lands).
+  const keyStatus = await bodyText();
   assert(
-    providerLabels.some((t) => t.includes("E2E Mock") && !t.includes("no key")),
-    "the app can read the provider key back (header no longer says '(no key)'): " +
-      JSON.stringify(providerLabels),
+    keyStatus.includes("Key saved"),
+    "the app can read the provider key back (provider row shows 'Key saved')",
   );
   await shot("02a-key-set");
 
