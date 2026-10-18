@@ -654,11 +654,24 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     if !cfg.sync_enabled {
         return Ok(());
     }
-    let Some(session) = load_session()? else {
+    let sync = app.state::<SyncState>();
+    // Record pre-flight failures in state rather than letting the `?` swallow
+    // them: the manual "Sync now" command awaits `do_sync` and only surfaces a
+    // status, so an error that never reaches `set_error` makes a click look
+    // dead. A mis-built binary's `ensure_configured` rejection (the
+    // `localhost.supabase.co` fallback) or a keychain read failure must land
+    // on the Settings panel's error line. `set_error` also clears the phase.
+    let session = load_session().map_err(|e| {
+        sync.set_error(e.clone());
+        e
+    })?;
+    let Some(session) = session else {
         return Ok(());
     };
-    let sync = app.state::<SyncState>();
-    ensure_configured(&sync.base_url)?;
+    ensure_configured(&sync.base_url).map_err(|e| {
+        sync.set_error(e.clone());
+        e
+    })?;
     if sync.syncing.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
     }
