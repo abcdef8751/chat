@@ -4,8 +4,11 @@
 # Starts a mock OpenAI-compatible SSE server, the Vite dev server, and
 # tauri-driver (WebKitWebDriver) pointed at the debug build, then drives the real
 # webview with e2e.mjs. The app runs with an isolated XDG_DATA_HOME so your real
-# chats/config are not touched. The API-key handling in e2e.mjs never overwrites
-# an existing keychain entry.
+# chats/config are not touched, AND with PI_SECRETS_DIR pointing into that same
+# isolated dir, so every keychain read/write the app makes (provider keys, Brave
+# key, sync session) lands in plain files under the temp dir instead of your
+# real OS secret service. e2e.mjs snapshots the real keychain before and after
+# the run and asserts it is byte-identical.
 #
 # Prerequisites:
 #   - node
@@ -19,6 +22,9 @@ E2E_DIR="$ROOT/e2e"
 APP="$ROOT/src-tauri/target/debug/pi-chat"
 MOCK_PORT="${MOCK_PORT:-8317}"
 WD_PORT="${WD_PORT:-4444}"
+# The debug app loads its frontend from `devUrl` in src-tauri/tauri.conf.json,
+# which is fixed at http://localhost:1420 — so the harness MUST serve on this
+# port and must never silently test a server it did not start.
 VITE_PORT=1420
 
 command -v node >/dev/null || { echo "node not found on PATH" >&2; exit 1; }
@@ -34,18 +40,34 @@ if [ ! -x "$APP" ]; then
 fi
 
 # Isolated app data dir; the app reads config from here, so seed the mock
-# endpoint + model before it starts.
+# endpoint + provider + model before it starts. `model` is deliberately a value
+# the mock does NOT serve: the harness asserts "mock-model" only appears in the
+# picker after the provider key is set and the endpoint fetch actually ran.
 DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-chat-e2e.XXXXXX")"
-mkdir -p "$DATA_DIR/com.rp.chat"
+mkdir -p "$DATA_DIR/com.rp.chat" "$DATA_DIR/secrets"
 cat > "$DATA_DIR/com.rp.chat/config.json" <<EOF
 {
   "baseUrl": "http://127.0.0.1:${MOCK_PORT}/v1",
-  "model": "mock-model",
+  "model": "e2e-never-listed",
+  "providers": [
+    {
+      "id": "e2e-mock",
+      "name": "E2E Mock",
+      "baseUrl": "http://127.0.0.1:${MOCK_PORT}/v1",
+      "defaultModel": null,
+      "catalogId": null
+    }
+  ],
+  "activeProviderId": "e2e-mock",
   "preferences": "",
   "thinkingLevel": "",
   "modelOverrides": {}
 }
 EOF
+# Never touch the user's real keychain: redirect ALL secret storage into the
+# isolated data dir (see src-tauri/src/secrets.rs). Inherited by the app,
+# which tauri-driver spawns.
+export PI_SECRETS_DIR="$DATA_DIR/secrets"
 
 pids=()
 kill_port() {
@@ -69,6 +91,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+port_in_use() {
+  ss -ltn 2>/dev/null | grep -qE "[:.]${1}[[:space:]]"
+}
+
+# Fail fast if any of our three ports is already occupied: the app's devUrl is
+# fixed at :1420 and we must never silently test a server we did not start, and
+# stale mock/WebDriver processes would be equally misleading.
+for port in "$VITE_PORT" "$MOCK_PORT" "$WD_PORT"; do
+  if port_in_use "$port"; then
+    echo "error: port $port is already in use — another e2e run or a dev server is" >&2
+    echo "       running. Stop it first and retry." >&2
+    exit 1
+  fi
+done
+
 wait_port() {
   local port="$1" i
   for i in $(seq 1 100); do
@@ -84,7 +121,9 @@ MOCK_PORT="$MOCK_PORT" node "$E2E_DIR/mock-llm.mjs" & pids+=($!)
 wait_port "$MOCK_PORT"
 
 echo "→ Vite dev server on :$VITE_PORT"
-node "$ROOT/node_modules/.bin/vite" & pids+=($!)
+# --strictPort: vite must exit when the port is taken, never silently move to
+# another port while the app connects to the fixed devUrl.
+node "$ROOT/node_modules/.bin/vite" --port "$VITE_PORT" --strictPort & pids+=($!)
 wait_port "$VITE_PORT"
 
 echo "→ tauri-driver on :$WD_PORT"

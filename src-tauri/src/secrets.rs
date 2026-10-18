@@ -35,14 +35,84 @@ const SESSION_USER: &str = "sync_session";
 const ENC_KEY_USER: &str = "sync_enc_key";
 
 // --- Storage backends -------------------------------------------------------
-// Desktop: the OS keychain via `keyring`. Android: app-private files (see the
-// module docs). The three operations (`read`/`write`/`remove`) are the seam the
-// rest of this file uses, so every secret maps to a single account name across
-// both platforms.
+// Desktop: the OS keychain via `keyring`, unless `PI_SECRETS_DIR` is set, in
+// which case secrets live in plain files under that directory (test-harness
+// isolation: the GUI e2e never touches the user's real keychain). Android:
+// app-private files (see the module docs). The three operations
+// (`read`/`write`/`remove`) are the seam the rest of this file uses, so every
+// secret maps to a single account name across all platforms/backends.
+
+/// One small file per secret, named after a lossless hex encoding of the
+/// account name. Shared by the Android store and the `PI_SECRETS_DIR`
+/// test-harness override so both bytes-match.
+mod file_store {
+    use std::path::Path;
+
+    fn path_for(dir: &Path, user: &str) -> std::path::PathBuf {
+        // Lossless hex encoding of the account name so two distinct accounts
+        // can never collide — provider ids may contain `/`, `:`, `_`, etc.,
+        // and a collapsing replace would let e.g. `a/b` and `a_b` share a file.
+        use std::fmt::Write as _;
+        let mut name = String::with_capacity(user.len() * 2);
+        for b in user.bytes() {
+            let _ = write!(name, "{b:02x}");
+        }
+        dir.join(format!("secret_{name}"))
+    }
+
+    pub fn read(dir: &Path, user: &str) -> Result<Option<String>, String> {
+        let p = path_for(dir, user);
+        match std::fs::read_to_string(&p) {
+            // Match desktop keychain semantics: an empty value is "not set",
+            // never a present-but-empty secret.
+            Ok(s) if s.is_empty() => Ok(None),
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("secrets read {}: {e}", p.display())),
+        }
+    }
+
+    pub fn write(dir: &Path, user: &str, value: &str) -> Result<(), String> {
+        let p = path_for(dir, user);
+        std::fs::write(&p, value).map_err(|e| format!("secrets write {}: {e}", p.display()))?;
+        // Tighten to owner-only (the dir itself is already sandboxed).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn remove(dir: &Path, user: &str) -> Result<(), String> {
+        let p = path_for(dir, user);
+        match std::fs::remove_file(&p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("secrets delete {}: {e}", p.display())),
+        }
+    }
+}
+
+/// When set, every secret operation is redirected from the OS keychain into
+/// plain files under this directory instead. This is the GUI e2e harness's
+/// isolation boundary: `e2e/run.sh` points it at the per-run temp data dir, so
+/// a run can never read, write, or delete the user's real keychain entries.
+/// Unset (the default) keeps the keyring backend byte-for-byte unchanged.
+fn secrets_dir_override() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("PI_SECRETS_DIR")?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(raw))
+}
 
 /// Read a stored secret for `user`. `Ok(None)` when none has been saved yet.
 #[cfg(not(target_os = "android"))]
 fn read(user: &str) -> Result<Option<String>, String> {
+    if let Some(dir) = secrets_dir_override() {
+        return file_store::read(&dir, user);
+    }
     let entry = Entry::new(SERVICE, user).map_err(|e| format!("open keychain entry: {e}"))?;
     match entry.get_password() {
         Ok(key) => Ok(Some(key)),
@@ -54,6 +124,9 @@ fn read(user: &str) -> Result<Option<String>, String> {
 /// Overwrite (or create) a stored secret for `user`.
 #[cfg(not(target_os = "android"))]
 fn write(user: &str, value: &str) -> Result<(), String> {
+    if let Some(dir) = secrets_dir_override() {
+        return file_store::write(&dir, user, value);
+    }
     let entry = Entry::new(SERVICE, user).map_err(|e| format!("open keychain entry: {e}"))?;
     entry
         .set_password(value)
@@ -63,6 +136,9 @@ fn write(user: &str, value: &str) -> Result<(), String> {
 /// Remove a stored secret for `user`. Removing a missing entry is a no-op.
 #[cfg(not(target_os = "android"))]
 fn remove(user: &str) -> Result<(), String> {
+    if let Some(dir) = secrets_dir_override() {
+        return file_store::remove(&dir, user);
+    }
     let entry = Entry::new(SERVICE, user).map_err(|e| format!("open keychain entry: {e}"))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
@@ -75,7 +151,6 @@ fn remove(user: &str) -> Result<(), String> {
 /// the app data dir; `init` is called once from `setup`.
 #[cfg(target_os = "android")]
 mod android_store {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
@@ -93,45 +168,16 @@ mod android_store {
             .expect("secrets::android_store::init must run before any secret access")
     }
 
-    fn path_for(user: &str) -> PathBuf {
-        // Lossless hex encoding of the account name so two distinct accounts
-        // can never collide — provider ids may contain `/`, `:`, `_`, etc.,
-        // and a collapsing replace would let e.g. `a/b` and `a_b` share a file.
-        use std::fmt::Write as _;
-        let mut name = String::with_capacity(user.len() * 2);
-        for b in user.bytes() {
-            let _ = write!(name, "{b:02x}");
-        }
-        dir().join(format!("secret_{name}"))
-    }
-
     pub fn read(user: &str) -> Result<Option<String>, String> {
-        let p = path_for(user);
-        match std::fs::read_to_string(&p) {
-            // Match desktop keychain semantics: an empty value is "not set",
-            // never a present-but-empty secret.
-            Ok(s) if s.is_empty() => Ok(None),
-            Ok(s) => Ok(Some(s)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("secrets read {}: {e}", p.display())),
-        }
+        super::file_store::read(dir(), user)
     }
 
     pub fn write(user: &str, value: &str) -> Result<(), String> {
-        let p = path_for(user);
-        std::fs::write(&p, value).map_err(|e| format!("secrets write {}: {e}", p.display()))?;
-        // The app-private dir is already sandboxed; tighten to owner-only too.
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-        Ok(())
+        super::file_store::write(dir(), user, value)
     }
 
     pub fn remove(user: &str) -> Result<(), String> {
-        let p = path_for(user);
-        match std::fs::remove_file(&p) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("secrets delete {}: {e}", p.display())),
-        }
+        super::file_store::remove(dir(), user)
     }
 }
 

@@ -4,16 +4,26 @@
 // webview against the mock LLM. Assertions cover the P0 UX fixes:
 //   - streaming reply is not truncated (unterminated final SSE chunk)
 //   - the reasoning trace button's DOM node survives stream updates, and the
-//     trace opens live and after completion (reasoning renders as inline
-//     containers, not one auto-collapsing activity row)
+//     trace opens live and after completion
 //   - the message list auto-scrolls to the bottom and short chats are
 //     bottom-anchored
 //   - the context readout uses the 0.8x / 200k allowed budget
+//
+// Key handling: the run gives the seeded provider an API key through the real
+// provider edit form in Settings (the *provider* key field — never the Brave
+// Search card, and never the legacy `api_key` account). All secret writes land
+// in the isolated PI_SECRETS_DIR the app was launched with (run.sh), so the
+// user's real OS keychain is never read or written; the before/after
+// keychain snapshots below prove byte-identity, and the suite fails if they
+// differ. The model picker is polled (not asserted once) and on failure the
+// dump includes the actual options plus the visible page text.
 //
 // Note: on this WebKitGTK build, WebDriver's Element Click / Send Keys / Actions
 // return "unsupported operation" (a build-time limitation; see e2e/README.md).
 // Clicks are dispatched in-page via `el.click()`, and the DOM-churn regression
 // the <Index> list fixes is covered by a node-identity check.
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -135,8 +145,70 @@ const closePopup = () =>
 if(b){b.click();return true;} return false;`,
   );
 
+// --- Real-keychain snapshot (read-only proof of isolation) ------------------
+// The app is launched with PI_SECRETS_DIR set, so it never touches the user's
+// keychain. These helpers still snapshot every `com.rp.chat` entry before the
+// run and again at the end, and the suite FAILS if they differ — the run must
+// leave the user's real keychain byte-identical, no exceptions.
+const KEYCHAIN_SERVICE = "com.rp.chat";
+
+function keychainSnapshot() {
+  try {
+    const raw = execFileSync(
+      "secret-tool",
+      ["search", "--all", "service", KEYCHAIN_SERVICE],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000 },
+    ).toString();
+    return {
+      sha256: createHash("sha256").update(raw).digest("hex"),
+      entries: (raw.match(/^\[/gm) ?? []).length,
+      users: [...raw.matchAll(/attribute\.username = (.+)/g)].map((m) => m[1]),
+    };
+  } catch (e) {
+    log("keychain snapshot unavailable (secret-tool missing or keyring locked):", e.message);
+    return null;
+  }
+}
+
+function reportKeychain(snapshot) {
+  return snapshot
+    ? `${snapshot.entries} com.rp.chat entrie(s), sha256 ${snapshot.sha256}`
+    : "unavailable";
+}
+
+// Compare a before-run snapshot with the current keychain state and assert
+// byte-identity. Called from the success path and from the failure path so the
+// proof holds even when an assertion further along aborts the run.
+function verifyKeychainUnchanged(before) {
+  const after = keychainSnapshot();
+  log("keychain snapshot (after run):", reportKeychain(after));
+  if (before && after) {
+    const same = before.sha256 === after.sha256;
+    if (!same) {
+      log(
+        "keychain entries changed!",
+        JSON.stringify(before.users),
+        "->",
+        JSON.stringify(after.users),
+      );
+    }
+    assert(
+      same,
+      `the real OS keychain is byte-identical before and after the run (before ${before.sha256}, after ${after.sha256})`,
+    );
+    return true;
+  }
+  log("keychain before/after proof skipped (secret-tool unavailable)");
+  return false;
+}
+
+let keychainBefore = null;
+const modelPollStates = new Set();
+
 async function main() {
   log("creating session for", APP);
+  keychainBefore = keychainSnapshot();
+  log("keychain snapshot (before run):", reportKeychain(keychainBefore));
   const created = await wd("POST", "/session", {
     capabilities: { alwaysMatch: { "tauri:options": { application: APP } } },
   });
@@ -151,32 +223,105 @@ async function main() {
   );
   await shot("01-startup");
 
-  // --- Settings: ensure an API key exists (never clobber an existing one) ---
-  await click("//button[normalize-space(.)='Settings']");
-  await waitFor("settings dialog", () => findCss("input[type='password']"));
-  const hasExistingKey = await exists(
-    "xpath",
-    "//button[normalize-space(.)='Remove saved key']",
+  // --- Settings: give the ACTIVE PROVIDER an API key through the real UI ---
+  // The *provider* edit form's API-key field is the only path that makes
+  // providers::resolve succeed for the seeded provider — the Brave Search
+  // card (a different password input further down the dialog) must stay
+  // untouched, and the legacy `api_key` account is never written either. All
+  // writes land in PI_SECRETS_DIR; the keychain snapshots prove it.
+  const modelOptionValues = () =>
+    exec(
+      `const s=document.querySelector('header select[title="Model"]');
+       return s ? [...s.options].map(o=>o.value) : [];`,
+    );
+  // The injected model (`e2e-never-listed`) is NOT what the mock serves, so
+  // this is a genuine pre-condition: the endpoint model cannot appear before
+  // the key is set and the endpoint fetch has run.
+  const initialValues = await modelOptionValues();
+  assert(
+    !initialValues.includes("mock-model"),
+    "the mock endpoint model is not listed before the key is set: " + JSON.stringify(initialValues),
   );
-  let addedKey = false;
-  if (!hasExistingKey) {
-    await setInputCss("input[type='password']", "mock-key");
-    addedKey = true;
-    log("stored a test API key (none existed before)");
-  } else {
-    log("existing keychain entry found — leaving it untouched");
-  }
+
+  await click("//button[normalize-space(.)='Settings']");
+  await waitFor("provider list with an Edit button", () =>
+    find("xpath", "//button[normalize-space(.)='Edit']").catch(() => null),
+  );
+  await click("//button[normalize-space(.)='Edit']");
+  // The edit form renders the provider's API-key field as the FIRST password
+  // input in the dialog DOM (the add-provider form is closed, and the Brave
+  // card + sync forms come later in the dialog).
+  await waitFor("provider API-key field", () => findCss("input[type='password']"));
+  await setInputCss("input[type='password']", "mock-key");
+  await click("//button[normalize-space(.)='Save']");
+
+  // Wait for the save + model refetch to land, polling the MODEL picker (the
+  // header has a sibling provider <select>; the model one is title="Model").
+  const pickerFailureDump = async () => {
+    const state = await exec(
+      `const v=document.querySelector('header select[title="Model"]');
+       return { values: v ? [...v.options].map(o=>o.value) : [],
+                text: document.body.innerText.slice(0, 500) };`,
+    );
+    return `actual options: ${JSON.stringify(state.values)}; page text: ${JSON.stringify(state.text)}`;
+  };
+  const listed = await waitFor(
+    "the model picker to list the mock endpoint model",
+    async () => {
+      const vals = await modelOptionValues();
+      // Diagnostic: log each distinct options state the poll observes, so a
+      // failure shows exactly what the select went through.
+      const stateKey = JSON.stringify(vals);
+      if (!modelPollStates.has(stateKey)) {
+        modelPollStates.add(stateKey);
+        log("poll saw model select:", stateKey);
+      }
+      return vals.includes("mock-model") ? vals : null;
+    },
+    20000,
+  ).catch(async (e) => {
+    throw new Error(
+      `model picker never listed the mock endpoint model — ${await pickerFailureDump()} (${e.message})`,
+    );
+  });
+  assert(
+    listed.includes("mock-model"),
+    "model picker lists the mock endpoint model: " + JSON.stringify(listed),
+  );
+  // The header provider <select> only renders while a conversation is active,
+  // so the reliable "key is readable" signal is the Settings provider row: it
+  // is derived from the backend's has_provider_key check ("No key" -> "Key
+  // saved" once the save lands).
+  const keyStatus = await bodyText();
+  assert(
+    keyStatus.includes("Key saved"),
+    "the app can read the provider key back (provider row shows 'Key saved')",
+  );
+  await shot("02a-key-set");
+
   await click("//button[normalize-space(.)='Done']");
   await waitFor("settings closed", async () =>
     (await exec("return !document.querySelector(\"input[type='password']\");")) === true,
   );
 
-  const modelValues = await exec(
-    "const s=document.querySelector('header select'); return s ? [...s.options].map(o=>o.value) : [];",
-  );
+  // The picker must still list the model after Settings closes — poll, don't
+  // assert once.
+  const listedAfterClose = await waitFor(
+    "the model picker after closing Settings",
+    async () => {
+      const vals = await modelOptionValues();
+      return vals.includes("mock-model") ? vals : null;
+    },
+    20000,
+  ).catch(async (e) => {
+    throw new Error(
+      `model picker lost the mock endpoint model after closing Settings — ${await pickerFailureDump()} (${e.message})`,
+    );
+  });
   assert(
-    modelValues.includes("mock-model"),
-    "model picker lists the mock endpoint model: " + JSON.stringify(modelValues),
+    listedAfterClose.includes("mock-model"),
+    "model picker lists the mock endpoint model after closing Settings: " +
+      JSON.stringify(listedAfterClose),
   );
   await shot("02-settings-done");
 
@@ -188,7 +333,8 @@ async function main() {
 
   // --- Send a message ---
   await setInputCss("footer textarea", "hello there");
-  await click("//button[normalize-space(.)='Send']");
+  // The composer's send control is an icon button (title="Send", no text).
+  await click("//button[@title='Send']");
 
   // --- The trace button's DOM node must survive streamed updates ---
   // <For> recreated the row on every delta (dropping mid-press clicks);
@@ -200,7 +346,7 @@ async function main() {
   );
   await sleep(1000);
   const stable = await exec(
-    "const b=document.querySelector(\"button[title='Show the reasoning trace']\"); return {same: !!window.__traceBtn && window.__traceBtn === b, streaming: document.body.innerText.includes('Stop'), container: !!document.querySelector(\"button[title='Show reasoning text']\")};",
+    "const b=document.querySelector(\"button[title='Show the reasoning trace']\"); return {same: !!window.__traceBtn && window.__traceBtn === b, streaming: !!document.querySelector(\"button[aria-label='Stop']\"), container: !!document.querySelector(\"button[title='Show reasoning text']\")};",
   );
   assert(stable.streaming, "still streaming while checking node identity (mid-stream)");
   assert(stable.same, "trace button DOM node survived a streamed update (<Index> fix)");
@@ -286,7 +432,7 @@ async function main() {
 
   // --- Tool calls + reasoning interleave inline, in stream order ---
   await setInputCss("footer textarea", "tooltest");
-  await click("//button[normalize-space(.)='Send']");
+  await click("//button[@title='Send']");
   await waitFor(
     "tool approval card",
     () => find("xpath", "//button[normalize-space(.)='Approve']").catch(() => null),
@@ -372,13 +518,11 @@ async function main() {
   assert(true, "a memory-consolidation note appears in the conversation");
   await shot("11-consolidation-note");
 
-  // --- Cleanup the test key if we added it ---
-  if (addedKey) {
-    await click("//button[normalize-space(.)='Settings']");
-    await click("//button[normalize-space(.)='Remove saved key']");
-    await click("//button[normalize-space(.)='Done']");
-    log("removed the test API key");
-  }
+  // --- Keychain proof: the real OS keychain must be byte-identical ---
+  // Nothing in this run may read, write, or delete a real keychain entry; the
+  // app wrote its test key into PI_SECRETS_DIR instead. Fail loudly if the
+  // user's keychain changed under us (an external process would show here too).
+  verifyKeychainUnchanged(keychainBefore);
 
   log("ALL ASSERTIONS PASSED");
 }
@@ -400,6 +544,13 @@ main()
       await shot("99-failure");
       console.error("[e2e] body text:\n", (await bodyText()).slice(0, 1500));
     } catch {}
+    // The keychain proof still runs on the failure path: an aborted run must
+    // not silently leave the user's real keychain in a different state.
+    try {
+      verifyKeychainUnchanged(keychainBefore);
+    } catch (k) {
+      console.error("[e2e] keychain check failed too:", k.message);
+    }
     await cleanup();
     process.exit(1);
   });
