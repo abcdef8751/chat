@@ -127,10 +127,7 @@ export default function App() {
   const [activeId, setActiveId] = createSignal<string | null>(null);
   const [messages, setMessages] = createSignal<Message[]>([]);
   const [draft, setDraft] = createSignal("");
-  const [streaming, setStreaming] = createSignal(false);
-  const [streamingConvId, setStreamingConvId] = createSignal<string | null>(null);
   const [streamError, setStreamError] = createSignal<string | null>(null);
-  const [liveTools, setLiveTools] = createSignal<LiveTool[]>([]);
   const [nearBottom, setNearBottom] = createSignal(true);
   let messagesScrollEl: HTMLElement | undefined;
 
@@ -140,9 +137,58 @@ export default function App() {
   const [editDraft, setEditDraft] = createSignal("");
   const [editAttachments, setEditAttachments] = createSignal<Attachment[]>([]);
 
-  // A monotonic token so a superseded turn's late channel events (after Stop /
-  // a re-send) are ignored.
-  let turnToken = 0;
+  // --- Per-conversation streaming state ---
+  // In-flight turn bookkeeping per conversation. `messages()` only holds the
+  // visible conversation's rows; a chat switched away from drops its `tmp-` rows
+  // on reload. This record preserves the accumulating answer (plus live tool
+  // cards and the current round's preamble/thinking) so switching back can
+  // re-attach the live row and keep rendering streamed output. Keyed by
+  // conversation id; an entry exists only while a turn is in flight.
+  interface LiveTurn {
+    token: number;            // this turn's per-conversation token (turnTokens[id])
+    assistantKey: string;     // "tmp-assistant-N"
+    content: string;          // accumulated assistant text
+    thinking: string;         // accumulated reasoning
+    liveTools: LiveTool[];
+  }
+  const [streamingIds, setStreamingIds] = createSignal<ReadonlySet<string>>(new Set());
+  const [liveTurns, setLiveTurns] = createSignal<Record<string, LiveTurn>>({});
+  // Per-conversation turn tokens: a resend/Stop→resend only supersedes the same
+  // conversation's events, never another conversation's stream.
+  const turnTokens: Record<string, number> = {};
+
+  const addStreaming = (id: string) =>
+    setStreamingIds((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
+  const removeStreaming = (id: string) =>
+    setStreamingIds((prev) =>
+      prev.has(id) ? new Set([...prev].filter((x) => x !== id)) : prev,
+    );
+  const isStreaming = (id: string | null | undefined) => !!id && streamingIds().has(id);
+  // Live tool cards for the ACTIVE conversation (derived, so no shared array):
+  const liveTools = () => liveTurns()[activeId() ?? ""]?.liveTools ?? [];
+
+  function patchLiveTurn(id: string, patch: (live: LiveTurn) => void) {
+    setLiveTurns((prev) => {
+      const cur = prev[id];
+      if (!cur) return prev;
+      const next = { ...cur };
+      patch(next);
+      return { ...prev, [id]: next };
+    });
+  }
+  function setLiveTurn(id: string, turn: LiveTurn) {
+    setLiveTurns((prev) => ({ ...prev, [id]: turn }));
+  }
+  // Token-guarded drop: a superseded (Stop→resend) turn's terminal event must not
+  // delete the NEW turn's live record — same pattern as the backend's registry.
+  function dropLiveTurn(id: string, token: number) {
+    setLiveTurns((prev) => {
+      if (prev[id]?.token !== token) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }
 
   // Files staged for the next message (picked or dropped).
   const [pendingAttachments, setPendingAttachments] = createSignal<Attachment[]>([]);
@@ -501,7 +547,7 @@ export default function App() {
       (event) => {
         void refreshReflectionStats();
         const id = activeId();
-        if (id && event.payload.conversationId === id && !streaming()) {
+        if (id && event.payload.conversationId === id && !isStreaming(id)) {
           listMessages(id).then(setMessages);
         }
         refreshConversations().catch(() => {});
@@ -535,7 +581,7 @@ export default function App() {
       if (!event.payload?.changed) return;
       refreshConversations().catch(() => {});
       const id = activeId();
-      if (id && !streaming()) listMessages(id).then(setMessages);
+      if (id && !isStreaming(id)) listMessages(id).then(setMessages);
     });
     onCleanup(() => unlistenSync);
 
@@ -684,7 +730,34 @@ export default function App() {
       setMessages([]);
       return;
     }
-    listMessages(id).then(setMessages);
+    listMessages(id).then((rows) => {
+      if (activeId() !== id) return; // user switched again while loading
+      const live = liveTurns()[id];
+      if (live) {
+        // Re-attach the in-flight assistant row so a chat switched back to
+        // mid-turn keeps rendering streamed output. Deltas keep appending to it.
+        setMessages([
+          ...rows,
+          {
+            id: live.assistantKey,
+            conversation_id: id,
+            role: "assistant",
+            index: rows.length,
+            content: live.content,
+            model: null,
+            provider: null,
+            thinking_level: null,
+            thinking: live.thinking,
+            usage: null,
+            stop_reason: null,
+            attachments: null,
+            created_at: Date.now(),
+          },
+        ]);
+      } else {
+        setMessages(rows);
+      }
+    });
   });
 
   // Keep the newest message in view unless the user has scrolled up or is
@@ -1459,28 +1532,26 @@ export default function App() {
     };
     setMessages((prev) => [...prev, assistantMsg]);
     setNearBottom(true);
-    setStreaming(true);
-    setStreamingConvId(id);
+    addStreaming(id);
     setStreamError(null);
-    setLiveTools([]);
     setOpenTrace(null);
 
-    const token = ++turnToken;
+    const token = (turnTokens[id] = (turnTokens[id] ?? 0) + 1);
+    setLiveTurn(id, { token, assistantKey, content: "", thinking: "", liveTools: [] });
 
     const received = { current: false };
     const channel = new Channel<StreamEvent>();
     channel.onmessage = (ev) => {
       // Ignore events from a superseded turn (Stop, then a new send).
-      if (token !== turnToken) return;
+      if (turnTokens[id] !== token) return;
       // Terminal events must ALWAYS be handled, even if the user switched to a
       // different conversation mid-turn. Dropping them left `streaming` set
       // forever, which disabled the composer in every chat. Only the visible
       // transcript needs refreshing.
       if (ev.type === "done" || ev.type === "error") {
         if (ev.type === "error" && activeId() === id) setStreamError(ev.message);
-        setStreaming(false);
-        setStreamingConvId(null);
-        setLiveTools([]);
+        removeStreaming(id);
+        dropLiveTurn(id, token);
         if (activeId() === id) listMessages(id).then(setMessages);
         refreshConversations().catch(() => {});
         return;
@@ -1494,6 +1565,9 @@ export default function App() {
       if (activeId() !== id) return;
       if (ev.type === "delta") {
         received.current = true;
+        patchLiveTurn(id, (live) => {
+          live.content += ev.text;
+        });
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantKey ? { ...m, content: m.content + ev.text } : m,
@@ -1501,6 +1575,9 @@ export default function App() {
         );
       } else if (ev.type === "thinkingDelta") {
         received.current = true;
+        patchLiveTurn(id, (live) => {
+          live.thinking += ev.text;
+        });
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantKey ? { ...m, thinking: (m.thinking ?? "") + ev.text } : m,
@@ -1512,46 +1589,56 @@ export default function App() {
         // then reset the in-flight message so the next round starts clean. The
         // final round emits no `toolCall`, so whatever text remains stays as the
         // answer bubble. `groupTurns` re-emits the flushed preamble before this
-        // call, matching the persisted rows after `done`.
-        const cur = messages().find((m) => m.id === assistantKey);
-        const thinking = cur?.thinking ?? "";
-        const preamble = cur?.content ?? "";
+        // call, matching the persisted rows after `done`. The preamble is read
+        // from the LIVE RECORD, not from `messages()` (which belongs to whatever
+        // conversation is visible — an off-screen turn captures its own).
+        const live = liveTurns()[id];
+        const thinking = live?.thinking ?? "";
+        const preamble = live?.content ?? "";
         const hasPreamble = thinking.trim().length > 0 || preamble.trim().length > 0;
         if (hasPreamble) {
+          patchLiveTurn(id, (l) => {
+            l.content = "";
+            l.thinking = "";
+          });
+        }
+        if (activeId() === id) {
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantKey ? { ...m, content: "", thinking: "" } : m,
             ),
           );
         }
-        setLiveTools((prev) => [
-          ...prev,
-          {
-            callId: ev.callId,
-            name: ev.name,
-            arguments: formatToolArgs(ev.arguments),
-            gated: ev.gated,
-            state: ev.gated ? "pending" : "running",
-            thinking: hasPreamble ? thinking : undefined,
-            text: hasPreamble ? preamble : undefined,
-          },
-        ]);
+        patchLiveTurn(id, (l) => {
+          l.liveTools = [
+            ...l.liveTools,
+            {
+              callId: ev.callId,
+              name: ev.name,
+              arguments: formatToolArgs(ev.arguments),
+              gated: ev.gated,
+              state: ev.gated ? "pending" : "running",
+              thinking: hasPreamble ? thinking : undefined,
+              text: hasPreamble ? preamble : undefined,
+            },
+          ];
+        });
       } else if (ev.type === "toolResult") {
         received.current = true;
-        setLiveTools((prev) =>
-          prev.map((t) =>
+        patchLiveTurn(id, (l) => {
+          l.liveTools = l.liveTools.map((t) =>
             t.callId === ev.callId
               ? { ...t, state: "done", ok: ev.ok, output: ev.output }
               : t,
-          ),
-        );
+          );
+        });
       }
     };
 
     try {
       await streamChat(id, text, staged, channel, regenerate);
     } catch (e) {
-      if (token !== turnToken) return;
+      if (turnTokens[id] !== token) return;
       if (activeId() === id && !received.current) {
         // Command errored before streaming began (e.g. missing key/match).
         setMessages((prev) =>
@@ -1564,17 +1651,16 @@ export default function App() {
           setPendingAttachments(staged);
         }
       }
-      setStreaming(false);
-      setStreamingConvId(null);
-      setLiveTools([]);
-      setStreamError(String(e));
+      removeStreaming(id);
+      dropLiveTurn(id, token);
+      if (activeId() === id) setStreamError(String(e));
     }
   }
 
   async function send() {
     const staged = pendingAttachments();
-    if (streaming() || (!draft().trim() && staged.length === 0)) return;
     let id = activeId();
+    if (isStreaming(id) || (!draft().trim() && staged.length === 0)) return;
     if (!id) {
       const created = await createConversation();
       setConversations([created, ...conversations()]);
@@ -1608,22 +1694,18 @@ export default function App() {
 
   async function stop() {
     const id = activeId();
-    if (!id) return;
-    // Close the abort race: keep `streaming` set until `stop_chat` has been
-    // delivered. Otherwise the composer is re-enabled while the abort is still
-    // in flight and a quick re-send can be cancelled by the late `stop_chat`.
-    // The command only raises the backend's cancel flag (it returns
-    // immediately), so the composer re-enables as soon as it lands. The
-    // stream's own `done` event still reloads the persisted rows (the turn
-    // token is deliberately not superseded), so the timeline still reconciles.
+    if (!id || !isStreaming(id)) return;
+    // Close the abort race exactly as before: keep the live turn (temp row +
+    // accumulated content) until the backend's terminal event arrives — its
+    // handler drops the record and reloads the persisted rows. The turn token
+    // is deliberately NOT superseded, so the terminal still reconciles; a quick
+    // re-send bumps the token and the old terminal is ignored.
     try {
       await stopChat(id);
     } catch {
       // noop — the backend still settles the aborted turn.
     }
-    setStreaming(false);
-    setStreamingConvId(null);
-    setLiveTools([]);
+    removeStreaming(id);
     // The user message is persisted by the backend *before* streaming starts, so
     // it is already in the transcript. Handing the draft back here would
     // duplicate it on the next send, so Stop simply returns the composer to its
@@ -1633,7 +1715,7 @@ export default function App() {
   // --- Inline editing of user messages (Item 13) --------------------------
 
   function startEditMessage(m: Message) {
-    if (streaming()) return;
+    if (isStreaming(activeId())) return;
     // Only persisted rows are editable; a `tmp-` row hasn't been written yet.
     if (m.id.startsWith("tmp-")) return;
     setEditingId(m.id);
@@ -1675,7 +1757,7 @@ export default function App() {
   async function saveEditMessage() {
     const id = activeId();
     const messageId = editingId();
-    if (!id || !messageId || streaming()) return;
+    if (!id || !messageId || isStreaming(id)) return;
     const text = editDraft().trim();
     const atts = editAttachments();
     if (!text && atts.length === 0) return;
@@ -1701,27 +1783,22 @@ export default function App() {
   }
 
   function approveLiveTool(callId: string) {
-    setLiveTools((prev) =>
-      prev.map((x) => (x.callId === callId ? { ...x, state: "running" } : x)),
-    );
+    patchLiveTurn(activeId() ?? "", (l) => {
+      l.liveTools = l.liveTools.map((x) => (x.callId === callId ? { ...x, state: "running" } : x));
+    });
     approveTool(callId).catch(() => {});
   }
 
   function denyLiveTool(callId: string) {
-    setLiveTools((prev) =>
-      prev.map((x) => (x.callId === callId ? { ...x, state: "running" } : x)),
-    );
+    patchLiveTurn(activeId() ?? "", (l) => {
+      l.liveTools = l.liveTools.map((x) => (x.callId === callId ? { ...x, state: "running" } : x));
+    });
     denyTool(callId).catch(() => {});
   }
 
   // Group messages into per-turn timelines, augmented with live tool activity.
   // Only show live tools when this conversation is the streaming one.
-  const turns = () =>
-    groupTurns(
-      messages(),
-      liveTools(),
-      streaming() && streamingConvId() === activeId(),
-    );
+  const turns = () => groupTurns(messages(), liveTools(), isStreaming(activeId()));
 
   const activeTitle = () => {
     const id = activeId();
@@ -1980,8 +2057,7 @@ export default function App() {
     const m = messages().find((x) => x.id === id);
     if (!m?.thinking?.trim()) return null;
     const live = Boolean(
-      streaming() &&
-        streamingConvId() === activeId() &&
+      isStreaming(activeId()) &&
         m.id.startsWith("tmp-assistant-") &&
         !m.content,
     );
@@ -2225,7 +2301,7 @@ export default function App() {
             <MessageList
               turns={turns()}
               empty={messages().length === 0}
-              streaming={streaming() && streamingConvId() === activeId()}
+              streaming={isStreaming(activeId())}
               thinkingOpenId={thinkingOpenId()}
               onToggleThought={toggleThought}
               onApprove={approveLiveTool}
@@ -2254,8 +2330,8 @@ export default function App() {
           onRemoveAttachment={removeAttachment}
           contextNote={contextNote()}
           attachmentWarning={attachmentWarning()}
-          streaming={streaming() && streamingConvId() === activeId()}
-          busy={streaming()}
+          streaming={isStreaming(activeId())}
+          busy={isStreaming(activeId())}
           onPickAttachments={pickAttachments}
           draft={draft()}
           setDraft={setDraft}
