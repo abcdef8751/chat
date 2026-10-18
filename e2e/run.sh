@@ -117,7 +117,12 @@ wait_port() {
 }
 
 echo "→ mock LLM on :$MOCK_PORT"
-MOCK_PORT="$MOCK_PORT" node "$E2E_DIR/mock-llm.mjs" & pids+=($!)
+# A deliberate, generous gap between reasoning chunks: the "(live)" reasoning
+# popup and the mid-stream node-identity check both need the reasoning phase to
+# still be in flight when they run, and the default 700 ms put the first content
+# chunk inside the same second as those assertions.
+MOCK_PORT="$MOCK_PORT" MOCK_THINK_GAP="${MOCK_THINK_GAP:-1200}" \
+  node "$E2E_DIR/mock-llm.mjs" & pids+=($!)
 wait_port "$MOCK_PORT"
 
 echo "→ Vite dev server on :$VITE_PORT"

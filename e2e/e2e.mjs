@@ -341,26 +341,33 @@ async function main() {
   // <Index> keeps the same DOM node. This is the P0 regression check.
   const traceXp = "//button[@title='Show the reasoning trace']";
   await waitFor("live thinking button", () => find("xpath", traceXp).catch(() => null), 8000);
-  await exec(
-    "window.__traceBtn = document.querySelector(\"button[title='Show the reasoning trace']\"); return !!window.__traceBtn;",
-  );
-  await sleep(1000);
-  const stable = await exec(
-    "const b=document.querySelector(\"button[title='Show the reasoning trace']\"); return {same: !!window.__traceBtn && window.__traceBtn === b, streaming: !!document.querySelector(\"button[aria-label='Stop']\"), container: !!document.querySelector(\"button[title='Show reasoning text']\")};",
-  );
-  assert(stable.streaming, "still streaming while checking node identity (mid-stream)");
-  assert(stable.same, "trace button DOM node survived a streamed update (<Index> fix)");
-  assert(
-    stable.container,
-    "the reasoning container is present (and toggleable) mid-stream, not hidden behind a global toggle",
-  );
 
+  // Open the popup IMMEDIATELY. The "(live)" badge only holds while the reasoning
+  // is the in-flight row and the answer has emitted no text yet, so any sleep
+  // here races the first content chunk and the badge is gone.
   await click(traceXp);
   const livePopup = await waitFor("live trace popup", async () => (await popupText()) || null, 6000);
   assert(livePopup.includes("live"), "live trace popup opened mid-stream and shows (live)");
   assert(livePopup.includes("Let me think"), "live popup contains streamed reasoning so far");
   await shot("04-live-trace-popup");
   await closePopup();
+
+  // Same node still there after further streamed updates, and after the popup
+  // toggled its highlight (which is exactly the kind of in-place update that a
+  // keyed <For> would have rebuilt).
+  await exec(
+    "window.__traceBtn = document.querySelector(\"button[title='Show the reasoning trace']\"); return !!window.__traceBtn;",
+  );
+  await sleep(1000);
+  const stable = await exec(
+    "const b=document.querySelector(\"button[title='Show the reasoning trace']\"); return {same: !!window.__traceBtn && window.__traceBtn === b, streaming: !!document.querySelector(\"button[aria-label='Stop']\"), container: !!document.querySelector(\"button[title='Show activity timeline']\")};",
+  );
+  assert(stable.streaming, "still streaming while checking node identity (mid-stream)");
+  assert(stable.same, "trace button DOM node survived a streamed update (<Index> fix)");
+  assert(
+    stable.container,
+    "the activity container is present mid-stream (auto-opened while streaming)",
+  );
 
   // --- Completion: full reply incl. the unterminated final SSE chunk ---
   await waitFor(
@@ -374,41 +381,49 @@ async function main() {
   assert(true, "reply complete incl. unterminated final SSE chunk (no cut-off)");
   await shot("05-reply-complete");
 
-  // --- The turn reads as ONE continuous reply: a reasoning container plus the
-  // output segment, in stream order. There is no single auto-collapsing
-  // "activity" row any more, so nothing may hide behind one global toggle. ---
+  // --- The turn keeps ONE activity container. It collapses when the turn ends,
+  // so the answer reads as the transcript; the raw trace is never inline — it
+  // lives in the popup, reachable from the Thought button inside the container. ---
   assert(
     (await bodyText()).includes(EXPECT_TEXT),
     "the reply renders as assistant output prose",
   );
   assert(
-    await exists("xpath", "//button[@title='Show reasoning text']"),
-    "the turn's reasoning container is present after the turn",
+    await exists("xpath", "//button[@title='Show activity timeline']"),
+    "the turn's activity container is present after the turn",
   );
   assert(
     !(await bodyText()).includes(EXPECT_THINK),
-    "the reasoning body stays collapsed by default (the output is not)",
+    "the activity body is collapsed by default (the answer is not)",
   );
 
-  // --- The container's own chevron toggles the reasoning inline, both ways ---
-  await click("//button[@title='Show reasoning text']");
+  // --- Its chevron toggles the body (Thought button + tool cards), never the
+  // raw trace, which stays popup-only. ---
+  await click("//button[@title='Show activity timeline']");
   await waitFor(
-    "inline reasoning text",
-    async () => ((await bodyText()).includes(EXPECT_THINK) ? true : null),
+    "inline Thought button",
+    () => find("xpath", traceXp).catch(() => null),
     6000,
   );
-  assert(true, "chevron expands the reasoning inline");
-  await shot("06-inline-reasoning");
-  await click("//button[@title='Hide reasoning text']");
+  assert(
+    !(await bodyText()).includes(EXPECT_THINK),
+    "expanding the container shows the Thought button, not the raw trace",
+  );
+  assert(true, "chevron expands the activity body inline");
+  await shot("06-inline-activity");
+  await click("//button[@title='Show activity timeline']");
   await waitFor(
-    "inline reasoning hidden again",
-    async () => ((await bodyText()).includes(EXPECT_THINK) ? null : true),
+    "activity body hidden again",
+    async () => ((await find("xpath", traceXp).catch(() => null)) ? null : true),
     6000,
   );
-  assert(true, "chevron collapses the reasoning inline again");
+  assert(true, "chevron collapses the activity body inline again");
 
-  // --- Trace popup still reachable after completion ---
-  await click("//button[@title='Show the reasoning trace']");
+  // --- Trace popup still reachable after completion (reopen: the button only
+  // exists while the container is expanded) ---
+  await click("//button[@title='Show activity timeline']");
+  await waitFor("Thought button for popup", () => find("xpath", traceXp).catch(() => null), 6000);
+  await click(traceXp);
   const finalPopup = await waitFor("final trace popup", async () => (await popupText()) || null, 6000);
   assert(finalPopup.includes(EXPECT_THINK), "final trace popup contains the reasoning trace");
   await shot("06-final-trace-popup");
@@ -459,8 +474,30 @@ async function main() {
   );
   assert(true, "tool round completed after approval");
 
-  // The call card and its paired result stay inline after the turn: nothing
-  // auto-collapses, and the final answer follows them as output prose.
+  // The activity (reasoning button + call card + paired result) collapses when
+  // the turn ends, so the transcript reads as the answer; expanding it brings
+  // them back, inline.
+  const collapsedBody = await waitFor(
+    "final answer only",
+    async () => {
+      const text = await bodyText();
+      return text.includes("TOOL DONE") ? text : null;
+    },
+    6000,
+  );
+  assert(
+    !collapsedBody.includes("timeline-ok"),
+    "the finished turn collapses its activity (the answer stays)",
+  );
+  const containers = await exec(
+    "return document.querySelectorAll(\"button[title='Show activity timeline']\").length;",
+  );
+  assert(
+    containers === 1,
+    `the whole turn's activity is grouped into one container (got ${containers})`,
+  );
+
+  await click("//button[@title='Show activity timeline']");
   const toolBody = await waitFor(
     "inline tool card + result",
     async () => {
@@ -477,14 +514,7 @@ async function main() {
   );
   assert(
     await exists("xpath", "//button[@title='Show the reasoning trace']"),
-    "the reasoning container persists after the turn",
-  );
-  const containers = await exec(
-    "return document.querySelectorAll(\"button[title='Show the reasoning trace']\").length;",
-  );
-  assert(
-    containers === 1,
-    `the turn's single run of reasoning is grouped into one container (got ${containers})`,
+    "the reasoning button lives inside the activity container",
   );
   await shot("09-tool-timeline");
 
