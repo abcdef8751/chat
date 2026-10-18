@@ -517,10 +517,71 @@ fn notify(app: &AppHandle, job: &db::CronJob, body: &str) {
     if focused && app.state::<CronState>().is_active(&job.conversation_id) {
         return;
     }
+    // Android 13+ silently drops a post without POST_NOTIFICATIONS, so check
+    // first: a blocked run should say so in the log, not look sent.
+    match notifications_allowed(app, false) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("cron: notification blocked by the OS (permission not granted)");
+            return;
+        }
+        Err(e) => eprintln!("cron: notification permission check failed: {e}"),
+    }
     match send_notification(app, &job.title, body) {
         Ok(()) => eprintln!("cron: notification sent for job {}", job.id),
         Err(e) => eprintln!("cron: notification failed: {e}"),
     }
+}
+
+/// Whether the OS will currently let us post notifications, optionally asking
+/// for the grant (Android 13+ needs a runtime permission; a denied grant is
+/// silent, which is why the app asks explicitly).
+pub(crate) fn notifications_allowed(app: &AppHandle, request: bool) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        // Check first. Asking for a permission that is ALREADY granted leaves
+        // the plugin's `requestPermissions` invoke unresolved (there is no
+        // system dialog to answer), which hung the Test button — and the first
+        // version of this command ran on the main thread, freezing the app.
+        let current = app
+            .notification()
+            .permission_state()
+            .map_err(|e| e.to_string())?;
+        match current {
+            tauri::plugin::PermissionState::Granted => return Ok(true),
+            // A denial is final until the user changes it in Android settings;
+            // asking again would only re-open a dialog the system suppresses.
+            tauri::plugin::PermissionState::Denied => return Ok(false),
+            _ => {}
+        }
+        if !request {
+            return Ok(false);
+        }
+        let state = app
+            .notification()
+            .request_permission()
+            .map_err(|e| e.to_string())?;
+        Ok(matches!(state, tauri::plugin::PermissionState::Granted))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Ok(true)
+    }
+}
+
+/// Ask for the notification permission (the Android system dialog). Returns
+/// whether notifications are allowed now. Desktop is always granted.
+///
+/// **Async on purpose:** a synchronous Tauri command runs on the main thread,
+/// and the Android plugin bridge blocks that thread while the Kotlin permission
+/// manager posts the dialog to it — a deadlock that froze the whole app the
+/// moment the Cron page opened. Async commands run on the async runtime, the
+/// same place the startup request already works from.
+#[tauri::command]
+pub async fn request_notification_permission(app: AppHandle) -> Result<bool, String> {
+    notifications_allowed(&app, true)
 }
 
 /// Show a desktop notification, returning the real result.
@@ -557,12 +618,21 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), Str
 
 /// UI command: send a notification through the exact path a finished run uses,
 /// and report failure instead of hiding it.
+/// Async for the same main-thread reason as `request_notification_permission`
+/// (it may trigger the permission dialog on Android).
 #[tauri::command]
-pub fn test_notification(app: AppHandle) -> Result<(), String> {
+pub async fn test_notification(app: AppHandle) -> Result<(), String> {
+    if !notifications_allowed(&app, true)? {
+        return Err(
+            "Notifications are blocked for Pi Chat. Allow them in Android settings → \
+             Apps → Pi Chat → Notifications, then try again."
+                .into(),
+        );
+    }
     send_notification(
         &app,
         "Pi Chat",
-        "Desktop notifications are working. Scheduled runs will use this.",
+        "Notifications are working. Scheduled runs will use this.",
     )
 }
 

@@ -655,9 +655,20 @@ old chat and past runs stay where they are).
   tauri 2.12, which would drop the vendored `tauri-runtime-wry` patch); its
   `show()` still swallows errors, so the test button only proves the call on
   Linux. The `cron-updated` event drives the in-app badge and thread refresh.
-  Desktop-first: Android needs a notification channel + `POST_NOTIFICATIONS`
-  (same deferred-device pattern as the other mobile work); the event/badge path
-  is platform-neutral.
+  **Android:** the plugin creates the `default` channel and the manifest already
+  declares `POST_NOTIFICATIONS`; Android 13+ additionally needs a **runtime
+  grant**, and a denied grant is silent (the post is dropped). The app asks for
+  it at startup when at least one enabled job has `notify`, again the first time
+  the Cron page is opened in a session, and from the Test button — then
+  `notifications_allowed` skips a blocked post instead of pretending it was
+  sent. Two Android-specific traps are handled: the notification commands are
+  **async** because a synchronous Tauri command runs on the main thread and the
+  plugin bridge blocks it while the permission manager needs it (the first
+  version deadlocked the whole app the moment the Cron page opened); and
+  `notifications_allowed` checks `permission_state()` first — asking for an
+  already-granted permission leaves the plugin's `requestPermissions` invoke
+  unresolved, which hung the Test button. The event/badge path is
+  platform-neutral.
 - **UI:** `src/components/CronPage.tsx` (Header → Cron) lists jobs (schedule,
   next/last run, count, enabled/notify toggles, policy + context badges, Thread /
   Run now / Edit / Delete), hosts the create/edit form (preset + raw cron, live
@@ -1290,9 +1301,10 @@ is not implemented — host tools operate on real paths with per-call approval.
   own** — the DB bookkeeping, schedule math, tool gating and turn core are tested
   separately, and the wiring is exercised by running the app. A `tauri::test`
   harness with a stubbed provider key would close that gap.
-- **Android notifications are deferred** (channel + `POST_NOTIFICATIONS` +
-  manifest). The plugin is registered and desktop works today; the in-app
-  `cron-updated` badge/refresh path is platform-neutral.
+- **Android notifications need the runtime grant** (asked at startup when a job
+  wants them, on first Cron-page open, and from the Test button). The plugin
+  creates the channel and the in-app `cron-updated` badge/refresh path is
+  platform-neutral.
 - Job definitions **and their threads** are local-only by design, so two devices
   each run their own copy of a job and keep their own run history; nothing about
   a scheduled job appears on another device.

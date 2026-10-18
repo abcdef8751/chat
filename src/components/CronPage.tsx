@@ -8,7 +8,11 @@ import type {
   CronRun,
   UpdateCronPayload,
 } from "../lib/api";
-import { cronPreview, testNotification } from "../lib/api";
+import {
+  cronPreview,
+  requestNotificationPermission,
+  testNotification,
+} from "../lib/api";
 import { BackArrowIcon, ClockIcon } from "../lib/icons";
 import { formatCost } from "../lib/turns";
 
@@ -40,6 +44,16 @@ export function CronPage(props: {
   /// Open the job's own thread (a `scheduled` conversation) in the transcript.
   onOpenThread: (conversationId: string) => void;
 }) {
+  // Ask for the OS notification permission the first time the page is opened
+  // (Android 13+; a no-op on desktop). Guarded so the dialog is not re-asked on
+  // every open in the same session.
+  let askedNotificationPermission = false;
+  createEffect(() => {
+    if (!props.cronOpen || askedNotificationPermission) return;
+    askedNotificationPermission = true;
+    void requestNotificationPermission().catch(() => {});
+  });
+
   // --- Local form state ---------------------------------------------------
   // The schedule is composed from a preset (Hourly / Daily / Weekly) or taken
   // raw from the "Custom" input. Daily/Weekly carry their time (and weekday)

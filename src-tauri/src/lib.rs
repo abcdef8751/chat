@@ -94,6 +94,26 @@ pub fn run() {
             // Background scheduled runs (cron jobs).
             cron::spawn(app.handle().clone());
 
+            // Android 13+ needs a runtime grant for POST_NOTIFICATIONS, and a
+            // denied grant is silent (the post is dropped). Ask once at startup,
+            // but only when a job actually wants notifications — the system
+            // dialog is not something to show every launch.
+            #[cfg(target_os = "android")]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let wants = crate::db::list_cron_jobs(&handle.state::<crate::db::Db>())
+                        .map(|jobs| jobs.iter().any(|j| j.enabled && j.notify))
+                        .unwrap_or(false);
+                    if wants {
+                        // Checks the state first; asking for an already-granted
+                        // permission never resolves in the plugin.
+                        let _ = crate::cron::notifications_allowed(&handle, true);
+                    }
+                });
+            }
+
             // Background sync scheduler (only active when enabled + logged in).
             sync::spawn(app.handle().clone());
 
@@ -172,6 +192,7 @@ pub fn run() {
             cron::cron_preview,
             cron::cron_set_active,
             cron::test_notification,
+            cron::request_notification_permission,
             db::memory_reflection_stats,
             pricing::get_pricing,
             pricing::refresh_pricing,

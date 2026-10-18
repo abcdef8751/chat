@@ -732,3 +732,10 @@ export function cronSetActive(conversationId: string | null): Promise<void> {
 export function testNotification(): Promise<void> {
   return invoke<void>("test_notification");
 }
+
+/** Ask for the OS notification permission (Android 13+ shows the system
+ * dialog); resolves to whether notifications may be posted now. Desktop is
+ * always granted. */
+export function requestNotificationPermission(): Promise<boolean> {
+  return invoke<boolean>("request_notification_permission");
+}
