@@ -30,9 +30,11 @@ is written and the visible page text is dumped.
 
 ## How it works
 
-- `run.sh` seeds an isolated `XDG_DATA_HOME` with a `config.json` pointing at the
-  mock (`http://127.0.0.1:8317/v1`) and a `mock-model` id, then starts the mock,
-  Vite, and `tauri-driver`, and runs `e2e.mjs`.
+- `run.sh` seeds an isolated `XDG_DATA_HOME` with a `config.json` carrying one
+  real mock provider (`http://127.0.0.1:8317/v1`, active, model id
+  `e2e-never-listed`) plus the mock model name, then starts the mock, Vite, and
+  `tauri-driver`, and runs `e2e.mjs`. It also sets `PI_SECRETS_DIR` into the
+  same temp dir so the app's secret storage never reaches the real keychain.
 - `mock-llm.mjs` serves `/v1/models` and a scripted `/v1/chat/completions` SSE
   stream (reasoning → content → usage → unterminated final content).
 - `e2e.mjs` is a tiny W3C WebDriver client (node `fetch`, no deps).
@@ -60,6 +62,17 @@ An isolated-display XTEST harness was prototyped and removed as overengineering.
 
 ## Notes / limitations
 
-- The API key: the harness stores a throwaway `mock-key` **only if the keychain
-  has no entry**, and removes it afterward. An existing key is left untouched.
+- **The real keychain is never touched.** `run.sh` launches the app with
+  `PI_SECRETS_DIR` pointing into the per-run temp data dir, so every secret the
+  app stores (the provider key typed into the Settings provider form, the Brave
+  key, sync session) lands in plain files under that temp dir — the user's real
+  OS secret service is never read or written. `e2e.mjs` snapshots the real
+  `com.rp.chat` keychain entries via `secret-tool` before the run and again
+  after (also on failures) and asserts they are byte-identical. The provider
+  key is set through the real provider edit form — the harness never types into
+  the Brave Search field and never calls "Remove saved key".
 - Env knobs: `MOCK_PORT`, `WD_PORT`, `APP`, `OUT`.
+- The Vite dev server must bind `:1420` (the debug app's `devUrl` is fixed
+  there); `run.sh` fails fast if the port is in use and runs vite with
+  `--strictPort`, so the suite can never silently test a server it did not
+  start.
