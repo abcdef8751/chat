@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::ipc::Channel;
 use tauri::Manager;
+use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 
 use crate::config::{AppConfig, ConfigState};
@@ -37,35 +38,97 @@ const CHARS_PER_TOKEN: u64 = 4;
 /// in place of the (meaningless) length of its base64 payload.
 const IMAGE_TOKENS: u64 = 1_200;
 
-/// Per-conversation cancellation flags so the UI can abort a running stream.
+/// Cancellation handle for one streaming turn.
+///
+/// A plain `AtomicBool` was only ever *polled*, so a Stop could appear dead for
+/// seconds: the request open and a running tool call (`bash` can take 60 s, a
+/// `web_fetch` 30 s) never looked at it at all. This pairs the flag — which
+/// stays the cheap check on hot paths — with a [`Notify`], so callers can
+/// `select!` on [`CancelToken::cancelled`] and drop an in-flight future at once
+/// (dropping the tool future kills its child process via `kill_on_drop`).
+///
+/// Cheap to clone; every clone observes the same cancellation.
+#[derive(Clone, Default, Debug)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether [`cancel`](Self::cancel) has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Request cancellation. Idempotent: later calls are no-ops, and the flag is
+    /// set *before* the wakeup so a waiter that starts during the call observes
+    /// it too.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        // `notify_waiters` only wakes futures that are already registered, which
+        // is why `cancelled` re-checks the flag after registering.
+        self.notify.notify_waiters();
+    }
+
+    /// Resolve as soon as the token is cancelled, immediately when it already
+    /// is. Race-free: interest is registered with `enable()` *before* the flag is
+    /// re-checked, so a `cancel()` landing in the window between the first check
+    /// and registration cannot be missed.
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Registration of a conversation's in-flight stream, so the UI can abort it and
+/// the reflection scheduler can stay out of a conversation that is mid-turn.
 #[derive(Default)]
 pub struct StreamRegistry {
-    flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    streams: Mutex<HashMap<String, CancelToken>>,
 }
 
 impl StreamRegistry {
-    pub fn register(&self, id: String) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
-        self.flags.lock().unwrap().insert(id, flag.clone());
-        flag
+    /// Register a conversation as streaming and hand back its cancel token. The
+    /// token stays valid after [`remove`](Self::remove) — cancellation is always
+    /// observable to whoever holds it.
+    pub fn register(&self, id: String) -> CancelToken {
+        let token = CancelToken::new();
+        self.streams.lock().unwrap().insert(id, token.clone());
+        token
     }
 
+    /// Abort the conversation's in-flight stream *now*: in-flight work blocked on
+    /// the request open or a tool call is dropped immediately, not on the next
+    /// poll.
     pub fn cancel(&self, id: &str) {
-        if let Some(flag) = self.flags.lock().unwrap().get(id) {
-            flag.store(true, Ordering::SeqCst);
+        if let Some(token) = self.streams.lock().unwrap().get(id) {
+            token.cancel();
         }
     }
 
     pub fn remove(&self, id: &str) {
-        self.flags.lock().unwrap().remove(id);
+        self.streams.lock().unwrap().remove(id);
     }
 
     /// Whether a chat turn is currently streaming for this conversation. Used by
     /// the memory-reflection scheduler to avoid running mid-turn.
     pub fn is_streaming(&self, id: &str) -> bool {
-        self.flags.lock().unwrap().contains_key(id)
+        self.streams.lock().unwrap().contains_key(id)
     }
 }
+
 
 /// Events pushed to the frontend over the stream channel.
 ///
@@ -426,30 +489,26 @@ fn completion_body(
 
 /// Consume a completion SSE stream, emitting `Delta`/`ThinkingDelta`/`Error`
 /// events as chunks arrive, accumulating streamed tool-call fragments, and
-/// stopping early when `flag` is set (abort). The stream is read in its raw
-/// form (not through async-openai's typed parser) so provider reasoning fields
-/// like `reasoning_content` are not dropped.
+/// stopping early when the token is cancelled (abort). The stream is read in its
+/// raw form (not through async-openai's typed parser) so provider reasoning
+/// fields like `reasoning_content` are not dropped.
 async fn run_completion(
     response: reqwest::Response,
     sink: &dyn EventSink,
-    flag: &AtomicBool,
+    token: &CancelToken,
 ) -> RoundAccum {
     let mut out = RoundAccum::default();
     let mut calls: HashMap<u32, (Option<String>, Option<String>, String)> = HashMap::new();
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut closed = false;
-    // A persistent deadline so the cancel flag is polled even while chunks keep
-    // arriving faster than the poll interval.
-    let poll = std::time::Duration::from_millis(200);
-    let mut deadline = tokio::time::Instant::now() + poll;
 
     'consume: loop {
-        if flag.load(Ordering::SeqCst) {
+        if token.is_cancelled() {
             break;
         }
         while let Some(event) = take_first_event(&mut buf) {
-            if flag.load(Ordering::SeqCst) {
+            if token.is_cancelled() {
                 break 'consume;
             }
             if process_event(&mut out, &mut calls, &event, sink) {
@@ -467,6 +526,10 @@ async fn run_completion(
             break;
         }
         tokio::select! {
+            // Wait on cancellation rather than re-checking on a timer: a stalled
+            // stream (or one that outpaces a poll interval) aborts immediately.
+            biased;
+            _ = token.cancelled() => break,
             maybe = stream.next() => {
                 match maybe {
                     None => closed = true,
@@ -479,12 +542,6 @@ async fn run_completion(
                         break;
                     }
                 }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                if flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                deadline = tokio::time::Instant::now() + poll;
             }
         }
     }
@@ -983,7 +1040,7 @@ async fn summarize_history(
     api_key: &str,
     previous: Option<&str>,
     fold: &[db::MessageRow],
-    flag: &AtomicBool,
+    token: &CancelToken,
 ) -> Result<(String, Value), String> {
     let system = match previous.filter(|p| !p.trim().is_empty()) {
         Some(prev) => format!("{COMPACTION_SYSTEM}\n\nSummary so far:\n{prev}"),
@@ -1013,15 +1070,19 @@ async fn summarize_history(
     );
 
     let body = completion_body(&cfg.model, &messages, &[], &cfg.thinking_level, None)?;
-    let response = open_completion_stream(&cfg.base_url, api_key, &body).await?;
-    let acc = run_completion(response, &NullSink, flag).await;
+    let response = tokio::select! {
+        biased;
+        _ = token.cancelled() => return Ok((String::new(), json!({}))),
+        opened = open_completion_stream(&cfg.base_url, api_key, &body) => opened?,
+    };
+    let acc = run_completion(response, &NullSink, token).await;
     if acc.failed {
         return Err(acc.error.unwrap_or_else(|| "compaction failed".into()));
     }
     let usage = acc.usage.unwrap_or_else(|| json!({}));
     // An aborted pass must not persist a partial summary; returning no text makes
     // the caller skip the compaction and let the turn abort normally.
-    if flag.load(Ordering::SeqCst) {
+    if token.is_cancelled() {
         return Ok((String::new(), usage));
     }
     Ok((acc.text, usage))
@@ -1042,7 +1103,7 @@ async fn compact_now(
     cfg: &AppConfig,
     use_bundled_context: bool,
     api_key: &str,
-    flag: &AtomicBool,
+    token: &CancelToken,
 ) -> Result<Option<(String, usize)>, String> {
     let start = keep_from(history, COMPACTION_KEEP_TOKENS);
     if start == 0 {
@@ -1067,7 +1128,7 @@ async fn compact_now(
         api_key,
         conversation.compaction_summary.as_deref(),
         &history[prev_start..start],
-        flag,
+        token,
     )
     .await
     {
@@ -1419,7 +1480,7 @@ pub(crate) async fn run_tool_loop(
     source: &str,
     mut messages: Vec<ChatCompletionRequestMessage>,
     tools_list: &[async_openai::types::chat::ChatCompletionTools],
-    flag: Arc<AtomicBool>,
+    token: CancelToken,
     sink: &dyn EventSink,
     persist: Option<&db::Db>,
     mode: ToolMode,
@@ -1447,7 +1508,18 @@ pub(crate) async fn run_tool_loop(
                 None
             },
         )?;
-        let response = match open_completion_stream(&cfg.base_url, api_key, &body).await {
+        let response = tokio::select! {
+            // Stop must abort the request open too: a provider that accepted the
+            // connection but hasn't answered yet would otherwise ignore the flag
+            // until the body started streaming.
+            biased;
+            _ = token.cancelled() => {
+                stop_reason = "aborted".into();
+                break;
+            }
+            opened = open_completion_stream(&cfg.base_url, api_key, &body) => opened,
+        };
+        let response = match response {
             Ok(r) => r,
             Err(e) => {
                 stop_reason = "error".into();
@@ -1457,11 +1529,11 @@ pub(crate) async fn run_tool_loop(
             }
         };
 
-        let acc = run_completion(response, sink, &flag).await;
+        let acc = run_completion(response, sink, &token).await;
         sum_usage(&mut usage_total, &acc.usage);
         track_context(&mut usage_total, &acc.usage);
 
-        let aborted = flag.load(Ordering::SeqCst);
+        let aborted = token.is_cancelled();
         if aborted || acc.failed || rounds >= tools::MAX_TOOL_ROUNDS {
             if aborted {
                 stop_reason = "aborted".into();
@@ -1588,24 +1660,35 @@ pub(crate) async fn run_tool_loop(
                     let mut approved = !host_gated || yolo;
                     if host_gated && !yolo {
                         let mut rx = approvals.register(call.id.clone());
-                        loop {
-                            tokio::select! {
-                                verdict = &mut rx => {
-                                    approved = verdict.unwrap_or(false);
-                                    break;
-                                }
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                                    if flag.load(Ordering::SeqCst) {
-                                        break;
-                                    }
-                                }
-                            }
+                        // Stop counts as a denial: the wait ends immediately, and
+                        // the call is never dispatched.
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {}
+                            verdict = &mut rx => approved = verdict.unwrap_or(false),
                         }
                     }
                     if approved {
-                        let dispatched =
-                            dispatch_tool(call, brave, shell, memory, cfg, persist).await;
-                        (dispatched.output, dispatched.image)
+                        // The dispatch is raced against cancellation so a running
+                        // `bash` (60 s) or `web_fetch` (30 s) is dropped at once;
+                        // dropping the future reaps the child (`kill_on_drop`).
+                        let dispatched = tokio::select! {
+                            biased;
+                            _ = token.cancelled() => None,
+                            d = dispatch_tool(call, brave, shell, memory, cfg, persist) => Some(d),
+                        };
+                        match dispatched {
+                            Some(d) => (d.output, d.image),
+                            None => {
+                                // Keep the transcript consistent (an assistant
+                                // `tool_calls` row must be followed by a result)
+                                // and let the UI stop showing the call as running.
+                                (
+                                    ToolOutput::err("The user aborted this tool call.".into()),
+                                    None,
+                                )
+                            }
+                        }
                     } else {
                         (
                             ToolOutput {
@@ -1654,7 +1737,7 @@ pub(crate) async fn run_tool_loop(
                     injected_images.push(image_request_message(call, data_url)?);
                 }
 
-                if flag.load(Ordering::SeqCst) {
+                if token.is_cancelled() {
                     aborted_mid_tools = true;
                     break;
                 }
@@ -1701,7 +1784,7 @@ pub(crate) async fn run_chat_turn(
     shell: &ShellExecutor,
     memory: &crate::memory::MemoryState,
     approvals: &tools::ApprovalRegistry,
-    flag: Arc<AtomicBool>,
+    token: CancelToken,
     sink: &dyn EventSink,
     conversation_id: String,
     content: String,
@@ -1850,7 +1933,7 @@ pub(crate) async fn run_chat_turn(
             &turn_cfg,
             use_bundled_context,
             api_key,
-            &flag,
+            &token,
         )
         .await?
         {
@@ -1877,7 +1960,7 @@ pub(crate) async fn run_chat_turn(
         &conversation_id,
         messages,
         &tools_list,
-        flag,
+        token,
         sink,
         Some(db),
         ToolMode::Live,
@@ -1960,7 +2043,7 @@ pub async fn stream_chat(
     let shell = app.state::<ShellExecutor>();
     let memory = app.state::<crate::memory::MemoryState>();
 
-    let flag = app
+    let token = app
         .state::<StreamRegistry>()
         .register(conversation_id.clone());
     let sink = ChannelSink(&channel);
@@ -1973,7 +2056,7 @@ pub async fn stream_chat(
         &shell,
         &memory,
         &approvals,
-        flag,
+        token,
         &sink,
         conversation_id.clone(),
         content,
@@ -1987,8 +2070,9 @@ pub async fn stream_chat(
     result
 }
 
-/// Abort a running stream for a conversation. The streaming loop notices the
-/// flag between chunks, preserves partial text, and marks `stop_reason = aborted`.
+/// Abort a running stream for a conversation, immediately: in-flight requests
+/// and tool calls are dropped (a running `bash` child is reaped), partial text is
+/// preserved, and the turn finishes with `stop_reason = "aborted"`.
 #[tauri::command]
 pub fn stop_chat(app: tauri::AppHandle, conversation_id: String) -> Result<(), String> {
     app.state::<StreamRegistry>().cancel(&conversation_id);

@@ -154,24 +154,24 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     );
 
     let tools_list = tools::tool_specs(tools::brave_available());
-    let flag = Arc::new(AtomicBool::new(false));
+    let token = chat::CancelToken::new();
 
     // Abort the pass if a real chat turn starts on this conversation.
     let watcher = {
         let app = app.clone();
         let cid = conversation_id.to_string();
-        let watcher_flag = flag.clone();
+        let watcher_token = token.clone();
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                if watcher_flag.load(Ordering::SeqCst) {
+                if watcher_token.is_cancelled() {
                     break;
                 }
                 if app
                     .state::<chat::StreamRegistry>()
                     .is_streaming(&cid)
                 {
-                    watcher_flag.store(true, Ordering::SeqCst);
+                    watcher_token.cancel();
                     break;
                 }
             }
@@ -189,7 +189,7 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
         conversation_id,
         messages,
         &tools_list,
-        flag,
+        token,
         &sink,
         None,
         chat::ToolMode::Reflection,
@@ -922,7 +922,7 @@ async fn extract_conversation(
     // tool rounds, so the map phase is one request per conversation instead of
     // roughly three.
     let tools_list: Vec<async_openai::types::chat::ChatCompletionTools> = Vec::new();
-    let flag = Arc::new(AtomicBool::new(false));
+    let token = chat::CancelToken::new();
     let sink = NullSink;
     let result = chat::run_tool_loop(
         &turn_cfg,
@@ -934,7 +934,7 @@ async fn extract_conversation(
         conversation_id,
         messages,
         &tools_list,
-        flag,
+        token,
         &sink,
         None,
         chat::ToolMode::Extract,
@@ -1158,7 +1158,7 @@ async fn run_reduce_pass(
     ];
 
     let tools_list = tools::tool_specs(tools::brave_available());
-    let flag = Arc::new(AtomicBool::new(false));
+    let token = chat::CancelToken::new();
     let sink = NullSink;
     let result = chat::run_tool_loop(
         &turn_cfg,
@@ -1170,7 +1170,7 @@ async fn run_reduce_pass(
         "memory-backfill",
         messages,
         &tools_list,
-        flag,
+        token,
         &sink,
         None,
         chat::ToolMode::Reflection,

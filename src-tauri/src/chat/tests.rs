@@ -59,17 +59,17 @@
         }
     }
 
-    /// A sink that trips the cancel flag as soon as the first delta lands, so an
+    /// A sink that cancels the turn as soon as the first delta lands, so an
     /// abort can be triggered deterministically mid-stream without a race.
     struct FlagOnDelta {
-        flag: Arc<AtomicBool>,
+        flag: CancelToken,
         events: Arc<Mutex<Vec<StreamEvent>>>,
     }
 
     impl EventSink for FlagOnDelta {
         fn emit(&self, ev: StreamEvent) {
             if matches!(&ev, StreamEvent::Delta { .. }) {
-                self.flag.store(true, Ordering::SeqCst);
+                self.flag.cancel();
             }
             self.events.lock().unwrap().push(ev);
         }
@@ -285,7 +285,7 @@
         .unwrap();
         let resp = open_completion_stream(&base, "k", &body).await.unwrap();
         let sink = TestSink(Arc::new(Mutex::new(Vec::new())));
-        run_completion(resp, &sink, &AtomicBool::new(false)).await
+        run_completion(resp, &sink, &CancelToken::new()).await
     }
 
     /// Like [`complete_once`], but also returns the emitted events.
@@ -302,7 +302,7 @@
         let resp = open_completion_stream(&base, "k", &body).await.unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
-        let acc = run_completion(resp, &sink, &AtomicBool::new(false)).await;
+        let acc = run_completion(resp, &sink, &CancelToken::new()).await;
         (acc, events)
     }
 
@@ -321,7 +321,7 @@
         let resp = open_completion_stream(&base, "k", &req).await.unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
-        let acc = run_completion(resp, &sink, &AtomicBool::new(false)).await;
+        let acc = run_completion(resp, &sink, &CancelToken::new()).await;
         let _ = handle.join();
         (acc, events)
     }
@@ -545,7 +545,7 @@
         )
         .unwrap();
         let resp = open_completion_stream(&base, "k", &body).await.unwrap();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = FlagOnDelta {
             flag: flag.clone(),
@@ -554,7 +554,7 @@
         let acc = run_completion(resp, &sink, &flag).await;
         let _ = handle.join();
 
-        assert!(flag.load(Ordering::SeqCst));
+        assert!(flag.is_cancelled());
         assert_eq!(acc.text, "one");
         assert_eq!(acc.finish, None);
     }
@@ -594,7 +594,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
         let cid_task = cid.clone();
@@ -686,7 +686,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let memory = temp_memory("prov-turn");
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
@@ -729,7 +729,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
         let cid_task = cid.clone();
@@ -772,7 +772,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let attachments = vec![
             Attachment {
                 id: "a1".into(),
@@ -854,7 +854,7 @@
         );
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
         let cid_task = cid.clone();
@@ -899,7 +899,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
         let cid_task = cid.clone();
@@ -951,7 +951,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
         let cid2 = cid.clone();
@@ -1053,7 +1053,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
         let cid2 = cid.clone();
@@ -1133,7 +1133,7 @@
         let shell = crate::shell::ShellExecutor::new();
 
         // First turn: a tool round whose reasoning is persisted on the row.
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
         let cid2 = cid.clone();
         let cfg2 = cfg.clone();
@@ -1164,7 +1164,7 @@
         task.await.unwrap().unwrap();
 
         // Second turn: a fresh user message replays the tool-call history.
-        let flag2 = Arc::new(AtomicBool::new(false));
+        let flag2 = CancelToken::new();
         let sink2 = TestSink(events.clone());
         let memory2 = temp_memory("echo-replay-2");
         let mcp2 = tools::BraveSearch::default();
@@ -1216,7 +1216,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
         let cid2 = cid.clone();
@@ -1284,7 +1284,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
         let cid2 = cid.clone();
@@ -1356,7 +1356,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
         let cid2 = cid.clone();
@@ -1420,7 +1420,7 @@
         };
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
         let flag2 = flag.clone();
@@ -1441,7 +1441,7 @@
             5000,
         )
         .await;
-        flag.store(true, Ordering::SeqCst);
+        flag.cancel();
 
         task.await.unwrap().unwrap();
         let _ = handle.join();
@@ -1450,6 +1450,164 @@
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].content, "Hello");
         assert_eq!(rows[1].stop_reason.as_deref(), Some("aborted"));
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(StreamEvent::Done { stop_reason }) if stop_reason == "aborted"
+        ));
+    }
+
+    /// Accept one connection, swallow the request, and never answer — the shape
+    /// of a provider that took the socket but has not started streaming. The
+    /// thread ends when the client closes (or after a safety timeout), so a
+    /// cancellation that drops the request can be observed as EOF.
+    fn start_silent_mock() -> (u16, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = match listener.accept() {
+                Ok(x) => x,
+                Err(_) => return,
+            };
+            let _ = read_request(&mut stream);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 1024];
+            while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+        (port, handle)
+    }
+
+    /// Stop must not wait for the provider. A request that was sent but has not
+    /// produced a single byte is unreachable by a polled flag; cancellation has
+    /// to drop the in-flight request instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_unblocks_a_pending_request_open() {
+        let (port, handle) = start_silent_mock();
+        let db = Arc::new(open_db("abort-open"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let mcp = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let token = CancelToken::new();
+
+        let (db2, approvals2, cid2) = (db.clone(), approvals.clone(), cid.clone());
+        let cancel = token.clone();
+        let memory = temp_memory("abort-open");
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, token, &sink, cid2,
+                "hi".into(), Vec::new(), false,
+            )
+            .await
+        });
+
+        // Let the turn reach the pending request, then stop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("Stop did not unblock the pending request open");
+        result.unwrap().unwrap();
+        let _ = handle.join();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "abort took {:?}",
+            started.elapsed()
+        );
+        let rows = msgs(&db, &cid);
+        assert_eq!(rows.last().unwrap().role, "assistant");
+        assert_eq!(rows.last().unwrap().content, "");
+        assert_eq!(rows.last().unwrap().stop_reason.as_deref(), Some("aborted"));
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(StreamEvent::Done { stop_reason }) if stop_reason == "aborted"
+        ));
+    }
+
+    /// A running `bash` can take a minute. The dispatch is raced against
+    /// cancellation, so Stop drops it (and the child, via `kill_on_drop`)
+    /// instead of waiting for the command to finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abort_drops_a_running_tool_dispatch() {
+        let (port, handle) = start_mock(
+            vec![vec![
+                tool_frag(0, "call_sleep", "bash", ""),
+                tool_frag(0, "", "", r#"{\"command\":\"sleep 20\"}"#),
+                finish_chunk("tool_calls"),
+            ]],
+            0,
+        );
+        let db = Arc::new(open_db("abort-tool"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            // YOLO: an ungated dispatch, so the abort lands inside the tool call
+            // rather than while waiting on an approval prompt.
+            auto_approve_tools: true,
+            ..Default::default()
+        };
+        let mcp = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let token = CancelToken::new();
+
+        let (db2, approvals2, cid2, events2) = (db.clone(), approvals.clone(), cid.clone(), events.clone());
+        let cancel = token.clone();
+        let memory = temp_memory("abort-tool");
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, token, &sink, cid2,
+                "run it".into(), Vec::new(), false,
+            )
+            .await
+        });
+
+        wait_for_event(
+            &events2,
+            |e| matches!(e, StreamEvent::ToolCall { name, .. } if name == "bash"),
+            5000,
+        )
+        .await;
+        // Let the child actually start, so the abort happens mid-dispatch.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("Stop did not drop the running tool call");
+        result.unwrap().unwrap();
+        let _ = handle.join();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "abort waited for the tool: {:?}",
+            started.elapsed()
+        );
+
+        let rows = msgs(&db, &cid);
+        let last = rows.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert_eq!(last.stop_reason.as_deref(), Some("aborted"));
+        // The cancelled call still gets a result row, so the stored transcript
+        // remains a valid replay (tool_calls must be followed by results).
+        let tool_row = rows
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("cancelled call must still be persisted");
+        let v: Value = serde_json::from_str(&tool_row.content).unwrap();
+        assert_eq!(v["error"], true);
+        assert!(v["output"].as_str().unwrap().contains("aborted"));
         assert!(matches!(
             events.lock().unwrap().last(),
             Some(StreamEvent::Done { stop_reason }) if stop_reason == "aborted"
@@ -1485,7 +1643,7 @@ async fn tool_loop_without_persistence_runs_memory_tool() {
     let shell = crate::shell::ShellExecutor::new();
     let memory = temp_memory("loop-nopersist");
     let approvals = tools::ApprovalRegistry::default();
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = CancelToken::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = TestSink(events.clone());
 
@@ -1550,7 +1708,7 @@ async fn write_memory_is_allowed_live_and_in_reflection() {
         let mcp = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
         let approvals = tools::ApprovalRegistry::default();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
         let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
@@ -1630,7 +1788,7 @@ async fn web_fetch_is_refused_in_reflection_mode() {
     let shell = crate::shell::ShellExecutor::new();
     let memory = temp_memory("webfetch-reflect");
     let approvals = tools::ApprovalRegistry::default();
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = CancelToken::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = TestSink(events.clone());
     let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
@@ -1688,7 +1846,7 @@ async fn web_fetch_in_live_mode_routes_to_web_tool() {
     let shell = crate::shell::ShellExecutor::new();
     let memory = temp_memory("webfetch-live-route");
     let approvals = tools::ApprovalRegistry::default();
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = CancelToken::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = TestSink(events.clone());
     let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
@@ -1769,7 +1927,7 @@ async fn extract_mode_refuses_every_tool_call() {
     let shell = crate::shell::ShellExecutor::new();
     let memory = temp_memory("extract-mode");
     let approvals = tools::ApprovalRegistry::default();
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = CancelToken::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = TestSink(events.clone());
     let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
@@ -1980,7 +2138,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
     let resp = open_completion_stream(&base, &key, &body)
         .await
         .expect("round 1 request failed");
-    let round1 = run_completion(resp, &sink, &AtomicBool::new(false)).await;
+    let round1 = run_completion(resp, &sink, &CancelToken::new()).await;
     assert!(!round1.failed, "round 1 stream failed");
 
     if round1.tool_calls.is_empty() {
@@ -2047,7 +2205,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
     let resp2 = open_completion_stream(&base, &key, &body2)
         .await
         .expect("round 2 rejected the echoed reasoning_content");
-    let round2 = run_completion(resp2, &sink, &AtomicBool::new(false)).await;
+    let round2 = run_completion(resp2, &sink, &CancelToken::new()).await;
     assert!(!round2.failed, "round 2 stream failed");
     assert!(
         !round2.text.trim().is_empty() || !round2.tool_calls.is_empty(),
@@ -2256,7 +2414,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let shell = crate::shell::ShellExecutor::new();
         let memory = temp_memory("compact");
         for turn in 0..2 {
-            let flag = Arc::new(AtomicBool::new(false));
+            let flag = CancelToken::new();
             run_chat_turn(
                 &db,
                 &cfg,
@@ -2339,7 +2497,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         };
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         let (db2, approvals2) = (db.clone(), approvals.clone());
         let cid2 = cid.clone();
@@ -2539,7 +2697,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
         let memory = temp_memory("regen-edit");
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         run_chat_turn(
             &db,
@@ -2640,7 +2798,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
         let memory = temp_memory("regen-appended");
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
 
         run_chat_turn(
             &db,
@@ -2731,7 +2889,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         };
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         run_chat_turn(
             &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-vision"), &approvals,
             flag, &sink, cid.clone(), "look".into(), Vec::new(),
@@ -2805,7 +2963,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         };
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         run_chat_turn(
             &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-text"), &approvals,
             flag, &sink, cid.clone(), "look".into(), Vec::new(),
@@ -2870,7 +3028,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         };
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         run_chat_turn(
             &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-image-oversize"),
             &approvals, flag, &sink, cid.clone(), "look".into(), Vec::new(),
@@ -2933,7 +3091,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         };
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         run_chat_turn(
             &db, &cfg, "test-key", &brave, &shell, &temp_memory("read-svg"), &approvals, flag,
             &sink, cid.clone(), "look".into(), Vec::new(),
@@ -3139,7 +3297,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
         let memory = temp_memory("large-low");
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let approvals = Arc::new(tools::ApprovalRegistry::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
@@ -3193,7 +3351,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
         let memory = temp_memory("reported-high");
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let approvals = Arc::new(tools::ApprovalRegistry::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
@@ -3221,7 +3379,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
         let memory = temp_memory("time-first");
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let approvals = Arc::new(tools::ApprovalRegistry::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
@@ -3277,7 +3435,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
         let memory = temp_memory("time-second");
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let approvals = Arc::new(tools::ApprovalRegistry::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
@@ -3329,7 +3487,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
         let memory = temp_memory("time-recent");
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let approvals = Arc::new(tools::ApprovalRegistry::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
@@ -3372,7 +3530,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let memory = temp_memory("clock-persist");
         let approvals = Arc::new(tools::ApprovalRegistry::default());
         for text in ["first", "second"] {
-            let flag = Arc::new(AtomicBool::new(false));
+            let flag = CancelToken::new();
             let events = Arc::new(Mutex::new(Vec::new()));
             let sink = TestSink(events.clone());
             run_chat_turn(&db, &cfg, "test-key", &brave, &shell, &memory, &approvals, flag, &sink, cid.clone(), text.into(), Vec::new(), false)
