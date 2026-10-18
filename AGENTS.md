@@ -349,9 +349,12 @@ topic files.
 - **Model:** the pass resolves the **conversation's own provider + model**
   (`reflect_conversation`), not the global `base_url`/`model` mirrors, and the
   scheduler must not bail out when the *global* model is blank — eligibility is
-  per conversation. The device's configured thinking level is inherited
-  (per-conversation thinking levels are deliberately not stored; rows keep
-  `thinking_level = NULL`). The exception is the backfill's reduce pass, which
+  per conversation. The **thinking level** is the conversation's own as well: a
+  live turn records the level it actually ran at on every row it writes
+  (`messages.thinking_level`, previously always `NULL`), and the pass resolves the
+  conversation's newest recorded level, falling back to the device's configured
+  level for chats that predate the recording. The exception is the backfill's
+  reduce pass, which
   stays on the active provider's default model for a whole run (`active_turn_cfg`).
 - **Eligibility:** a chat becomes due only when a message is inserted
   (user/assistant/tool). Merely opening a chat does not touch `updated_at`.
