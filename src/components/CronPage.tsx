@@ -158,23 +158,33 @@ export function CronPage(props: {
     setFormOpen(true);
   }
 
-  /// Pre-fill the form from an existing job. The schedule is parsed back into
-  /// its preset when it matches one of the known shapes; anything else lands
-  /// in the Custom input, where the raw expression stays editable.
+  /// Pre-fill the form from an existing job. A stored schedule is the
+  /// **normalized** expression (the backend canonicalizes presets on write), so
+  /// the shape is parsed back into a preset when it matches `hourly`, a daily
+  /// `M H * * *`, or a weekly `M H * * DOW`; anything else lands in Custom.
   function startEdit(job: CronJob) {
     props.setCronError(null);
     setConfirmDeleteId(null);
-    const daily = job.schedule.match(/^daily@(\d{2}:\d{2})$/);
-    const weekly = job.schedule.match(/^weekly@([A-Za-z]{3}):(\d{2}:\d{2})$/);
-    if (job.schedule === "hourly") {
+    const daily = job.schedule.match(/^(\d{1,2}) (\d{1,2}) \* \* \*$/);
+    const weekly = job.schedule.match(/^(\d{1,2}) (\d{1,2}) \* \* ([A-Za-z0-9]{3}|[0-7])$/);
+    const pad = (n: string) => n.padStart(2, "0");
+    const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    if (job.schedule === "0 * * * *") {
       setPreset("hourly");
     } else if (daily) {
       setPreset("daily");
-      setDailyTime(daily[1]);
+      setDailyTime(`${pad(daily[2])}:${pad(daily[1])}`);
     } else if (weekly) {
       setPreset("weekly");
-      setWeeklyDay(weekly[1]);
-      setWeeklyTime(weekly[2]);
+      // The select's options are "Mon"…"Sun"; map names or numeric DOW (0/7 =
+      // Sunday, matching cron).
+      const token = weekly[3];
+      const byName = WEEKDAYS.find((d) => d.toLowerCase().startsWith(token.toLowerCase()));
+      const numeric = Number(token);
+      setWeeklyDay(
+        byName ?? (Number.isInteger(numeric) ? (WEEKDAYS[numeric % 7] ?? "Mon") : "Mon"),
+      );
+      setWeeklyTime(`${pad(weekly[2])}:${pad(weekly[1])}`);
     } else {
       setPreset("custom");
       setCustomSchedule(job.schedule);
@@ -236,34 +246,32 @@ export function CronPage(props: {
 
   // --- Small pure helpers (schedule/time rendering) ------------------------
 
-  /// Human-readable description of a schedule string ("hourly", `daily@HH:MM`,
-  /// `weekly@DDD:HH:MM`, or a 5-field cron). Returns null when there is no
-  /// friendly rendering, so the caller falls back to the raw expression.
+  /// Human-readable description of a **stored** (normalized) schedule. The
+  /// backend canonicalizes presets on write, so this recognizes `hourly`'s
+  /// normalized form, `M H * * *` (daily) and `M H * * DOW` (weekly, numeric or
+  /// 3-letter name). Anything more complex returns null, and the caller falls
+  /// back to the raw expression. (Mirrors `cron::schedule::describe`.)
   function describeSchedule(sched: string): string | null {
-    if (sched === "hourly") return "Every hour";
-    const daily = sched.match(/^daily@(\d{2}:\d{2})$/);
-    if (daily) return `Daily at ${daily[1]}`;
-    const weekly = sched.match(/^weekly@([A-Za-z]{3}):(\d{2}:\d{2})$/);
-    if (weekly) return `Weekly on ${weekly[1]} at ${weekly[2]}`;
-    // 5-field cron: recognize the common shapes; anything else renders raw.
+    if (sched === "hourly" || sched === "0 * * * *") return "Every hour";
     const fields = sched.trim().split(/\s+/);
-    if (fields.length === 5) {
-      const [min, hour, dom, mon, dow] = fields;
-      if (min === "*" && hour === "*" && dom === "*" && mon === "*" && dow === "*")
-        return "Every minute";
-      if (min === "0" && hour === "*" && dom === "*" && mon === "*" && dow === "*")
-        return "Every hour";
-      const at = (h: string, m: string) => `${h.padStart(2, "0")}:${m.padStart(2, "0")}`;
-      const DOW: Record<string, string> = {
-        "0": "Sunday", "1": "Monday", "2": "Tuesday", "3": "Wednesday",
-        "4": "Thursday", "5": "Friday", "6": "Saturday", "7": "Sunday",
-      };
-      if (min === "0" && hour !== "*" && dom === "*" && mon === "*" && dow === "*")
-        return `Daily at ${at(hour, min)}`;
-      if (min === "0" && hour !== "*" && dom === "*" && mon === "*" && DOW[dow])
-        return `Weekly on ${DOW[dow]} at ${at(hour, min)}`;
-    }
-    return null;
+    if (fields.length !== 5) return null;
+    const [min, hour, dom, mon, dow] = fields;
+    if (dom !== "*" || mon !== "*") return null;
+    if (min === "*" && hour === "*" && dow === "*") return "Every minute";
+    const minute = Number(min);
+    const h = Number(hour);
+    if (!Number.isInteger(minute) || !Number.isInteger(h)) return null;
+    if (minute < 0 || minute > 59 || h < 0 || h > 23) return null;
+    const at = `${String(h).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+    const WEEKDAYS: Record<string, string> = {
+      "0": "Sunday", "1": "Monday", "2": "Tuesday", "3": "Wednesday",
+      "4": "Thursday", "5": "Friday", "6": "Saturday", "7": "Sunday",
+      sun: "Sunday", mon: "Monday", tue: "Tuesday", wed: "Wednesday",
+      thu: "Thursday", fri: "Friday", sat: "Saturday",
+    };
+    if (dow === "*") return `Daily at ${at}`;
+    const day = WEEKDAYS[dow.toLowerCase()];
+    return day ? `Weekly on ${day} at ${at}` : null;
   }
 
   /// Compact absolute time (e.g. "Oct 18, 09:00"); `null` renders "never".

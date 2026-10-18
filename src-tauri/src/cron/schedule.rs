@@ -63,6 +63,11 @@ pub fn normalize(raw: &str) -> Result<String, String> {
 }
 
 /// Whether `schedule` is a valid *normalized* expression.
+///
+/// Part of the module's small public surface (the UI validates through
+/// `cron_preview`, so this is exercised by tests today); retained because it is
+/// the natural predicate for callers that already have a normalized string.
+#[allow(dead_code)]
 pub fn is_valid(schedule: &str) -> bool {
     normalize(schedule).is_ok()
 }
@@ -353,7 +358,7 @@ mod tests {
             .local_minus_utc();
         let mut from_ms = probe.timestamp_millis();
         for _ in 0..4000 {
-            probe = probe + TimeDelta::hours(6);
+            probe += TimeDelta::hours(6);
             let cur = Local
                 .from_utc_datetime(&probe.naive_utc())
                 .offset()

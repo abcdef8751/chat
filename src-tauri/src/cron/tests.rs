@@ -145,6 +145,31 @@ fn conversation_delete_cascades_jobs_and_runs() {
     assert!(db::list_cron_runs(&db, None, 10).unwrap().is_empty());
 }
 
+/// Catch-up is max one: a job whose slot passed while the app was closed is
+/// selected once, and `advance` resyncs the next slot into the future instead of
+/// replaying every missed slot.
+#[test]
+fn catch_up_fires_once_and_resyncs_forward() {
+    let db = open_db("catchup");
+    insert_conv(&db, "c1");
+    let now = db::now_ms();
+    // An hourly slot two hours in the past: two thresholds were crossed.
+    let j = job(&db, "c1", "0 * * * *", now - 2 * 3_600_000);
+
+    let due = db::due_cron_jobs(&db, now).unwrap();
+    assert_eq!(due.len(), 1, "a missed backlog must collapse to one fire");
+
+    advance(&db, &j, now, false).unwrap();
+    let after = db::get_cron_job(&db, &j.id).unwrap().unwrap();
+    assert!(
+        after.next_run_at > now,
+        "the schedule must resync forward, got {} (now {now})",
+        after.next_run_at
+    );
+    assert_eq!(after.run_count, 1);
+    assert!(db::due_cron_jobs(&db, now + 1).unwrap().is_empty());
+}
+
 /// The fired user turn carries the prompt plus an autonomous footer naming the
 /// job, so both the model and a reader know why it appeared.
 #[test]
