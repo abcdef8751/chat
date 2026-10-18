@@ -1,7 +1,7 @@
 import { createEffect, For, onCleanup, Show } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import type { Conversation } from "../lib/api";
-import { CloseIcon, MarkAvatar } from "../lib/icons";
+import { CloseIcon, ClockIcon, MarkAvatar } from "../lib/icons";
 
 /// The chat-list drawer: header + new-chat dialog, search, list items with
 /// inline rename/delete, plus the narrow-viewport edge-swipe gesture.
@@ -29,6 +29,9 @@ export function Sidebar(props: {
   confirmDeleteId: string | null;
   setConfirmDeleteId: (id: string | null) => void;
   removeConversation: (id: string) => void;
+  /// Conversations owning at least one enabled job — the tiny clock glyph next
+  /// to their title (informational only, never interactive).
+  cronConversationIds: ReadonlySet<string>;
 }) {
   const drawerHidden = () => !props.wideViewport && !props.sidebarOpen;
 
@@ -235,13 +238,25 @@ export function Sidebar(props: {
                         props.setConfirmDeleteId(null);
                         props.setSidebarOpen(false);
                       }}
-                      class={`w-full truncate rounded-lg px-3 py-2 pr-14 text-left text-sm transition ${
+                      class={`w-full rounded-lg px-3 py-2 pr-14 text-left text-sm transition ${
                         props.activeId === c.id
                           ? "bg-neutral-200/80 font-medium dark:bg-neutral-800 dark:text-neutral-100"
                           : "text-neutral-700 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
                       }`}
                     >
-                      {c.title}
+                      {/* The glyph must survive a long title, so truncation moved
+                          from the button to the inner title span. */}
+                      <span class="flex min-w-0 items-center gap-1">
+                        <span class="truncate">{c.title}</span>
+                        <Show when={props.cronConversationIds.has(c.id)}>
+                          <span
+                            title="Has a scheduled job"
+                            class="shrink-0 text-neutral-400 dark:text-neutral-500"
+                          >
+                            <ClockIcon class="h-3.5 w-3.5" />
+                          </span>
+                        </Show>
+                      </span>
                     </button>
                     {/* Row actions: hover-revealed at `lg`; always visible on
                         narrow (touch) viewports where there is no hover. */}

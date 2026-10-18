@@ -1,6 +1,6 @@
 import { For, Index, Show } from "solid-js";
 import type { Attachment, Message } from "../lib/api";
-import { DocIcon, PaperclipIcon } from "../lib/icons";
+import { ClockIcon, DocIcon, PaperclipIcon } from "../lib/icons";
 import { isAndroid } from "../lib/platform";
 import { formatBytes, parseAttachments, type Turn } from "../lib/turns";
 import { openImage } from "./ImageLightbox";
@@ -26,6 +26,9 @@ export function MessageList(props: {
   onSaveEdit: () => void;
   onRemoveEditAttachment: (id: string) => void;
   onPickEditAttachments: () => void;
+  /// messageId → cron job title: a scheduled run posted that user message.
+  /// Rendered as a small pill beside the bubble; purely informational.
+  cronTriggers?: Record<string, string>;
 }) {
   /// Expand any image in the transcript (attachment images and images rendered
   /// by markdown prose) in the lightbox. Delegated here so the shared markdown
@@ -62,6 +65,20 @@ export function MessageList(props: {
                         fallback={
                           <>
                             <div class="flex items-start justify-end gap-1.5">
+                              {/* A scheduled run posted this message: pill with
+                                  the job's title, truncating long titles. The
+                                  `title` attribute explains the origin. */}
+                              <Show when={props.cronTriggers?.[u().id]}>
+                                {(cronTitle) => (
+                                  <span
+                                    title={`Posted by the scheduled job “${cronTitle()}”`}
+                                    class="mt-1 inline-flex max-w-40 items-center gap-1 truncate rounded-full border border-neutral-200 px-2.5 py-1 text-[10px] text-neutral-500 dark:border-neutral-700 dark:text-neutral-400"
+                                  >
+                                    <ClockIcon class="h-3 w-3 shrink-0" />
+                                    <span class="truncate">scheduled · {cronTitle()}</span>
+                                  </span>
+                                )}
+                              </Show>
                               <button
                                 onClick={() => props.onStartEdit(u())}
                                 disabled={props.streaming}
