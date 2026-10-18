@@ -3218,6 +3218,7 @@ dependencies = [
  "croner",
  "jni 0.22.4",
  "keyring",
+ "notify-rust",
  "rand 0.8.8",
  "reqwest",
  "rusqlite",

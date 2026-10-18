@@ -517,16 +517,53 @@ fn notify(app: &AppHandle, job: &db::CronJob, body: &str) {
     if focused && app.state::<CronState>().is_active(&job.conversation_id) {
         return;
     }
-    use tauri_plugin_notification::NotificationExt;
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(&job.title)
-        .body(body)
-        .show()
-    {
-        eprintln!("cron: notification failed: {e}");
+    match send_notification(app, &job.title, body) {
+        Ok(()) => eprintln!("cron: notification sent for job {}", job.id),
+        Err(e) => eprintln!("cron: notification failed: {e}"),
     }
+}
+
+/// Show a desktop notification, returning the real result.
+///
+/// On Linux this bypasses `tauri-plugin-notification`: its `show()` spawns the
+/// D-Bus call and **discards the error**, so a broken path (no daemon, no
+/// session bus, a rejected notification) looked exactly like success. notify-rust
+/// is the same backend the plugin uses, called synchronously so the result is
+/// real (and the "Send test notification" button can report it).
+fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app;
+        notify_rust::Notification::new()
+            .summary(title)
+            .body(body)
+            .appname("Pi Chat")
+            .timeout(notify_rust::Timeout::Milliseconds(8000))
+            .show()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        app.notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// UI command: send a notification through the exact path a finished run uses,
+/// and report failure instead of hiding it.
+#[tauri::command]
+pub fn test_notification(app: AppHandle) -> Result<(), String> {
+    send_notification(
+        &app,
+        "Pi Chat",
+        "Desktop notifications are working. Scheduled runs will use this.",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -924,5 +961,21 @@ pub fn run_cron_now(
     match launch(&app, &job, true)? {
         true => Ok(()),
         false => Err("A scheduled run is already in flight for that chat.".into()),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod notification_smoke {
+    /// Opt-in: actually pops a desktop notification (needs a session bus and a
+    /// notification daemon). Proves the D-Bus path the app uses.
+    #[test]
+    #[ignore]
+    fn live_notification_smoke() {
+        notify_rust::Notification::new()
+            .summary("Pi Chat test")
+            .body("If you can see this, desktop notifications work.")
+            .appname("Pi Chat")
+            .show()
+            .expect("notification D-Bus call failed");
     }
 }

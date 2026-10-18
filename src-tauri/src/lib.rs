@@ -171,6 +171,7 @@ pub fn run() {
             cron::list_cron_triggers,
             cron::cron_preview,
             cron::cron_set_active,
+            cron::test_notification,
             db::memory_reflection_stats,
             pricing::get_pricing,
             pricing::refresh_pricing,

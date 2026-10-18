@@ -952,7 +952,11 @@ export default function App() {
   // null — the backend treats that as "no chat open").
   createEffect(() => {
     const id = activeId();
-    cronSetActive(id).catch(() => {});
+    // Suppress a run's notification only while the transcript it lands in is
+    // actually on screen: an open Cron / Memory / Settings dialog covers it even
+    // though the window still has focus.
+    const visible = !cronOpen() && !memoryOpen() && !settingsOpen();
+    cronSetActive(visible ? id : null).catch(() => {});
   });
 
   // Conversations owning at least one enabled job — the sidebar glyph source.

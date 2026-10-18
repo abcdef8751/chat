@@ -65,8 +65,9 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **329 passed, 3 ignored** (the opt-in live reasoning-echo
-check, the real-export import, and the real models.dev catalog parse). Clippy,
+`cargo test --lib`: **329 passed, 4 ignored** (the opt-in live reasoning-echo
+check, the real-export import, the real models.dev catalog parse, and a live
+desktop-notification smoke test). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
 `CC_aarch64_linux_android` etc.). The GUI e2e needs a display and is run
@@ -640,12 +641,20 @@ old chat and past runs stay where they are).
   full run history is never shipped over IPC on every refresh. A run that cannot start (no model or no provider key)
   moves the slot forward silently — no run row, no counter bump — so it does not
   retry every 20 s.
-- **Notifications:** `tauri-plugin-notification` (pinned `=2.4.0`: 2.5+ requires
-  tauri 2.12, which would drop the vendored `tauri-runtime-wry` patch). On
-  completion/failure a job with `notify` raises an OS notification (title = job
-  title, body = reply snippet or error), suppressed while the window is focused
-  *and* the run's conversation is the open one (`cron_set_active` is fed by the
-  UI). The `cron-updated` event drives the in-app badge and thread refresh.
+- **Notifications:** on completion/failure a job with `notify` raises an OS
+  notification (title = job title, body = reply snippet or error). It is
+  suppressed only while the user can actually see the thread: the window is
+  focused, no Cron/Memory/Settings dialog is open, and that thread is the active
+  conversation (`cron_set_active` is fed by the UI; an open dialog sends `null`).
+  On **Linux** the send bypasses `tauri-plugin-notification` and calls
+  `notify-rust` directly: the plugin's `show()` spawns the D-Bus call and
+  discards its error, so a broken path looked like success. The direct call
+  returns the real result, logs it, and backs the Cron page's **Test
+  notification** button (`test_notification`), which reports failures instead of
+  hiding them. Other platforms keep the plugin (pinned `=2.4.0`: 2.5+ requires
+  tauri 2.12, which would drop the vendored `tauri-runtime-wry` patch); its
+  `show()` still swallows errors, so the test button only proves the call on
+  Linux. The `cron-updated` event drives the in-app badge and thread refresh.
   Desktop-first: Android needs a notification channel + `POST_NOTIFICATIONS`
   (same deferred-device pattern as the other mobile work); the event/badge path
   is platform-neutral.

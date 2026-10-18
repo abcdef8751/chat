@@ -48,6 +48,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # OS trust store (see crate::android::init_rustls). `jni` 0.22 matches the
 # version rustls-platform-verifier 0.7 uses so our export can feed it the Env
 # directly.
+# Desktop Linux notifications go through notify-rust directly: the plugin's
+# Linux `show()` spawns and discards the D-Bus error, so a broken notification
+# path is invisible. Sending here returns the real result (and powers the
+# "Send test notification" button).
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = "4"
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.22", default-features = false }
 rustls-platform-verifier = "0.7"

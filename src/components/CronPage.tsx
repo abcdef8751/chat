@@ -8,7 +8,7 @@ import type {
   CronRun,
   UpdateCronPayload,
 } from "../lib/api";
-import { cronPreview } from "../lib/api";
+import { cronPreview, testNotification } from "../lib/api";
 import { BackArrowIcon, ClockIcon } from "../lib/icons";
 import { formatCost } from "../lib/turns";
 
@@ -64,6 +64,9 @@ export function CronPage(props: {
   const [confirmDeleteId, setConfirmDeleteId] = createSignal<string | null>(null);
   // Live validation + next-run preview (`cron_preview`, debounced below).
   const [preview, setPreview] = createSignal<CronPreview | null>(null);
+  // "Send test notification": the backend returns the real OS/D-Bus result.
+  const [notifyBusy, setNotifyBusy] = createSignal(false);
+  const [notifyNote, setNotifyNote] = createSignal<string | null>(null);
 
   // The schedule string the form currently describes, in the backend's
   // preset-or-5-field vocabulary.
@@ -244,6 +247,19 @@ export function CronPage(props: {
     await props.onDeleteCron(jobId);
   }
 
+  async function sendTestNotification() {
+    setNotifyBusy(true);
+    setNotifyNote(null);
+    try {
+      await testNotification();
+      setNotifyNote("Sent — check your notification centre.");
+    } catch (e) {
+      setNotifyNote(String(e));
+    } finally {
+      setNotifyBusy(false);
+    }
+  }
+
   // --- Small pure helpers (schedule/time rendering) ------------------------
 
   /// Human-readable description of a **stored** (normalized) schedule. The
@@ -332,12 +348,25 @@ export function CronPage(props: {
               <BackArrowIcon />
             </Dialog.CloseButton>
             <Dialog.Title class="text-base font-semibold">Scheduled jobs</Dialog.Title>
+            <button
+              onClick={() => void sendTestNotification()}
+              disabled={notifyBusy()}
+              title="Send a desktop notification through the same path a finished run uses"
+              class={`${smallButtonClass} ml-auto`}
+            >
+              {notifyBusy() ? "Sending…" : "Test notification"}
+            </button>
           </div>
           <Dialog.Description class="mt-1 text-sm text-neutral-500 dark:text-neutral-400">
-            Jobs run a prompt in a conversation on a schedule, in the background, without
-            opening the app. Runs post a message to that chat and can send an OS
-            notification. Each run spends tokens like a normal turn.
+            Jobs run a prompt on a schedule, in the background, without opening the app.
+            Runs post into the job's own thread (under “Scheduled” in the sidebar) and can
+            send an OS notification. Each run spends tokens like a normal turn.
           </Dialog.Description>
+          <Show when={notifyNote()}>
+            <p class="mt-2 text-[11px] text-neutral-500 dark:text-neutral-400">
+              {notifyNote()}
+            </p>
+          </Show>
 
           <Show when={props.cronError}>
             <p class="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-400">

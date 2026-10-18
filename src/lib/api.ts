@@ -726,3 +726,9 @@ export function cronPreview(schedule: string): Promise<CronPreview> {
 export function cronSetActive(conversationId: string | null): Promise<void> {
   return invoke<void>("cron_set_active", { conversationId });
 }
+
+/** Send a notification through the same path a finished run uses; rejects with
+ * the OS/D-Bus error instead of hiding it. */
+export function testNotification(): Promise<void> {
+  return invoke<void>("test_notification");
+}
