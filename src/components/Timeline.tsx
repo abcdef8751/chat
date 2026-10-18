@@ -1,4 +1,4 @@
-import { createSignal, For, Index, Match, Show, Switch } from "solid-js";
+import { createMemo, createSignal, For, Index, Match, Show, Switch } from "solid-js";
 import type { Message } from "../lib/api";
 import { DocIcon } from "../lib/icons";
 import Markdown from "../lib/Markdown";
@@ -139,7 +139,7 @@ export function Timeline(props: {
   onApprove: (callId: string) => void;
   onDeny: (callId: string) => void;
 }) {
-  const blocks = () => groupBlocks(props.entries);
+  const blocks = createMemo(() => groupBlocks(props.entries));
   const answer = () => props.answer;
   const answerLive = () => props.live && !!answer()?.id.startsWith("tmp-assistant-");
   const shownAnswer = () => {
