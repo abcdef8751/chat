@@ -1821,6 +1821,14 @@ export default function App() {
       await updateProvider(id, name, url, key ? key : undefined);
       await refreshProviders();
       setEditId(null);
+      if (key) {
+        // Setting a provider key is catalog-relevant: without it list_models
+        // errors, so the model picker is empty (or stale) until a restart.
+        // Refetch the edited provider's model list right away — same as
+        // switching providers in the header — so a new key takes effect
+        // without leaving and reopening Settings.
+        await loadModels(true, id);
+      }
     } catch (e) {
       setProviderError(String(e));
     }
