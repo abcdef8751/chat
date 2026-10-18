@@ -314,6 +314,9 @@ export default function App() {
   // Sequencing guard for `loadCronRuns`: a slow response for a previous job
   // must not overwrite the newer selection's runs.
   let cronRunsSeq = 0;
+  /// Guard for `refreshCronTriggers`: a response for a chat the user already
+  /// switched away from must not overwrite the current chat's pill map.
+  let cronTriggersSeq = 0;
 
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
@@ -819,12 +822,16 @@ export default function App() {
   // even after years of scheduled runs; no chat means no pills.
   async function refreshCronTriggers() {
     const id = activeId();
+    const seq = ++cronTriggersSeq;
     if (!id) {
       setCronTriggers({});
       return;
     }
     try {
       const triggers = await listCronTriggers(id);
+      // A slow response for a previous chat must not overwrite the current
+      // chat's pills (and the user may have switched away in the meantime).
+      if (seq !== cronTriggersSeq || activeId() !== id) return;
       const map: Record<string, string> = {};
       for (const t of triggers) map[t.messageId] = t.title;
       setCronTriggers(map);
