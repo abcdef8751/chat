@@ -64,12 +64,12 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **280 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **288 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
 `CC_aarch64_linux_android` etc.). The GUI e2e needs a display and is run
-separately.
+separately — it passes end to end (`ALL ASSERTIONS PASSED`).
 
 | Area              | State | Notes                                                                                                     |
 | ----------------- | ----- | --------------------------------------------------------------------------------------------------------- |
@@ -316,6 +316,14 @@ memory_backfill_runs(             -- reduce-pass spend (spans many conversations
   capability metadata), so its models get the defaults above. Cache rows in
   `model_prices` are keyed by the normalized base-URL string (`provider_key`),
   not by catalog id.
+
+  **Saving a provider's key refetches its model list immediately**
+  (`doUpdateProvider` → `loadModels(true, id)`). Without that the picker stayed
+  empty until a restart, because nothing else changes when a key is added:
+  `closeSettings` only refreshes when the *endpoint* or the **Brave** key changed
+  (`persistSettings` reads `braveKeyDraft`, not the provider key), and the
+  header-sync effect deliberately early-returns unless the active
+  conversation/provider changed.
 
 ---
 
@@ -614,16 +622,29 @@ approval state) and memory consolidation. Screenshots →
 - The runner builds the debug binary **only if missing** — after changing Rust
   code, `cargo build` first so the harness picks it up.
 - It launches the app with an **isolated `XDG_DATA_HOME`** (seeded with the mock
-  endpoint). The mock key is entered by `e2e.mjs` through the Settings dialog
-  **only if the app reports no stored key** — it never overwrites an existing
-  keychain entry. `run.sh` itself writes no secret.
-- **Known blocker (pre-existing, environmental):** the suite stops at its first
-  model assertion when the app's keychain read fails in the harness context — the
-  custom mock provider has no catalog entry, so `list_models` needs a key and
-  returns `Err` without one (`models.rs`), leaving the picker empty
-  (`model picker … : [""]`). This reproduces identically on a checkout *before*
-  the feature work, so it is not a code regression; it needs the harness's key
-  handling to stop depending on an interactive secret service.
+  endpoint) *and an isolated secret store*: `run.sh` exports
+  `PI_SECRETS_DIR="$DATA_DIR/secrets"`, and `secrets.rs` redirects every
+  read/write/remove into plain `0600` files there when that variable is set
+  (unset — the default — the OS keychain path is byte-for-byte unchanged; the
+  Android file store shares the same `file_store` module, so the two cannot
+  drift). A run therefore cannot read, write or delete a real keychain entry. The
+  harness still *proves* it: it snapshots every `com.rp.chat` entry (via
+  `secret-tool`, sha256) before and after and fails if they differ, on the failure
+  path too.
+- The mock key is set through the **provider edit form**, never Settings' first
+  `input[type=password]` — **that one is the Brave Search key**. Getting this
+  wrong is silent: an earlier version typed `mock-key` into the Brave slot and
+  left the LLM key unset, which is why the picker stayed empty
+  (`model picker … : [""]`) and why a `brave_key` of `mock-key` appeared in the
+  keychain. (That history is why this used to be mis-documented as a keychain
+  failure.)
+- `run.sh` seeds the config's `model` with a **deliberately unlisted** id
+  (`e2e-never-listed`). The header `<select>` always synthesizes a stub option for
+  the current model, so seeding the mock's own id would make the picker assertion
+  vacuous; `mock-model` appearing proves the endpoint fetch actually ran.
+- **Ports are strict.** `run.sh` fails fast if `1420`/`8317`/`4444` are busy and
+  starts Vite with `--strictPort` — otherwise a stale dev server on 1420 is
+  silently tested instead of the tree under test.
 - **Input / clicks:** on this WebKitGTK build, `Element Click` / `Send Keys` /
   W3C Actions return `unsupported operation` (`/usr/bin/WebKitWebDriver` is the
   GTK4 build while the app runs on `webkit2gtk-4.1`). Clicks are dispatched via
@@ -992,8 +1013,6 @@ Residuals/open from that pass:
   Route it through the `picker` plugin and copy/stream the file to a real path
   when it's next touched. The two *attachment* pickers were fixed in-app via the
   `picker` bridge (see the Android file-pick gotcha).
-- **GUI e2e was not run** (no display in the change window) — the live-interleave
-  DOM stability and the flushed-reasoning popup are the areas worth re-checking.
 - **`stop()` does not restore the draft.** The user row is persisted before
   streaming starts, so restoring would duplicate it on the next send; the turn
   stays in the transcript and is editable instead. (Zero-event aborts therefore
