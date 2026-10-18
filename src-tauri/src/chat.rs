@@ -147,6 +147,22 @@ impl StreamRegistry {
     pub fn is_streaming(&self, id: &str) -> bool {
         self.streams.lock().unwrap().contains_key(id)
     }
+
+    /// Register a conversation **only if nothing is in flight**. Used by the cron
+    /// scheduler, whose interlock must not be racy: a live user turn may start in
+    /// the window between the scheduler's `is_streaming` check and its own
+    /// registration, and an unconditional [`register`](Self::register) would
+    /// silently replace that turn's cancel token (so Stop would abort the wrong
+    /// one). `None` means "someone else is using this conversation — defer".
+    pub fn try_register(&self, id: String) -> Option<CancelToken> {
+        let mut streams = self.streams.lock().unwrap();
+        if streams.contains_key(&id) {
+            return None;
+        }
+        let token = CancelToken::new();
+        streams.insert(id, token.clone());
+        Some(token)
+    }
 }
 
 
@@ -1548,6 +1564,7 @@ async fn dispatch_tool(
     memory: &crate::memory::MemoryState,
     cfg: &AppConfig,
     db: Option<&db::Db>,
+    source: &str,
 ) -> DispatchedTool {
     if call.name == "read_file" {
         if let Some(path) = call.arguments.get("path").and_then(Value::as_str) {
@@ -1572,6 +1589,18 @@ async fn dispatch_tool(
     } else if call.name == "web_fetch" {
         // Read-only and ungated, like the Brave tools, and needs no API key.
         tools::execute_web_tool(call).await
+    } else if crate::cron::is_cron_tool(&call.name) {
+        // Cron management is app-local and ungated (like the memory tools), so
+        // "remind me every morning" works conversationally. It needs the DB;
+        // the tool list is shared with reflection/extraction, which have no
+        // `persist` handle and refuse these calls by mode before reaching here.
+        match db {
+            Some(db) => crate::cron::execute_tool(call, db, source),
+            None => ToolOutput::err(format!(
+                "{} is not available in this context.",
+                call.name
+            )),
+        }
     } else {
         tools::execute_host_tool(call, shell).await
     };
@@ -1592,6 +1621,20 @@ pub(crate) enum ToolMode {
     /// at all, because extraction is pure summarization. The gate below is a
     /// guard in case a model emits a tool call anyway.
     Extract,
+    /// An unattended cron run. Memory and web tools are always allowed; the
+    /// job's policy decides the gated host tools (`bash`/`read_file`/
+    /// `write_file`).
+    Cron(CronToolPolicy),
+}
+
+/// Per-job host-tool access for a cron run. The tool *list* is unchanged (cache
+/// alignment); only dispatch differs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CronToolPolicy {
+    /// Refuse gated host tools with a tool-error so the model self-corrects.
+    ReadOnly,
+    /// Run gated host tools unapproved (YOLO semantics), per this job only.
+    AutoApprove,
 }
 
 /// The capped tool loop, factored out of [`run_chat_turn`] so the memory
@@ -1807,6 +1850,15 @@ pub(crate) async fn run_tool_loop(
                          text instead of calling tools.",
                         call.name
                     )),
+                    // A scheduled run blocks host-tool side effects unless the
+                    // job opted into auto-approval. Memory and web tools stay
+                    // available (read-only / app-local).
+                    ToolMode::Cron(CronToolPolicy::ReadOnly) if host_gated => Some(format!(
+                        "{} is not available in this scheduled run: the job's tool policy is \
+                         'readonly'. Enable auto-approve on the job (or ask the user to run it \
+                         manually).",
+                        call.name
+                    )),
                     _ => None,
                 };
                 let outcome = if let Some(message) = refused {
@@ -1837,7 +1889,7 @@ pub(crate) async fn run_tool_loop(
                         let dispatched = tokio::select! {
                             biased;
                             _ = token.cancelled() => None,
-                            d = dispatch_tool(call, brave, shell, memory, cfg, persist) => Some(d),
+                            d = dispatch_tool(call, brave, shell, memory, cfg, persist, source) => Some(d),
                         };
                         match dispatched {
                             Some(d) => d,
@@ -1968,14 +2020,16 @@ pub(crate) async fn run_tool_loop(
     })
 }
 
-/// The live chat turn: persist the user message, run the capped tool loop with
+/// The shared turn core: persist the user message, run the capped tool loop with
 /// DB persistence, freeze the turn's price, and store the final assistant turn.
+/// Used by a live chat turn ([`run_chat_turn`]) and by an unattended cron run
+/// (which passes [`ToolMode::Cron`] and records `cron_runs` from the outcome).
 ///
 /// When `regenerate` is true the user message is assumed to already exist (the
 /// `edit_user_message` path), so no `user` row is inserted; the turn is built
 /// from `content` all the same.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_chat_turn(
+pub(crate) async fn run_turn_core(
     db: &db::Db,
     cfg: &AppConfig,
     api_key: &str,
@@ -1989,7 +2043,8 @@ pub(crate) async fn run_chat_turn(
     content: String,
     attachments: Vec<crate::attachments::Attachment>,
     regenerate: bool,
-) -> Result<(), String> {
+    mode: ToolMode,
+) -> Result<TurnOutcome, String> {
     let conversation = db::get_conversation(db, &conversation_id)?
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
     let mut history = db::read_messages(db, &conversation_id)?;
@@ -2036,6 +2091,7 @@ pub(crate) async fn run_chat_turn(
     // turn. Instead, drop the (now last) user row from the history we send and
     // rebuild the request from `content` — exactly one copy of the turn goes
     // upstream, and no new row is persisted. A normal send has no such row yet.
+    let mut user_message_id: Option<String> = None;
     if regenerate {
         // `apply_user_message_edit` truncated everything after the edited row, so
         // it is the last persisted message. Match it by content at the last
@@ -2057,7 +2113,7 @@ pub(crate) async fn run_chat_turn(
         } else {
             Some(serde_json::to_string(&attachments).map_err(|e| e.to_string())?)
         };
-        db::insert_message_full(
+        let row = db::insert_message_full(
             db,
             conversation_id.clone(),
             "user".into(),
@@ -2073,6 +2129,7 @@ pub(crate) async fn run_chat_turn(
             None,
             attachments_json,
         )?;
+        user_message_id = Some(row.id);
     }
 
     let system_prompt = conversation_system_prompt(
@@ -2159,7 +2216,7 @@ pub(crate) async fn run_chat_turn(
         token,
         sink,
         Some(db),
-        ToolMode::Live,
+        mode,
     )
     .await?;
 
@@ -2205,9 +2262,69 @@ pub(crate) async fn run_chat_turn(
     )?;
 
     sink.emit(StreamEvent::Done {
-        stop_reason: result.stop_reason,
+        stop_reason: result.stop_reason.clone(),
     });
-    Ok(())
+    Ok(TurnOutcome {
+        user_message_id,
+        usage: result.usage,
+        stop_reason: result.stop_reason,
+        error: result.error,
+        text: result.text,
+    })
+}
+
+/// Result of one persisted turn, for callers that need bookkeeping (cron runs):
+/// which user row was appended, the accumulated usage (with `cost` frozen), and
+/// how the turn ended.
+pub(crate) struct TurnOutcome {
+    /// The user row this turn appended; `None` on the regenerate path, where the
+    /// row already existed.
+    pub user_message_id: Option<String>,
+    pub usage: Value,
+    pub stop_reason: String,
+    /// Provider/turn failure text when `stop_reason == "error"`.
+    pub error: Option<String>,
+    /// The final assistant text (empty on abort/cap paths), for notification
+    /// snippets.
+    pub text: String,
+}
+
+/// The live chat turn: [`run_turn_core`] in [`ToolMode::Live`], ignoring the
+/// bookkeeping outcome (the UI follows the stream events).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_chat_turn(
+    db: &db::Db,
+    cfg: &AppConfig,
+    api_key: &str,
+    brave: &tools::BraveSearch,
+    shell: &ShellExecutor,
+    memory: &crate::memory::MemoryState,
+    approvals: &tools::ApprovalRegistry,
+    token: CancelToken,
+    sink: &dyn EventSink,
+    conversation_id: String,
+    content: String,
+    attachments: Vec<crate::attachments::Attachment>,
+    regenerate: bool,
+) -> Result<(), String> {
+    run_turn_core(
+        db,
+        cfg,
+        api_key,
+        brave,
+        shell,
+        memory,
+        approvals,
+        token,
+        sink,
+        conversation_id,
+        content,
+        attachments,
+        regenerate,
+        ToolMode::Live,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Stream an assistant reply for the given conversation: read config + key,

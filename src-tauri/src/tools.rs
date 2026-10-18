@@ -239,10 +239,84 @@ pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
         web_fetch_tool(),
         fetch_image_tool(),
     ];
+    tools.extend(cron_tools());
     if brave {
         tools.extend(brave_tools());
     }
     tools
+}
+
+/// Cron management tools. App-local and ungated, like the memory tools, so a
+/// user can say "remind me every morning at 8" conversationally. They are in the
+/// shared tool list for every mode (prompt-cache alignment); reflection and
+/// extraction refuse them by mode.
+fn cron_tools() -> Vec<ChatCompletionTools> {
+    let schedule_desc = "Schedule: a preset token (`hourly`, `daily@HH:MM`, \
+        `weekly@mon:HH:MM`) or a 5-field cron expression \
+        (`minute hour day-of-month month day-of-week`, device local time). The floor is \
+        once per minute.";
+    vec![
+        fn_tool(
+            "create_cron",
+            &format!(
+                "Create a scheduled chat run: at each fire the app appends a normal user → \
+                 assistant exchange to a conversation, so the run sees the thread's full \
+                 history and memory. {schedule_desc} Returns the job id and next run time."
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "The instruction to carry out at each fire" },
+                    "schedule": { "type": "string", "description": "Preset token or 5-field cron expression" },
+                    "title": { "type": "string", "description": "Short human label; derived from the prompt when omitted" },
+                    "conversation_id": { "type": "string", "description": "Thread to append runs to; defaults to this conversation" },
+                    "tool_policy": { "type": "string", "description": "`readonly` (default: bash/read_file/write_file refused) or `autoapprove` (run host tools without asking)" },
+                    "notify": { "type": "boolean", "description": "Send an OS notification when the run finishes (default true)" }
+                },
+                "required": ["prompt", "schedule"]
+            }),
+        ),
+        fn_tool(
+            "list_crons",
+            "List scheduled runs: id, title, schedule, next/last run, enabled state, tool policy, and run count.",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        fn_tool(
+            "update_cron",
+            "Change an existing scheduled run. Only the fields you pass are updated; changing the schedule recomputes the next run time. The run's thread and history are untouched.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Job id (from list_crons)" },
+                    "prompt": { "type": "string" },
+                    "schedule": { "type": "string", "description": "Preset token or 5-field cron expression" },
+                    "title": { "type": "string" },
+                    "tool_policy": { "type": "string", "description": "`readonly` or `autoapprove`" },
+                    "notify": { "type": "boolean" },
+                    "enabled": { "type": "boolean", "description": "false pauses the job without deleting it" }
+                },
+                "required": ["id"]
+            }),
+        ),
+        fn_tool(
+            "delete_cron",
+            "Delete a scheduled run permanently. Its past messages stay in the thread.",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "Job id (from list_crons)" } },
+                "required": ["id"]
+            }),
+        ),
+        fn_tool(
+            "run_cron_now",
+            "Fire a scheduled run immediately without changing its schedule. The run starts within ~20 seconds (the scheduler picks it up) and appears in the job's thread.",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "Job id (from list_crons)" } },
+                "required": ["id"]
+            }),
+        ),
+    ]
 }
 
 /// Brave's native tool surface (mirrors the official `brave-search-mcp-server`

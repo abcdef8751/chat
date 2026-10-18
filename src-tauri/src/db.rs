@@ -1897,6 +1897,8 @@ pub struct CronJob {
     pub next_run_at: i64,
     pub last_run_at: Option<i64>,
     pub run_count: i64,
+    /// A one-shot "fire now" queued by the agent tool; the scheduler clears it.
+    pub run_requested: bool,
     pub created_at: i64,
 }
 
@@ -1941,12 +1943,13 @@ fn cron_job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         next_run_at: r.get(8)?,
         last_run_at: r.get(9)?,
         run_count: r.get(10)?,
-        created_at: r.get(11)?,
+        run_requested: r.get::<_, i64>(11)? != 0,
+        created_at: r.get(12)?,
     })
 }
 
 const CRON_JOB_COLUMNS: &str = "id, conversation_id, title, schedule, prompt, enabled, \
-     tool_policy, notify, next_run_at, last_run_at, run_count, created_at";
+     tool_policy, notify, next_run_at, last_run_at, run_count, run_requested, created_at";
 
 pub fn list_cron_jobs(db: &Db) -> Result<Vec<CronJob>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -2012,6 +2015,7 @@ pub fn insert_cron_job(
         next_run_at,
         last_run_at: None,
         run_count: 0,
+        run_requested: false,
         created_at: now_ms(),
     };
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -2084,6 +2088,19 @@ pub fn set_cron_job_run_state(
              run_count = run_count + ?4
          WHERE id = ?1",
         params![id, next_run_at, last_run_at, if bump_count { 1 } else { 0 }],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Move only the next slot (used when a due job cannot run at all: no model or
+/// no key). The run timestamp/counter stay untouched, so the UI does not claim a
+/// run happened.
+pub fn set_cron_job_next_run(db: &Db, id: &str, next_run_at: i64) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE cron_jobs SET next_run_at = ?2 WHERE id = ?1",
+        params![id, next_run_at],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
