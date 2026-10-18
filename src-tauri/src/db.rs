@@ -433,6 +433,37 @@ pub fn insert_message_full(
     attachments: Option<String>,
 ) -> Result<MessageRow, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    insert_message_on(
+        &conn,
+        conversation_id,
+        role,
+        content,
+        model,
+        provider,
+        thinking_level,
+        thinking,
+        usage,
+        stop_reason,
+        attachments,
+    )
+}
+
+/// [`insert_message_full`] against an already-locked connection or an open
+/// transaction.
+#[allow(clippy::too_many_arguments)]
+fn insert_message_on(
+    conn: &Connection,
+    conversation_id: String,
+    role: String,
+    content: String,
+    model: Option<String>,
+    provider: Option<String>,
+    thinking_level: Option<String>,
+    thinking: Option<String>,
+    usage: Option<String>,
+    stop_reason: Option<String>,
+    attachments: Option<String>,
+) -> Result<MessageRow, String> {
     let id = Uuid::new_v4().to_string();
     let now = now();
     let next_index: i64 = conn
@@ -450,7 +481,7 @@ pub fn insert_message_full(
     let rev = if internal {
         0
     } else {
-        bump_revision_c(&conn)?
+        bump_revision_c(conn)?
     };
     conn.execute(
         "INSERT INTO messages (id, conversation_id, role, \"index\", content, model, provider, thinking_level, thinking, usage, stop_reason, attachments, created_at, revision, dirty)
@@ -511,6 +542,44 @@ pub fn insert_message_full(
         attachments,
         created_at: now,
     })
+}
+
+/// Persist a tool round's result rows in one transaction.
+///
+/// `run_tool_loop` writes the round's assistant `tool_calls` row before it
+/// dispatches anything, and replayed history must carry exactly one result per
+/// call. Inserting the results one statement at a time meant a failure at call
+/// *k* left its own row missing while later calls were still written — a
+/// half-round that replays as an invalid request (HTTP 400). One transaction for
+/// the batch removes that: either every call in the round gets a result row or
+/// none does, and the caller then fails the turn instead of continuing on a
+/// transcript it cannot replay.
+pub fn insert_tool_results(
+    db: &Db,
+    conversation_id: &str,
+    model: Option<String>,
+    provider: Option<String>,
+    thinking_level: Option<String>,
+    contents: &[String],
+) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for content in contents {
+        insert_message_on(
+            &tx,
+            conversation_id.to_string(),
+            "tool".into(),
+            content.clone(),
+            model.clone(),
+            provider.clone(),
+            thinking_level.clone(),
+            None,
+            None,
+            None,
+            None,
+        )?;
+    }
+    tx.commit().map_err(|e| e.to_string())
 }
 
 #[tauri::command]

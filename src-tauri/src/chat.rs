@@ -1732,13 +1732,13 @@ pub(crate) async fn run_tool_loop(
                     .into(),
             );
 
-            // One outcome per requested call, then one `tool` result row per
-            // outcome. The invariant is enforced in this single place: every call
-            // in the assistant `tool_calls` row the loop just persisted gets
-            // exactly one result, on every exit path (Stop mid-round, a cancelled
-            // approval wait, or a failed result insert). History replays that row
-            // verbatim, so a missing result would make the next turn an invalid
-            // request (HTTP 400) and brick the conversation.
+            // One outcome per requested call; after dispatch, the outcomes become
+            // one `tool` result row per call, written as a single transaction.
+            // Every exit path from the dispatch loop below yields an outcome too
+            // (Stop mid-round, a cancelled approval wait, a dropped dispatch), so
+            // a round the loop persists normally is replay-valid. What is NOT
+            // covered is the insert itself: if that batch fails, no result row is
+            // written at all — see the comment at the batch for the consequence.
             let mut aborted_mid_tools = false;
             let mut outcomes: Vec<DispatchedTool> = Vec::with_capacity(acc.tool_calls.len());
             for call in &acc.tool_calls {
@@ -1858,55 +1858,65 @@ pub(crate) async fn run_tool_loop(
             // in the round, so the request never interleaves a user turn between
             // an assistant `tool_calls` message and its tool responses.
             let mut injected_images: Vec<ChatCompletionRequestMessage> = Vec::new();
-            let mut persist_error: Option<String> = None;
-            for (call, dispatched) in acc.tool_calls.iter().zip(outcomes) {
+            let mut result_contents: Vec<String> = Vec::with_capacity(acc.tool_calls.len());
+            let mut result_texts: Vec<String> = Vec::with_capacity(acc.tool_calls.len());
+            let mut images: Vec<(usize, String)> = Vec::new();
+            for (pos, (call, dispatched)) in acc.tool_calls.iter().zip(outcomes).enumerate() {
                 let DispatchedTool {
                     output,
                     image,
                     attachment,
                 } = dispatched;
-
                 if let Some(attachment) = attachment {
                     attachments.push(attachment);
                 }
-
-                if let Some(db) = persist {
-                    if let Err(e) = db::insert_message(
-                        db,
-                        source.to_string(),
-                        "tool".into(),
-                        encode_tool_result(&call.id, &call.name, &output),
-                        Some(cfg.model.clone()),
-                        Some(cfg.base_url.clone()),
-                        Some(cfg.thinking_level.clone()),
-                        None,
-                        None,
-                        None,
-                    ) {
-                        // A failed write must not strand the calls after it:
-                        // keep persisting their results, then report the first
-                        // failure once the round's rows are all attempted.
-                        persist_error.get_or_insert(e);
-                    }
+                result_contents.push(encode_tool_result(&call.id, &call.name, &output));
+                result_texts.push(output.content);
+                if let Some(data_url) = image {
+                    images.push((pos, data_url));
                 }
+            }
+
+            // Persist the round's result rows as ONE batch, before building any
+            // of the fallible request messages. A batch is all-or-nothing, so no
+            // failure can leave a round half-written.
+            //
+            // Two residual holes, stated so nobody assumes more:
+            //  * The round's assistant `tool_calls` row was already persisted
+            //    before dispatch. If this batch fails, that row is left without
+            //    results: the turn fails here (the error propagates; no final
+            //    assistant row is written) rather than continuing as if the round
+            //    were saved, but `build_history_messages` does not detect the
+            //    shape, so the next request would be rejected provider-side
+            //    (HTTP 400). Practically unreachable, since every field is set.
+            //  * Nothing below can desync the transcript: the tool rows are
+            //    committed first, so a (practically unreachable) builder error
+            //    only ends the turn.
+            if let Some(db) = persist {
+                db::insert_tool_results(
+                    db,
+                    source,
+                    Some(cfg.model.clone()),
+                    Some(cfg.base_url.clone()),
+                    Some(cfg.thinking_level.clone()),
+                    &result_contents,
+                )?;
+            }
+            for (pos, call) in acc.tool_calls.iter().enumerate() {
                 messages.push(
                     ChatCompletionRequestToolMessageArgs::default()
-                        .content(output.content.clone())
+                        .content(result_texts[pos].clone())
                         .tool_call_id(call.id.clone())
                         .build()
                         .map_err(|e| e.to_string())?
                         .into(),
                 );
-
+            }
+            for (pos, data_url) in images {
                 // A `read_file` on an image hands the model a synthetic user
                 // image part (tool messages are text-only). It is request-scoped:
                 // never persisted, so it does not appear as a turn or replay.
-                if let Some(data_url) = image {
-                    injected_images.push(image_request_message(call, data_url)?);
-                }
-            }
-            if let Some(e) = persist_error {
-                return Err(e);
+                injected_images.push(image_request_message(&acc.tool_calls[pos], data_url)?);
             }
 
             if aborted_mid_tools {
