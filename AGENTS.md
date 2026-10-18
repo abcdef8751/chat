@@ -24,8 +24,14 @@ A general-purpose AI chat app (not a coding agent) with:
   (ungated; raster-only; persisted on the message, so it survives reload)
 - Reasoning traces from thinking models (inline "Thought" container → popup),
   interleaved with the answer as it streams
-- Per-turn **transcript blocks**: reasoning container(s) and always-inline tool
-  cards woven between the answer's output segments, in stream order
+- Per-turn **activity container**: one collapsible per turn, labelled
+  `Thought · N tools`, holding the reasoning button(s) (which open the trace
+  popup — the raw trace never renders inline), the tool cards, and the interim
+  text. It opens itself while the turn streams and collapses when it finishes;
+  the final answer renders below it. Interim text lives *inside* it rather than
+  between the answer's segments because some models reuse their pre-tool
+  narration as a draft and restate it in the answer (the system prompt also asks
+  them not to, but that is only a nudge)
 - LaTeX math (`$…$` / `$$…$$`) rendered with KaTeX
 - Click any transcript image to expand it centred on screen
 - Plain-Markdown long-term **memory** curated by an idle reflection pass
