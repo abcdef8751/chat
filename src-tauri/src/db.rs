@@ -270,7 +270,7 @@ pub struct Conversation {
     pub updated_at: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct MessageRow {
     pub id: String,
     pub conversation_id: String,
@@ -380,6 +380,13 @@ pub fn read_messages(db: &Db, conversation_id: &str) -> Result<Vec<MessageRow>, 
     Ok(out)
 }
 
+/// Roles that live in `messages` but are not conversation turns: `memory`
+/// consolidation notes and `clock` time notes. They are never synced, never bump
+/// the conversation's revision/updated_at, and are skipped by the timeline.
+fn is_internal_role(role: &str) -> bool {
+    matches!(role, "memory" | "clock")
+}
+
 /// Insert a message row, assigning the next monotonic index. Used by both the
 /// `add_message` command and the streaming command, keeping DB locking short.
 #[allow(clippy::too_many_arguments)]
@@ -435,9 +442,12 @@ pub fn insert_message_full(
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    // Only real turns are syncable; memory consolidation notes are background
-    // bookkeeping and are never pushed (so they keep revision 0 / dirty 0).
-    let rev = if role == "memory" {
+    // Only real turns are syncable; memory consolidation notes and clock notes are
+    // background bookkeeping and are never pushed (so they keep revision 0 /
+    // dirty 0). Clock notes also stay out of `updated_at`, so writing one can
+    // never reset the reflection idle timer or reorder the sidebar on its own.
+    let internal = is_internal_role(&role);
+    let rev = if internal {
         0
     } else {
         bump_revision_c(&conn)?
@@ -460,14 +470,14 @@ pub fn insert_message_full(
             attachments,
             now,
             rev,
-            if role == "memory" { 0 } else { 1 }
+            if internal { 0 } else { 1 }
         ],
     )
     .map_err(|e| e.to_string())?;
     // Keep the conversation fresh in the sidebar order and auto-title the
-    // first user message when the conversation is still unnamed. Memory
-    // consolidation notes are background bookkeeping, so they don't reorder
-    // the sidebar. Only real turns bump the conversation's sync revision.
+    // first user message when the conversation is still unnamed. Memory and clock
+    // notes are background bookkeeping, so they don't reorder the sidebar. Only
+    // real turns bump the conversation's sync revision.
     if role == "user" {
         conn.execute(
             "UPDATE conversations
@@ -479,7 +489,7 @@ pub fn insert_message_full(
             params![conversation_id, now, derive_title(&content), rev],
         )
         .map_err(|e| e.to_string())?;
-    } else if role != "memory" {
+    } else if !internal {
         conn.execute(
             "UPDATE conversations SET updated_at = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
             params![conversation_id, now, rev],
@@ -845,7 +855,8 @@ pub fn search_conversations(
             "SELECT DISTINCT c.id, c.title, c.model, c.provider_id, c.system_prompt, c.compaction_summary, c.compaction_through, c.created_at, c.updated_at
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
-             WHERE lower(c.title) LIKE ?1 OR lower(m.content) LIKE ?1
+             WHERE lower(c.title) LIKE ?1
+                OR (m.role <> 'clock' AND lower(m.content) LIKE ?1)
              ORDER BY c.updated_at DESC",
         )
         .map_err(|e| e.to_string())?;

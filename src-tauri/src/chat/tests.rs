@@ -37,7 +37,17 @@
         id
     }
 
+    /// Turn rows only: `clock` notes are hidden bookkeeping (the timeline skips
+    /// them too), so a test asserting transcript structure need not count them.
+    /// Use [`raw_msgs`] when the notes themselves are the subject.
     fn msgs(db: &Db, cid: &str) -> Vec<crate::db::MessageRow> {
+        raw_msgs(db, cid)
+            .into_iter()
+            .filter(|m| m.role != "clock")
+            .collect()
+    }
+
+    fn raw_msgs(db: &Db, cid: &str) -> Vec<crate::db::MessageRow> {
         crate::db::read_messages(db, cid).unwrap()
     }
 
@@ -3018,77 +3028,50 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
     }
 
     #[test]
-    fn time_note_schedule_follows_the_last_update() {
-        let mk = |created_at: i64| crate::db::MessageRow {
-            id: "u".into(),
-            conversation_id: "c".into(),
-            role: "user".into(),
-            index: 0,
-            content: "hi".into(),
-            model: None,
-            provider: None,
-            thinking_level: None,
-            thinking: None,
-            usage: None,
-            stop_reason: None,
-            attachments: None,
-            created_at,
-        };
-        const MIN: i64 = 60 * 1000;
-        const DAY: i64 = 86_400 * 1000;
-        let midnight = 1_789_603_200_000; // 2026-09-17 00:00 UTC (a Thursday)
-
-        // Empty history => the first message always gets the initial note.
-        assert_eq!(time_note_kind(&[], midnight), Some(TimeNoteKind::Initial));
-
-        // The first user message IS the initial update, so a quick follow-up is
-        // suppressed...
-        let history = vec![mk(midnight), mk(midnight + MIN)];
-        assert_eq!(time_note_kind(&history, midnight + 2 * MIN), None);
-        // ...but 5 minutes after the *update* (midnight) the clock still refreshes,
-        // even though the newest user message is only 4.5 minutes old. The old
-        // 'since the last user message' rule would wrongly stay silent here.
-        assert_eq!(
-            time_note_kind(&history, midnight + 5 * MIN + 30_000),
-            Some(TimeNoteKind::Update)
+    fn clock_note_carries_utc_and_local_time() {
+        let ms = 1_789_603_200_000; // 2026-09-17 00:00 UTC, a Thursday
+        let content = clock_note_text(ms);
+        assert!(
+            content.starts_with("Current time: 2026-09-17 00:00 UTC (Thursday)."),
+            "note: {content}"
         );
-
-        // A burst denser than the interval refreshes once per interval, not never.
-        let burst = vec![mk(midnight), mk(midnight + 2 * MIN), mk(midnight + 4 * MIN)];
-        assert_eq!(time_note_kind(&burst, midnight + 5 * MIN), Some(TimeNoteKind::Update));
-
-        // A short gap across a UTC midnight still forces an update.
-        let late = midnight + DAY - MIN; // 2026-09-17 23:59
-        let early = midnight + DAY + MIN; // 2026-09-18 00:01, only 2 min later
-        assert_eq!(time_note_kind(&[mk(late)], early), Some(TimeNoteKind::Update));
-
-        // Same date, small gap => nothing.
-        assert_eq!(time_note_kind(&[mk(midnight)], midnight + MIN), None);
-
-        // Out-of-order timestamps never move the watermark: the later of the two
-        // user rows anchors it, so a 30s follow-up is still suppressed.
-        let jumbled = vec![mk(midnight + 2 * MIN), mk(midnight)];
-        assert_eq!(time_note_kind(&jumbled, midnight + 2 * MIN + 30_000), None);
+        // The local half is spelled out with the offset, so the model never has to
+        // add it itself (and cannot get the sign wrong).
+        let offset = local_utc_offset_minutes();
+        assert!(
+            content.contains(&format!(
+                "The user's local time is {} (UTC{})",
+                format_local_date_time(ms, offset),
+                format_utc_offset(offset)
+            )),
+            "note: {content}"
+        );
     }
 
     #[test]
-    fn time_note_message_formats_by_kind() {
-        let ms = 1_789_603_200_000; // 2026-09-17 00:00 UTC, a Thursday
-        let content = |kind| {
-            let v = serde_json::to_value(time_note_message(ms, kind).unwrap()).unwrap();
-            v["content"].as_str().unwrap().to_string()
-        };
-        let initial = content(TimeNoteKind::Initial);
-        assert!(
-            initial.starts_with("Current time: 2026-09-17 00:00 UTC (Thursday)."),
-            "initial note: {initial}"
+    fn local_offset_matches_the_os_timezone() {
+        use chrono::{Datelike, TimeZone, Timelike};
+        // Cross-check against chrono for a fixed instant. This is the check
+        // `format_utc_offset`'s own unit test cannot make: it pins the DIRECTION
+        // the offset is applied in, so an inverted sign (or a seconds-vs-minutes
+        // slip) fails here even though a signed HH:MM still renders.
+        let ms = 1_789_603_200_000; // 2026-09-17 00:00 UTC
+        let local = chrono::Local.timestamp_millis_opt(ms).unwrap();
+        let offset = local.offset().local_minus_utc() / 60;
+        let expected = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            local.year(),
+            local.month(),
+            local.day(),
+            local.hour(),
+            local.minute()
         );
-        assert!(initial.contains("Your local UTC offset is"), "initial note: {initial}");
-        // Every later refresh still carries the date + weekday, just not the offset.
-        assert_eq!(
-            content(TimeNoteKind::Update),
-            "Current time: 2026-09-17 00:00 UTC (Thursday)."
-        );
+        assert_eq!(format_local_date_time(ms, offset), expected);
+        // The live read agrees with the same source at the present instant, and is
+        // a sane zone offset.
+        let live = local_utc_offset_minutes();
+        assert_eq!(live, chrono::Local::now().offset().local_minus_utc() / 60);
+        assert!((-720..=840).contains(&live), "implausible offset: {live}");
     }
 
     #[test]
@@ -3256,7 +3239,11 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             "first note must carry the date + weekday, got: {}", caps[0]
         );
         assert!(
-            caps[0].contains("Your local UTC offset is"),
+            caps[0].contains("The user's local time is "),
+            "first note must spell out the local time, got: {}", caps[0]
+        );
+        assert!(
+            caps[0].contains("(UTC+") || caps[0].contains("(UTC-"),
             "first note must state the UTC offset, got: {}", caps[0]
         );
     }
@@ -3307,13 +3294,13 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             "the update note must carry the date + weekday, got: {}", caps[0]
         );
         assert!(
-            !caps[0].contains("Your local UTC offset is"),
-            "only the first note states the offset; got: {}", caps[0]
+            caps[0].contains("The user's local time is "),
+            "every note must state the local time + offset; got: {}", caps[0]
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn recent_follow_up_gets_no_clock_note() {
+    async fn recent_follow_up_also_carries_a_clock_note() {
         let (port, bodies, handle) = start_mock_capture(
             vec![vec![delta_chunk("hi"), finish_chunk("stop")]],
             0,
@@ -3350,29 +3337,120 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let _ = handle.join();
         let caps = bodies.lock().unwrap().clone();
         assert_eq!(caps.len(), 1);
-        // Guard against running exactly across a UTC midnight, which would force
-        // a new-date note regardless of the gap.
-        if format_date(now) == format_date(now - 60 * 1000) {
-            assert!(
-                !caps[0].contains("Current time:"),
-                "a <5 min follow-up must not carry a note, got: {}", caps[0]
-            );
+        // A follow-up seconds old gets a note just like any other turn: the notes
+        // are transient, so suppressing this one left the model with no clock at
+        // all on the very turns a user is most likely to ask the time.
+        assert!(
+            caps[0].contains("Current time:"),
+            "a <5 min follow-up must still carry a clock note, got: {}", caps[0]
+        );
+    }
+
+
+    /// The clock note must be *stored*, not just injected. A transient note shifts
+    /// the request sequence at its insertion point, so the next turn can only hit
+    /// the cache up to the previous turn's start and re-bills that whole exchange.
+    /// Persisting it makes every request an exact extension of the one before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clock_note_is_persisted_and_each_request_extends_the_last() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![delta_chunk("one"), finish_chunk("stop")],
+                vec![delta_chunk("two"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("clock-persist"));
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("clock-persist");
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        for text in ["first", "second"] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = TestSink(events.clone());
+            run_chat_turn(&db, &cfg, "test-key", &brave, &shell, &memory, &approvals, flag, &sink, cid.clone(), text.into(), Vec::new(), false)
+                .await
+                .unwrap();
         }
+        let _ = handle.join();
+
+        // Stored order: one note, then the turn it annotates, then the reply.
+        let rows = raw_msgs(&db, &cid);
+        let roles: Vec<&str> = rows.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["clock", "user", "assistant", "clock", "user", "assistant"],
+            "clock notes must be persisted before their user turn"
+        );
+        assert!(
+            rows[0].content.starts_with("Current time: ") && rows[0].content.contains("(UTC"),
+            "stored note: {}",
+            rows[0].content
+        );
+        // Bookkeeping, not a turn: no sync revision, never pushed.
+        {
+            let conn = db.0.lock().unwrap();
+            let (rev, dirty): (i64, i64) = conn
+                .query_row(
+                    "SELECT revision, dirty FROM messages WHERE role = 'clock' LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((rev, dirty), (0, 0), "clock notes must not be synced");
+        }
+
+        let caps = bodies.lock().unwrap().clone();
+        assert_eq!(caps.len(), 2);
+        let b1 = request_body(&caps[0]);
+        let b2 = request_body(&caps[1]);
+        let m1 = b1["messages"].as_array().unwrap();
+        let m2 = b2["messages"].as_array().unwrap();
+        assert_eq!(
+            &m2[..m1.len()],
+            &m1[..],
+            "the second request must extend the first verbatim, so the provider \
+             prefix cache covers it (a transient note would shift it instead)"
+        );
+        // Exactly one new note, immediately before the new user turn.
+        let before_last = &m2[m2.len() - 2];
+        assert_eq!(before_last["role"], "system");
+        assert!(
+            before_last["content"].as_str().unwrap().starts_with("Current time: "),
+            "expected a fresh clock note before the new turn, got: {before_last}"
+        );
+        assert_eq!(m2[m2.len() - 1]["role"], "user");
     }
 
     #[test]
-    fn time_note_absent_from_reflection_build() {
+    fn clock_note_is_not_injected_into_the_system_prompt() {
         let memory = temp_memory("reflection-time-note");
         let prompt = build_system_prompt("BASE", "mock", "", &memory, Some(0));
-        assert!(!prompt.contains("Current time:"), "system prompt must not contain time note");
-        // Reflection builds context directly without time note.
+        assert!(!prompt.contains("Current time:"), "system prompt must not contain the clock note");
+        // Reflection builds context directly: it gets no *fresh* note...
         let history = vec![row("a", "user", "hello")];
         let msgs = build_context(&prompt, None, &history).unwrap();
         let serialized = serde_json::to_string(&msgs).unwrap();
-        assert!(!serialized.contains("Current time:"), "reflection build must not contain time note");
-        // Also verify the time note helper formats correctly.
-        let note = format_date_time(0);
-        assert_eq!(note, "1970-01-01 00:00");
+        assert!(!serialized.contains("Current time:"), "no fresh note is injected");
+        // ...but a *stored* clock row replays as a system message, so live and
+        // reflection share the exact same prefix (and its prompt cache).
+        let stored = vec![
+            row("a", "clock", "Current time: 1970-01-01 00:00 UTC (Thursday)."),
+            row("b", "user", "hello"),
+        ];
+        let msgs = build_context(&prompt, None, &stored).unwrap();
+        let serialized = serde_json::to_string(&msgs).unwrap();
+        assert!(serialized.contains("Current time: 1970-01-01 00:00 UTC (Thursday)."));
+        assert!(serialized.contains("\"system\""));
+        // The formatters themselves.
+        assert_eq!(format_date_time(0), "1970-01-01 00:00");
         let note_ms = 1_789_646_269_072; // 2026-09-17 11:57 UTC
         assert!(format_date_time(note_ms).starts_with("2026-09-17 11:57"));
     }

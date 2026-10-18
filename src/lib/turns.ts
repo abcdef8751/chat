@@ -222,6 +222,9 @@ export function groupTurns(messages: Message[], liveTools: LiveTool[], streaming
       rowsByTurn.set(current, []);
       continue;
     }
+    // Clock notes are hidden bookkeeping rows: they belong in the model's context
+    // (and in the shared prompt prefix), never in the timeline.
+    if (m.role === "clock") continue;
     if (m.role === "memory") {
       if (!current) {
         current = { key: m.id, user: null, entries: [], answer: null, live: false, note: m };

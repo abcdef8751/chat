@@ -1,3 +1,7 @@
+User instructions:
+
+- Preferably don't read the messages in the database
+
 # AGENTS.md — Pi Chat
 
 This is the single working document for **Pi Chat**, a small desktop AI chat app:
@@ -48,7 +52,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **238 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **267 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -125,6 +129,46 @@ images.
 
 ---
 
+## Clock updates
+
+The model is told the time by a **`clock` row written immediately before each
+user turn** — a real `messages` row, hidden from the timeline. The **system
+prompt is left untouched**.
+
+- **Stored, not injected.** A *transient* note is the wrong shape for prompt
+  caching: it sits at the end of one request but not the next, so the sequence
+  shifts at its insertion point and every turn has to re-send the previous
+  exchange — uncached — from there on. A stored row makes each request an exact
+  extension of the previous one, so the provider's prefix cache covers the whole
+  conversation. A note is ~25 tokens (~100 chars) of cached context per turn.
+- **Why every turn.** An earlier version only injected a note when **≥5 minutes**
+  had passed since the last update or the UTC date had rolled over. Because
+  nothing was stored, each note vanished with the turn that injected it, so every
+  turn in between carried **no clock at all** and the model could answer "I don't
+  know the current time" seconds after being told. Always writing one removes
+  both the gap and the staleness.
+- **Shape.** UTC time + weekday, the device's local wall time, and the offset:
+  `Current time: 2026-10-16 14:30 UTC (Friday). The user's local time is 2026-10-16 17:30 (UTC+03:00).`
+  The offset is read fresh from the OS every turn (`chrono::Local`, DST-aware —
+  the one place chrono is used), so a DST change or a move to another timezone
+  shows up immediately, and the local time is spelled out so the model never does
+  the arithmetic (or gets the sign wrong). The date rides every note because chat
+  history carries no timestamps.
+- **Bookkeeping, not a turn.** `clock` rows are local-only like `memory` notes:
+  never synced (revision 0 / dirty 0), no `updated_at` bump (so a note can't reset
+  the reflection idle timer or reorder the sidebar), skipped by `groupTurns` in
+  the timeline, and filtered out of `summarize_history`'s fold. On the
+  `regenerate` path (the edited user row already exists) the note is stored just
+  after it; every other turn stores it before.
+- **Replay.** `build_history_messages` surfaces `clock` rows as `system`
+  messages, so live and reflection build the same prefix. Reflection gets no
+  *fresh* note (`build_context` directly) — only the stored ones.
+
+The system prompt's `This conversation started on <date> (<Weekday>) UTC.` line
+carries its weekday too.
+
+---
+
 ## Context compaction
 
 Keeps a long conversation inside the model's window without losing the raw
@@ -193,7 +237,7 @@ conversations(
   created_at, updated_at)
 
 messages(
-  id, conversation_id, role,     -- user | assistant | tool | memory
+  id, conversation_id, role,     -- user | assistant | tool | memory | clock
   "index",                        -- per-conversation monotonic order
   content, model, provider, thinking_level, thinking,
   usage,                          -- JSON token/cost (frozen `cost` per turn)
@@ -221,7 +265,10 @@ memory_backfill_runs(             -- reduce-pass spend (spans many conversations
 - **`role`:** `memory` rows are consolidation notes. `build_history_messages`
   surfaces them to the model as lightweight `system` messages (so they're part of
   the cacheable prefix in both live and reflection turns), and the UI renders them
-  as a centered note, not a turn.
+  as a centered note, not a turn. `clock` rows are the per-turn time note (see
+  "Clock updates"): same treatment, but the timeline skips them entirely. Both
+  roles are **local-only bookkeeping** — never synced, never bumping the
+  conversation's revision or `updated_at`.
 - **Tool-turn persistence:** assistant tool-request rows are
   `{"tool_calls":[{id,name,arguments}]}`; tool-result rows (`role="tool"`) are
   `{"tool_call_id","name","error","output"}`. Frontend parsers in `App.tsx`
@@ -562,10 +609,13 @@ and the app is byte-identical to before. Never blocks the UI.
   hard-delete), and re-orders a conversation's local `index` by `(created_at,
   id)` for consistent cross-device ordering. **Live progress** rides
   `SyncStatus` for the Settings panel: push reports per batch against `pending`,
-  and pull reports per page with a real total (`pull_total`, from PostgREST
-  `Prefer: count=exact` → `Content-Range` on each table's first page) that the
-  UI turns into a bar; a server without the count leaves pull `↓N` without a
-  denominator. **User config** (explicit
+  and pull reports per page with a total (`pull_total`, from PostgREST
+  `Prefer: count=estimated` → `Content-Range` on each table's first page) that the
+  UI turns into a bar — `estimated` (exact up to `db-max-rows`, planner estimate
+  beyond) rather than `count=exact`, because the unbounded exact COUNT over the
+  whole filtered set on a large `messages` table under RLS blows Supabase's
+  statement timeout (57014) and wedges the pull at its first page; a server
+  without the count leaves pull `↓N` without a denominator. **User config** (explicit
   preferences + providers + price/capability overrides) syncs as a single global
   `user_config` row. It is the one place a single row's whole-row LWW was not
   enough: a row mixes fields edited independently, so the row revision had to
@@ -719,7 +769,7 @@ and the app is byte-identical to before. Never blocks the UI.
 │     └─ Markdown.tsx  # marked + DOMPurify renderer (prose + dark:prose-invert)
 └─ src-tauri/
    ├─ tauri.conf.json  # v2 config (productName, window, devUrl, frontendDist)
-   ├─ Cargo.toml       # tauri, serde, rusqlite [bundled], uuid, async-openai, keyring, reqwest, tokio, tokio-stream
+   ├─ Cargo.toml       # tauri, serde, rusqlite [bundled], uuid, async-openai, keyring, reqwest, tokio, tokio-stream, chrono
    ├─ capabilities/default.json
    ├─ vendor/tauri-runtime-wry/  # vendored+patched crate (see PATCH.md) via [patch.crates-io]
    ├─ gen/android/     # generated Android project (Kotlin: MainActivity.kt window

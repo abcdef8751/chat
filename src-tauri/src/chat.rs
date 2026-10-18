@@ -751,11 +751,13 @@ pub(crate) fn build_history_messages(
                         .into(),
                 );
             }
-            // Consolidation notes are background bookkeeping, but surface them to
-            // the model as lightweight system messages so it knows memory was
-            // updated (and doesn't re-save). Both live and reflection build
-            // history through here, so the shared prefix stays identical.
-            "memory" => {
+            // Consolidation notes and clock notes are bookkeeping, but both surface
+            // to the model as lightweight system messages: `memory` so it knows
+            // memory was updated (and doesn't re-save), `clock` so the current time
+            // and the device's UTC offset are in context on every turn. Live and
+            // reflection build history through here, so the shared prefix stays
+            // identical.
+            "memory" | "clock" => {
                 out.push(
                     ChatCompletionRequestSystemMessageArgs::default()
                         .content(row.content.clone())
@@ -994,7 +996,14 @@ async fn summarize_history(
             .map_err(|e| e.to_string())?
             .into(),
     ];
-    messages.extend(build_history_messages(fold)?);
+    // Clock notes are per-turn bookkeeping: folding them into the summary would
+    // spend tokens to record that the model was told the time, repeatedly.
+    let fold: Vec<db::MessageRow> = fold
+        .iter()
+        .filter(|m| m.role != "clock")
+        .cloned()
+        .collect();
+    messages.extend(build_history_messages(&fold)?);
     messages.push(
         ChatCompletionRequestUserMessageArgs::default()
             .content(COMPACTION_INSTRUCTION.to_string())
@@ -1167,93 +1176,45 @@ pub(crate) fn format_utc_offset(minutes: i32) -> String {
     format!("{sign}{:02}:{:02}", m / 60, m % 60)
 }
 
-/// How often the clock is refreshed in the model's context.
-const CLOCK_UPDATE_INTERVAL_MS: i64 = 5 * 60 * 1000;
-
-/// What the transient clock note before the new user turn should carry. Every
-/// note carries the date + weekday + time; only the first also carries the
-/// offset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TimeNoteKind {
-    /// First note of the conversation: the only one carrying the UTC offset.
-    Initial,
-    /// Any later refresh: >=5 minutes since the last update, or a new UTC date.
-    Update,
+/// Format an epoch millisecond timestamp in the device's local timezone for the
+/// clock note's local half. The offset is applied by hand so this stays
+/// consistent with the UTC formatter above.
+pub(crate) fn format_local_date_time(ms: i64, offset_minutes: i32) -> String {
+    format_date_time(ms + offset_minutes as i64 * 60_000)
 }
 
-/// Decide what --- if anything --- the clock note before the new user turn
-/// should carry.
+/// The clock note's text for this turn: the UTC time + weekday, the device's
+/// local wall time, and the local UTC offset. Split out from
+/// [`clock_note_message`] because the same string is both persisted (as a
+/// `clock` row) and injected into the request.
 ///
-/// The update schedule is *replayed* from the transcript rather than read back
-/// from stored state, because the notes are transient and never persisted: a
-/// note was shown before the first user message, and again before any later
-/// user message that arrived at least 5 minutes after the previous note or on a
-/// new UTC date. Replaying --- instead of measuring from
-/// the last user message --- makes the decision turn on the time since the
-/// **last clock update**, so a burst of messages more frequent than the interval
-/// still refreshes the clock once per interval rather than never.
-pub(crate) fn time_note_kind(
-    history: &[crate::db::MessageRow],
-    now_ms: i64,
-) -> Option<TimeNoteKind> {
-    let mut last_update: Option<i64> = None;
-    for m in history.iter().filter(|m| m.role == "user") {
-        last_update = Some(match last_update {
-            None => m.created_at,
-            Some(prev) => {
-                let elapsed = m.created_at - prev;
-                if m.created_at > prev
-                    && (elapsed >= CLOCK_UPDATE_INTERVAL_MS
-                        || format_date(m.created_at) != format_date(prev))
-                {
-                    m.created_at
-                } else {
-                    prev
-                }
-            }
-        });
-    }
-    // The replay only ever moves the watermark forwards; the live check below
-    // needs no such guard because `now_ms` is the present instant.
-    match last_update {
-        None => Some(TimeNoteKind::Initial),
-        Some(prev) => {
-            let new_date = format_date(now_ms) != format_date(prev);
-            if new_date || now_ms - prev >= CLOCK_UPDATE_INTERVAL_MS {
-                Some(TimeNoteKind::Update)
-            } else {
-                None
-            }
-        }
-    }
+/// The offset is read fresh from the OS every turn, so a DST change or a move to
+/// another timezone shows up immediately, and the local time is spelled out so
+/// the model never has to do the arithmetic (or get its sign wrong).
+pub(crate) fn clock_note_text(now_ms: i64) -> String {
+    let offset = local_utc_offset_minutes();
+    format!(
+        "Current time: {} UTC ({}). The user's local time is {} (UTC{}).",
+        format_date_time(now_ms),
+        weekday_name(now_ms),
+        format_local_date_time(now_ms, offset),
+        format_utc_offset(offset),
+    )
 }
 
-/// Build the transient clock-note system message for the current turn. It is
-/// injected, never persisted, and the system prompt itself is left untouched.
-pub(crate) fn time_note_message(
-    now_ms: i64,
-    kind: TimeNoteKind,
-) -> Result<ChatCompletionRequestMessage, String> {
-    let content = match kind {
-        // The offset rides only the first note: later notes are UTC times, which
-        // the model can map to local time once it knows the offset.
-        TimeNoteKind::Initial => format!(
-            "Current time: {} UTC ({}). Your local UTC offset is {}.",
-            format_date_time(now_ms),
-            weekday_name(now_ms),
-            format_utc_offset(local_utc_offset_minutes())
-        ),
-        // Every update still carries the date + weekday, not just the time: the
-        // notes are transient and chat history carries no timestamps, so a bare
-        // time would leave the model unable to tell which day it is.
-        TimeNoteKind::Update => format!(
-            "Current time: {} UTC ({}).",
-            format_date_time(now_ms),
-            weekday_name(now_ms)
-        ),
-    };
+/// Wrap the clock note in the system message injected before the new user turn.
+///
+/// The note is **persisted** as a `clock` row (hidden from the timeline) rather
+/// than only injected, because of prompt caching: a transient note sits at the
+/// end of one request but not the next, so the sequence shifts at its insertion
+/// point and every turn has to re-send the previous exchange — uncached — from
+/// there on. A stored row makes each request an exact extension of the last one,
+/// so the provider's prefix cache covers the whole conversation. It costs ~25
+/// tokens (~100 chars) per turn, which is far cheaper than re-billing one exchange
+/// per turn.
+pub(crate) fn clock_note_message(text: &str) -> Result<ChatCompletionRequestMessage, String> {
     Ok(ChatCompletionRequestSystemMessageArgs::default()
-        .content(content)
+        .content(text.to_string())
         .build()
         .map_err(|e| e.to_string())?
         .into())
@@ -1766,6 +1727,26 @@ pub(crate) async fn run_chat_turn(
     turn_cfg.base_url = provider.base_url.clone();
     turn_cfg.model = model.clone();
 
+    // Clock note (persisted, hidden from the timeline): written *before* the user
+    // turn so it replays verbatim on every later turn and each request stays an
+    // exact extension of the previous one (see `clock_note_message`). On the
+    // `regenerate` path the edited user row already exists, so the note lands just
+    // after it in storage — the one turn whose stored order differs from what was
+    // sent, so only that turn's prefix is not strictly extendable.
+    let note_text = clock_note_text(crate::db::now_ms());
+    db::insert_message(
+        db,
+        conversation_id.clone(),
+        "clock".into(),
+        note_text.clone(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+
     // Persist the incoming user turn before streaming so it survives an abort/error.
     //
     // `regenerate` is the edit path: `apply_user_message_edit` already updated the
@@ -1824,15 +1805,10 @@ pub(crate) async fn run_chat_turn(
         Some(conversation.created_at),
     );
 
-    // Clock note (transient, never persisted): inject a system message before the
-    // new user turn when this is the first message, when >=5 minutes have passed
-    // since the last clock update, or when the UTC date has rolled over. It must
+    // The note row was written above, before the user turn; the request still
+    // appends it explicitly because `history` was read before it existed. It must
     // survive the compaction rebuild below.
-    let now_ms = crate::db::now_ms();
-    let time_note = match time_note_kind(&history, now_ms) {
-        Some(kind) => Some(time_note_message(now_ms, kind)?),
-        None => None,
-    };
+    let time_note = clock_note_message(&note_text)?;
 
     // Context layout: system prompt → compaction summary (when one exists) →
     // verbatim history → [time note] → the new turn. If the request would cross
@@ -1841,9 +1817,7 @@ pub(crate) async fn run_chat_turn(
     let (mut summary, mut keep_start) = compacted_history(&conversation, &history);
     let mut messages = {
         let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
-        if let Some(ref note) = time_note {
-            msgs.push(note.clone());
-        }
+        msgs.push(time_note.clone());
         msgs.push(user_request_message(&content, &attachments)?);
         msgs
     };
@@ -1884,9 +1858,7 @@ pub(crate) async fn run_chat_turn(
             keep_start = new_start;
             messages = {
                 let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
-                if let Some(ref note) = time_note {
-                    msgs.push(note.clone());
-                }
+                msgs.push(time_note.clone());
                 msgs.push(user_request_message(&content, &attachments)?);
                 msgs
             };
