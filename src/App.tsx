@@ -764,6 +764,8 @@ export default function App() {
   // actively dragging. Without the gesture guard a streamed delta arriving
   // mid-drag re-pins to the bottom and fights the user's scroll-up.
   let userInteracting = false;
+  let lastScrollTop: number | null = null;
+  let lastScrollHeight = 0;
   createEffect(() => {
     messages();
     liveTools();
@@ -772,8 +774,25 @@ export default function App() {
     if (el) el.scrollTop = el.scrollHeight;
   });
 
+  // `nearBottom` gates auto-follow. A scroll event must never *re-enable* it the
+  // moment the user starts scrolling up: the wheel handler clears it on the first
+  // wheel-up, then the arriving scroll event recomputed `dist <= 80` and set it
+  // back, so the next streamed delta re-pinned to the bottom — visibly jittering
+  // for the first ~80px of every scroll-up attempt. Only an actual scroll *down*
+  // toward the bottom edge re-engages auto-follow; `shrank` covers the case where
+  // content collapsed under a pinned viewport and the browser clamped scrollTop
+  // down — the user is still at the bottom, so auto-follow must stay engaged.
   const updateNearBottom = (el: HTMLElement) => {
-    setNearBottom(el.scrollHeight - el.scrollTop - el.clientHeight <= 80);
+    const prev = lastScrollTop;
+    lastScrollTop = el.scrollTop;
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const shrank = el.scrollHeight < lastScrollHeight;
+    lastScrollHeight = el.scrollHeight;
+    if (dist > 80) {
+      setNearBottom(false);
+      return;
+    }
+    setNearBottom(shrank || prev == null || el.scrollTop >= prev);
   };
 
   async function createNewChat() {
