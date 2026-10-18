@@ -65,7 +65,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **311 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **319 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -557,7 +557,11 @@ device just sees the thread continue.
   naming the fix; `autoapprove` runs them unapproved. Memory / Brave / web tools
   are always allowed. The cron-management tools are allowed too, so a job can
   reschedule or disable itself. The job's policy is authoritative — it does not
-  inherit the global YOLO switch, and `readonly` is not overridden by it.
+  inherit the global YOLO switch, and `readonly` is not overridden by it. **No
+  approval prompt can ever be surfaced for a cron run:** it has no UI channel, so
+  the mode itself bypasses the approval pipeline (`yolo` includes
+  `ToolMode::Cron(_)`), which keeps a `Cron(AutoApprove)` turn from waiting
+  forever on a prompt nobody can answer.
   **Privilege escalation is gated:** `create_cron`/`update_cron` are ungated for
   ordinary use, but a call whose `tool_policy` is `autoapprove` is treated as a
   **gated** call (`chat::grants_autoapprove`) — the model may freely create

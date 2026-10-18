@@ -4667,6 +4667,76 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         )));
     }
 
+    /// The mode is authoritative for an unattended run: `Cron(AutoApprove)`
+    /// executes gated tools even when the global YOLO flag is OFF, and never
+    /// touches the approval channel (there is no UI to answer it). This pins the
+    /// anti-hang guarantee independently of `cfg.auto_approve_tools`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_autoapprove_never_waits_on_an_approval() {
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag(0, "c1", "bash", ""),
+                    tool_frag(0, "", "", r#"{\"command\":\"printf mode-authoritative\"}"#),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("done"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = open_db("cron-mode-authoritative");
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            // Deliberately OFF: the mode must not depend on it.
+            auto_approve_tools: false,
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("cron-mode-authoritative");
+        let approvals = tools::ApprovalRegistry::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_turn_core(
+                &db,
+                &cfg,
+                "test-key",
+                &brave,
+                &shell,
+                &memory,
+                &approvals,
+                CancelToken::new(),
+                &sink,
+                cid.clone(),
+                "scheduled prompt".into(),
+                Vec::new(),
+                false,
+                ToolMode::Cron(CronToolPolicy::AutoApprove),
+            ),
+        )
+        .await
+        .expect("cron run parked on an approval it can never surface")
+        .unwrap();
+        let _ = handle.join();
+
+        let guard = events.lock().unwrap();
+        assert!(guard.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolResult { ok: true, output, .. }
+                if output.contains("mode-authoritative")
+        )));
+        // And nothing was ever announced as gated (with NullSink this is moot,
+        // but it keeps the invariant if a sink is ever attached).
+        assert!(!guard
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCall { gated: true, .. })));
+    }
+
     /// `run_turn_core` returns the bookkeeping a cron run needs: the appended
     /// user row, the accumulated usage (with the frozen cost), and the stop
     /// reason. The transcript is a normal user → assistant pair.

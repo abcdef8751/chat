@@ -1869,7 +1869,13 @@ pub(crate) async fn run_tool_loop(
                 if host_gated {
                     gated_ids.push(call.id.clone());
                 }
-                let yolo = cfg.auto_approve_tools;
+                // A scheduled run has no approval UI (`NullSink`), so the mode
+                // must never park on the approval channel. `Cron(ReadOnly)`
+                // refuses gated calls above; `Cron(AutoApprove)` executes them —
+                // and no config value can put an unattended run into the
+                // interactive pipeline (the old hang: a `Cron(AutoApprove)` turn
+                // with `auto_approve_tools = false` waited forever).
+                let yolo = cfg.auto_approve_tools || matches!(mode, ToolMode::Cron(_));
                 sink.emit(StreamEvent::ToolCall {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
