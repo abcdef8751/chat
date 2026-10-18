@@ -521,9 +521,12 @@ device just sees the thread continue.
   (`try_register`, not `register` — a live turn may start in the window since the
   due check, and replacing its cancel token would make Stop abort the wrong
   turn). A busy chat defers the job to the next tick **without advancing its
-  slot**. The reflection scheduler already skips `is_streaming` conversations and
-  aborts an in-flight pass when one appears, so cron, live and reflection never
-  overlap; Stop in the UI also aborts a runaway scheduled reply.
+  slot**. The registry records whether the holder is a cron run or a live turn:
+  a live send is refused ("a scheduled run is in progress — wait for it") while a
+  cron run owns the chat, while a Stop-then-resend may still replace an earlier
+  *live* turn. The reflection scheduler already skips `is_streaming`
+  conversations and aborts an in-flight pass when one appears, so cron, live and
+  reflection never overlap; Stop in the UI also aborts a runaway scheduled reply.
 - **Catch-up is max one.** The overdue slot fires once, then `next_run_at` is
   recomputed from **now**, so a device that slept for a day resyncs forward
   instead of replaying every missed slot. A manual "Run now" never touches the

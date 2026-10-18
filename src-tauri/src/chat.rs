@@ -99,29 +99,62 @@ impl CancelToken {
     }
 }
 
+/// One conversation's in-flight registration: its cancel token and whether a
+/// **cron run** (rather than a live turn) owns it. The distinction matters
+/// because a live send may replace another live turn's token (Stop-then-resend,
+/// see [`StreamRegistry::remove`]) but must never silently take over a scheduled
+/// run, and vice versa.
+struct StreamEntry {
+    token: CancelToken,
+    cron: bool,
+}
+
 /// Registration of a conversation's in-flight stream, so the UI can abort it and
 /// the reflection scheduler can stay out of a conversation that is mid-turn.
 #[derive(Default)]
 pub struct StreamRegistry {
-    streams: Mutex<HashMap<String, CancelToken>>,
+    streams: Mutex<HashMap<String, StreamEntry>>,
 }
 
 impl StreamRegistry {
     /// Register a conversation as streaming and hand back its cancel token. The
     /// token stays valid after [`remove`](Self::remove) — cancellation is always
     /// observable to whoever holds it.
+    ///
+    /// This is the *live* registration and deliberately overwrites whatever is
+    /// there (the resend path). [`StreamRegistry::try_register_live`] is the
+    /// guarded variant the `stream_chat` command uses so a scheduled run is not
+    /// clobbered; this one remains for that contract's unit test and for callers
+    /// that have already established ownership.
     pub fn register(&self, id: String) -> CancelToken {
         let token = CancelToken::new();
-        self.streams.lock().unwrap().insert(id, token.clone());
+        self.streams
+            .lock()
+            .unwrap()
+            .insert(id, StreamEntry { token: token.clone(), cron: false });
         token
+    }
+
+    /// A live-chat registration that refuses to take over a **cron** run.
+    /// `None` means a scheduled run owns this conversation right now; the send
+    /// should be refused (wait for the run to finish) rather than corrupt the
+    /// transcript with two interleaved turns.
+    pub fn try_register_live(&self, id: String) -> Option<CancelToken> {
+        let mut streams = self.streams.lock().unwrap();
+        if streams.get(&id).is_some_and(|e| e.cron) {
+            return None;
+        }
+        let token = CancelToken::new();
+        streams.insert(id, StreamEntry { token: token.clone(), cron: false });
+        Some(token)
     }
 
     /// Abort the conversation's in-flight stream *now*: in-flight work blocked on
     /// the request open or a tool call is dropped immediately, not on the next
     /// poll.
     pub fn cancel(&self, id: &str) {
-        if let Some(token) = self.streams.lock().unwrap().get(id) {
-            token.cancel();
+        if let Some(entry) = self.streams.lock().unwrap().get(id) {
+            entry.token.cancel();
         }
     }
 
@@ -137,30 +170,34 @@ impl StreamRegistry {
     /// token leaves a subsequent turn's registration untouched.
     pub fn remove(&self, id: &str, token: &CancelToken) {
         let mut streams = self.streams.lock().unwrap();
-        if streams.get(id).is_some_and(|current| current.same_turn(token)) {
+        if streams
+            .get(id)
+            .is_some_and(|current| current.token.same_turn(token))
+        {
             streams.remove(id);
         }
     }
 
-    /// Whether a chat turn is currently streaming for this conversation. Used by
-    /// the memory-reflection scheduler to avoid running mid-turn.
+    /// Whether a chat turn (live or scheduled) is currently streaming for this
+    /// conversation. Used by the memory-reflection scheduler to avoid running
+    /// mid-turn.
     pub fn is_streaming(&self, id: &str) -> bool {
         self.streams.lock().unwrap().contains_key(id)
     }
 
-    /// Register a conversation **only if nothing is in flight**. Used by the cron
-    /// scheduler, whose interlock must not be racy: a live user turn may start in
-    /// the window between the scheduler's `is_streaming` check and its own
-    /// registration, and an unconditional [`register`](Self::register) would
-    /// silently replace that turn's cancel token (so Stop would abort the wrong
-    /// one). `None` means "someone else is using this conversation — defer".
+    /// Register a conversation for a **cron run** only if nothing is in flight.
+    /// Used by the cron scheduler, whose interlock must not be racy: a live user
+    /// turn may start in the window between the scheduler's `is_streaming` check
+    /// and its own registration, and an unconditional overwrite would make Stop
+    /// abort the wrong turn (and hide one from reflection). `None` means "someone
+    /// else is using this conversation — defer".
     pub fn try_register(&self, id: String) -> Option<CancelToken> {
         let mut streams = self.streams.lock().unwrap();
         if streams.contains_key(&id) {
             return None;
         }
         let token = CancelToken::new();
-        streams.insert(id, token.clone());
+        streams.insert(id, StreamEntry { token: token.clone(), cron: true });
         Some(token)
     }
 }
@@ -2367,7 +2404,10 @@ pub async fn stream_chat(
 
     let token = app
         .state::<StreamRegistry>()
-        .register(conversation_id.clone());
+        .try_register_live(conversation_id.clone())
+        .ok_or_else(|| {
+            "A scheduled run is in progress in this chat — wait for it to finish.".to_string()
+        })?;
     let sink = ChannelSink(&channel);
 
     let result = run_chat_turn(

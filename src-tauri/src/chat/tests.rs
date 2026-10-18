@@ -2229,6 +2229,35 @@ fn stream_registry_remove_only_removes_its_own_token() {
     assert!(!registry.is_streaming("c1"));
 }
 
+/// A live send must not silently take over a scheduled run (that would interleave
+/// two turns' rows in one transcript and hide the cron run from reflection).
+/// Both directions are refused: a cron run defers while a live turn is in flight,
+/// and a live send is refused while a cron run owns the chat.
+#[test]
+fn cron_and_live_registrations_exclude_each_other() {
+    let registry = StreamRegistry::default();
+
+    // Live owns the chat: a cron run cannot start.
+    let live = registry.register("c1".into());
+    assert!(registry.try_register("c1".into()).is_none());
+    registry.remove("c1", &live);
+
+    // Cron owns the chat: a live send is refused, and Stop still reaches it.
+    let cron = registry.try_register("c1".into()).expect("free chat");
+    assert!(registry.try_register_live("c1".into()).is_none());
+    registry.cancel("c1");
+    assert!(cron.is_cancelled());
+    registry.remove("c1", &cron);
+    assert!(!registry.is_streaming("c1"));
+
+    // A live resend may still replace an earlier live turn (Stop-then-resend).
+    let old = registry.register("c1".into());
+    let new = registry.try_register_live("c1".into()).expect("live over live");
+    registry.remove("c1", &old);
+    assert!(registry.is_streaming("c1"));
+    registry.remove("c1", &new);
+}
+
 /// The extracted loop used by the reflection pass runs without a DB and still
 /// executes memory tools (writes land in the memory dir, nothing persisted).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
