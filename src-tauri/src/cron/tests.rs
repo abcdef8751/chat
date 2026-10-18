@@ -566,3 +566,76 @@ fn job_context_mode_round_trips_and_validates() {
     assert_eq!(chat::HistoryMode::from_context("recent"), chat::HistoryMode::Recent);
     assert_eq!(chat::HistoryMode::from_context("garbage"), chat::HistoryMode::Recent);
 }
+
+/// The idle memory sweep must never pick up a job's thread: its runs are output,
+/// not a conversation the user had (and an orphan would otherwise keep being
+/// consolidated after its job was gone).
+#[test]
+fn reflection_sweep_skips_scheduled_threads() {
+    let db = open_db("reflect-skip");
+    insert_conv(&db, "chat-1");
+    let j = job(&db, "0 * * * *", 1_000);
+    {
+        let conn = db.0.lock().unwrap();
+        for (id, conv) in [("m-chat", "chat-1"), ("m-job", &j.conversation_id)] {
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at)
+                 VALUES (?1, ?2, 'user', 0, 'hello', 0)",
+                rusqlite::params![id, conv],
+            )
+            .unwrap();
+        }
+    }
+
+    let due = db::conversations_due_for_reflection(&db, db::now_ms() + 60_000).unwrap();
+    assert!(due.contains(&"chat-1".to_string()));
+    assert!(
+        !due.contains(&j.conversation_id),
+        "a scheduled thread must never be consolidated into memory"
+    );
+}
+
+/// A `scheduled` conversation with no owning job is a leftover (interrupted
+/// delete, crash, older bug). Opening the database removes it — and its
+/// messages — without touching real chats.
+#[test]
+fn opening_a_db_purges_orphan_scheduled_threads() {
+    let mut p = std::env::temp_dir();
+    p.push(format!("pi-chat-cron-orphan-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    {
+        let conn = crate::db::open(&p).unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, title, kind, created_at, updated_at)
+             VALUES ('chat-1', 'Real chat', 'chat', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, title, kind, created_at, updated_at)
+             VALUES ('orphan', 'Orphaned thread', 'scheduled', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at)
+             VALUES ('m1', 'orphan', 'user', 0, 'stale run', 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = Db(Arc::new(Mutex::new(crate::db::open(&p).unwrap())));
+    assert!(db::get_conversation(&db, "orphan").unwrap().is_none());
+    let orphan_messages: i64 = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = 'orphan'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(orphan_messages, 0, "its messages cascade away too");
+    assert!(db::get_conversation(&db, "chat-1").unwrap().is_some());
+}

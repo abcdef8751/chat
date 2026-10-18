@@ -222,6 +222,11 @@ impl Drop for RunSlot {
 /// Register and spawn one run. Returns `false` when the conversation is busy or
 /// the concurrency cap is reached (the caller leaves the slot alone).
 fn launch(app: &AppHandle, job: &db::CronJob, manual: bool) -> Result<bool, String> {
+    // Deleted since the tick selected it? Do not even claim the conversation —
+    // `run_job` repeats this check for the window between here and the task.
+    if db::get_cron_job(&app.state::<db::Db>(), &job.id)?.is_none() {
+        return Ok(false);
+    }
     let state = app.state::<CronState>();
     if !state.try_begin(&job.conversation_id) {
         return Ok(false);
@@ -274,6 +279,15 @@ async fn run_job(
 ) -> Result<(), String> {
     let cfg = app.state::<ConfigState>().get();
     let db = app.state::<db::Db>();
+
+    // The job may have been deleted between the tick's due check and this task
+    // starting. Never run a deleted job: no turn, no phantom `cron_runs` row, no
+    // notification, no spend. (Its thread is deleted with it, so the lookup
+    // below would fail anyway — this makes the guarantee explicit and quiet.)
+    let Some(job) = db::get_cron_job(&db, &job.id)? else {
+        return Ok(());
+    };
+    let job = &job;
 
     let conversation = db::get_conversation(&db, &job.conversation_id)?
         .ok_or_else(|| format!("conversation not found: {}", job.conversation_id))?;

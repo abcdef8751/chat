@@ -316,6 +316,16 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     // Runs last: moving a job to its own thread needs the `kind`, `revision` and
     // `dirty` columns, which the ALTERs above guarantee on databases of any age.
     migrate_cron_threads(&conn);
+    // A job and its thread are deleted together, so a `scheduled` row with no job
+    // is a leftover (an interrupted delete, a crash, an older bug). Drop it here
+    // — with its messages — so it can never be reflected, show in the sidebar, or
+    // be resurrected.
+    let _ = conn.execute(
+        "DELETE FROM conversations
+         WHERE kind = 'scheduled'
+           AND id NOT IN (SELECT conversation_id FROM cron_jobs)",
+        [],
+    );
     Ok(conn)
 }
 
@@ -1417,6 +1427,10 @@ pub fn conversations_due_for_reflection(db: &Db, cutoff_ms: i64) -> Result<Vec<S
         .prepare(
             "SELECT c.id FROM conversations c
              WHERE c.updated_at <= ?1
+               -- A cron job's thread is output, not a chat: consolidating it
+               -- would feed scheduled runs into long-term memory (and keep an
+               -- orphaned thread busy after its job is gone).
+               AND c.kind = 'chat'
                AND COALESCE(c.last_reflected_index, -1) <
                    COALESCE((SELECT MAX(m.\"index\") FROM messages m
                              WHERE m.conversation_id = c.id AND m.role != 'memory'), -1)

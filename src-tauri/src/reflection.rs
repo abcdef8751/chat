@@ -201,6 +201,12 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     // chat actually runs on), falling back to the active provider.
     let conversation = db::get_conversation(&db, conversation_id)?
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
+    // A scheduled job's thread is output, not a conversation the user had: its
+    // runs must never be consolidated into memory (the sweep already excludes
+    // them; this also covers an explicit `reflect_now` on an open thread).
+    if conversation.kind != "chat" {
+        return Ok(());
+    }
     let provider = cfg.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
     // Guard on the actual model the conversation would run on (it may pin one
     // even when the global default is unset).

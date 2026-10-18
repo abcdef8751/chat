@@ -65,7 +65,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **327 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **329 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -538,6 +538,22 @@ thread with normal compaction. The transcript itself is always complete — this
 only bounds what is *sent*. `chat::HistoryMode` (`apply_history_mode`) slices at a
 `user` row, and compaction is skipped for the bounded modes (injecting the
 thread's summary into a fresh run would smuggle the history back in).
+
+**Deletion is complete, and nothing can quietly outlive it.** Deleting a job
+removes its thread (messages cascade) and its `cron_runs` history in the same
+transaction; deleting the thread from the sidebar cascades the job. A
+`scheduled` conversation with no owning job is a leftover (interrupted delete,
+crash, older build) and `db::open` purges it — messages included. Scheduled
+threads never sync, so no pull can resurrect one. The scheduler also re-reads the
+job when it launches and again inside `run_job`, so a job deleted between the due
+check and the task starting does not run at all (no phantom turn, run row,
+notification or spend).
+
+**Scheduled output never feeds memory.** The idle reflection sweep only selects
+`kind = 'chat'` conversations and `reflect_conversation` no-ops on a scheduled
+thread (covering an explicit "Consolidate this chat"), so a job's runs are never
+consolidated into the memory files — a deleted or orphaned thread has nothing to
+consolidate. For the same reason a cron thread is not a source for the backfill.
 
 **Migration:** a database from before job-owned threads has jobs pinned to user
 chats. `db::open` moves each such job to a fresh `scheduled` thread (once; the
