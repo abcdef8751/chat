@@ -35,6 +35,9 @@ export function MessageList(props: {
     const target = e.target as HTMLElement | null;
     if (target?.tagName !== "IMG") return;
     const img = target as HTMLImageElement;
+    // An `src=""` attribute resolves to the document URL, so require the real
+    // attribute rather than trusting `img.src`.
+    if (!img.getAttribute("src")) return;
     const src = img.currentSrc || img.src;
     if (!src) return;
     openImage(src, img.alt || undefined);
