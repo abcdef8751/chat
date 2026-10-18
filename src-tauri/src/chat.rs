@@ -1334,6 +1334,19 @@ pub(crate) fn build_system_prompt(
          they are sending from — not on a remote server."
             .to_string(),
     );
+    // The transcript shows the text a model emits *before* a tool call, and models
+    // tend to reuse that as a draft and restate it in the answer, so the user sees
+    // the same thing twice. Naming the boundary is the documented fix (LangChain's
+    // duplicate-plan issue took the same route); it is a nudge, not a guarantee,
+    // which is why the UI also folds that text into the collapsed activity
+    // container. Kept in the shared prefix so the prompt-cache hash is unchanged
+    // between live and reflection turns.
+    parts.push(
+        "Text you emit before a tool call is shown to the user as part of the transcript. Treat \
+         it as a short work note, not a draft of the answer: do not restate it after the tool \
+         result. Write the user-facing answer once, after the last tool call."
+            .to_string(),
+    );
     if let Some(ms) = conversation_started {
         parts.push(format!(
             "This conversation started on {} ({}) UTC.",
