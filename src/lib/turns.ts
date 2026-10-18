@@ -32,6 +32,42 @@ export type ProcessEntry =
     };
 
 export type CallEntry = Extract<ProcessEntry, { kind: "call" }>;
+export type ThoughtEntry = Extract<ProcessEntry, { kind: "thought" }>;
+export type TextEntry = Extract<ProcessEntry, { kind: "text" }>;
+
+/// A run of consecutive reasoning entries, rendered as ONE collapsible
+/// container. `key` is stable across re-renders of the same run so the
+/// container's own open/closed state survives streamed updates.
+export type ThoughtBlock = { kind: "thoughts"; key: string; entries: ThoughtEntry[] };
+export type ProcessBlock =
+  | ThoughtBlock
+  | { kind: "text"; key: string; entry: TextEntry }
+  | { kind: "call"; key: string; entry: CallEntry };
+
+/// Fold the flat entry list into render blocks: consecutive thoughts collapse
+/// into one container, everything else stays a single block at its position.
+/// Block order is exactly the entry order, so the transcript reads as one
+/// continuous assistant output with reasoning containers interleaved.
+export function groupBlocks(entries: ProcessEntry[]): ProcessBlock[] {
+  const blocks: ProcessBlock[] = [];
+  let thoughts: ThoughtEntry[] = [];
+  const flushThoughts = () => {
+    if (thoughts.length === 0) return;
+    blocks.push({ kind: "thoughts", key: `t:${thoughts[0].id}`, entries: thoughts });
+    thoughts = [];
+  };
+  for (const entry of entries) {
+    if (entry.kind === "thought") {
+      thoughts.push(entry);
+      continue;
+    }
+    flushThoughts();
+    if (entry.kind === "text") blocks.push({ kind: "text", key: `x:${entry.id}`, entry });
+    else blocks.push({ kind: "call", key: `c:${entry.id}`, entry });
+  }
+  flushThoughts();
+  return blocks;
+}
 
 export interface Turn {
   key: string;

@@ -215,7 +215,18 @@ export default function App() {
 
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
-  const [thinkingOpenId, setThinkingOpenId] = createSignal<string | null>(null);
+  /// Reasoning popup state: a `{id, text}` snapshot rather than a bare id. The
+  /// id is re-resolved against `messages()`/`liveTools()` while it still
+  /// exists (so a streamed trace keeps growing), and the snapshot text is the
+  /// fallback once the row it named goes away — a round flushing to a tool call
+  /// resets the in-flight row, and the end-of-stream reload replaces `tmp-` rows
+  /// with persisted ones. That is what keeps an open popup from vanishing.
+  const [openTrace, setOpenTrace] = createSignal<{
+    id: string;
+    text: string;
+    live: boolean;
+  } | null>(null);
+  const thinkingOpenId = () => openTrace()?.id ?? null;
 
   // Android system-bar insets (px), exposed by the native side via
   // `window.PiInsets` + the `pi-insets` event (see MainActivity.kt). Absent on
@@ -428,8 +439,8 @@ export default function App() {
         setNewOpen(false);
         return true;
       }
-      if (openThinking()) {
-        setThinkingOpenId(null);
+      if (openTrace()) {
+        setOpenTrace(null);
         return true;
       }
       if (sidebarOpen()) {
@@ -447,8 +458,15 @@ export default function App() {
 
     // Narrow-viewport drawer: Escape closes it and returns focus to the
     // hamburger (no-op on wide viewports where the sidebar is always in flow).
+    // Escape also closes the reasoning popup (the image lightbox handles its own
+    // Escape inside the component).
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && sidebarOpen()) {
+      if (e.key !== "Escape") return;
+      if (openTrace()) {
+        setOpenTrace(null);
+        return;
+      }
+      if (sidebarOpen()) {
         setSidebarOpen(false);
         hamburgerEl?.focus();
       }
@@ -654,7 +672,7 @@ export default function App() {
   // Auto-load messages whenever the active conversation changes.
   createEffect(() => {
     const id = activeId();
-    setThinkingOpenId(null);
+    setOpenTrace(null);
     setNearBottom(true);
     // Editing a message is scoped to the conversation it lives in; a switch
     // would otherwise let Save target the wrong conversation.
@@ -1444,7 +1462,7 @@ export default function App() {
     setStreamingConvId(id);
     setStreamError(null);
     setLiveTools([]);
-    setThinkingOpenId(null);
+    setOpenTrace(null);
 
     const token = ++turnToken;
 
@@ -1938,15 +1956,12 @@ export default function App() {
     return [current, ...rest];
   };
 
-  // Resolve the reasoning popup's source from `thinkingOpenId`. A persisted (or
-  // current-round) trace lives on a message row; a *flushed* live round's trace
-  // lives on its `LiveTool` — its synthetic `live:<callId>:thought` id matches
-  // no message, so it must be resolved against `liveTools()`. Returns null when
-  // the id is stale/unresolvable, which also serves as the "popup is open"
-  // predicate (see the hardware-back handler).
-  const openThinking = (): { text: string; live: boolean } | null => {
-    const id = thinkingOpenId();
-    if (!id) return null;
+  // Resolve a reasoning trace by id. A persisted (or current-round) trace lives
+  // on a message row; a *flushed* live round's trace lives on its `LiveTool` —
+  // its synthetic `live:<callId>:thought` id matches no message, so it must be
+  // resolved against `liveTools()`. Returns null when the id no longer names
+  // anything (the row was reset by a tool round or replaced by the reload).
+  const resolveTrace = (id: string): { text: string; live: boolean } | null => {
     if (id.startsWith("live:")) {
       const rest = id.slice("live:".length);
       const callId = rest.endsWith(":thought") ? rest.slice(0, -":thought".length) : rest;
@@ -1956,10 +1971,46 @@ export default function App() {
     const m = messages().find((x) => x.id === id);
     if (!m?.thinking?.trim()) return null;
     const live = Boolean(
-      streaming() && streamingConvId() === activeId() && m.id.startsWith("tmp-assistant-") && !m.content,
+      streaming() &&
+        streamingConvId() === activeId() &&
+        m.id.startsWith("tmp-assistant-") &&
+        !m.content,
     );
     return { text: m.thinking, live };
   };
+
+  // The popup's live text: the resolved trace while its source still exists,
+  // otherwise the snapshot taken when it was opened / last resolvable. Never
+  // null while a snapshot is held, so an open popup survives the flush and the
+  // end-of-stream row swap instead of closing under the user.
+  const openThinking = (): { text: string; live: boolean } | null => {
+    const snapshot = openTrace();
+    if (!snapshot) return null;
+    return resolveTrace(snapshot.id) ?? { text: snapshot.text, live: false };
+  };
+
+  // Keep the snapshot text fresh while the popup is open (a streamed trace grows
+  // until its round flushes), without ever clearing it. Guarded so the write
+  // cannot re-trigger itself in a loop.
+  createEffect(() => {
+    const snapshot = openTrace();
+    if (!snapshot) return;
+    const resolved = resolveTrace(snapshot.id);
+    if (resolved && (resolved.text !== snapshot.text || resolved.live !== snapshot.live)) {
+      setOpenTrace({ ...snapshot, text: resolved.text, live: resolved.live });
+    }
+  });
+
+  /// Open the reasoning popup for `id`, snapshotting `text` as a fallback, or
+  /// close it when the same trace is already open.
+  function toggleThought(id: string, text: string) {
+    if (thinkingOpenId() === id) {
+      setOpenTrace(null);
+      return;
+    }
+    const resolved = resolveTrace(id);
+    setOpenTrace({ id, text: resolved?.text ?? text, live: resolved?.live ?? false });
+  }
 
   // Context window + cost readouts for the active conversation. The meter shows
   // the model's actual context window — resolved from a per-model override, the
@@ -2167,9 +2218,7 @@ export default function App() {
               empty={messages().length === 0}
               streaming={streaming() && streamingConvId() === activeId()}
               thinkingOpenId={thinkingOpenId()}
-              onToggleThought={(id) =>
-                setThinkingOpenId(thinkingOpenId() === id ? null : id)
-              }
+              onToggleThought={toggleThought}
               onApprove={approveLiveTool}
               onDeny={denyLiveTool}
               editingId={editingId()}
@@ -2344,7 +2393,7 @@ export default function App() {
       <Show when={openThinking()}>
         <div
           class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
-          onClick={() => setThinkingOpenId(null)}
+          onClick={() => setOpenTrace(null)}
         >
           <div
             class="flex max-h-[75vh] w-full max-w-2xl flex-col rounded-xl border border-neutral-200 bg-white shadow-xl dark:border-neutral-700 dark:bg-neutral-900"
@@ -2362,7 +2411,7 @@ export default function App() {
                 </Show>
               </p>
               <button
-                onClick={() => setThinkingOpenId(null)}
+                onClick={() => setOpenTrace(null)}
                 class="rounded-md px-2 py-1 text-xs text-neutral-500 transition hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
                 title="Close"
               >
