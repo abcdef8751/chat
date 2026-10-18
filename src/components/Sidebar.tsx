@@ -1,4 +1,4 @@
-import { createEffect, For, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import type { Conversation } from "../lib/api";
 import { CloseIcon, ClockIcon, MarkAvatar } from "../lib/icons";
@@ -127,6 +127,102 @@ export function Sidebar(props: {
     });
   });
 
+  // Scheduled runs are job-owned threads (`kind = 'scheduled'`), rendered in
+  // their own collapsible section. Everything else is a normal chat.
+  const chats = () => props.visibleConversations.filter((c) => c.kind !== "scheduled");
+  const scheduled = () =>
+    props.visibleConversations.filter((c) => c.kind === "scheduled");
+  const [scheduledOpen, setScheduledOpen] = createSignal(true);
+
+  const row = (c: Conversation) => (
+    <li class="group relative">
+      <Show
+        when={props.renameId !== c.id}
+        fallback={
+          <input
+            class="w-full rounded-lg border border-neutral-400 bg-white px-3 py-2 text-sm outline-none dark:border-neutral-600 dark:bg-neutral-800"
+            value={props.renameValue}
+            onInput={(e) => props.setRenameValue(e.currentTarget.value)}
+            onBlur={() => void props.commitRename(c.id)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void props.commitRename(c.id);
+              if (e.key === "Escape") props.setRenameId(null);
+            }}
+          />
+        }
+      >
+        <button
+          onClick={() => {
+            props.setActiveId(c.id);
+            props.setConfirmDeleteId(null);
+            props.setSidebarOpen(false);
+          }}
+          class={`w-full rounded-lg px-3 py-2 pr-14 text-left text-sm transition ${
+            props.activeId === c.id
+              ? "bg-neutral-200/80 font-medium dark:bg-neutral-800 dark:text-neutral-100"
+              : "text-neutral-700 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
+          }`}
+        >
+          {/* The glyph must survive a long title, so truncation moved
+              from the button to the inner title span. */}
+          <span class="flex min-w-0 items-center gap-1">
+            <span class="truncate">{c.title}</span>
+            <Show when={props.cronConversationIds.has(c.id)}>
+              <span
+                title="Has a scheduled job"
+                class="shrink-0 text-neutral-400 dark:text-neutral-500"
+              >
+                <ClockIcon class="h-3.5 w-3.5" />
+              </span>
+            </Show>
+          </span>
+        </button>
+        {/* Row actions: hover-revealed at `lg`; always visible on
+            narrow (touch) viewports where there is no hover. */}
+        <div class="absolute right-1.5 top-1/2 flex -translate-y-1/2 gap-0.5 lg:hidden lg:group-hover:flex">
+          <button
+            title="Rename"
+            class="rounded px-1.5 py-1 text-xs text-neutral-400 transition hover:bg-neutral-200 hover:text-neutral-700 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
+            onClick={() => {
+              props.setRenameId(c.id);
+              props.setRenameValue(c.title);
+            }}
+          >
+            ✎
+          </button>
+          <Show
+            when={props.confirmDeleteId === c.id}
+            fallback={
+              <button
+                title={
+                  c.kind === "scheduled"
+                    ? "Delete this thread and its scheduled job"
+                    : "Delete"
+                }
+                class="rounded px-1.5 py-1 text-xs text-neutral-400 transition hover:bg-red-100 hover:text-red-600 dark:text-neutral-500 dark:hover:bg-red-950 dark:hover:text-red-400"
+                onClick={() => props.setConfirmDeleteId(c.id)}
+              >
+                ✕
+              </button>
+            }
+          >
+            <button
+              title={
+                c.kind === "scheduled"
+                  ? "Delete the thread and its job"
+                  : "Confirm delete"
+              }
+              class="rounded bg-red-600 px-1.5 py-1 text-xs text-white"
+              onClick={() => void props.removeConversation(c.id)}
+            >
+              Delete?
+            </button>
+          </Show>
+        </div>
+      </Show>
+    </li>
+  );
+
   return (
     <>
       {/* Sidebar backdrop — narrow viewports only, closes the drawer on tap */}
@@ -214,94 +310,43 @@ export function Sidebar(props: {
 
         <nav class="flex-1 overflow-y-auto px-2 pb-2 pt-2">
           <ul class="space-y-1">
-            <For each={props.visibleConversations}>
-              {(c) => (
-                <li class="group relative">
-                  <Show
-                    when={props.renameId !== c.id}
-                    fallback={
-                      <input
-                        class="w-full rounded-lg border border-neutral-400 bg-white px-3 py-2 text-sm outline-none dark:border-neutral-600 dark:bg-neutral-800"
-                        value={props.renameValue}
-                        onInput={(e) => props.setRenameValue(e.currentTarget.value)}
-                        onBlur={() => void props.commitRename(c.id)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") void props.commitRename(c.id);
-                          if (e.key === "Escape") props.setRenameId(null);
-                        }}
-                      />
-                    }
-                  >
-                    <button
-                      onClick={() => {
-                        props.setActiveId(c.id);
-                        props.setConfirmDeleteId(null);
-                        props.setSidebarOpen(false);
-                      }}
-                      class={`w-full rounded-lg px-3 py-2 pr-14 text-left text-sm transition ${
-                        props.activeId === c.id
-                          ? "bg-neutral-200/80 font-medium dark:bg-neutral-800 dark:text-neutral-100"
-                          : "text-neutral-700 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
-                      }`}
-                    >
-                      {/* The glyph must survive a long title, so truncation moved
-                          from the button to the inner title span. */}
-                      <span class="flex min-w-0 items-center gap-1">
-                        <span class="truncate">{c.title}</span>
-                        <Show when={props.cronConversationIds.has(c.id)}>
-                          <span
-                            title="Has a scheduled job"
-                            class="shrink-0 text-neutral-400 dark:text-neutral-500"
-                          >
-                            <ClockIcon class="h-3.5 w-3.5" />
-                          </span>
-                        </Show>
-                      </span>
-                    </button>
-                    {/* Row actions: hover-revealed at `lg`; always visible on
-                        narrow (touch) viewports where there is no hover. */}
-                    <div class="absolute right-1.5 top-1/2 flex -translate-y-1/2 gap-0.5 lg:hidden lg:group-hover:flex">
-                      <button
-                        title="Rename"
-                        class="rounded px-1.5 py-1 text-xs text-neutral-400 transition hover:bg-neutral-200 hover:text-neutral-700 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
-                        onClick={() => {
-                          props.setRenameId(c.id);
-                          props.setRenameValue(c.title);
-                        }}
-                      >
-                        ✎
-                      </button>
-                      <Show
-                        when={props.confirmDeleteId === c.id}
-                        fallback={
-                          <button
-                            title="Delete"
-                            class="rounded px-1.5 py-1 text-xs text-neutral-400 transition hover:bg-red-100 hover:text-red-600 dark:text-neutral-500 dark:hover:bg-red-950 dark:hover:text-red-400"
-                            onClick={() => props.setConfirmDeleteId(c.id)}
-                          >
-                            ✕
-                          </button>
-                        }
-                      >
-                        <button
-                          title="Confirm delete"
-                          class="rounded bg-red-600 px-1.5 py-1 text-xs text-white"
-                          onClick={() => void props.removeConversation(c.id)}
-                        >
-                          Delete?
-                        </button>
-                      </Show>
-                    </div>
-                  </Show>
-                </li>
-              )}
-            </For>
+            <For each={chats()}>{(c) => row(c)}</For>
             <Show when={props.visibleConversations.length === 0}>
               <li class="px-3 py-2 text-sm text-neutral-400 dark:text-neutral-500">
                 No chats found.
               </li>
             </Show>
           </ul>
+          {/* Scheduled runs live on job-owned threads. They get their own
+              section so a job firing every minute never pushes real chats
+              down the list (and so a run's output is never mistaken for a
+              conversation the user started). */}
+          <Show when={scheduled().length > 0}>
+            <div class="mt-3 border-t border-neutral-200 pt-2 dark:border-neutral-800">
+              <button
+                onClick={() => setScheduledOpen((v) => !v)}
+                title={scheduledOpen() ? "Collapse scheduled runs" : "Expand scheduled runs"}
+                class="flex w-full items-center gap-1.5 rounded-md px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400 transition hover:bg-neutral-100 hover:text-neutral-600 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
+              >
+                <span
+                  class={`inline-block transition-transform ${scheduledOpen() ? "rotate-90" : ""}`}
+                  aria-hidden="true"
+                >
+                  ›
+                </span>
+                <ClockIcon class="h-3 w-3" />
+                Scheduled
+                <span class="ml-auto font-normal normal-case tracking-normal">
+                  {scheduled().length}
+                </span>
+              </button>
+              <Show when={scheduledOpen()}>
+                <ul class="mt-1 space-y-1">
+                  <For each={scheduled()}>{(c) => row(c)}</For>
+                </ul>
+              </Show>
+            </div>
+          </Show>
         </nav>
       </aside>
     </>

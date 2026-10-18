@@ -3,6 +3,8 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 export interface Conversation {
   id: string;
   title: string;
+  /** `chat` (user-owned) or `scheduled` (a cron job's own thread). */
+  kind: "chat" | "scheduled";
   model: string | null;
   provider_id: string | null;
   system_prompt: string | null;
@@ -596,7 +598,8 @@ export function syncRemoveEncryption(): Promise<SyncStatus> {
 
 // --- Scheduled jobs (cron) ---
 
-/** A scheduled chat run: fires `prompt` into `conversationId` on `schedule`. */
+/** A scheduled run: carries out `prompt` in its own thread (`conversationId`)
+ * on `schedule`. The thread is created with the job, not picked from chats. */
 export interface CronJob {
   id: string;
   conversationId: string;
@@ -647,9 +650,6 @@ export interface CronPreview {
 
 /** Payload for `create_cron` (all field names frozen by the backend). */
 export type CreateCronPayload = {
-  /** Owning conversation. The frontend always passes the active chat's id;
-   * `null` is rejected by the backend. */
-  conversationId?: string | null;
   /** Omitted/null => derived from the prompt by the backend. */
   title?: string | null;
   /** Preset ("hourly" | "daily@HH:MM" | "weekly@DDD:HH:MM") or 5-field cron. */

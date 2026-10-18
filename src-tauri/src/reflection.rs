@@ -1557,6 +1557,7 @@ mod tests {
         db::Conversation {
             id: "c1".into(),
             title: "t".into(),
+            kind: "chat".into(),
             model: model.map(str::to_string),
             provider_id: None,
             system_prompt: None,

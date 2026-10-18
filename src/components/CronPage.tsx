@@ -36,9 +36,8 @@ export function CronPage(props: {
   onUpdateCron: (id: string, patch: Omit<UpdateCronPayload, "id">) => Promise<boolean>;
   onDeleteCron: (id: string) => Promise<void>;
   onRunCronNow: (id: string) => Promise<void>;
-  /// The open conversation — every new job is pinned to it (the backend
-  /// rejects a null conversation, so Save is disabled without one).
-  activeId: string | null;
+  /// Open the job's own thread (a `scheduled` conversation) in the transcript.
+  onOpenThread: (conversationId: string) => void;
 }) {
   // --- Local form state ---------------------------------------------------
   // The schedule is composed from a preset (Hourly / Daily / Weekly) or taken
@@ -199,14 +198,13 @@ export function CronPage(props: {
   }
 
   // Save is disabled until the schedule preview has resolved VALID (an error,
-  // or no preview yet, keeps it disabled), the prompt is non-empty, and —
-  // for a new job — a conversation is open to own it.
+  // or no preview yet, keeps it disabled) and the prompt is non-empty. A new
+  // job always gets its own thread; there is no conversation to pick.
   const canSave = () => {
     if (props.cronBusy) return false;
     if (!formPrompt().trim()) return false;
     const p = preview();
     if (!p || !!p.error) return false;
-    if (!editingJobId() && !props.activeId) return false;
     return true;
   };
 
@@ -224,12 +222,7 @@ export function CronPage(props: {
     const jobId = editingJobId();
     const ok = jobId
       ? await props.onUpdateCron(jobId, base)
-      : await props.onCreateCron({
-          // The backend requires the owning conversation: always send the active
-          // chat's id (a null is rejected).
-          conversationId: props.activeId ?? null,
-          ...base,
-        });
+      : await props.onCreateCron(base);
     // Keep the form (and the typed prompt/title) open when the backend rejected
     // the save; the error banner above explains why.
     if (ok) closeForm();
@@ -487,11 +480,10 @@ export function CronPage(props: {
                 Send an OS notification when this job runs
               </label>
 
-              <Show when={!editingJobId() && !props.activeId}>
-                <p class="mt-2 text-[11px] text-neutral-400 dark:text-neutral-500">
-                  Open a conversation first — a new job needs a chat to post its runs into.
-                </p>
-              </Show>
+              <p class="mt-3 text-[11px] text-neutral-400 dark:text-neutral-500">
+                Each job gets its own thread for its runs (kept under “Scheduled” in the
+                sidebar); it never posts into one of your chats.
+              </p>
 
               <div class="mt-3 flex items-center justify-end gap-2">
                 <button
@@ -587,6 +579,13 @@ export function CronPage(props: {
                             </span>
                           </button>
                           <div class="flex shrink-0 items-center gap-1">
+                            <button
+                              onClick={() => props.onOpenThread(job.conversationId)}
+                              title="Open this job's thread (its runs live there)"
+                              class={smallButtonClass}
+                            >
+                              Thread
+                            </button>
                             <button
                               onClick={() => void runNow(job.id)}
                               disabled={props.cronBusy}

@@ -65,7 +65,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **321 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **325 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -81,7 +81,7 @@ separately — it passes end to end (`ALL ASSERTIONS PASSED`).
 | Tools             | ✅    | `bash` (one-shot shell), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` + `fetch_image` (ungated) |
 | UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; memory page list→detail on narrow viewports |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
-| Cron jobs         | ✅    | Scheduled runs append to a thread; per-job tool policy; catch-up max 1; OS notification (desktop) + badge |
+| Cron jobs         | ✅    | Each job owns a local-only thread (kept out of the chat list); per-job tool policy; catch-up max 1; OS notification (desktop) + badge |
 | Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
 | Context + price   | ✅    | Context counter, frozen per-turn cost, near-limit note, forced compaction (M7)                            |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
@@ -246,7 +246,8 @@ best-effort `ALTER TABLE ... ADD COLUMN` migrations in `open()`.
 
 ```sql
 conversations(
-  id, title, model, system_prompt, compaction_summary,
+  id, title, kind,              -- 'chat' | 'scheduled' (a cron job's own thread)
+  model, system_prompt, compaction_summary,
   compaction_through,            -- id of the newest message folded into the summary (local-only)
   last_reflected_index,          -- memory-reflection watermark
   imported,                      -- 1 = came from an export; backfill-only
@@ -278,6 +279,8 @@ memory_backfill_runs(             -- reduce-pass spend (spans many conversations
   id, model, usage, cost, files, note, created_at)
 
 cron_jobs(                        -- local-only scheduled runs
+  -- the job's own `scheduled` thread (created with the job, deleted with it);
+  -- never one of the user's chats.
   id, conversation_id REFERENCES conversations(id) ON DELETE CASCADE,
   title, schedule, prompt, enabled, tool_policy, notify,
   next_run_at, last_run_at, run_count, run_requested, created_at)
@@ -502,14 +505,30 @@ default**; it only chunks when the payload exceeds `CONTEXT_BUDGET` (80%) of the
 
 ## Cron jobs
 
-A **cron job** is a schedule + a prompt + a conversation thread. Each fire appends
-one ordinary `user → assistant` exchange to that thread, so a run is a
+A **cron job** is a schedule + a prompt + **its own thread**. Creating a job (from
+the Cron page or the `create_cron` tool) creates a conversation flagged
+`kind = 'scheduled'` and titles it after the job — a job never attaches to one of
+the user's chats and never inherits the chat that happened to be open. Each fire
+appends one ordinary `user → assistant` exchange to that thread, so a run is a
 *continuation*: it sees the full prior history (memory notes, clock notes,
-compaction summary), runs with memory available, and its reply lands in the
-conversation the user can scroll and answer. Agent-created jobs hang off the
-conversation in which they were created. **Job definitions are local-only**
-(never synced); the messages a run produces are normal rows and sync, so a second
-device just sees the thread continue.
+compaction summary), runs with memory available, and its reply lands somewhere
+the user can scroll and answer. The sidebar renders those threads in a separate
+collapsible **Scheduled** section (never mixed with chats, so a job firing every
+minute cannot push real chats down), and each job row has a **Thread** button.
+Renaming a job renames its thread while the thread still carries the job's title
+(a sidebar rename wins). Deleting a job deletes its thread and run history;
+deleting the thread from the sidebar cascades the job.
+
+**Scheduled threads are local-only, like the job definitions that own them** —
+neither the conversation nor its messages are pushed to the mirror (a second
+device has no job, so syncing the thread would only produce orphan chats). The
+push, first-sync seed, tombstones and edit-time truncation all exclude
+`kind = 'scheduled'`. On startup the app opens the newest *chat*, not a
+scheduled thread that happened to fire most recently.
+
+**Migration:** a database from before job-owned threads has jobs pinned to user
+chats. `db::open` moves each such job to a fresh `scheduled` thread (once; the
+old chat and past runs stay where they are).
 
 - **Scheduler** (`cron.rs`, mirrors `reflection::spawn`): one pass 3 s after
   startup (a slot missed while the app was closed catches up), then every 20 s so
@@ -602,10 +621,12 @@ device just sees the thread continue.
   (same deferred-device pattern as the other mobile work); the event/badge path
   is platform-neutral.
 - **UI:** `src/components/CronPage.tsx` (Header → Cron) lists jobs (schedule,
-  next/last run, count, enabled/notify toggles, policy badge, Run now / Edit /
-  Delete), hosts the create/edit form (preset + raw cron, live preview, prompt,
-  policy, notify) and the recent-runs audit trail. Sidebar conversations owning
-  an enabled job get a clock glyph; the transcript shows the "scheduled" chip.
+  next/last run, count, enabled/notify toggles, policy badge, Thread / Run now /
+  Edit / Delete), hosts the create/edit form (preset + raw cron, live preview,
+  prompt, policy, notify) and the recent-runs audit trail. The Sidebar splits
+  `kind = 'scheduled'` threads into a collapsible **Scheduled** section (with a
+  clock glyph) instead of the chat list; the transcript shows the "scheduled"
+  chip. The form needs no open chat — a job always owns its thread.
 
 ## Tool surface
 
@@ -651,7 +672,7 @@ fetch_image(url)                  // raster only (png/jpg/gif/webp/bmp; capped a
 
 // Cron management — app-local, read/write to local DB (ungated; live + cron
 // modes only, refused by reflection/extraction by mode)
-create_cron(prompt, schedule, title?, conversation_id?, tool_policy?, notify?)
+create_cron(prompt, schedule, title?, tool_policy?, notify?)   // own thread
 list_crons()
 update_cron(id, prompt?, schedule?, title?, tool_policy?, notify?, enabled?)
 delete_cron(id)
@@ -1233,5 +1254,6 @@ is not implemented — host tools operate on real paths with per-call approval.
 - **Android notifications are deferred** (channel + `POST_NOTIFICATIONS` +
   manifest). The plugin is registered and desktop works today; the in-app
   `cron-updated` badge/refresh path is platform-neutral.
-- Job definitions are local-only by design, so two devices each run their own
-  copy of a job; the *threads* sync, so runs from both devices interleave.
+- Job definitions **and their threads** are local-only by design, so two devices
+  each run their own copy of a job and keep their own run history; nothing about
+  a scheduled job appears on another device.

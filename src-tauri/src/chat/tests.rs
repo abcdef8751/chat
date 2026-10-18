@@ -3063,6 +3063,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         crate::db::Conversation {
             id: "c".into(),
             title: "t".into(),
+            kind: "chat".into(),
             model: None,
             provider_id: None,
             system_prompt: None,
@@ -4587,10 +4588,8 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
     #[test]
     fn autoapprove_grants_are_treated_as_gated_calls() {
         let db = open_db("gate-classify");
-        let cid = insert_conv(&db);
         let auto = crate::db::insert_cron_job(
             &db,
-            cid.clone(),
             "auto".into(),
             "0 * * * *".into(),
             "trusted work".into(),
@@ -4601,7 +4600,6 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         .unwrap();
         let ro = crate::db::insert_cron_job(
             &db,
-            cid,
             "ro".into(),
             "0 * * * *".into(),
             "read work".into(),
@@ -4741,7 +4739,6 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let cid = insert_conv(&db);
         let job = crate::db::insert_cron_job(
             &db,
-            cid.clone(),
             "trusted".into(),
             "0 * * * *".into(),
             "trusted prompt".into(),

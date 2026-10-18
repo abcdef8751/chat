@@ -725,10 +725,17 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
     // `role != 'memory'` excludes the never-synced consolidation notes.
     {
         let conn = ctx.db.0.lock().map_err(|e| e.to_string())?;
-        conn.execute("UPDATE conversations SET dirty = 1 WHERE revision = 0", [])
-            .map_err(|e| e.to_string())?;
+        // Scheduled threads are local-only (their job definitions are), so they
+        // are excluded here as well as from the push queries.
         conn.execute(
-            "UPDATE messages SET dirty = 1 WHERE revision = 0 AND role != 'memory'",
+            "UPDATE conversations SET dirty = 1 WHERE revision = 0 AND kind = 'chat'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE messages SET dirty = 1
+             WHERE revision = 0 AND role != 'memory'
+               AND conversation_id IN (SELECT id FROM conversations WHERE kind = 'chat')",
             [],
         )
         .map_err(|e| e.to_string())?;
@@ -841,7 +848,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
             .prepare(
                 "SELECT id, title, model, provider_id, system_prompt, compaction_summary,
                         last_reflected_index, imported, import_batch, created_at, updated_at, revision
-                 FROM conversations WHERE dirty = 1",
+                 FROM conversations WHERE dirty = 1 AND kind = 'chat'",
             )
             .map_err(|e| e.to_string())?;
         let key = ctx.key;
@@ -923,7 +930,10 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                 .prepare(
                     "SELECT id, conversation_id, role, \"index\", content, model, provider,
                             thinking_level, thinking, usage, stop_reason, attachments, created_at, revision
-                     FROM messages WHERE dirty = 1 AND revision > 0 LIMIT ?1",
+                     FROM messages
+                     WHERE dirty = 1 AND revision > 0
+                       AND conversation_id IN (SELECT id FROM conversations WHERE kind = 'chat')
+                     LIMIT ?1",
                 )
                 .map_err(|e| e.to_string())?;
             let key = ctx.key;

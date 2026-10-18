@@ -518,9 +518,9 @@ fn notify(app: &AppHandle, job: &db::CronJob, body: &str) {
 
 /// Dispatch one cron-management tool call. Ungated and app-local (like the
 /// memory tools), so it needs only the DB.
-pub fn execute_tool(call: &ToolCall, db: &db::Db, source: &str) -> ToolOutput {
+pub fn execute_tool(call: &ToolCall, db: &db::Db) -> ToolOutput {
     match call.name.as_str() {
-        "create_cron" => tool_create(db, &call.arguments, source),
+        "create_cron" => tool_create(db, &call.arguments),
         "list_crons" => tool_list(db),
         "update_cron" => tool_update(db, &call.arguments),
         "delete_cron" => tool_delete(db, &call.arguments),
@@ -577,7 +577,7 @@ fn job_json(job: &db::CronJob) -> Value {
     })
 }
 
-fn tool_create(db: &db::Db, args: &Value, source: &str) -> ToolOutput {
+fn tool_create(db: &db::Db, args: &Value) -> ToolOutput {
     let Some(prompt) = arg_str(args, "prompt") else {
         return ToolOutput::err("create_cron requires `prompt`".into());
     };
@@ -588,19 +588,6 @@ fn tool_create(db: &db::Db, args: &Value, source: &str) -> ToolOutput {
         Ok(s) => s,
         Err(e) => return ToolOutput::err(format!("invalid schedule: {e}")),
     };
-    let conversation_id = arg_str(args, "conversation_id")
-        .map(str::to_string)
-        .unwrap_or_else(|| source.to_string());
-    if conversation_id.is_empty() {
-        return ToolOutput::err("create_cron requires a conversation".into());
-    }
-    match db::get_conversation(db, &conversation_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return ToolOutput::err(format!("conversation not found: {conversation_id}"))
-        }
-        Err(e) => return ToolOutput::err(e),
-    }
     let policy = match normalize_policy(arg_str(args, "tool_policy")) {
         Ok(p) => p,
         Err(e) => return ToolOutput::err(e),
@@ -615,7 +602,6 @@ fn tool_create(db: &db::Db, args: &Value, source: &str) -> ToolOutput {
     };
     match db::insert_cron_job(
         db,
-        conversation_id,
         title,
         normalized,
         prompt.to_string(),
@@ -661,6 +647,7 @@ fn apply_updates(db: &db::Db, mut job: db::CronJob, args: &Value) -> Result<db::
     if let Some(prompt) = arg_str(args, "prompt") {
         job.prompt = prompt.to_string();
     }
+    let previous_title = job.title.clone();
     if let Some(title) = arg_str(args, "title") {
         job.title = title.to_string();
     }
@@ -686,6 +673,9 @@ fn apply_updates(db: &db::Db, mut job: db::CronJob, args: &Value) -> Result<db::
         }
     }
     db::update_cron_job(db, &job)?;
+    // A job owns its thread, so a renamed job renames it too — unless the user
+    // renamed the thread itself in the sidebar (then the titles differ).
+    db::rename_scheduled_thread(db, &job.conversation_id, &previous_title, &job.title)?;
     Ok(job)
 }
 
@@ -795,7 +785,6 @@ pub fn cron_set_active(
 #[tauri::command]
 pub fn create_cron(
     db: tauri::State<'_, db::Db>,
-    conversation_id: Option<String>,
     title: Option<String>,
     schedule: String,
     prompt: String,
@@ -806,13 +795,6 @@ pub fn create_cron(
     if prompt.is_empty() {
         return Err("A scheduled run needs a prompt.".into());
     }
-    let conversation_id = conversation_id
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| "A scheduled run needs a conversation.".to_string())?;
-    if db::get_conversation(&db, &conversation_id)?.is_none() {
-        return Err(format!("conversation not found: {conversation_id}"));
-    }
     let normalized = schedule::normalize(&schedule)?;
     let next_run_at = schedule::next_after_ms(&normalized, db::now_ms())?;
     let policy = normalize_policy(tool_policy.as_deref())?;
@@ -822,7 +804,6 @@ pub fn create_cron(
         .unwrap_or_else(|| db::derive_title(&prompt));
     db::insert_cron_job(
         &db,
-        conversation_id,
         title,
         normalized,
         prompt,

@@ -22,6 +22,10 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
+  -- 'chat' = a conversation the user owns; 'scheduled' = a job-owned thread.
+  -- Scheduled threads are kept out of the chat list, never sync (their job
+  -- definitions are local-only), and die with their job.
+  kind TEXT NOT NULL DEFAULT 'chat',
   model TEXT,
   provider_id TEXT,
   system_prompt TEXT,
@@ -227,6 +231,14 @@ pub fn open(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE conversations ADD COLUMN provider_id TEXT",
         [],
     );
+    // Older databases predate job-owned threads (`kind`). A cron job used to be
+    // pinned to whatever chat was open when it was created; give each such job
+    // its own `scheduled` thread now, so future runs stop landing in user chats.
+    // Past runs stay where they were (their messages are interleaved).
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'",
+        [],
+    );
     // Older databases predate resumable consolidation.
     let _ = conn.execute(
         "ALTER TABLE memory_extractions ADD COLUMN folded INTEGER NOT NULL DEFAULT 0",
@@ -292,6 +304,9 @@ pub fn open(path: &Path) -> Result<Connection, String> {
          )",
         [],
     );
+    // Runs last: moving a job to its own thread needs the `kind`, `revision` and
+    // `dirty` columns, which the ALTERs above guarantee on databases of any age.
+    migrate_cron_threads(&conn);
     Ok(conn)
 }
 
@@ -300,6 +315,8 @@ pub fn open(path: &Path) -> Result<Connection, String> {
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    /// `chat` (user-owned) or `scheduled` (a cron job's thread).
+    pub kind: String,
     pub model: Option<String>,
     pub provider_id: Option<String>,
     pub system_prompt: Option<String>,
@@ -359,7 +376,8 @@ pub fn get_conversation(
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, model, provider_id, system_prompt, compaction_summary, compaction_through, created_at, updated_at
+            "SELECT id, title, kind, model, provider_id, system_prompt, compaction_summary,
+                    compaction_through, created_at, updated_at
              FROM conversations WHERE id = ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -368,13 +386,14 @@ pub fn get_conversation(
             Ok(Conversation {
                 id: r.get(0)?,
                 title: r.get(1)?,
-                model: r.get(2)?,
-                provider_id: r.get(3)?,
-                system_prompt: r.get(4)?,
-                compaction_summary: r.get(5)?,
-                compaction_through: r.get(6)?,
-                created_at: r.get(7)?,
-                updated_at: r.get(8)?,
+                kind: r.get(2)?,
+                model: r.get(3)?,
+                provider_id: r.get(4)?,
+                system_prompt: r.get(5)?,
+                compaction_summary: r.get(6)?,
+                compaction_through: r.get(7)?,
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -626,7 +645,8 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, model, provider_id, system_prompt, compaction_summary, compaction_through, created_at, updated_at
+            "SELECT id, title, kind, model, provider_id, system_prompt, compaction_summary,
+                    compaction_through, created_at, updated_at
              FROM conversations ORDER BY updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -635,13 +655,14 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
             Ok(Conversation {
                 id: r.get(0)?,
                 title: r.get(1)?,
-                model: r.get(2)?,
-                provider_id: r.get(3)?,
-                system_prompt: r.get(4)?,
-                compaction_summary: r.get(5)?,
-                compaction_through: r.get(6)?,
-                created_at: r.get(7)?,
-                updated_at: r.get(8)?,
+                kind: r.get(2)?,
+                model: r.get(3)?,
+                provider_id: r.get(4)?,
+                system_prompt: r.get(5)?,
+                compaction_summary: r.get(6)?,
+                compaction_through: r.get(7)?,
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -671,6 +692,7 @@ pub fn create_conversation(
     Ok(Conversation {
         id,
         title: t,
+        kind: "chat".into(),
         model: None,
         provider_id: None,
         system_prompt: None,
@@ -796,6 +818,17 @@ pub fn apply_user_message_edit(
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
 
+    // Scheduled threads never sync, so edit-time truncation there needs no
+    // message tombstones (and pushing one would reference a conversation the
+    // mirror does not have).
+    let synced: bool = tx
+        .query_row(
+            "SELECT kind = 'chat' FROM conversations WHERE id = ?1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
     // The edit target must be a user turn in this conversation.
     let target = tx
         .query_row(
@@ -838,7 +871,9 @@ pub fn apply_user_message_edit(
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<String>, _>>().map_err(|e| e.to_string())?
     };
-    tombstone_messages(&tx, conversation_id, &stale_ids)?;
+    if synced {
+        tombstone_messages(&tx, conversation_id, &stale_ids)?;
+    }
     tx.execute(
         "DELETE FROM messages WHERE conversation_id = ?1 AND \"index\" > ?2",
         params![conversation_id, target_index],
@@ -974,7 +1009,8 @@ pub fn search_conversations(
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT c.id, c.title, c.model, c.provider_id, c.system_prompt, c.compaction_summary, c.compaction_through, c.created_at, c.updated_at
+            "SELECT DISTINCT c.id, c.title, c.kind, c.model, c.provider_id, c.system_prompt,
+                    c.compaction_summary, c.compaction_through, c.created_at, c.updated_at
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              WHERE lower(c.title) LIKE ?1
@@ -987,13 +1023,14 @@ pub fn search_conversations(
             Ok(Conversation {
                 id: r.get(0)?,
                 title: r.get(1)?,
-                model: r.get(2)?,
-                provider_id: r.get(3)?,
-                system_prompt: r.get(4)?,
-                compaction_summary: r.get(5)?,
-                compaction_through: r.get(6)?,
-                created_at: r.get(7)?,
-                updated_at: r.get(8)?,
+                kind: r.get(2)?,
+                model: r.get(3)?,
+                provider_id: r.get(4)?,
+                system_prompt: r.get(5)?,
+                compaction_summary: r.get(6)?,
+                compaction_through: r.get(7)?,
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1179,12 +1216,19 @@ pub fn seed_initial_sync(db: &Db, user_id: &str, memory_files: &[String]) -> Res
     if already.is_some() {
         return Ok(());
     }
-    conn.execute("UPDATE conversations SET dirty = 1", [])
+    // Scheduled threads are local-only (their job definitions are local-only),
+    // so the seed must not mark them for upload — same for their messages.
+    conn.execute("UPDATE conversations SET dirty = 1 WHERE kind = 'chat'", [])
         .map_err(|e| e.to_string())?;
     // Memory consolidation notes (`role = 'memory'`) are background bookkeeping —
     // never pushed — so the seed must exclude them, matching the insert path.
-    conn.execute("UPDATE messages SET dirty = 1 WHERE role != 'memory'", [])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE messages SET dirty = 1
+         WHERE role != 'memory'
+           AND conversation_id IN (SELECT id FROM conversations WHERE kind = 'chat')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     for path in memory_files {
         mark_memory_dirty(&conn, path)?;
     }
@@ -1201,6 +1245,20 @@ pub fn seed_initial_sync(db: &Db, user_id: &str, memory_files: &[String]) -> Res
 /// conversation itself is tombstoned (its messages cascade-delete locally and on
 /// consumers, so per-message tombstones would carry no row data anyway).
 pub fn tombstone_conversation(conn: &Connection, conversation_id: &str) -> Result<i64, String> {
+    // Scheduled threads never reach the mirror (their jobs are local-only), so
+    // there is nothing to tombstone — and a tombstone for a conversation the
+    // server never saw would just create an orphan row there.
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM conversations WHERE id = ?1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if kind.as_deref() == Some("scheduled") {
+        return Ok(0);
+    }
     let rev = bump_revision_c(conn)?;
     conn.execute(
         "INSERT OR REPLACE INTO sync_tombstones(entity, id, revision)
@@ -2008,10 +2066,53 @@ pub fn due_cron_jobs(db: &Db, now_ms: i64) -> Result<Vec<CronJob>, String> {
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+/// Create the job-owned thread for a scheduled job.
+///
+/// It is a normal conversation with `kind = 'scheduled'`: the sidebar keeps it
+/// out of the chat list, the sync engine never uploads it (job definitions are
+/// local-only, so a second device would get orphan threads), and it is deleted
+/// with its job.
+fn insert_scheduled_conversation(conn: &Connection, title: &str) -> Result<String, String> {
+    let id = Uuid::new_v4().to_string();
+    let now = now();
+    conn.execute(
+        "INSERT INTO conversations (id, title, kind, created_at, updated_at, revision, dirty)
+         VALUES (?1, ?2, 'scheduled', ?3, ?4, 0, 0)",
+        params![id, title, now, now],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Give a job its own thread when it is still pinned to a user chat (databases
+/// that predate job-owned threads). Runs already recorded stay in the old chat;
+/// only future runs use the new thread.
+fn migrate_cron_threads(conn: &Connection) {
+    let stale: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT j.id, j.title FROM cron_jobs j
+             JOIN conversations c ON c.id = j.conversation_id
+             WHERE c.kind <> 'scheduled'",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+    for (job_id, title) in stale {
+        if let Ok(conv) = insert_scheduled_conversation(conn, &title) {
+            let _ = conn.execute(
+                "UPDATE cron_jobs SET conversation_id = ?2 WHERE id = ?1",
+                params![job_id, conv],
+            );
+        }
+    }
+}
+
+/// A new job always owns a fresh thread; callers never pick a conversation.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_cron_job(
     db: &Db,
-    conversation_id: String,
     title: String,
     schedule: String,
     prompt: String,
@@ -2019,6 +2120,9 @@ pub fn insert_cron_job(
     notify: bool,
     next_run_at: i64,
 ) -> Result<CronJob, String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let conversation_id = insert_scheduled_conversation(&tx, &title)?;
     let job = CronJob {
         id: Uuid::new_v4().to_string(),
         conversation_id,
@@ -2034,8 +2138,7 @@ pub fn insert_cron_job(
         run_requested: false,
         created_at: now_ms(),
     };
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO cron_jobs (id, conversation_id, title, schedule, prompt, enabled, tool_policy, notify, next_run_at, last_run_at, run_count, run_requested, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
         params![
@@ -2054,6 +2157,7 @@ pub fn insert_cron_job(
         ],
     )
     .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(job)
 }
 
@@ -2080,12 +2184,57 @@ pub fn update_cron_job(db: &Db, job: &CronJob) -> Result<(), String> {
     Ok(())
 }
 
+/// Delete a job **and its thread** (messages cascade). The thread is job-owned
+/// and local-only, so there is no sync tombstone to record. Guarded by
+/// `kind = 'scheduled'` so a legacy job still pinned to a user chat can never
+/// delete that chat.
 pub fn delete_cron_job(db: &Db, id: &str) -> Result<bool, String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let n = conn
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let conversation_id: Option<String> = tx
+        .query_row(
+            "SELECT conversation_id FROM cron_jobs WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let n = tx
         .execute("DELETE FROM cron_jobs WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
+    if n > 0 {
+        if let Some(conv) = conversation_id {
+            tx.execute(
+                "DELETE FROM conversations WHERE id = ?1 AND kind = 'scheduled'",
+                [&conv],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(n > 0)
+}
+
+/// Keep a job's thread title in step with the job — but only while the thread
+/// still carries the job's previous title, so a rename made in the sidebar is
+/// never clobbered.
+pub fn rename_scheduled_thread(
+    db: &Db,
+    conversation_id: &str,
+    previous: &str,
+    title: &str,
+) -> Result<(), String> {
+    if previous == title {
+        return Ok(());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE conversations SET title = ?3
+         WHERE id = ?1 AND title = ?2 AND kind = 'scheduled'",
+        params![conversation_id, previous, title],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Advance a job after it fired: the next slot, the run timestamp, and (for a

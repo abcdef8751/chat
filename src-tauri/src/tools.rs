@@ -259,17 +259,16 @@ fn cron_tools() -> Vec<ChatCompletionTools> {
         fn_tool(
             "create_cron",
             &format!(
-                "Create a scheduled chat run: at each fire the app appends a normal user → \
-                 assistant exchange to a conversation, so the run sees the thread's full \
-                 history and memory. {schedule_desc} Returns the job id and next run time."
+                "Create a scheduled run: at each fire the app starts a turn on the job's own \
+                 thread (created for it, not one of the user's chats), so the run sees the \
+                 thread's history and memory. {schedule_desc} Returns the job id and next run time."
             ),
             json!({
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string", "description": "The instruction to carry out at each fire" },
                     "schedule": { "type": "string", "description": "Preset token or 5-field cron expression" },
-                    "title": { "type": "string", "description": "Short human label; derived from the prompt when omitted" },
-                    "conversation_id": { "type": "string", "description": "Thread to append runs to; defaults to this conversation" },
+                    "title": { "type": "string", "description": "Short human label; derived from the prompt when omitted. Also titles the job's thread." },
                     "tool_policy": { "type": "string", "description": "`readonly` (default: bash/read_file/write_file refused) or `autoapprove` (run host tools without asking)" },
                     "notify": { "type": "boolean", "description": "Send an OS notification when the run finishes (default true)" }
                 },

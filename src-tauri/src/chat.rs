@@ -1640,7 +1640,6 @@ async fn dispatch_tool(
     memory: &crate::memory::MemoryState,
     cfg: &AppConfig,
     db: Option<&db::Db>,
-    source: &str,
 ) -> DispatchedTool {
     if call.name == "read_file" {
         if let Some(path) = call.arguments.get("path").and_then(Value::as_str) {
@@ -1671,7 +1670,7 @@ async fn dispatch_tool(
         // the tool list is shared with reflection/extraction, which have no
         // `persist` handle and refuse these calls by mode before reaching here.
         match db {
-            Some(db) => crate::cron::execute_tool(call, db, source),
+            Some(db) => crate::cron::execute_tool(call, db),
             None => ToolOutput::err(format!(
                 "{} is not available in this context.",
                 call.name
@@ -1981,7 +1980,7 @@ pub(crate) async fn run_tool_loop(
                         let dispatched = tokio::select! {
                             biased;
                             _ = token.cancelled() => None,
-                            d = dispatch_tool(call, brave, shell, memory, cfg, persist, source) => Some(d),
+                            d = dispatch_tool(call, brave, shell, memory, cfg, persist) => Some(d),
                         };
                         match dispatched {
                             Some(d) => d,

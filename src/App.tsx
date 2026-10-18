@@ -678,7 +678,9 @@ export default function App() {
     const rows = await listConversations();
     setConversations(rows);
     setVisibleConversations(rows);
-    if (rows.length > 0) setActiveId(rows[0].id);
+    // Open a real chat, not a job's thread that happened to fire most recently.
+    const firstChat = rows.find((c) => c.kind !== "scheduled") ?? rows[0];
+    if (firstChat) setActiveId(firstChat.id);
 
     const cfg = await getConfig();
     setBaseUrl(cfg.baseUrl);
@@ -861,6 +863,8 @@ export default function App() {
     try {
       await createCron(payload);
       await refreshCrons();
+      // The job owns a fresh thread (kind `scheduled`): show it in the sidebar.
+      void refreshConversations();
       return true;
     } catch (e) {
       setCronError(String(e));
@@ -880,6 +884,8 @@ export default function App() {
     try {
       await updateCron({ id, ...patch });
       await refreshCrons();
+      // A title edit renames the job's thread too.
+      if (patch.title != null) void refreshConversations();
       return true;
     } catch (e) {
       setCronError(String(e));
@@ -892,11 +898,22 @@ export default function App() {
   async function deleteCronJob(id: string) {
     setCronBusy(true);
     setCronError(null);
+    const threadId = cronJobs().find((j) => j.id === id)?.conversationId ?? null;
     try {
       await deleteCron(id);
       // Drop the selection if the deleted job was the one shown.
       setCronSelectedId((sel) => (sel === id ? null : sel));
       await refreshCrons();
+      // The job owned its thread, so that conversation is gone too.
+      if (threadId) {
+        await refreshConversations();
+        void refreshCronTriggers();
+        if (activeId() === threadId) {
+          const next =
+            conversations().find((c) => c.kind !== "scheduled") ?? conversations()[0];
+          setActiveId(next ? next.id : null);
+        }
+      }
     } catch (e) {
       setCronError(String(e));
     } finally {
@@ -1058,7 +1075,8 @@ export default function App() {
     void refreshCrons();
     void refreshCronTriggers();
     if (activeId() === id) {
-      const next = conversations()[0];
+      const next =
+        conversations().find((c) => c.kind !== "scheduled") ?? conversations()[0];
       setActiveId(next ? next.id : null);
     }
   }
@@ -2774,7 +2792,14 @@ export default function App() {
         onUpdateCron={patchCron}
         onDeleteCron={deleteCronJob}
         onRunCronNow={runCronJobNow}
-        activeId={activeId()}
+        onOpenThread={(id) => {
+          // The job's thread is a normal conversation (kind `scheduled`), so
+          // opening it just activates it; the sidebar keeps it in its own
+          // section rather than mixing it with chats.
+          setCronOpen(false);
+          setActiveId(id);
+          setSidebarOpen(false);
+        }}
       />
 
       {/* Expanded transcript image (clicked in MessageList) */}
