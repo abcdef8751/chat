@@ -39,6 +39,12 @@ export function Header(props: {
   changeThinking: (level: string) => void;
   openMemory: () => void;
   openSettings: () => void;
+  /// Scheduled-jobs dialog (the header "Cron" button + overflow item). The
+  /// dot marks unseen cron activity and only shows when at least one job
+  /// exists — a fresh install with zero jobs must not light up.
+  openCron: () => void;
+  cronUnseen: boolean;
+  cronHasJobs: boolean;
 }) {
   // Re-apply the selection after the option list is rebuilt. WebKit clears a
   // <select> when its selected <option> is removed during a refresh, and the
@@ -230,6 +236,17 @@ export function Header(props: {
           Memory
         </button>
         <button
+          onClick={props.openCron}
+          class="relative hidden rounded-md px-3 py-1.5 text-xs text-neutral-500 transition hover:bg-neutral-100 lg:inline-block dark:text-neutral-400 dark:hover:bg-neutral-800"
+        >
+          Cron
+          {/* Unseen-activity dot: collapses into the overflow menu below on
+              narrow viewports, where this button is hidden. */}
+          <Show when={props.cronUnseen && props.cronHasJobs}>
+            <span class="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-amber-500" />
+          </Show>
+        </button>
+        <button
           onClick={props.openSettings}
           class="hidden rounded-md px-3 py-1.5 text-xs text-neutral-500 transition hover:bg-neutral-100 lg:inline-block dark:text-neutral-400 dark:hover:bg-neutral-800"
         >
@@ -251,6 +268,14 @@ export function Header(props: {
             >
               <DropdownMenu.Item class={MENU_ITEM_CLASS} onSelect={props.openMemory}>
                 Memory
+              </DropdownMenu.Item>
+              <DropdownMenu.Item class={MENU_ITEM_CLASS} onSelect={props.openCron}>
+                <span class="flex w-full items-center justify-between gap-3">
+                  Cron
+                  <Show when={props.cronUnseen && props.cronHasJobs}>
+                    <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
+                  </Show>
+                </span>
               </DropdownMenu.Item>
               <DropdownMenu.Item class={MENU_ITEM_CLASS} onSelect={props.openSettings}>
                 Settings

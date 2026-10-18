@@ -11,7 +11,10 @@ import {
   cancelBackfill,
   clearExtractions,
   createConversation,
+  createCron,
+  cronSetActive,
   deleteConversation,
+  deleteCron,
   deleteMemoryFile,
   denyTool,
   editUserMessage,
@@ -20,6 +23,9 @@ import {
   hasBraveKey,
   importConversations,
   listConversations,
+  listCronRuns,
+  listCrons,
+  listCronTriggers,
   listMemoryFiles,
   listMessages,
   listModels,
@@ -32,6 +38,7 @@ import {
   reflectNow,
   removeProvider,
   renameConversation,
+  runCronNow,
   searchConversations,
   setActiveProvider,
   setBraveKey,
@@ -41,6 +48,7 @@ import {
   setModelOverrides as saveModelOverrides,
   stopChat,
   streamChat,
+  updateCron,
   updateProvider,
   syncNow,
   syncSignIn,
@@ -57,6 +65,10 @@ import {
   type Attachment,
   type BackfillStatus,
   type Conversation,
+  type CreateCronPayload,
+  type CronJob,
+  type CronRun,
+  type CronUpdateEvent,
   type ExtractionStats,
   type ImportReport,
   type MemoryFile,
@@ -71,10 +83,12 @@ import {
   type StreamEvent,
   type SyncStatus,
   type ThinkingOptions,
+  type UpdateCronPayload,
 } from "./lib/api";
 import { isAndroidDevice, onBack, readAttachmentFromUri } from "./lib/platform";
 import { acceptsImages, resolveInputModalities } from "./lib/capabilities";
 import { Composer } from "./components/Composer";
+import { CronPage } from "./components/CronPage";
 import { Header } from "./components/Header";
 import { ImageLightbox } from "./components/ImageLightbox";
 import { MemoryPage } from "./components/MemoryPage";
@@ -152,6 +166,13 @@ export default function App() {
     liveTools: LiveTool[];
   }
   const [streamingIds, setStreamingIds] = createSignal<ReadonlySet<string>>(new Set());
+  // Conversations with a **scheduled run** in flight. A cron run has no UI
+  // channel, so `streamingIds` (populated by live stream events) cannot know
+  // about it; the `cron-updated` started/finished/error events drive this set.
+  // It is part of `isBusy`, so Stop, send and edit are gated on it — without
+  // that, a scheduled run is invisible and un-abortable (and editing mid-run
+  // would fork the transcript).
+  const [cronRunning, setCronRunning] = createSignal<ReadonlySet<string>>(new Set());
   const [liveTurns, setLiveTurns] = createSignal<Record<string, LiveTurn>>({});
   // Per-conversation turn tokens: a resend/Stop→resend only supersedes the same
   // conversation's events, never another conversation's stream.
@@ -164,6 +185,19 @@ export default function App() {
       prev.has(id) ? new Set([...prev].filter((x) => x !== id)) : prev,
     );
   const isStreaming = (id: string | null | undefined) => !!id && streamingIds().has(id);
+  const setCronRun = (id: string, running: boolean) =>
+    setCronRunning((prev) => {
+      if (running === prev.has(id)) return prev;
+      const next = new Set(prev);
+      if (running) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  // "A turn of any kind is using this chat": live streaming OR a scheduled run.
+  // UI gates (send / Stop / inline edit) must use this, not `isStreaming`, or a
+  // cron run becomes invisible and un-abortable.
+  const isBusy = (id: string | null | undefined) =>
+    isStreaming(id) || (!!id && cronRunning().has(id));
   // Live tool cards for the ACTIVE conversation (derived, so no shared array):
   const liveTools = () => liveTurns()[activeId() ?? ""]?.liveTools ?? [];
 
@@ -259,6 +293,30 @@ export default function App() {
   const [syncRecoveryInput, setSyncRecoveryInput] = createSignal("");
   const [syncRecoveryShown, setSyncRecoveryShown] = createSignal<string | null>(null);
   const [syncEncBusy, setSyncEncBusy] = createSignal(false);
+
+  // --- Scheduled jobs (cron) ---
+  // Jobs run prompts in conversations on a schedule, in the background.
+  // `cronUnseen` drives the header dot: set when a run finishes/errors while
+  // the Cron dialog is closed, cleared when it opens. `cronEnabled` is the
+  // global kill-switch (Settings toggle, default true).
+  const [cronOpen, setCronOpen] = createSignal(false);
+  const [cronJobs, setCronJobs] = createSignal<CronJob[]>([]);
+  const [cronRuns, setCronRuns] = createSignal<CronRun[]>([]);
+  // messageId → job title for the transcript "scheduled · <title>" pill.
+  const [cronTriggers, setCronTriggers] = createSignal<Record<string, string>>({});
+  // The job whose recent runs are shown in the dialog; owned here so the
+  // cron-updated handler can also refresh those runs.
+  const [cronSelectedId, setCronSelectedId] = createSignal<string | null>(null);
+  const [cronBusy, setCronBusy] = createSignal(false);
+  const [cronError, setCronError] = createSignal<string | null>(null);
+  const [cronUnseen, setCronUnseen] = createSignal(false);
+  const [cronEnabled, setCronEnabled] = createSignal(true);
+  // Sequencing guard for `loadCronRuns`: a slow response for a previous job
+  // must not overwrite the newer selection's runs.
+  let cronRunsSeq = 0;
+  /// Guard for `refreshCronTriggers`: a response for a chat the user already
+  /// switched away from must not overwrite the current chat's pill map.
+  let cronTriggersSeq = 0;
 
   // Theme: dark by default, persisted across launches, toggled from the header.
   const [dark, setDark] = createSignal(true);
@@ -462,13 +520,13 @@ export default function App() {
     }
 
     // Android hardware/gesture back: pop exactly one layer per press, in
-    // priority order (memory detail → memory dialog → settings → new chat →
-    // reasoning popup → sidebar drawer → inline edit). Returning `false` when
-    // nothing is open lets the native side finish the activity, so back exits
-    // only on the chat page. Each close goes through the same setter/handler as
-    // its visible control (e.g. `closeSettings` saves, the edit branch cancels
-    // the inline editor). Inert on desktop, where no `pi-back` event is ever
-    // dispatched.
+    // priority order (memory detail → memory dialog → cron dialog → settings →
+    // new chat → reasoning popup → sidebar drawer → inline edit). Returning
+    // `false` when nothing is open lets the native side finish the activity,
+    // so back exits only on the chat page. Each close goes through the same
+    // setter/handler as its visible control (e.g. `closeSettings` saves, the
+    // edit branch cancels the inline editor). Inert on desktop, where no
+    // `pi-back` event is ever dispatched.
     const offBack = onBack(() => {
       if (memoryOpen() && memoryDetailOpen()) {
         setMemoryDetailOpen(false);
@@ -476,6 +534,10 @@ export default function App() {
       }
       if (memoryOpen()) {
         setMemoryOpen(false);
+        return true;
+      }
+      if (cronOpen()) {
+        setCronOpen(false);
         return true;
       }
       if (settingsOpen()) {
@@ -585,6 +647,34 @@ export default function App() {
     });
     onCleanup(() => unlistenSync);
 
+    // A scheduled job started / finished / errored. Any event refreshes the
+    // job list (next-run, counters) and the trigger map (a run may have posted
+    // a message); a run in the OPEN chat reloads its transcript (unless that
+    // chat is mid-stream, whose own reload reconciles it) and re-sorts the
+    // conversation list. The unseen dot is set only when a run settles while
+    // the dialog is closed — opening it clears the flag.
+    const unlistenCron = await listen<CronUpdateEvent>("cron-updated", (event) => {
+      const { jobId, conversationId, status } = event.payload;
+      // A scheduled run has no stream channel, so this event is the only signal
+      // that the chat is occupied: feed the busy set first, then refresh.
+      setCronRun(conversationId, status === "started");
+      void refreshCrons();
+      void refreshCronTriggers();
+      if (status === "finished" || status === "error") {
+        if (!cronOpen()) setCronUnseen(true);
+        // A run appends messages and bumps `updated_at`, so the sidebar order
+        // must refresh even when the chat is not the open one.
+        void refreshConversations();
+      }
+      const id = activeId();
+      if (id && conversationId === id && !isStreaming(id)) {
+        listMessages(id).then(setMessages);
+      }
+      // Keep the selected job's run history live while the dialog is open.
+      if (cronSelectedId() && cronSelectedId() === jobId) void loadCronRuns(jobId);
+    });
+    onCleanup(() => unlistenCron);
+
     const rows = await listConversations();
     setConversations(rows);
     setVisibleConversations(rows);
@@ -597,6 +687,7 @@ export default function App() {
     setThinkingLevel(cfg.thinkingLevel ?? "");
     setEchoReasoning(cfg.echoReasoningContent ?? true);
     setAutoApproveTools(cfg.autoApproveTools ?? false);
+    setCronEnabled(cfg.cronEnabled ?? true);
     setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
     setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
     setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
@@ -612,6 +703,10 @@ export default function App() {
     // Background: pull fresh data from models.dev and replace values if they
     // changed, without blocking startup.
     loadModels(true, cfg.activeProviderId ?? "").catch(() => {});
+    // Cron jobs + the transcript trigger map, so the sidebar glyphs and the
+    // "scheduled · <title>" pills are right on first paint.
+    void refreshCrons();
+    void refreshCronTriggers();
   });
 
   // Re-resolve pricing whenever the selected model, its provider, or the catalog
@@ -709,6 +804,146 @@ export default function App() {
     setVisibleConversations(rows);
   }
 
+  // --- Scheduled jobs (cron) handlers ---
+
+  // Refresh the job list. Background (event-driven) refreshes must never flash
+  // an error banner, so failures are swallowed here; user-triggered actions
+  // set `cronError` themselves.
+  async function refreshCrons() {
+    try {
+      setCronJobs(await listCrons());
+    } catch {
+      // non-fatal — a later event/action retries
+    }
+  }
+
+  // Rebuild the messageId → job title map for the transcript pills. Scoped to
+  // the open chat (that is all MessageList renders), so the query stays small
+  // even after years of scheduled runs; no chat means no pills.
+  async function refreshCronTriggers() {
+    const id = activeId();
+    const seq = ++cronTriggersSeq;
+    if (!id) {
+      setCronTriggers({});
+      return;
+    }
+    try {
+      const triggers = await listCronTriggers(id);
+      // A slow response for a previous chat must not overwrite the current
+      // chat's pills (and the user may have switched away in the meantime).
+      if (seq !== cronTriggersSeq || activeId() !== id) return;
+      const map: Record<string, string> = {};
+      for (const t of triggers) map[t.messageId] = t.title;
+      setCronTriggers(map);
+    } catch {
+      // non-fatal (the pill is a nice-to-have)
+    }
+  }
+
+  async function loadCronRuns(jobId: string | null) {
+    if (!jobId) {
+      setCronRuns([]);
+      return;
+    }
+    const seq = ++cronRunsSeq;
+    try {
+      const runs = await listCronRuns(jobId, 20);
+      // A newer selection superseded this one — drop the stale result.
+      if (seq === cronRunsSeq) setCronRuns(runs);
+    } catch (e) {
+      if (seq === cronRunsSeq) setCronError(String(e));
+    }
+  }
+
+  async function createCronJob(payload: CreateCronPayload): Promise<boolean> {
+    setCronBusy(true);
+    setCronError(null);
+    try {
+      await createCron(payload);
+      await refreshCrons();
+      return true;
+    } catch (e) {
+      setCronError(String(e));
+      return false;
+    } finally {
+      setCronBusy(false);
+    }
+  }
+
+  /// Patch a job (enabled/notify toggles and the edit form all land here).
+  async function patchCron(
+    id: string,
+    patch: Omit<UpdateCronPayload, "id">,
+  ): Promise<boolean> {
+    setCronBusy(true);
+    setCronError(null);
+    try {
+      await updateCron({ id, ...patch });
+      await refreshCrons();
+      return true;
+    } catch (e) {
+      setCronError(String(e));
+      return false;
+    } finally {
+      setCronBusy(false);
+    }
+  }
+
+  async function deleteCronJob(id: string) {
+    setCronBusy(true);
+    setCronError(null);
+    try {
+      await deleteCron(id);
+      // Drop the selection if the deleted job was the one shown.
+      setCronSelectedId((sel) => (sel === id ? null : sel));
+      await refreshCrons();
+    } catch (e) {
+      setCronError(String(e));
+    } finally {
+      setCronBusy(false);
+    }
+  }
+
+  async function runCronJobNow(id: string) {
+    setCronBusy(true);
+    setCronError(null);
+    try {
+      await runCronNow(id);
+      // The `cron-updated` events refresh jobs/runs; refresh once here too so
+      // lastRunAt/counters update even if the run settles before the listener
+      // fires.
+      void refreshCrons();
+      void loadCronRuns(cronSelectedId());
+    } catch (e) {
+      setCronError(String(e));
+    } finally {
+      setCronBusy(false);
+    }
+  }
+
+  function openCron() {
+    setCronError(null);
+    setCronOpen(true);
+    // Opening the dialog clears the unseen dot; fresh data on the way.
+    setCronUnseen(false);
+    void refreshCrons();
+    void refreshCronTriggers();
+  }
+
+  // Tell the backend which chat is open so a scheduled run there suppresses
+  // its OS notification. Fires on every conversation switch (and the initial
+  // null — the backend treats that as "no chat open").
+  createEffect(() => {
+    const id = activeId();
+    cronSetActive(id).catch(() => {});
+  });
+
+  // Conversations owning at least one enabled job — the sidebar glyph source.
+  // Excludes paused jobs, matching "Has a scheduled job" in spirit.
+  const cronConversationIds = createMemo(
+    () => new Set(cronJobs().filter((j) => j.enabled).map((j) => j.conversationId)),
+  );
+
   // Sidebar search: query the backend (title + message text) when non-empty.
   createEffect(() => {
     const q = searchQuery().trim();
@@ -721,6 +956,8 @@ export default function App() {
     const id = activeId();
     setOpenTrace(null);
     setNearBottom(true);
+    // Scheduled-run pills are per chat: reload the trigger map for the new one.
+    void refreshCronTriggers();
     // Editing a message is scoped to the conversation it lives in; a switch
     // would otherwise let Save target the wrong conversation.
     setEditingId(null);
@@ -816,6 +1053,10 @@ export default function App() {
     setConfirmDeleteId(null);
     await deleteConversation(id);
     await refreshConversations();
+    // Its cron jobs cascade away with the conversation row: refresh so a ghost
+    // job disappears from the (possibly open) Cron dialog and sidebar glyphs.
+    void refreshCrons();
+    void refreshCronTriggers();
     if (activeId() === id) {
       const next = conversations()[0];
       setActiveId(next ? next.id : null);
@@ -844,6 +1085,7 @@ export default function App() {
       setThinkingLevel(cfg.thinkingLevel ?? "");
       setEchoReasoning(cfg.echoReasoningContent ?? true);
       setAutoApproveTools(cfg.autoApproveTools ?? false);
+      setCronEnabled(cfg.cronEnabled ?? true);
       setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
       setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
       setShellWorkspaceDir(cfg.shellWorkspaceDir ?? "");
@@ -877,6 +1119,7 @@ export default function App() {
       thinkingLevel: current.thinkingLevel,
       echoReasoningContent: echoReasoning(),
       autoApproveTools: autoApproveTools(),
+      cronEnabled: cronEnabled(),
       memoryReflectionEnabled: reflectionEnabled(),
       memoryReflectionIdleMinutes: reflectionIdleMinutes(),
       modelOverrides: modelOverrides(),
@@ -1181,6 +1424,7 @@ export default function App() {
         thinkingLevel: level,
         echoReasoningContent: echoReasoning(),
         autoApproveTools: autoApproveTools(),
+        cronEnabled: cronEnabled(),
         memoryReflectionEnabled: reflectionEnabled(),
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
@@ -1217,6 +1461,7 @@ export default function App() {
         thinkingLevel: level,
         echoReasoningContent: echoReasoning(),
         autoApproveTools: autoApproveTools(),
+        cronEnabled: cronEnabled(),
         memoryReflectionEnabled: reflectionEnabled(),
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
         modelOverrides: modelOverrides(),
@@ -1573,6 +1818,10 @@ export default function App() {
         dropLiveTurn(id, token);
         if (activeId() === id) listMessages(id).then(setMessages);
         refreshConversations().catch(() => {});
+        // A live turn may have created / changed / deleted cron jobs through the
+        // agent tools (which have no event emitter of their own).
+        void refreshCrons();
+        void refreshCronTriggers();
         return;
       }
       // Everything below updates the per-conversation live record — which must
@@ -1682,7 +1931,7 @@ export default function App() {
   async function send() {
     const staged = pendingAttachments();
     let id = activeId();
-    if (isStreaming(id) || (!draft().trim() && staged.length === 0)) return;
+    if (isBusy(id) || (!draft().trim() && staged.length === 0)) return;
     if (!id) {
       const created = await createConversation();
       setConversations([created, ...conversations()]);
@@ -1716,7 +1965,7 @@ export default function App() {
 
   async function stop() {
     const id = activeId();
-    if (!id || !isStreaming(id)) return;
+    if (!id || !isBusy(id)) return;
     // Close the abort race exactly as before: keep the live turn (temp row +
     // accumulated content) until the backend's terminal event arrives — its
     // handler drops the record and reloads the persisted rows. The turn token
@@ -1728,6 +1977,11 @@ export default function App() {
       // noop — the backend still settles the aborted turn.
     }
     removeStreaming(id);
+    // A cron run has no stream channel of its own: clear its busy marker
+    // optimistically too, so a failed/missed terminal event cannot leave the
+    // composer permanently showing Stop. If the run somehow keeps going, the
+    // backend refuses the next send with an explicit message.
+    setCronRun(id, false);
     // The user message is persisted by the backend *before* streaming starts, so
     // it is already in the transcript. Handing the draft back here would
     // duplicate it on the next send, so Stop simply returns the composer to its
@@ -1737,7 +1991,7 @@ export default function App() {
   // --- Inline editing of user messages (Item 13) --------------------------
 
   function startEditMessage(m: Message) {
-    if (isStreaming(activeId())) return;
+    if (isBusy(activeId())) return;
     // Only persisted rows are editable; a `tmp-` row hasn't been written yet.
     if (m.id.startsWith("tmp-")) return;
     setEditingId(m.id);
@@ -1779,7 +2033,7 @@ export default function App() {
   async function saveEditMessage() {
     const id = activeId();
     const messageId = editingId();
-    if (!id || !messageId || isStreaming(id)) return;
+    if (!id || !messageId || isBusy(id)) return;
     const text = editDraft().trim();
     const atts = editAttachments();
     if (!text && atts.length === 0) return;
@@ -2256,6 +2510,7 @@ export default function App() {
         confirmDeleteId={confirmDeleteId()}
         setConfirmDeleteId={setConfirmDeleteId}
         removeConversation={removeConversation}
+        cronConversationIds={cronConversationIds()}
       />
 
       {/* Main */}
@@ -2288,6 +2543,9 @@ export default function App() {
           changeThinking={changeThinking}
           openMemory={openMemory}
           openSettings={openSettings}
+          openCron={openCron}
+          cronUnseen={cronUnseen()}
+          cronHasJobs={cronJobs().length > 0}
         />
 
         <Show when={settingsError() && !settingsOpen()}>
@@ -2323,7 +2581,7 @@ export default function App() {
             <MessageList
               turns={turns()}
               empty={messages().length === 0}
-              streaming={isStreaming(activeId())}
+              streaming={isBusy(activeId())}
               thinkingOpenId={thinkingOpenId()}
               onToggleThought={toggleThought}
               onApprove={approveLiveTool}
@@ -2337,6 +2595,7 @@ export default function App() {
               onSaveEdit={() => void saveEditMessage()}
               onRemoveEditAttachment={removeEditAttachment}
               onPickEditAttachments={() => void pickEditAttachments()}
+              cronTriggers={cronTriggers()}
             />
           </Show>
 
@@ -2352,8 +2611,8 @@ export default function App() {
           onRemoveAttachment={removeAttachment}
           contextNote={contextNote()}
           attachmentWarning={attachmentWarning()}
-          streaming={isStreaming(activeId())}
-          busy={isStreaming(activeId())}
+          streaming={isBusy(activeId())}
+          busy={isBusy(activeId())}
           onPickAttachments={pickAttachments}
           draft={draft()}
           setDraft={setDraft}
@@ -2418,6 +2677,8 @@ export default function App() {
         setEchoReasoning={setEchoReasoning}
         autoApproveTools={autoApproveTools()}
         setAutoApproveTools={setAutoApproveTools}
+        cronEnabled={cronEnabled()}
+        setCronEnabled={setCronEnabled}
         reflectionEnabled={reflectionEnabled()}
         setReflectionEnabled={setReflectionEnabled}
         reflectionIdleMinutes={reflectionIdleMinutes()}
@@ -2494,6 +2755,26 @@ export default function App() {
         consolidating={consolidating()}
         consolidateNow={consolidateNow}
         reflectionStats={reflectionStats()}
+      />
+
+      <CronPage
+        cronOpen={cronOpen()}
+        setCronOpen={setCronOpen}
+        wideViewport={wideViewport()}
+        fullscreenInsetStyle={fullscreenInsetStyle}
+        cronJobs={cronJobs()}
+        cronRuns={cronRuns()}
+        loadCronRuns={loadCronRuns}
+        cronSelectedId={cronSelectedId()}
+        setCronSelectedId={setCronSelectedId}
+        cronBusy={cronBusy()}
+        cronError={cronError()}
+        setCronError={setCronError}
+        onCreateCron={createCronJob}
+        onUpdateCron={patchCron}
+        onDeleteCron={deleteCronJob}
+        onRunCronNow={runCronJobNow}
+        activeId={activeId()}
       />
 
       {/* Expanded transcript image (clicked in MessageList) */}

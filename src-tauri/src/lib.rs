@@ -3,6 +3,7 @@ mod attachments;
 mod android;
 mod chat;
 mod config;
+mod cron;
 mod crypt;
 mod db;
 mod import;
@@ -20,7 +21,9 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init());
     // Android-only native bridges: the host-shell bridge (Termux RUN_COMMAND),
     // the content-URI file bridge (ContentResolver), and the app-owned file
     // picker (whose launcher survives Activity recreation; see PickerPlugin.kt).
@@ -74,6 +77,7 @@ pub fn run() {
             app.manage(shell_state);
             app.manage(reflection::Backfill::default());
             app.manage(import::ImportState::default());
+            app.manage(cron::CronState::default());
 
             let mut memory = memory::MemoryState::load(dir.join("memory")).map_err(
                 |e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) },
@@ -86,6 +90,9 @@ pub fn run() {
 
             // Background idle memory reflection.
             reflection::spawn(app.handle().clone());
+
+            // Background scheduled runs (cron jobs).
+            cron::spawn(app.handle().clone());
 
             // Background sync scheduler (only active when enabled + logged in).
             sync::spawn(app.handle().clone());
@@ -155,6 +162,15 @@ pub fn run() {
             reflection::cancel_backfill,
             reflection::memory_extraction_stats,
             reflection::clear_extractions,
+            cron::list_crons,
+            cron::create_cron,
+            cron::update_cron,
+            cron::delete_cron,
+            cron::run_cron_now,
+            cron::list_cron_runs,
+            cron::list_cron_triggers,
+            cron::cron_preview,
+            cron::cron_set_active,
             db::memory_reflection_stats,
             pricing::get_pricing,
             pricing::refresh_pricing,

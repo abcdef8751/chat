@@ -239,10 +239,84 @@ pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
         web_fetch_tool(),
         fetch_image_tool(),
     ];
+    tools.extend(cron_tools());
     if brave {
         tools.extend(brave_tools());
     }
     tools
+}
+
+/// Cron management tools. App-local and ungated, like the memory tools, so a
+/// user can say "remind me every morning at 8" conversationally. They are in the
+/// shared tool list for every mode (prompt-cache alignment); reflection and
+/// extraction refuse them by mode.
+fn cron_tools() -> Vec<ChatCompletionTools> {
+    let schedule_desc = "Schedule: a preset token (`hourly`, `daily@HH:MM`, \
+        `weekly@mon:HH:MM`) or a 5-field cron expression \
+        (`minute hour day-of-month month day-of-week`, device local time). The floor is \
+        once per minute.";
+    vec![
+        fn_tool(
+            "create_cron",
+            &format!(
+                "Create a scheduled chat run: at each fire the app appends a normal user → \
+                 assistant exchange to a conversation, so the run sees the thread's full \
+                 history and memory. {schedule_desc} Returns the job id and next run time."
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "The instruction to carry out at each fire" },
+                    "schedule": { "type": "string", "description": "Preset token or 5-field cron expression" },
+                    "title": { "type": "string", "description": "Short human label; derived from the prompt when omitted" },
+                    "conversation_id": { "type": "string", "description": "Thread to append runs to; defaults to this conversation" },
+                    "tool_policy": { "type": "string", "description": "`readonly` (default: bash/read_file/write_file refused) or `autoapprove` (run host tools without asking)" },
+                    "notify": { "type": "boolean", "description": "Send an OS notification when the run finishes (default true)" }
+                },
+                "required": ["prompt", "schedule"]
+            }),
+        ),
+        fn_tool(
+            "list_crons",
+            "List scheduled runs: id, title, schedule, next/last run, enabled state, tool policy, and run count.",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        fn_tool(
+            "update_cron",
+            "Change an existing scheduled run. Only the fields you pass are updated; changing the schedule recomputes the next run time. The run's thread and history are untouched.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Job id (from list_crons)" },
+                    "prompt": { "type": "string" },
+                    "schedule": { "type": "string", "description": "Preset token or 5-field cron expression" },
+                    "title": { "type": "string" },
+                    "tool_policy": { "type": "string", "description": "`readonly` or `autoapprove`" },
+                    "notify": { "type": "boolean" },
+                    "enabled": { "type": "boolean", "description": "false pauses the job without deleting it" }
+                },
+                "required": ["id"]
+            }),
+        ),
+        fn_tool(
+            "delete_cron",
+            "Delete a scheduled run permanently. Its past messages stay in the thread.",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "Job id (from list_crons)" } },
+                "required": ["id"]
+            }),
+        ),
+        fn_tool(
+            "run_cron_now",
+            "Fire a scheduled run immediately without changing its schedule. The run starts within ~20 seconds (the scheduler picks it up) and appears in the job's thread.",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "Job id (from list_crons)" } },
+                "required": ["id"]
+            }),
+        ),
+    ]
 }
 
 /// Brave's native tool surface (mirrors the official `brave-search-mcp-server`
@@ -1345,11 +1419,22 @@ impl ApprovalRegistry {
         }
     }
 
-    /// Deny everything pending (used on abort/stop).
-    pub fn deny_all(&self) {
+    /// Deny only the calls **this turn** registered.
+    ///
+    /// A global "deny everything" is wrong here: a background cron run (or a
+    /// second chat's turn) finishing would silently answer another
+    /// conversation's pending prompt with "denied" — a denial the user never
+    /// made. Each tool loop therefore cleans up its own call ids and leaves
+    /// everyone else's alone.
+    pub fn deny_calls(&self, call_ids: &[String]) {
+        if call_ids.is_empty() {
+            return;
+        }
         let mut map = self.pending.lock().unwrap();
-        for (_, tx) in map.drain() {
-            let _ = tx.send(false);
+        for id in call_ids {
+            if let Some(tx) = map.remove(id) {
+                let _ = tx.send(false);
+            }
         }
     }
 }
@@ -1519,17 +1604,48 @@ mod tests {
         assert!(rx.blocking_recv().unwrap());
     }
 
+    /// Turn-scoped approval cleanup: a cron run finishing (or any turn ending)
+    /// must never answer a prompt the user is looking at in another chat.
+    #[test]
+    fn deny_calls_leaves_other_turns_approvals_alone() {
+        let reg = ApprovalRegistry::default();
+        let mut mine = reg.register("mine".into());
+        let mut theirs = reg.register("theirs".into());
+
+        reg.deny_calls(&["mine".into()]);
+        assert!(!mine.try_recv().unwrap());
+        assert!(
+            theirs.try_recv().is_err(),
+            "another turn's pending approval was touched"
+        );
+
+        reg.deny_calls(&["theirs".into()]);
+        assert!(!theirs.try_recv().unwrap());
+    }
+
     #[test]
     fn tool_specs_shape() {
         let with = tool_specs(true);
-        // 9 host/memory/web tools + 6 native Brave tools.
-        assert_eq!(with.len(), 15);
+        // 14 host/memory/web/cron tools + 6 native Brave tools.
+        assert_eq!(with.len(), 20);
         let without = tool_specs(false);
-        assert_eq!(without.len(), 9);
+        assert_eq!(without.len(), 14);
         // The list is identical for live and reflection (cache alignment);
         // access is enforced by mode at execution time, not by the list.
         for name in ["write_memory", "memory_str_replace", "web_fetch", "fetch_image"] {
             assert!(without.iter().any(|t| tool_name(t) == name), "missing {name}");
+        }
+        // Cron management is app-local and ungated, and present in every mode
+        // (the list is shared; dispatch enforces access).
+        for name in [
+            "create_cron",
+            "list_crons",
+            "update_cron",
+            "delete_cron",
+            "run_cron_now",
+        ] {
+            assert!(without.iter().any(|t| tool_name(t) == name), "missing {name}");
+            assert!(!is_gated(name));
         }
         assert!(is_gated("bash"));
         assert!(!is_gated("brave_web_search"));

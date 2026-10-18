@@ -116,6 +116,12 @@ export function SettingsDialog(props: {
    */
   autoApproveTools: boolean;
   setAutoApproveTools: (value: boolean) => void;
+  /**
+   * Global kill-switch for the cron scheduler. Default true; off stops every
+   * job from firing (jobs keep their config, they just don't run).
+   */
+  cronEnabled: boolean;
+  setCronEnabled: (value: boolean) => void;
   reflectionEnabled: boolean;
   setReflectionEnabled: (value: boolean) => void;
   reflectionIdleMinutes: number;
@@ -799,6 +805,22 @@ export function SettingsDialog(props: {
               <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
                 A background pass reads the conversation and rewrites the Markdown memory
                 files. Spends tokens; cost is tracked separately.
+              </span>
+            </div>
+
+            <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+              <label class="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                <input
+                  type="checkbox"
+                  class="h-4 w-4 rounded border-neutral-300 dark:border-neutral-700"
+                  checked={props.cronEnabled}
+                  onChange={(e) => props.setCronEnabled(e.currentTarget.checked)}
+                />
+                Scheduled jobs
+              </label>
+              <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                Run scheduled prompts in the background (local-only; runs spend tokens).
+                Turn this off to pause every job without deleting them.
               </span>
             </div>
 

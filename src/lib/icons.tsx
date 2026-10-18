@@ -100,6 +100,25 @@ export function BackArrowIcon() {
   );
 }
 
+/** A small clock — the "has a scheduled job" glyph and the cron transcript pill. */
+export function ClockIcon(props: { class?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      class={props.class ?? "h-4 w-4"}
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.7"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 2" />
+    </svg>
+  );
+}
+
 /** The app mark — the assistant's face, and the app's identity in the sidebar. */
 export function MarkAvatar(props: { class?: string }) {
   return (

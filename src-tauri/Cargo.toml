@@ -20,6 +20,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
+# Desktop notifications for finished cron runs. Pinned to 2.4: 2.5+ requires
+# tauri 2.12, and bumping tauri past 2.11.x drops the vendored
+# `tauri-runtime-wry` patch (the Android blank-relaunch fix — see AGENTS.md).
+tauri-plugin-notification = "=2.4.0"
+# Cron schedule parsing + next-fire computation (local wall clock).
+croner = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }

@@ -112,6 +112,12 @@ export interface Config {
    * every existing `setConfig` call site.
    */
   autoApproveTools?: boolean;
+  /**
+   * Global kill-switch for the cron scheduler ("Scheduled jobs"). When off,
+   * no job runs. On by default; optional here only to avoid churning every
+   * existing `setConfig` call site.
+   */
+  cronEnabled?: boolean;
 }
 
 export interface Pricing {
@@ -586,4 +592,130 @@ export function syncRecoveryCode(): Promise<string> {
 /** Disable client-side encryption and re-upload rows as plaintext. */
 export function syncRemoveEncryption(): Promise<SyncStatus> {
   return invoke<SyncStatus>("sync_remove_encryption");
+}
+
+// --- Scheduled jobs (cron) ---
+
+/** A scheduled chat run: fires `prompt` into `conversationId` on `schedule`. */
+export interface CronJob {
+  id: string;
+  conversationId: string;
+  title: string;
+  /** Normalized 5-field cron expression. */
+  schedule: string;
+  prompt: string;
+  enabled: boolean;
+  toolPolicy: "readonly" | "autoapprove";
+  notify: boolean;
+  /** Epoch ms of the next scheduled run. */
+  nextRunAt: number;
+  lastRunAt: number | null;
+  runCount: number;
+  createdAt: number;
+}
+
+/** One execution of a cron job (created per run, not per message). */
+export interface CronRun {
+  id: string;
+  jobId: string;
+  conversationId: string;
+  triggerMessageId: string;
+  scheduledFor: number;
+  startedAt: number;
+  finishedAt: number | null;
+  stopReason: string | null;
+  error: string | null;
+  usage: string | null;
+  cost: number | null;
+}
+
+/** One message that fired a run — what the transcript pill is built from. */
+export interface CronTrigger {
+  messageId: string;
+  jobId: string;
+  title: string;
+  scheduledFor: number;
+}
+
+/** `cron_preview` result: validation plus the next run time. */
+export interface CronPreview {
+  schedule: string;
+  description: string;
+  nextRunAt: number | null;
+  error: string | null;
+}
+
+/** Payload for `create_cron` (all field names frozen by the backend). */
+export type CreateCronPayload = {
+  /** Owning conversation. The frontend always passes the active chat's id;
+   * `null` is rejected by the backend. */
+  conversationId?: string | null;
+  /** Omitted/null => derived from the prompt by the backend. */
+  title?: string | null;
+  /** Preset ("hourly" | "daily@HH:MM" | "weekly@DDD:HH:MM") or 5-field cron. */
+  schedule: string;
+  prompt: string;
+  toolPolicy?: "readonly" | "autoapprove" | null;
+  notify?: boolean | null;
+};
+
+/** Payload for `update_cron` — every field optional; only what's present changes. */
+export type UpdateCronPayload = {
+  id: string;
+  title?: string | null;
+  schedule?: string | null;
+  prompt?: string | null;
+  enabled?: boolean | null;
+  toolPolicy?: "readonly" | "autoapprove" | null;
+  notify?: boolean | null;
+};
+
+/** `cron-updated` event payload (started / finished / error per job). */
+export interface CronUpdateEvent {
+  jobId: string;
+  conversationId: string;
+  status: "started" | "finished" | "error";
+}
+
+export function listCrons(): Promise<CronJob[]> {
+  return invoke<CronJob[]>("list_crons");
+}
+
+export function createCron(payload: CreateCronPayload): Promise<CronJob> {
+  return invoke<CronJob>("create_cron", payload);
+}
+
+export function updateCron(payload: UpdateCronPayload): Promise<CronJob> {
+  return invoke<CronJob>("update_cron", payload);
+}
+
+export function deleteCron(id: string): Promise<void> {
+  return invoke<void>("delete_cron", { id });
+}
+
+/** Fire the job immediately in the background (no scheduler wait). */
+export function runCronNow(id: string): Promise<void> {
+  return invoke<void>("run_cron_now", { id });
+}
+
+export function listCronRuns(jobId?: string | null, limit?: number | null): Promise<CronRun[]> {
+  return invoke<CronRun[]>("list_cron_runs", { jobId: jobId ?? null, limit: limit ?? null });
+}
+
+export function listCronTriggers(conversationId?: string | null): Promise<CronTrigger[]> {
+  // Scoped to one chat: the transcript chip only renders the open conversation,
+  // so the backend returns that chat's triggers (never the whole history).
+  return invoke<CronTrigger[]>("list_cron_triggers", {
+    conversationId: conversationId ?? null,
+  });
+}
+
+/** Validate a schedule and resolve its next run; call debounced as the user types. */
+export function cronPreview(schedule: string): Promise<CronPreview> {
+  return invoke<CronPreview>("cron_preview", { schedule });
+}
+
+/** Tell the backend which chat is open, so a run there can skip its OS notification. */
+export function cronSetActive(conversationId: string | null): Promise<void> {
+  return invoke<void>("cron_set_active", { conversationId });
 }

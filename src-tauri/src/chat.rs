@@ -99,29 +99,63 @@ impl CancelToken {
     }
 }
 
+/// One conversation's in-flight registration: its cancel token and whether a
+/// **cron run** (rather than a live turn) owns it. The distinction matters
+/// because a live send may replace another live turn's token (Stop-then-resend,
+/// see [`StreamRegistry::remove`]) but must never silently take over a scheduled
+/// run, and vice versa.
+struct StreamEntry {
+    token: CancelToken,
+    cron: bool,
+}
+
 /// Registration of a conversation's in-flight stream, so the UI can abort it and
 /// the reflection scheduler can stay out of a conversation that is mid-turn.
 #[derive(Default)]
 pub struct StreamRegistry {
-    streams: Mutex<HashMap<String, CancelToken>>,
+    streams: Mutex<HashMap<String, StreamEntry>>,
 }
 
 impl StreamRegistry {
     /// Register a conversation as streaming and hand back its cancel token. The
     /// token stays valid after [`remove`](Self::remove) — cancellation is always
     /// observable to whoever holds it.
+    ///
+    /// This is the *live* registration and deliberately overwrites whatever is
+    /// there (the resend path). [`StreamRegistry::try_register_live`] is the
+    /// guarded variant the `stream_chat` command uses so a scheduled run is not
+    /// clobbered; this one remains as the explicit-overwrite primitive the
+    /// registry's contract test exercises.
+    #[cfg(test)]
     pub fn register(&self, id: String) -> CancelToken {
         let token = CancelToken::new();
-        self.streams.lock().unwrap().insert(id, token.clone());
+        self.streams
+            .lock()
+            .unwrap()
+            .insert(id, StreamEntry { token: token.clone(), cron: false });
         token
+    }
+
+    /// A live-chat registration that refuses to take over a **cron** run.
+    /// `None` means a scheduled run owns this conversation right now; the send
+    /// should be refused (wait for the run to finish) rather than corrupt the
+    /// transcript with two interleaved turns.
+    pub fn try_register_live(&self, id: String) -> Option<CancelToken> {
+        let mut streams = self.streams.lock().unwrap();
+        if streams.get(&id).is_some_and(|e| e.cron) {
+            return None;
+        }
+        let token = CancelToken::new();
+        streams.insert(id, StreamEntry { token: token.clone(), cron: false });
+        Some(token)
     }
 
     /// Abort the conversation's in-flight stream *now*: in-flight work blocked on
     /// the request open or a tool call is dropped immediately, not on the next
     /// poll.
     pub fn cancel(&self, id: &str) {
-        if let Some(token) = self.streams.lock().unwrap().get(id) {
-            token.cancel();
+        if let Some(entry) = self.streams.lock().unwrap().get(id) {
+            entry.token.cancel();
         }
     }
 
@@ -137,15 +171,35 @@ impl StreamRegistry {
     /// token leaves a subsequent turn's registration untouched.
     pub fn remove(&self, id: &str, token: &CancelToken) {
         let mut streams = self.streams.lock().unwrap();
-        if streams.get(id).is_some_and(|current| current.same_turn(token)) {
+        if streams
+            .get(id)
+            .is_some_and(|current| current.token.same_turn(token))
+        {
             streams.remove(id);
         }
     }
 
-    /// Whether a chat turn is currently streaming for this conversation. Used by
-    /// the memory-reflection scheduler to avoid running mid-turn.
+    /// Whether a chat turn (live or scheduled) is currently streaming for this
+    /// conversation. Used by the memory-reflection scheduler to avoid running
+    /// mid-turn.
     pub fn is_streaming(&self, id: &str) -> bool {
         self.streams.lock().unwrap().contains_key(id)
+    }
+
+    /// Register a conversation for a **cron run** only if nothing is in flight.
+    /// Used by the cron scheduler, whose interlock must not be racy: a live user
+    /// turn may start in the window between the scheduler's `is_streaming` check
+    /// and its own registration, and an unconditional overwrite would make Stop
+    /// abort the wrong turn (and hide one from reflection). `None` means "someone
+    /// else is using this conversation — defer".
+    pub fn try_register(&self, id: String) -> Option<CancelToken> {
+        let mut streams = self.streams.lock().unwrap();
+        if streams.contains_key(&id) {
+            return None;
+        }
+        let token = CancelToken::new();
+        streams.insert(id, StreamEntry { token: token.clone(), cron: true });
+        Some(token)
     }
 }
 
@@ -1448,6 +1502,44 @@ fn aborted_tool_output() -> ToolOutput {
     ToolOutput::err("The user aborted this tool call.".into())
 }
 
+/// Whether a cron-management call would **grant** or **use** the `autoapprove`
+/// tool policy — i.e. whether it must be a gated call in a live turn.
+///
+/// Classification is target-aware, because an argument-only check is bypassable:
+/// a `readonly`/injected run could rewrite the prompt of an *existing*
+/// autoapprove job (no `tool_policy` in the arguments) and turn it into a
+/// persistent shell, or fire it with `run_cron_now`. So:
+/// - `create_cron` — gated when it asks for `autoapprove`.
+/// - `update_cron` — gated when it asks for `autoapprove`, **or** when the target
+///   job is already `autoapprove` (any mutation of such a job).
+/// - `run_cron_now` — gated when the target job is `autoapprove`.
+/// - `delete_cron` — never gated: removing a job cannot grant anything.
+///
+/// In a `Cron(ReadOnly)` run the gated branch refuses the call outright (a
+/// scheduled run cannot escalate), while an `autoapprove` run is already
+/// privileged. A live turn surfaces the normal approve/deny prompt.
+fn grants_autoapprove(name: &str, arguments: &Value, db: Option<&db::Db>) -> bool {
+    let asks_for_autoapprove = || {
+        crate::cron::normalize_policy(arguments.get("tool_policy").and_then(Value::as_str))
+            .map(|p| p == "autoapprove")
+            .unwrap_or(false)
+    };
+    let target_is_autoapprove = || {
+        // Must use the SAME argument reader the tool implementation uses: it
+        // trims, so a padded `" <id>"` would otherwise miss this lookup and slip
+        // through as ungated while `update_cron` still found and mutated the job.
+        let id = crate::cron::arg_str(arguments, "id")?;
+        let job = db::get_cron_job(db?, id).ok()??;
+        Some(job.tool_policy == "autoapprove")
+    };
+    match name {
+        "create_cron" => asks_for_autoapprove(),
+        "update_cron" => asks_for_autoapprove() || target_is_autoapprove().unwrap_or(false),
+        "run_cron_now" => target_is_autoapprove().unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// Handle a `read_file` call for an image path. Multimodal models get a short
 /// text result plus the image (returned for injection); text-only models get a
 /// result telling them they cannot view it, so they can relay that to the user.
@@ -1548,6 +1640,7 @@ async fn dispatch_tool(
     memory: &crate::memory::MemoryState,
     cfg: &AppConfig,
     db: Option<&db::Db>,
+    source: &str,
 ) -> DispatchedTool {
     if call.name == "read_file" {
         if let Some(path) = call.arguments.get("path").and_then(Value::as_str) {
@@ -1572,6 +1665,18 @@ async fn dispatch_tool(
     } else if call.name == "web_fetch" {
         // Read-only and ungated, like the Brave tools, and needs no API key.
         tools::execute_web_tool(call).await
+    } else if crate::cron::is_cron_tool(&call.name) {
+        // Cron management is app-local and ungated (like the memory tools), so
+        // "remind me every morning" works conversationally. It needs the DB;
+        // the tool list is shared with reflection/extraction, which have no
+        // `persist` handle and refuse these calls by mode before reaching here.
+        match db {
+            Some(db) => crate::cron::execute_tool(call, db, source),
+            None => ToolOutput::err(format!(
+                "{} is not available in this context.",
+                call.name
+            )),
+        }
     } else {
         tools::execute_host_tool(call, shell).await
     };
@@ -1592,6 +1697,20 @@ pub(crate) enum ToolMode {
     /// at all, because extraction is pure summarization. The gate below is a
     /// guard in case a model emits a tool call anyway.
     Extract,
+    /// An unattended cron run. Memory and web tools are always allowed; the
+    /// job's policy decides the gated host tools (`bash`/`read_file`/
+    /// `write_file`).
+    Cron(CronToolPolicy),
+}
+
+/// Per-job host-tool access for a cron run. The tool *list* is unchanged (cache
+/// alignment); only dispatch differs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CronToolPolicy {
+    /// Refuse gated host tools with a tool-error so the model self-corrects.
+    ReadOnly,
+    /// Run gated host tools unapproved (YOLO semantics), per this job only.
+    AutoApprove,
 }
 
 /// The capped tool loop, factored out of [`run_chat_turn`] so the memory
@@ -1630,6 +1749,9 @@ pub(crate) async fn run_tool_loop(
     // final assistant row, so they are collected before the loop can break on an
     // abort or an error (a partial turn keeps whatever it already produced).
     let mut attachments: Vec<crate::attachments::Attachment> = Vec::new();
+    // Call ids this turn parked on an approval. Cleaned up on every exit so a
+    // background run can never answer another conversation's pending prompt.
+    let mut gated_ids: Vec<String> = Vec::new();
 
     loop {
         let body = completion_body(
@@ -1757,9 +1879,22 @@ pub(crate) async fn run_tool_loop(
             for call in &acc.tool_calls {
                 // YOLO mode treats a gated call as ungated: it runs immediately
                 // and is announced with `gated: false` so the UI never renders
-                // (or waits on) the approve/deny prompt.
-                let host_gated = tools::is_gated(&call.name);
-                let yolo = cfg.auto_approve_tools;
+                // (or waits on) the approve/deny prompt. A cron call that would
+                // *grant* auto-approval is gated even though the tool name is
+                // app-local: that click is the boundary against a prompt-injected
+                // page scheduling an unattended shell (see `grants_autoapprove`).
+                let host_gated = tools::is_gated(&call.name)
+                    || grants_autoapprove(&call.name, &call.arguments, persist);
+                if host_gated {
+                    gated_ids.push(call.id.clone());
+                }
+                // A scheduled run has no approval UI (`NullSink`), so the mode
+                // must never park on the approval channel. `Cron(ReadOnly)`
+                // refuses gated calls above; `Cron(AutoApprove)` executes them —
+                // and no config value can put an unattended run into the
+                // interactive pipeline (the old hang: a `Cron(AutoApprove)` turn
+                // with `auto_approve_tools = false` waited forever).
+                let yolo = cfg.auto_approve_tools || matches!(mode, ToolMode::Cron(_));
                 sink.emit(StreamEvent::ToolCall {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -1807,6 +1942,15 @@ pub(crate) async fn run_tool_loop(
                          text instead of calling tools.",
                         call.name
                     )),
+                    // A scheduled run blocks host-tool side effects unless the
+                    // job opted into auto-approval. Memory and web tools stay
+                    // available (read-only / app-local).
+                    ToolMode::Cron(CronToolPolicy::ReadOnly) if host_gated => Some(format!(
+                        "{} is not available in this scheduled run: the job's tool policy is \
+                         'readonly'. Enable auto-approve on the job (or ask the user to run it \
+                         manually).",
+                        call.name
+                    )),
                     _ => None,
                 };
                 let outcome = if let Some(message) = refused {
@@ -1837,7 +1981,7 @@ pub(crate) async fn run_tool_loop(
                         let dispatched = tokio::select! {
                             biased;
                             _ = token.cancelled() => None,
-                            d = dispatch_tool(call, brave, shell, memory, cfg, persist) => Some(d),
+                            d = dispatch_tool(call, brave, shell, memory, cfg, persist, source) => Some(d),
                         };
                         match dispatched {
                             Some(d) => d,
@@ -1958,6 +2102,11 @@ pub(crate) async fn run_tool_loop(
         break;
     }
 
+    // This turn is done: release any approval it registered (an aborted wait
+    // leaves its sender behind). Only OUR call ids — a background run must not
+    // deny a prompt the user is looking at in another conversation.
+    approvals.deny_calls(&gated_ids);
+
     Ok(ToolLoopResult {
         usage: usage_total,
         text: final_text,
@@ -1968,14 +2117,16 @@ pub(crate) async fn run_tool_loop(
     })
 }
 
-/// The live chat turn: persist the user message, run the capped tool loop with
+/// The shared turn core: persist the user message, run the capped tool loop with
 /// DB persistence, freeze the turn's price, and store the final assistant turn.
+/// Used by a live chat turn ([`run_chat_turn`]) and by an unattended cron run
+/// (which passes [`ToolMode::Cron`] and records `cron_runs` from the outcome).
 ///
 /// When `regenerate` is true the user message is assumed to already exist (the
 /// `edit_user_message` path), so no `user` row is inserted; the turn is built
 /// from `content` all the same.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_chat_turn(
+pub(crate) async fn run_turn_core(
     db: &db::Db,
     cfg: &AppConfig,
     api_key: &str,
@@ -1989,7 +2140,8 @@ pub(crate) async fn run_chat_turn(
     content: String,
     attachments: Vec<crate::attachments::Attachment>,
     regenerate: bool,
-) -> Result<(), String> {
+    mode: ToolMode,
+) -> Result<TurnOutcome, String> {
     let conversation = db::get_conversation(db, &conversation_id)?
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
     let mut history = db::read_messages(db, &conversation_id)?;
@@ -2036,6 +2188,7 @@ pub(crate) async fn run_chat_turn(
     // turn. Instead, drop the (now last) user row from the history we send and
     // rebuild the request from `content` — exactly one copy of the turn goes
     // upstream, and no new row is persisted. A normal send has no such row yet.
+    let mut user_message_id: Option<String> = None;
     if regenerate {
         // `apply_user_message_edit` truncated everything after the edited row, so
         // it is the last persisted message. Match it by content at the last
@@ -2057,7 +2210,7 @@ pub(crate) async fn run_chat_turn(
         } else {
             Some(serde_json::to_string(&attachments).map_err(|e| e.to_string())?)
         };
-        db::insert_message_full(
+        let row = db::insert_message_full(
             db,
             conversation_id.clone(),
             "user".into(),
@@ -2073,6 +2226,7 @@ pub(crate) async fn run_chat_turn(
             None,
             attachments_json,
         )?;
+        user_message_id = Some(row.id);
     }
 
     let system_prompt = conversation_system_prompt(
@@ -2159,11 +2313,9 @@ pub(crate) async fn run_chat_turn(
         token,
         sink,
         Some(db),
-        ToolMode::Live,
+        mode,
     )
     .await?;
-
-    approvals.deny_all();
 
     // Freeze the turn's price at the model/rates in effect now, so switching
     // models later never retroactively re-prices turns already billed.
@@ -2205,9 +2357,69 @@ pub(crate) async fn run_chat_turn(
     )?;
 
     sink.emit(StreamEvent::Done {
-        stop_reason: result.stop_reason,
+        stop_reason: result.stop_reason.clone(),
     });
-    Ok(())
+    Ok(TurnOutcome {
+        user_message_id,
+        usage: result.usage,
+        stop_reason: result.stop_reason,
+        error: result.error,
+        text: result.text,
+    })
+}
+
+/// Result of one persisted turn, for callers that need bookkeeping (cron runs):
+/// which user row was appended, the accumulated usage (with `cost` frozen), and
+/// how the turn ended.
+pub(crate) struct TurnOutcome {
+    /// The user row this turn appended; `None` on the regenerate path, where the
+    /// row already existed.
+    pub user_message_id: Option<String>,
+    pub usage: Value,
+    pub stop_reason: String,
+    /// Provider/turn failure text when `stop_reason == "error"`.
+    pub error: Option<String>,
+    /// The final assistant text (empty on abort/cap paths), for notification
+    /// snippets.
+    pub text: String,
+}
+
+/// The live chat turn: [`run_turn_core`] in [`ToolMode::Live`], ignoring the
+/// bookkeeping outcome (the UI follows the stream events).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_chat_turn(
+    db: &db::Db,
+    cfg: &AppConfig,
+    api_key: &str,
+    brave: &tools::BraveSearch,
+    shell: &ShellExecutor,
+    memory: &crate::memory::MemoryState,
+    approvals: &tools::ApprovalRegistry,
+    token: CancelToken,
+    sink: &dyn EventSink,
+    conversation_id: String,
+    content: String,
+    attachments: Vec<crate::attachments::Attachment>,
+    regenerate: bool,
+) -> Result<(), String> {
+    run_turn_core(
+        db,
+        cfg,
+        api_key,
+        brave,
+        shell,
+        memory,
+        approvals,
+        token,
+        sink,
+        conversation_id,
+        content,
+        attachments,
+        regenerate,
+        ToolMode::Live,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Stream an assistant reply for the given conversation: read config + key,
@@ -2250,7 +2462,10 @@ pub async fn stream_chat(
 
     let token = app
         .state::<StreamRegistry>()
-        .register(conversation_id.clone());
+        .try_register_live(conversation_id.clone())
+        .ok_or_else(|| {
+            "A scheduled run is in progress in this chat — wait for it to finish.".to_string()
+        })?;
     let sink = ChannelSink(&channel);
 
     let result = run_chat_turn(
@@ -2274,7 +2489,6 @@ pub async fn stream_chat(
     .await;
 
     app.state::<StreamRegistry>().remove(&conversation_id, &token);
-    approvals.deny_all();
     result
 }
 
@@ -2284,7 +2498,6 @@ pub async fn stream_chat(
 #[tauri::command]
 pub fn stop_chat(app: tauri::AppHandle, conversation_id: String) -> Result<(), String> {
     app.state::<StreamRegistry>().cancel(&conversation_id);
-    app.state::<tools::ApprovalRegistry>().deny_all();
     Ok(())
 }
 

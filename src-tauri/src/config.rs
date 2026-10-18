@@ -125,6 +125,8 @@ pub struct AppConfig {
     /// per-call approve/deny. Off by default. Behavioral/local, so unlike
     /// `preferences` it is deliberately NOT part of `syncable_payload`.
     pub auto_approve_tools: bool,
+    /// Global kill-switch for the cron scheduler. Local behavior, not synced.
+    pub cron_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -144,6 +146,7 @@ impl Default for AppConfig {
             sync_enabled: false,
             sync_last_sync_at: None,
             auto_approve_tools: false,
+            cron_enabled: true,
         }
     }
 }

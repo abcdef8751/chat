@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use tauri::Manager;
 use uuid::Uuid;
 
 /// Shared database state installed into Tauri via `manage`.
@@ -125,6 +126,42 @@ CREATE TABLE IF NOT EXISTS sync_tombstones (
   PRIMARY KEY (entity, id)
 );
 
+-- Cron jobs (local-only: never synced; the messages a run produces are ordinary
+-- user/assistant rows and sync normally).
+CREATE TABLE IF NOT EXISTS cron_jobs (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  schedule TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  tool_policy TEXT NOT NULL DEFAULT 'readonly',
+  notify INTEGER NOT NULL DEFAULT 1,
+  next_run_at INTEGER NOT NULL,
+  last_run_at INTEGER,
+  run_count INTEGER NOT NULL DEFAULT 0,
+  -- A one-shot "fire now" request (agent tool / UI) that does not disturb the
+  -- schedule: the scheduler treats it like a due job and clears the flag.
+  run_requested INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cron_runs (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES cron_jobs(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL,
+  -- The user row this run appended (UI "scheduled" chip). '' until the turn has
+  -- created it.
+  trigger_message_id TEXT NOT NULL,
+  scheduled_for INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  stop_reason TEXT,
+  error TEXT,
+  usage TEXT,
+  cost REAL
+);
+
 -- Syncable copy of the user-edited config (explicit preferences, the provider
 -- list, and per-model price/context overrides). One 'main' row holds the whole
 -- subset as JSON; API keys are never stored here (they live in the OS
@@ -139,6 +176,8 @@ CREATE TABLE IF NOT EXISTS user_config (
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, "index");
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reflections_conv ON memory_reflections(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_due ON cron_jobs(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_cron_runs_job ON cron_runs(job_id, started_at DESC);
 "#;
 
 /// Open (or create) the SQLite database at `path` and run the schema migration.
@@ -897,12 +936,26 @@ pub fn apply_user_message_edit(
 /// later message). Registered in `lib.rs`'s `invoke_handler`.
 #[tauri::command]
 pub async fn edit_user_message(
+    app: tauri::AppHandle,
     db: tauri::State<'_, Db>,
     conversation_id: String,
     message_id: String,
     content: String,
     attachments: Option<Vec<crate::attachments::Attachment>>,
 ) -> Result<(), String> {
+    // Editing truncates every later row, so it must not race a turn that is
+    // still writing rows into this chat (a live turn OR a scheduled run). The UI
+    // already blocks this; the guard is the source of truth against a stale
+    // window/event.
+    if app
+        .state::<crate::chat::StreamRegistry>()
+        .is_streaming(&conversation_id)
+    {
+        return Err(
+            "A turn is still running in this chat — stop it or wait for it to finish before editing."
+                .into(),
+        );
+    }
     apply_user_message_edit(&db, &conversation_id, &message_id, &content, attachments)
 }
 
@@ -1835,6 +1888,384 @@ pub fn extraction_stats(db: &Db, min_chars: i64) -> Result<ExtractionStats, Stri
     };
     let pending = conversations_pending_extraction(db, min_chars)?.len() as i64;
     Ok(ExtractionStats { staged, pending })
+}
+
+// ---------------------------------------------------------------------------
+// Cron jobs (local-only: job definitions and run history are never synced; the
+// ordinary user/assistant rows a run appends are, so other devices just see the
+// thread continue).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronJob {
+    pub id: String,
+    pub conversation_id: String,
+    pub title: String,
+    /// Normalized 5-field cron expression (local wall clock).
+    pub schedule: String,
+    pub prompt: String,
+    pub enabled: bool,
+    /// `readonly` (host tools refused) or `autoapprove` (host tools run unasked).
+    pub tool_policy: String,
+    pub notify: bool,
+    pub next_run_at: i64,
+    pub last_run_at: Option<i64>,
+    pub run_count: i64,
+    /// A one-shot "fire now" queued by the agent tool; the scheduler clears it.
+    pub run_requested: bool,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronRunRecord {
+    pub id: String,
+    pub job_id: String,
+    pub conversation_id: String,
+    /// Empty until the run's user row exists (see `finish_cron_run`).
+    pub trigger_message_id: String,
+    pub scheduled_for: i64,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub stop_reason: Option<String>,
+    pub error: Option<String>,
+    pub usage: Option<String>,
+    pub cost: Option<f64>,
+}
+
+/// A message that fired a run, so the timeline can show a "scheduled" chip
+/// without a new column on `messages`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronTrigger {
+    pub message_id: String,
+    pub job_id: String,
+    pub title: String,
+    pub scheduled_for: i64,
+}
+
+fn cron_job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
+    Ok(CronJob {
+        id: r.get(0)?,
+        conversation_id: r.get(1)?,
+        title: r.get(2)?,
+        schedule: r.get(3)?,
+        prompt: r.get(4)?,
+        enabled: r.get::<_, i64>(5)? != 0,
+        tool_policy: r.get(6)?,
+        notify: r.get::<_, i64>(7)? != 0,
+        next_run_at: r.get(8)?,
+        last_run_at: r.get(9)?,
+        run_count: r.get(10)?,
+        run_requested: r.get::<_, i64>(11)? != 0,
+        created_at: r.get(12)?,
+    })
+}
+
+const CRON_JOB_COLUMNS: &str = "id, conversation_id, title, schedule, prompt, enabled, \
+     tool_policy, notify, next_run_at, last_run_at, run_count, run_requested, created_at";
+
+pub fn list_cron_jobs(db: &Db) -> Result<Vec<CronJob>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CRON_JOB_COLUMNS} FROM cron_jobs ORDER BY created_at ASC"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], cron_job_from_row)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+pub fn get_cron_job(db: &Db, id: &str) -> Result<Option<CronJob>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        &format!("SELECT {CRON_JOB_COLUMNS} FROM cron_jobs WHERE id = ?1"),
+        [id],
+        cron_job_from_row,
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// Jobs the scheduler should fire now: an explicit one-shot request (even on a
+/// paused job — "Run now" must work while paused), or an enabled job whose slot
+/// is due. Ordered so the oldest due slot wins when several are pending.
+pub fn due_cron_jobs(db: &Db, now_ms: i64) -> Result<Vec<CronJob>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CRON_JOB_COLUMNS} FROM cron_jobs
+             WHERE (enabled = 1 AND next_run_at <= ?1) OR run_requested = 1
+             ORDER BY next_run_at ASC"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([now_ms], cron_job_from_row)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_cron_job(
+    db: &Db,
+    conversation_id: String,
+    title: String,
+    schedule: String,
+    prompt: String,
+    tool_policy: String,
+    notify: bool,
+    next_run_at: i64,
+) -> Result<CronJob, String> {
+    let job = CronJob {
+        id: Uuid::new_v4().to_string(),
+        conversation_id,
+        title,
+        schedule,
+        prompt,
+        enabled: true,
+        tool_policy,
+        notify,
+        next_run_at,
+        last_run_at: None,
+        run_count: 0,
+        run_requested: false,
+        created_at: now_ms(),
+    };
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO cron_jobs (id, conversation_id, title, schedule, prompt, enabled, tool_policy, notify, next_run_at, last_run_at, run_count, run_requested, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
+        params![
+            job.id,
+            job.conversation_id,
+            job.title,
+            job.schedule,
+            job.prompt,
+            job.enabled as i64,
+            job.tool_policy,
+            job.notify as i64,
+            job.next_run_at,
+            job.last_run_at,
+            job.run_count,
+            job.created_at
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(job)
+}
+
+/// Persist the editable fields of a job (everything the UI / agent tools set).
+/// The schedule-related state (`next_run_at`, counters) has its own writers.
+pub fn update_cron_job(db: &Db, job: &CronJob) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE cron_jobs SET title = ?2, schedule = ?3, prompt = ?4, enabled = ?5,
+             tool_policy = ?6, notify = ?7, next_run_at = ?8
+         WHERE id = ?1",
+        params![
+            job.id,
+            job.title,
+            job.schedule,
+            job.prompt,
+            job.enabled as i64,
+            job.tool_policy,
+            job.notify as i64,
+            job.next_run_at
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn delete_cron_job(db: &Db, id: &str) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let n = conn
+        .execute("DELETE FROM cron_jobs WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// Advance a job after it fired: the next slot, the run timestamp, and (for a
+/// real scheduled fire) the run counter. A manual fire passes `bump_count =
+/// false` and leaves `next_run_at` alone.
+pub fn set_cron_job_run_state(
+    db: &Db,
+    id: &str,
+    next_run_at: i64,
+    last_run_at: i64,
+    bump_count: bool,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE cron_jobs SET next_run_at = ?2, last_run_at = ?3,
+             run_count = run_count + ?4
+         WHERE id = ?1",
+        params![id, next_run_at, last_run_at, if bump_count { 1 } else { 0 }],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Move only the next slot (used when a due job cannot run at all: no model or
+/// no key). The run timestamp/counter stay untouched, so the UI does not claim a
+/// run happened.
+pub fn set_cron_job_next_run(db: &Db, id: &str, next_run_at: i64) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE cron_jobs SET next_run_at = ?2 WHERE id = ?1",
+        params![id, next_run_at],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn set_cron_job_enabled(db: &Db, id: &str, enabled: bool) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE cron_jobs SET enabled = ?2 WHERE id = ?1",
+        params![id, enabled as i64],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Ask the scheduler to fire a job at its next tick without disturbing its
+/// schedule (the agent's `run_cron_now`).
+pub fn request_cron_run(db: &Db, id: &str) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute("UPDATE cron_jobs SET run_requested = 1 WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn clear_cron_run_request(db: &Db, id: &str) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute("UPDATE cron_jobs SET run_requested = 0 WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Record a run as started. `trigger_message_id` is filled in when the turn has
+/// created its user row; until then it is the empty string.
+pub fn insert_cron_run(db: &Db, job: &CronJob, scheduled_for: i64) -> Result<String, String> {
+    let id = Uuid::new_v4().to_string();
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO cron_runs (id, job_id, conversation_id, trigger_message_id, scheduled_for, started_at)
+         VALUES (?1, ?2, ?3, '', ?4, ?5)",
+        params![id, job.id, job.conversation_id, scheduled_for, now_ms()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+pub fn finish_cron_run(
+    db: &Db,
+    run_id: &str,
+    trigger_message_id: Option<&str>,
+    stop_reason: &str,
+    error: Option<&str>,
+    usage: Option<&str>,
+    cost: Option<f64>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE cron_runs SET trigger_message_id = CASE WHEN ?2 != '' THEN ?2 ELSE trigger_message_id END,
+             finished_at = ?3, stop_reason = ?4, error = ?5, usage = ?6, cost = ?7
+         WHERE id = ?1",
+        params![
+            run_id,
+            trigger_message_id.unwrap_or(""),
+            now_ms(),
+            stop_reason,
+            error,
+            usage,
+            cost
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Close a run row left open by an abnormal exit (a panic in the run task), so
+/// the audit trail never shows a run "in progress" forever.
+pub fn finish_open_cron_run(db: &Db, job_id: &str, error: &str) -> Result<usize, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE cron_runs SET finished_at = ?2, stop_reason = 'error', error = ?3
+         WHERE job_id = ?1 AND finished_at IS NULL",
+        params![job_id, now_ms(), error],
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn list_cron_runs(
+    db: &Db,
+    job_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<CronRunRecord>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, job_id, conversation_id, trigger_message_id, scheduled_for, started_at,
+                    finished_at, stop_reason, error, usage, cost
+             FROM cron_runs
+             WHERE (?1 IS NULL OR job_id = ?1)
+             ORDER BY started_at DESC LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![job_id, limit], |r| {
+            Ok(CronRunRecord {
+                id: r.get(0)?,
+                job_id: r.get(1)?,
+                conversation_id: r.get(2)?,
+                trigger_message_id: r.get(3)?,
+                scheduled_for: r.get(4)?,
+                started_at: r.get(5)?,
+                finished_at: r.get(6)?,
+                stop_reason: r.get(7)?,
+                error: r.get(8)?,
+                usage: r.get(9)?,
+                cost: r.get(10)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// Every message that fired a run, with its job's title (the timeline's
+/// "scheduled" chip). Scoped to one conversation when given — the UI only ever
+/// renders the open chat's transcript, so the full history is never shipped over
+/// IPC on every refresh.
+pub fn list_cron_triggers(
+    db: &Db,
+    conversation_id: Option<&str>,
+) -> Result<Vec<CronTrigger>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.trigger_message_id, r.job_id, j.title, r.scheduled_for
+             FROM cron_runs r JOIN cron_jobs j ON j.id = r.job_id
+             WHERE r.trigger_message_id != ''
+               AND (?1 IS NULL OR r.conversation_id = ?1)
+             ORDER BY r.started_at DESC LIMIT 5000",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([conversation_id], |r| {
+            Ok(CronTrigger {
+                message_id: r.get(0)?,
+                job_id: r.get(1)?,
+                title: r.get(2)?,
+                scheduled_for: r.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
