@@ -1556,33 +1556,36 @@ export default function App() {
         refreshConversations().catch(() => {});
         return;
       }
-      // Everything below mutates the on-screen transcript / live tool list, so it
-      // only applies while this conversation is the one being viewed. Tool
-      // events are included deliberately: on return to a chat the backend has
-      // usually already persisted the completed tool rounds, and `turns()` gates
-      // live entries on a `tmp-assistant-` row that a reload drops — so recording
-      // them for an off-screen chat would show data the UI cannot render.
-      if (activeId() !== id) return;
+      // Everything below updates the per-conversation live record — which must
+      // accumulate REGARDLESS of what is on screen, so a conversation switched
+      // away from keeps growing and switching back re-attaches an up-to-date
+      // row instead of one frozen at the switch moment. Only the visible
+      // transcript mutations (`setMessages`) are gated on the conversation
+      // being the one viewed; tool events are recorded the same way, and
+      // `turns()` only renders live entries while this chat is visible anyway
+      // (a `done`/`error` reload then replaces them with the persisted rows).
       if (ev.type === "delta") {
         received.current = true;
         patchLiveTurn(id, (live) => {
           live.content += ev.text;
         });
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantKey ? { ...m, content: m.content + ev.text } : m,
-          ),
-        );
+        if (activeId() === id)
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantKey ? { ...m, content: m.content + ev.text } : m,
+            ),
+          );
       } else if (ev.type === "thinkingDelta") {
         received.current = true;
         patchLiveTurn(id, (live) => {
           live.thinking += ev.text;
         });
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantKey ? { ...m, thinking: (m.thinking ?? "") + ev.text } : m,
-          ),
-        );
+        if (activeId() === id)
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantKey ? { ...m, thinking: (m.thinking ?? "") + ev.text } : m,
+            ),
+          );
       } else if (ev.type === "toolCall") {
         received.current = true;
         // Flush the round's streamed reasoning + preamble text onto this call,
