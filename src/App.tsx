@@ -76,6 +76,7 @@ import { isAndroidDevice, onBack, readAttachmentFromUri } from "./lib/platform";
 import { acceptsImages, resolveInputModalities } from "./lib/capabilities";
 import { Composer } from "./components/Composer";
 import { Header } from "./components/Header";
+import { ImageLightbox } from "./components/ImageLightbox";
 import { MemoryPage } from "./components/MemoryPage";
 import { MessageList } from "./components/MessageList";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -2388,6 +2389,9 @@ export default function App() {
         consolidateNow={consolidateNow}
         reflectionStats={reflectionStats()}
       />
+
+      {/* Expanded transcript image (clicked in MessageList) */}
+      <ImageLightbox />
 
       {/* Reasoning trace popup */}
       <Show when={openThinking()}>

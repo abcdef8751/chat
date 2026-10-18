@@ -3,6 +3,7 @@ import type { Attachment, Message } from "../lib/api";
 import { DocIcon, PaperclipIcon } from "../lib/icons";
 import { isAndroid } from "../lib/platform";
 import { formatBytes, parseAttachments, type Turn } from "../lib/turns";
+import { openImage } from "./ImageLightbox";
 import { Timeline } from "./Timeline";
 
 /// The per-turn rendering: user bubble, then the assistant side as one ordered
@@ -26,8 +27,24 @@ export function MessageList(props: {
   onRemoveEditAttachment: (id: string) => void;
   onPickEditAttachments: () => void;
 }) {
+  /// Expand any image in the transcript (attachment images and images rendered
+  /// by markdown prose) in the lightbox. Delegated here so the shared markdown
+  /// renderer needs no change; a click on the edit strip's "remove attachment"
+  /// button is not an IMG, so it keeps its own handler.
+  function onTranscriptClick(e: MouseEvent) {
+    const target = e.target as HTMLElement | null;
+    if (target?.tagName !== "IMG") return;
+    const img = target as HTMLImageElement;
+    const src = img.currentSrc || img.src;
+    if (!src) return;
+    openImage(src, img.alt || undefined);
+  }
+
   return (
-    <div class="flex min-h-full flex-col justify-end space-y-3">
+    <div
+      onClick={onTranscriptClick}
+      class="flex min-h-full flex-col justify-end space-y-3 [&_img]:cursor-zoom-in"
+    >
       <Index each={props.turns}>
         {(turn) => {
           const t = () => turn();
@@ -61,7 +78,7 @@ export function MessageList(props: {
                                           <img
                                             src={a.dataUrl}
                                             alt={a.name}
-                                            class="max-h-64 max-w-full rounded-lg border border-white/20 dark:border-neutral-900/20"
+                                            class="max-h-64 max-w-full cursor-zoom-in rounded-lg border border-white/20 dark:border-neutral-900/20"
                                           />
                                         ) : (
                                           <div class="flex items-center gap-2 rounded-lg border border-white/25 bg-white/10 px-2.5 py-1.5 text-xs dark:border-neutral-900/20 dark:bg-neutral-900/10">
