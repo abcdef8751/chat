@@ -100,24 +100,6 @@ pub(crate) fn conversation_model(
         .or_else(|| Some(cfg.model.clone()).filter(|m| !m.trim().is_empty()))
 }
 
-/// The reasoning level a conversation's consolidation pass should use: the one
-/// recorded on the conversation's newest message that has one (see the live
-/// turn's inserts in `chat::run_chat_turn`), falling back to the app-wide level.
-///
-/// Rows written before the level was recorded carry `None`, so an older chat
-/// behaves exactly as before. A recorded *empty* level is not skipped: it means
-/// "no reasoning for this conversation", which must win over the global setting.
-pub(crate) fn conversation_thinking_level(
-    history: &[db::MessageRow],
-    cfg: &AppConfig,
-) -> String {
-    history
-        .iter()
-        .rev()
-        .find_map(|m| m.thinking_level.clone())
-        .unwrap_or_else(|| cfg.thinking_level.clone())
-}
-
 /// Run one reflection pass over a conversation. Public so the "Consolidate now"
 /// button / a test can trigger it directly.
 pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Result<(), String> {
@@ -159,10 +141,6 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     }
 
     let history = db::read_messages(&db, conversation_id)?;
-    // Run at the level this conversation last ran at, not the current global
-    // one: thinking levels are per-model choices, and the chat may have been
-    // recorded under a different setting since.
-    turn_cfg.thinking_level = conversation_thinking_level(&history, &cfg);
     let before = snapshot_files(&memory);
     // Recent consolidation notes (across chats) so the model doesn't repeat work.
     let recent = db::recent_reflections(&db, 8).unwrap_or_default();
@@ -1469,34 +1447,6 @@ mod tests {
         assert!(!sweep_enabled(&cfg));
     }
 
-    /// Consolidation runs at the level the conversation's own last turn used, so
-    /// a chat recorded under "high" is not reflected at a later global default.
-    #[test]
-    fn conversation_thinking_level_prefers_the_newest_recorded_level() {
-        let mut cfg = AppConfig::default();
-        cfg.thinking_level = "low".into();
-
-        let msgs = vec![
-            message(None),
-            message(Some("high")),
-            message(None), // later rows without a level are skipped
-        ];
-        assert_eq!(conversation_thinking_level(&msgs, &cfg), "high");
-
-        // Nothing recorded (rows written before the level was stored, or a chat
-        // that never ran) → the app-wide level, exactly as before.
-        assert_eq!(
-            conversation_thinking_level(&[message(None)], &cfg),
-            "low"
-        );
-        assert_eq!(conversation_thinking_level(&[], &cfg), "low");
-
-        // A recorded *empty* level means "no reasoning for this conversation"
-        // and must win over the global one.
-        cfg.thinking_level = "high".into();
-        assert_eq!(conversation_thinking_level(&[message(Some(""))], &cfg), "");
-    }
-
     fn conversation(model: Option<&str>) -> db::Conversation {
         db::Conversation {
             id: "c1".into(),
@@ -1508,24 +1458,6 @@ mod tests {
             compaction_through: None,
             created_at: 0,
             updated_at: 0,
-        }
-    }
-
-    fn message(thinking_level: Option<&str>) -> db::MessageRow {
-        db::MessageRow {
-            id: "m".into(),
-            conversation_id: "c1".into(),
-            role: "assistant".into(),
-            index: 0,
-            content: "hi".into(),
-            model: None,
-            provider: None,
-            thinking_level: thinking_level.map(str::to_string),
-            thinking: None,
-            usage: None,
-            stop_reason: None,
-            attachments: None,
-            created_at: 0,
         }
     }
 
