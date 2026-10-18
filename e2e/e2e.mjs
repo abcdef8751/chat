@@ -325,7 +325,8 @@ async function main() {
 
   // --- Send a message ---
   await setInputCss("footer textarea", "hello there");
-  await click("//button[normalize-space(.)='Send']");
+  // The composer's send control is an icon button (title="Send", no text).
+  await click("//button[@title='Send']");
 
   // --- The trace button's DOM node must survive streamed updates ---
   // <For> recreated the row on every delta (dropping mid-press clicks);
@@ -337,7 +338,7 @@ async function main() {
   );
   await sleep(1000);
   const stable = await exec(
-    "const b=document.querySelector(\"button[title='Show the reasoning trace']\"); return {same: !!window.__traceBtn && window.__traceBtn === b, streaming: document.body.innerText.includes('Stop'), container: !!document.querySelector(\"button[title='Show reasoning text']\")};",
+    "const b=document.querySelector(\"button[title='Show the reasoning trace']\"); return {same: !!window.__traceBtn && window.__traceBtn === b, streaming: !!document.querySelector(\"button[aria-label='Stop']\"), container: !!document.querySelector(\"button[title='Show reasoning text']\")};",
   );
   assert(stable.streaming, "still streaming while checking node identity (mid-stream)");
   assert(stable.same, "trace button DOM node survived a streamed update (<Index> fix)");
@@ -423,7 +424,7 @@ async function main() {
 
   // --- Tool calls + reasoning interleave inline, in stream order ---
   await setInputCss("footer textarea", "tooltest");
-  await click("//button[normalize-space(.)='Send']");
+  await click("//button[@title='Send']");
   await waitFor(
     "tool approval card",
     () => find("xpath", "//button[normalize-space(.)='Approve']").catch(() => null),
