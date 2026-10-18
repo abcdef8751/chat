@@ -2226,19 +2226,25 @@ pub fn list_cron_runs(
 }
 
 /// Every message that fired a run, with its job's title (the timeline's
-/// "scheduled" chip).
-pub fn list_cron_triggers(db: &Db) -> Result<Vec<CronTrigger>, String> {
+/// "scheduled" chip). Scoped to one conversation when given — the UI only ever
+/// renders the open chat's transcript, so the full history is never shipped over
+/// IPC on every refresh.
+pub fn list_cron_triggers(
+    db: &Db,
+    conversation_id: Option<&str>,
+) -> Result<Vec<CronTrigger>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
             "SELECT r.trigger_message_id, r.job_id, j.title, r.scheduled_for
              FROM cron_runs r JOIN cron_jobs j ON j.id = r.job_id
              WHERE r.trigger_message_id != ''
-             ORDER BY r.started_at DESC",
+               AND (?1 IS NULL OR r.conversation_id = ?1)
+             ORDER BY r.started_at DESC LIMIT 5000",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([conversation_id], |r| {
             Ok(CronTrigger {
                 message_id: r.get(0)?,
                 job_id: r.get(1)?,

@@ -1502,23 +1502,39 @@ fn aborted_tool_output() -> ToolOutput {
     ToolOutput::err("The user aborted this tool call.".into())
 }
 
-/// Whether a cron-management call would **grant** the `autoapprove` tool policy
-/// (create a new job with it, or switch an existing job to it).
+/// Whether a cron-management call would **grant** or **use** the `autoapprove`
+/// tool policy — i.e. whether it must be a gated call in a live turn.
 ///
-/// Treating that as *gated* is what keeps a prompt-injected page from turning an
-/// ungated tool into a persistent unattended shell: the model may freely create
-/// `readonly` jobs, but granting auto-approval needs the user's click in a live
-/// turn. A `readonly` scheduled run cannot escalate (its gate refuses gated
-/// calls), and an `autoapprove` run is already privileged.
-fn grants_autoapprove(name: &str, arguments: &Value) -> bool {
-    if !matches!(name, "create_cron" | "update_cron") {
-        return false;
+/// Classification is target-aware, because an argument-only check is bypassable:
+/// a `readonly`/injected run could rewrite the prompt of an *existing*
+/// autoapprove job (no `tool_policy` in the arguments) and turn it into a
+/// persistent shell, or fire it with `run_cron_now`. So:
+/// - `create_cron` — gated when it asks for `autoapprove`.
+/// - `update_cron` — gated when it asks for `autoapprove`, **or** when the target
+///   job is already `autoapprove` (any mutation of such a job).
+/// - `run_cron_now` — gated when the target job is `autoapprove`.
+/// - `delete_cron` — never gated: removing a job cannot grant anything.
+///
+/// In a `Cron(ReadOnly)` run the gated branch refuses the call outright (a
+/// scheduled run cannot escalate), while an `autoapprove` run is already
+/// privileged. A live turn surfaces the normal approve/deny prompt.
+fn grants_autoapprove(name: &str, arguments: &Value, db: Option<&db::Db>) -> bool {
+    let asks_for_autoapprove = || {
+        crate::cron::normalize_policy(arguments.get("tool_policy").and_then(Value::as_str))
+            .map(|p| p == "autoapprove")
+            .unwrap_or(false)
+    };
+    let target_is_autoapprove = || {
+        let id = arguments.get("id").and_then(Value::as_str)?;
+        let job = db::get_cron_job(db?, id).ok()??;
+        Some(job.tool_policy == "autoapprove")
+    };
+    match name {
+        "create_cron" => asks_for_autoapprove(),
+        "update_cron" => asks_for_autoapprove() || target_is_autoapprove().unwrap_or(false),
+        "run_cron_now" => target_is_autoapprove().unwrap_or(false),
+        _ => false,
     }
-    arguments
-        .get("tool_policy")
-        .and_then(Value::as_str)
-        .map(|p| p.trim().to_ascii_lowercase().replace(['-', '_'], "") == "autoapprove")
-        .unwrap_or(false)
 }
 
 /// Handle a `read_file` call for an image path. Multimodal models get a short
@@ -1864,8 +1880,8 @@ pub(crate) async fn run_tool_loop(
                 // *grant* auto-approval is gated even though the tool name is
                 // app-local: that click is the boundary against a prompt-injected
                 // page scheduling an unattended shell (see `grants_autoapprove`).
-                let host_gated =
-                    tools::is_gated(&call.name) || grants_autoapprove(&call.name, &call.arguments);
+                let host_gated = tools::is_gated(&call.name)
+                    || grants_autoapprove(&call.name, &call.arguments, persist);
                 if host_gated {
                     gated_ids.push(call.id.clone());
                 }

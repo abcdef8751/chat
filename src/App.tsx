@@ -814,10 +814,17 @@ export default function App() {
     }
   }
 
-  // Rebuild the messageId → job title map for the transcript pills.
+  // Rebuild the messageId → job title map for the transcript pills. Scoped to
+  // the open chat (that is all MessageList renders), so the query stays small
+  // even after years of scheduled runs; no chat means no pills.
   async function refreshCronTriggers() {
+    const id = activeId();
+    if (!id) {
+      setCronTriggers({});
+      return;
+    }
     try {
-      const triggers = await listCronTriggers();
+      const triggers = await listCronTriggers(id);
       const map: Record<string, string> = {};
       for (const t of triggers) map[t.messageId] = t.title;
       setCronTriggers(map);
@@ -942,6 +949,8 @@ export default function App() {
     const id = activeId();
     setOpenTrace(null);
     setNearBottom(true);
+    // Scheduled-run pills are per chat: reload the trigger map for the new one.
+    void refreshCronTriggers();
     // Editing a message is scoped to the conversation it lives in; a switch
     // would otherwise let Save target the wrong conversation.
     setEditingId(null);

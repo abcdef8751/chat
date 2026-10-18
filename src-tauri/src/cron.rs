@@ -168,17 +168,43 @@ async fn tick(app: &AppHandle) -> Result<(), String> {
 }
 
 /// Releases a run's two claims (the conversation's stream registration and its
-/// `CronState` slot) when it finishes — including on a panic in the task, which
-/// would otherwise leave the chat permanently "streaming" (blocking live sends
-/// and reflection) with no way to recover but a restart.
+/// `CronState` slot) when it finishes, and guarantees a terminal `cron-updated`
+/// event — including on a panic in the task. Without the latter the client's
+/// `cronRunning` marker could stick (no Stop, composer locked) whenever
+/// `run_job` returned early through `?`, and the chat would stay "streaming"
+/// with no way to recover but a restart.
 struct RunSlot {
     app: AppHandle,
+    job_id: String,
     conversation_id: String,
     token: CancelToken,
+    terminal_emitted: bool,
+}
+
+impl RunSlot {
+    /// Emit the run's terminal event exactly once. The wrapper calls this on a
+    /// normal/error return; `Drop` calls it only if that never happened (panic).
+    fn emit_terminal(&mut self, status: &str) {
+        if self.terminal_emitted {
+            return;
+        }
+        self.terminal_emitted = true;
+        let _ = self.app.emit(
+            "cron-updated",
+            json!({
+                "jobId": self.job_id,
+                "conversationId": self.conversation_id,
+                "status": status,
+            }),
+        );
+    }
 }
 
 impl Drop for RunSlot {
     fn drop(&mut self) {
+        // A panic unwinds through here: report the run as failed so the client
+        // clears its marker instead of waiting forever.
+        self.emit_terminal("error");
         self.app
             .state::<chat::StreamRegistry>()
             .remove(&self.conversation_id, &self.token);
@@ -206,17 +232,22 @@ fn launch(app: &AppHandle, job: &db::CronJob, manual: bool) -> Result<bool, Stri
 
     let app = app.clone();
     let job = job.clone();
-    let slot = RunSlot {
+    let mut slot = RunSlot {
         app: app.clone(),
+        job_id: job.id.clone(),
         conversation_id: job.conversation_id.clone(),
         token: token.clone(),
+        terminal_emitted: false,
     };
     tauri::async_runtime::spawn(async move {
-        // `_slot` releases both claims when this task ends (normally or not).
-        let _slot = slot;
-        if let Err(e) = run_job(&app, &job, manual, token).await {
-            eprintln!("cron: run of {} failed: {e}", job.id);
+        match run_job(&app, &job, manual, token).await {
+            Ok(()) => slot.emit_terminal("finished"),
+            Err(e) => {
+                eprintln!("cron: run of {} failed: {e}", job.id);
+                slot.emit_terminal("error");
+            }
         }
+        // `slot` drops here and releases both claims.
     });
     Ok(true)
 }
@@ -344,15 +375,8 @@ async fn run_job(
     let latest = db::get_cron_job(&db, &job.id)?;
     let Some(latest) = latest else {
         // Deleted mid-run: the transcript stays, but there is no schedule left
-        // to advance and nothing to notify about.
-        let _ = app.emit(
-            "cron-updated",
-            json!({
-                "jobId": job.id,
-                "conversationId": job.conversation_id,
-                "status": if stop_reason == "error" { "error" } else { "finished" },
-            }),
-        );
+        // to advance and nothing to notify about. (`launch`'s guard still emits
+        // the terminal `cron-updated` event so the client clears its marker.)
         return Ok(());
     };
     advance(&db, &latest, now, manual)?;
@@ -369,15 +393,9 @@ async fn run_job(
         snippet(&reply)
     };
     notify(app, &latest, &body);
-    let _ = app.emit(
-        "cron-updated",
-        json!({
-            "jobId": job.id,
-            "conversationId": job.conversation_id,
-            "status": if failed { "error" } else { "finished" },
-        }),
-    );
-    // A failed turn is already recorded and notified; report Ok so the scheduler
+    // The terminal `cron-updated` is emitted by `RunSlot` in `launch`, which
+    // guarantees it on EVERY exit path (including an early `?` or a panic). A
+    // failed turn is already recorded and notified; report Ok so the scheduler
     // does not double-log it as a scheduler error.
     Ok(())
 }
@@ -510,8 +528,9 @@ fn arg_bool(args: &Value, key: &str) -> Option<bool> {
 }
 
 /// Normalize a tool-supplied policy (`readonly` | `autoapprove`, tolerating
-/// `auto-approve` / `auto_approve`).
-fn normalize_policy(raw: Option<&str>) -> Result<String, String> {
+/// `auto-approve` / `auto_approve`). Shared with `chat::grants_autoapprove`, so
+/// the gating classification and the stored value can never disagree.
+pub(crate) fn normalize_policy(raw: Option<&str>) -> Result<String, String> {
     let raw = raw.unwrap_or("readonly").trim().to_ascii_lowercase();
     match raw.replace(['-', '_'], "").as_str() {
         "" | "readonly" => Ok("readonly".into()),
@@ -738,8 +757,11 @@ pub fn list_cron_runs(
 }
 
 #[tauri::command]
-pub fn list_cron_triggers(db: tauri::State<'_, db::Db>) -> Result<Vec<db::CronTrigger>, String> {
-    db::list_cron_triggers(&db)
+pub fn list_cron_triggers(
+    db: tauri::State<'_, db::Db>,
+    conversation_id: Option<String>,
+) -> Result<Vec<db::CronTrigger>, String> {
+    db::list_cron_triggers(&db, conversation_id.as_deref())
 }
 
 /// Tell the backend which chat is on screen, so a finished run in that chat does

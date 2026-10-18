@@ -702,8 +702,12 @@ export function listCronRuns(jobId?: string | null, limit?: number | null): Prom
   return invoke<CronRun[]>("list_cron_runs", { jobId: jobId ?? null, limit: limit ?? null });
 }
 
-export function listCronTriggers(): Promise<CronTrigger[]> {
-  return invoke<CronTrigger[]>("list_cron_triggers");
+export function listCronTriggers(conversationId?: string | null): Promise<CronTrigger[]> {
+  // Scoped to one chat: the transcript chip only renders the open conversation,
+  // so the backend returns that chat's triggers (never the whole history).
+  return invoke<CronTrigger[]>("list_cron_triggers", {
+    conversationId: conversationId ?? null,
+  });
 }
 
 /** Validate a schedule and resolve its next run; call debounced as the user types. */

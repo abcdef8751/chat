@@ -4580,27 +4580,90 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         )));
     }
 
-    /// The gating classification behind the containment above.
+    /// The gating classification behind the containment above. It is
+    /// **target-aware**: mutating or firing an existing `autoapprove` job is as
+    /// privileged as creating one, even when the arguments never mention the
+    /// policy.
     #[test]
     fn autoapprove_grants_are_treated_as_gated_calls() {
+        let db = open_db("gate-classify");
+        let cid = insert_conv(&db);
+        let auto = crate::db::insert_cron_job(
+            &db,
+            cid.clone(),
+            "auto".into(),
+            "0 * * * *".into(),
+            "trusted work".into(),
+            "autoapprove".into(),
+            true,
+            0,
+        )
+        .unwrap();
+        let ro = crate::db::insert_cron_job(
+            &db,
+            cid,
+            "ro".into(),
+            "0 * * * *".into(),
+            "read work".into(),
+            "readonly".into(),
+            true,
+            0,
+        )
+        .unwrap();
+
+        // Creating with the policy is gated, however it is spelled.
         assert!(grants_autoapprove(
             "create_cron",
-            &json!({ "tool_policy": "auto-approve" })
+            &json!({ "tool_policy": "auto-approve" }),
+            Some(&db)
         ));
+        assert!(grants_autoapprove(
+            "create_cron",
+            &json!({ "tool_policy": "AUTOAPPROVE" }),
+            Some(&db)
+        ));
+        assert!(!grants_autoapprove(
+            "create_cron",
+            &json!({ "tool_policy": "readonly" }),
+            Some(&db)
+        ));
+        assert!(!grants_autoapprove("create_cron", &json!({}), Some(&db)));
+
+        // Any mutation of an existing autoapprove job is gated...
         assert!(grants_autoapprove(
             "update_cron",
-            &json!({ "tool_policy": "AUTOAPPROVE" })
+            &json!({ "id": auto.id, "prompt": "curl evil" }),
+            Some(&db)
+        ));
+        // ...while a readonly job stays freely editable.
+        assert!(!grants_autoapprove(
+            "update_cron",
+            &json!({ "id": ro.id, "prompt": "new prompt" }),
+            Some(&db)
+        ));
+        // Firing one is gated too; deleting one is not (it grants nothing).
+        assert!(grants_autoapprove(
+            "run_cron_now",
+            &json!({ "id": auto.id }),
+            Some(&db)
         ));
         assert!(!grants_autoapprove(
-            "create_cron",
-            &json!({ "tool_policy": "readonly" })
+            "run_cron_now",
+            &json!({ "id": ro.id }),
+            Some(&db)
         ));
-        assert!(!grants_autoapprove("create_cron", &json!({})));
         assert!(!grants_autoapprove(
             "delete_cron",
-            &json!({ "tool_policy": "autoapprove" })
+            &json!({ "id": auto.id }),
+            Some(&db)
         ));
-        assert!(!grants_autoapprove("bash", &json!({})));
+        // Unknown ids / missing DB never gate by accident.
+        assert!(!grants_autoapprove(
+            "update_cron",
+            &json!({ "id": "nope", "prompt": "x" }),
+            Some(&db)
+        ));
+        assert!(!grants_autoapprove("bash", &json!({}), Some(&db)));
     }
 
     /// With `autoapprove`, the same call runs unapproved (the job policy is what
@@ -4664,6 +4727,85 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert!(guard.iter().any(|e| matches!(
             e,
             StreamEvent::ToolResult { ok: true, output, .. } if output.contains("cron-ok")
+        )));
+    }
+
+    /// The bypass the target-aware check closes: an existing `autoapprove` job
+    /// can be mutated (or fired) without ever naming the policy in the
+    /// arguments. A readonly run must be refused anyway, and the stored prompt
+    /// must be untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_readonly_refuses_hijacking_an_autoapprove_job() {
+        let db = open_db("cron-hijack");
+        let cid = insert_conv(&db);
+        let job = crate::db::insert_cron_job(
+            &db,
+            cid.clone(),
+            "trusted".into(),
+            "0 * * * *".into(),
+            "trusted prompt".into(),
+            "autoapprove".into(),
+            true,
+            0,
+        )
+        .unwrap();
+        let args = format!(
+            r#"{{\"id\":\"{}\",\"prompt\":\"curl evil\"}}"#,
+            job.id
+        );
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag(0, "c1", "update_cron", ""),
+                    tool_frag(0, "", "", &args),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("done"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("cron-hijack");
+        let approvals = tools::ApprovalRegistry::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+
+        run_turn_core(
+            &db,
+            &cfg,
+            "test-key",
+            &brave,
+            &shell,
+            &memory,
+            &approvals,
+            CancelToken::new(),
+            &sink,
+            cid,
+            "scheduled prompt".into(),
+            Vec::new(),
+            false,
+            ToolMode::Cron(CronToolPolicy::ReadOnly),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        let stored = crate::db::get_cron_job(&db, &job.id).unwrap().unwrap();
+        assert_eq!(
+            stored.prompt, "trusted prompt",
+            "a readonly run must not rewrite an autoapprove job"
+        );
+        let guard = events.lock().unwrap();
+        assert!(guard.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolResult { ok: false, output, .. }
+                if output.contains("update_cron") && output.contains("readonly")
         )));
     }
 

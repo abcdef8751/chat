@@ -115,11 +115,14 @@ fn run_rows_and_triggers() {
     .unwrap();
     let pending = db::insert_cron_run(&db, &j, 1_000).unwrap();
 
-    let triggers = db::list_cron_triggers(&db).unwrap();
+    let triggers = db::list_cron_triggers(&db, None).unwrap();
     assert_eq!(triggers.len(), 1, "only finished runs carry a trigger");
     assert_eq!(triggers[0].message_id, "msg-1");
     assert_eq!(triggers[0].job_id, j.id);
     assert_eq!(triggers[0].title, "Test job");
+    // The transcript chip is per conversation: another chat sees nothing.
+    assert_eq!(db::list_cron_triggers(&db, Some("c1")).unwrap().len(), 1);
+    assert!(db::list_cron_triggers(&db, Some("other")).unwrap().is_empty());
 
     let runs = db::list_cron_runs(&db, Some(&j.id), 10).unwrap();
     assert_eq!(runs.len(), 2);

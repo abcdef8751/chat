@@ -65,7 +65,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **319 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **320 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -534,7 +534,9 @@ device just sees the thread continue.
   composer's busy state (`isBusy` = live streaming OR cron running) even though a
   scheduled run has no stream channel of its own. A run also has a 15-minute
   watchdog that cancels its token, so a wedged provider connection cannot lock
-  the chat out of new sends.
+  the chat out of new sends. The terminal `cron-updated` is emitted by the run's
+  RAII guard on **every** exit path (including an early `?` and a panic), so the
+  client's busy marker cannot stick.
 - **Approvals are turn-scoped.** `run_tool_loop` tracks only the call ids it
   parked on an approval and releases exactly those when the turn ends
   (`ApprovalRegistry::deny_calls`). A background cron run finishing therefore
@@ -563,12 +565,16 @@ device just sees the thread continue.
   `ToolMode::Cron(_)`), which keeps a `Cron(AutoApprove)` turn from waiting
   forever on a prompt nobody can answer.
   **Privilege escalation is gated:** `create_cron`/`update_cron` are ungated for
-  ordinary use, but a call whose `tool_policy` is `autoapprove` is treated as a
-  **gated** call (`chat::grants_autoapprove`) — the model may freely create
-  readonly jobs, while granting unattended host-tool access needs the user's
-  click in a live turn. A `readonly` run cannot mint an `autoapprove` job at all
-  (its mode gate refuses the call before dispatch), so a prompt-injected page
-  cannot bootstrap a persistent shell through the cron tools.
+  ordinary use, but a call that would grant `autoapprove` is treated as a
+  **gated** call (`chat::grants_autoapprove`) — the model may freely create and
+  edit readonly jobs, while granting unattended host-tool access needs the user's
+  click in a live turn. The check is **target-aware**, not just argument-aware:
+  `update_cron` of an existing `autoapprove` job (even without a `tool_policy`
+  field) and `run_cron_now` on one are gated too, because mutating or firing such
+  a job is as privileged as creating it. A `readonly` run cannot mint **or
+  hijack** an autoapprove job (its mode gate refuses the call before dispatch), so
+  a prompt-injected page cannot bootstrap a persistent shell through the cron
+  tools.
 - **Schedule format:** a preset token (`hourly`, `daily@HH:MM`,
   `weekly@mon:HH:MM`) or a raw **5-field** cron expression, resolved in the
   device's local wall clock (`cron::schedule`, `croner`). Input is normalized on
@@ -578,7 +584,9 @@ device just sees the thread continue.
   finished, stop reason, usage, frozen cost, error). It is inserted at start with
   an empty `trigger_message_id` and updated when the turn's user row exists; the
   timeline maps that id to the job title as a **"scheduled" chip**, without a new
-  column on `messages`. A run that cannot start (no model or no provider key)
+  column on `messages`. The chip query (`list_cron_triggers`) is scoped to the
+  open conversation and capped, because that is all the transcript renders — the
+  full run history is never shipped over IPC on every refresh. A run that cannot start (no model or no provider key)
   moves the slot forward silently — no run row, no counter bump — so it does not
   retry every 20 s.
 - **Notifications:** `tauri-plugin-notification` (pinned `=2.4.0`: 2.5+ requires
