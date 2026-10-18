@@ -794,9 +794,12 @@ async fn fetch_image_url(
         .unwrap_or_default();
     let url_ext = image_ext_from_url(url);
     let mime = if content_type.starts_with("image/") {
-        // `is_viewable_image` is the one shared decision: raster `image/*` only,
-        // SVG and ICO excluded (most vision APIs reject them).
-        if !crate::attachments::is_viewable_image("", Some(&content_type)) {
+        // `fetch_image` promises only the five advertised raster formats. A
+        // server can label anything `image/*` (tiff, heic, avif, …) and most
+        // vision APIs reject those, failing the whole turn — so this is a
+        // positive allow-list, not the broader user-picker predicate
+        // (`is_viewable_image`, which must keep accepting device images).
+        if !crate::attachments::is_raster_image_mime(&content_type) {
             return Err(format!(
                 "fetch_image: {url} is a '{content_type}', which cannot be attached; \
                  only raster images (PNG, JPEG, GIF, WebP, BMP) are supported"
@@ -1928,6 +1931,38 @@ mod tests {
             let err = fetch_image_url(&url, true).await.unwrap_err();
             let _ = handle.join();
             assert!(err.contains("cannot be attached"), "{mime}: {err}");
+        }
+    }
+
+    /// Anything else the server labels `image/*` — TIFF, HEIC, AVIF — is not one
+    /// of the five formats `fetch_image` advertises. Attaching it would 400 the
+    /// whole turn provider-side, so the guard is a positive allow-list.
+    #[tokio::test]
+    async fn fetch_image_rejects_image_types_outside_the_raster_allow_list() {
+        for mime in ["image/tiff", "image/heic", "image/avif", "image/jxl"] {
+            let (port, handle) = start_http_mock("200 OK", mime, "IMAGEDATA");
+            let url = format!("http://127.0.0.1:{port}/photo");
+            let err = fetch_image_url(&url, true).await.unwrap_err();
+            let _ = handle.join();
+            assert!(err.contains("cannot be attached"), "{mime}: {err}");
+            assert!(
+                err.contains("only raster images (PNG, JPEG, GIF, WebP, BMP)"),
+                "{mime}: {err}"
+            );
+        }
+        // The five advertised types still pass the guard.
+        for (mime, ext) in [
+            ("image/png", "png"),
+            ("image/jpeg", "jpg"),
+            ("image/gif", "gif"),
+            ("image/webp", "webp"),
+            ("image/bmp", "bmp"),
+        ] {
+            let (port, handle) = start_http_mock("200 OK", mime, "IMAGEDATA");
+            let url = format!("http://127.0.0.1:{port}/photo.{ext}");
+            let att = fetch_image_url(&url, true).await.unwrap();
+            let _ = handle.join();
+            assert_eq!(att.mime, mime);
         }
     }
 

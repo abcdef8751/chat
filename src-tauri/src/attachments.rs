@@ -149,6 +149,22 @@ pub(crate) fn is_raster_image_ext(ext: &str) -> bool {
     matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
 }
 
+/// The positive allow-list of raster MIME types the vision path actually
+/// promises to support (PNG, JPEG, GIF, WebP, BMP).
+///
+/// [`is_viewable_image`] is deliberately broader — it also accepts formats a
+/// user may legitimately *pick* locally (`image/heic`, `image/avif`, …) — but a
+/// **remote** URL that advertises some other `image/*` (TIFF, HEIC, AVIF, …)
+/// must not be attached: most vision APIs reject it, which would fail the whole
+/// turn provider-side. `fetch_image` promises only these five formats, so it
+/// uses this positive check.
+pub(crate) fn is_raster_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+    )
+}
+
 /// Whether a file should be treated as a viewable image, given what we know
 /// about it: its extension and (optionally) a MIME type from a resolver.
 ///
