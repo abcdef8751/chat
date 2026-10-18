@@ -2055,6 +2055,128 @@ async fn abort_mid_multi_call_round_leaves_one_result_per_call() {
     }
 }
 
+/// A multi-call round emits each call's `ToolResult` as soon as that call
+/// finishes — not after every call in the round has been awaited.
+///
+/// The second call is gated and parks on its approval prompt, which is
+/// deterministic: by the time its `ToolCall` is observed, call 1 has returned
+/// (the loop only moves on after a dispatch completes), so call 1's result must
+/// already be on the stream. Deferring the emit to the round's persist loop —
+/// as an earlier revision did — leaves the first card spinning until the slowest
+/// call finishes, and fails this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_results_are_emitted_as_each_call_completes() {
+    let (port, handle) = start_mock(
+        vec![
+            vec![
+                tool_frag(0, "call_1", "bash", r#"{\"command\":\"echo one\"}"#),
+                tool_frag(1, "call_2", "bash", r#"{\"command\":\"echo two\"}"#),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("done"), finish_chunk("stop")],
+        ],
+        0,
+    );
+    let db = Arc::new(open_db("tool-emit-order"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let mcp = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    let flag = CancelToken::new();
+
+    let (db2, approvals2, events2) = (db.clone(), approvals.clone(), events.clone());
+    let cid2 = cid.clone();
+    let memory = temp_memory("tool-emit-order");
+    let task = tokio::spawn(async move {
+        run_chat_turn(
+            &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, flag, &sink, cid2,
+            "run both".into(), Vec::new(), false,
+        )
+        .await
+    });
+
+    // Approve the first gated call, then wait until the loop has announced the
+    // second and parked on its approval prompt.
+    wait_for_event(
+        &events2,
+        |e| matches!(e, StreamEvent::ToolCall { call_id, .. } if call_id == "call_1"),
+        5000,
+    )
+    .await;
+    while !approvals.resolve("call_1", true) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    wait_for_event(
+        &events2,
+        |e| matches!(e, StreamEvent::ToolCall { call_id, .. } if call_id == "call_2"),
+        5000,
+    )
+    .await;
+
+    {
+        let guard = events2.lock().unwrap();
+        assert!(
+            guard.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolResult { call_id, output, .. }
+                    if call_id == "call_1" && output == "one"
+            )),
+            "call 1's ToolResult was deferred until the whole round finished"
+        );
+    }
+
+    while !approvals.resolve("call_2", true) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    task.await.unwrap().unwrap();
+    let _ = handle.join();
+
+    // The round's event order is per call: call, result, call, result — never
+    // every call first and every result afterwards.
+    let order: Vec<(String, String)> = {
+        let guard = events2.lock().unwrap();
+        guard
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCall { call_id, .. } => {
+                    Some(("call".to_string(), call_id.clone()))
+                }
+                StreamEvent::ToolResult { call_id, .. } => {
+                    Some(("result".to_string(), call_id.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        order,
+        vec![
+            ("call".to_string(), "call_1".to_string()),
+            ("result".to_string(), "call_1".to_string()),
+            ("call".to_string(), "call_2".to_string()),
+            ("result".to_string(), "call_2".to_string()),
+        ]
+    );
+
+    // Both outcomes still persist, one row per call.
+    let rows = msgs(&db, &cid);
+    let tool_rows: Vec<Value> = rows
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| serde_json::from_str(&m.content).unwrap())
+        .collect();
+    assert_eq!(tool_rows.len(), 2);
+    assert_eq!(tool_rows[0]["output"], "one");
+    assert_eq!(tool_rows[1]["output"], "two");
+}
+
 /// Stop-then-resend: the old turn's tail must not remove the *new* turn's
 /// registration. An unconditional remove would make the new turn's Stop a
 /// silent no-op and hide it from `is_streaming` (which the reflection scheduler
