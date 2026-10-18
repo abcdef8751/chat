@@ -32,6 +32,9 @@ use crate::tools::{ToolCall, ToolOutput};
 
 pub mod schedule;
 
+#[cfg(test)]
+mod tests;
+
 /// How often the scheduler looks for due jobs. Finer than reflection's 60 s so a
 /// `* * * * *` job does not visibly drift.
 const TICK: Duration = Duration::from_secs(20);

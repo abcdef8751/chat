@@ -4404,3 +4404,206 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let note_ms = 1_789_646_269_072; // 2026-09-17 11:57 UTC
         assert!(format_date_time(note_ms).starts_with("2026-09-17 11:57"));
     }
+
+    /// A scheduled run with the default `readonly` policy refuses the gated host
+    /// tools with a self-correcting tool-error: the model learns why, and the
+    /// command never executes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_readonly_refuses_host_tools() {
+        let marker = std::env::temp_dir()
+            .join(format!("pi-cron-readonly-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let args = format!(r#"{{\"command\":\"touch {}\"}}"#, marker.display());
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag(0, "c1", "bash", ""),
+                    tool_frag(0, "", "", &args),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("done"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = open_db("cron-readonly");
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("cron-readonly");
+        let approvals = tools::ApprovalRegistry::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+
+        run_turn_core(
+            &db,
+            &cfg,
+            "test-key",
+            &brave,
+            &shell,
+            &memory,
+            &approvals,
+            CancelToken::new(),
+            &sink,
+            cid.clone(),
+            "scheduled prompt".into(),
+            Vec::new(),
+            false,
+            ToolMode::Cron(CronToolPolicy::ReadOnly),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        assert!(
+            !marker.exists(),
+            "a readonly scheduled run must not execute the command"
+        );
+        let guard = events.lock().unwrap();
+        assert!(
+            guard.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolResult { ok: false, output, .. }
+                    if output.contains("readonly") && output.contains("bash")
+            )),
+            "expected a readonly refusal"
+        );
+    }
+
+    /// With `autoapprove`, the same call runs unapproved (the job policy is what
+    /// the cron path feeds in via `cfg.auto_approve_tools`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_autoapprove_runs_host_tools() {
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag(0, "c1", "bash", ""),
+                    tool_frag(0, "", "", r#"{\"command\":\"printf cron-ok\"}"#),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("done"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let db = open_db("cron-autoapprove");
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            auto_approve_tools: true,
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("cron-autoapprove");
+        let approvals = tools::ApprovalRegistry::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+
+        run_turn_core(
+            &db,
+            &cfg,
+            "test-key",
+            &brave,
+            &shell,
+            &memory,
+            &approvals,
+            CancelToken::new(),
+            &sink,
+            cid.clone(),
+            "scheduled prompt".into(),
+            Vec::new(),
+            false,
+            ToolMode::Cron(CronToolPolicy::AutoApprove),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        let guard = events.lock().unwrap();
+        assert!(guard.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolResult { ok: true, output, .. } if output.contains("cron-ok")
+        )));
+    }
+
+    /// `run_turn_core` returns the bookkeeping a cron run needs: the appended
+    /// user row, the accumulated usage (with the frozen cost), and the stop
+    /// reason. The transcript is a normal user → assistant pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_turn_returns_outcome_and_persists_rows() {
+        let (port, handle) = start_mock(
+            vec![vec![
+                delta_chunk("scheduled reply"),
+                usage_chunk(),
+                finish_chunk("stop"),
+            ]],
+            0,
+        );
+        let db = open_db("cron-outcome");
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            // Give the mock model real rates so the frozen-cost assertion is
+            // meaningful (an unpriced model legitimately has no `cost`).
+            model_overrides: std::collections::HashMap::from([(
+                "mock".to_string(),
+                crate::config::ModelOverride {
+                    input_per_million: Some(1.0),
+                    output_per_million: Some(1.0),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let brave = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("cron-outcome");
+        let approvals = tools::ApprovalRegistry::default();
+        let sink = TestSink(Arc::new(Mutex::new(Vec::new())));
+
+        let outcome = run_turn_core(
+            &db,
+            &cfg,
+            "test-key",
+            &brave,
+            &shell,
+            &memory,
+            &approvals,
+            CancelToken::new(),
+            &sink,
+            cid.clone(),
+            "scheduled prompt".into(),
+            Vec::new(),
+            false,
+            ToolMode::Cron(CronToolPolicy::ReadOnly),
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        assert_eq!(outcome.stop_reason, "stop");
+        assert_eq!(outcome.text, "scheduled reply");
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.usage["prompt_tokens"], 3);
+        assert!(
+            outcome.usage.get("cost").is_some(),
+            "the turn's price must be frozen on its usage"
+        );
+
+        let rows = msgs(&db, &cid);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[0].content, "scheduled prompt");
+        assert_eq!(rows[1].role, "assistant");
+        assert_eq!(
+            outcome.user_message_id.as_deref(),
+            Some(rows[0].id.as_str()),
+            "the outcome must point at the row that triggered the run"
+        );
+    }

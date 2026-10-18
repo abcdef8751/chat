@@ -1,6 +1,7 @@
 User instructions:
 
 - Preferably don't read the messages in the database
+- If you need to update the database schema, use the `supabase` CLI, it's logged in
 
 # AGENTS.md — Pi Chat
 
@@ -80,6 +81,7 @@ separately — it passes end to end (`ALL ASSERTIONS PASSED`).
 | Tools             | ✅    | `bash` (one-shot shell), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` + `fetch_image` (ungated) |
 | UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; memory page list→detail on narrow viewports |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
+| Cron jobs         | ✅    | Scheduled runs append to a thread; per-job tool policy; catch-up max 1; OS notification (desktop) + badge |
 | Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
 | Context + price   | ✅    | Context counter, frozen per-turn cost, near-limit note, forced compaction (M7)                            |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
@@ -274,6 +276,16 @@ memory_extractions(               -- staged backfill summaries (map-phase output
 
 memory_backfill_runs(             -- reduce-pass spend (spans many conversations)
   id, model, usage, cost, files, note, created_at)
+
+cron_jobs(                        -- local-only scheduled runs
+  id, conversation_id REFERENCES conversations(id) ON DELETE CASCADE,
+  title, schedule, prompt, enabled, tool_policy, notify,
+  next_run_at, last_run_at, run_count, run_requested, created_at)
+
+cron_runs(                        -- per-fire audit trail
+  id, job_id REFERENCES cron_jobs(id) ON DELETE CASCADE,
+  conversation_id, trigger_message_id, scheduled_for,
+  started_at, finished_at, stop_reason, error, usage, cost)
 ```
 
 - **`role`:** `memory` rows are consolidation notes. `build_history_messages`
@@ -488,6 +500,75 @@ default**; it only chunks when the payload exceeds `CONTEXT_BUDGET` (80%) of the
 
 ---
 
+## Cron jobs
+
+A **cron job** is a schedule + a prompt + a conversation thread. Each fire appends
+one ordinary `user → assistant` exchange to that thread, so a run is a
+*continuation*: it sees the full prior history (memory notes, clock notes,
+compaction summary), runs with memory available, and its reply lands in the
+conversation the user can scroll and answer. Agent-created jobs hang off the
+conversation in which they were created. **Job definitions are local-only**
+(never synced); the messages a run produces are normal rows and sync, so a second
+device just sees the thread continue.
+
+- **Scheduler** (`cron.rs`, mirrors `reflection::spawn`): one pass 3 s after
+  startup (a slot missed while the app was closed catches up), then every 20 s so
+  `* * * * *` jobs feel right. Global kill-switch `AppConfig.cron_enabled`
+  (Settings → Scheduled jobs; local, not synced). Due = `enabled = 1 AND
+  (run_requested = 1 OR next_run_at <= now)`, oldest slot first, capped at 5
+  launches per tick and 3 concurrent runs.
+- **Interlock:** a conversation is claimed through `StreamRegistry`
+  (`try_register`, not `register` — a live turn may start in the window since the
+  due check, and replacing its cancel token would make Stop abort the wrong
+  turn). A busy chat defers the job to the next tick **without advancing its
+  slot**. The reflection scheduler already skips `is_streaming` conversations and
+  aborts an in-flight pass when one appears, so cron, live and reflection never
+  overlap; Stop in the UI also aborts a runaway scheduled reply.
+- **Catch-up is max one.** The overdue slot fires once, then `next_run_at` is
+  recomputed from **now**, so a device that slept for a day resyncs forward
+  instead of replaying every missed slot. A manual "Run now" never touches the
+  schedule (it only records `last_run_at`), except that it satisfies an already
+  overdue slot so the scheduler cannot fire that same slot again a tick later.
+- **Run path:** `chat::run_turn_core` (shared with live turns) does the clock
+  note, compaction check, price freeze, tool rounds, abort/error semantics and
+  `fetch_image` attachments; `cron::run_job` wraps it with `ToolMode::Cron`, a
+  `NullSink`, a `cron_runs` row and `cron-updated` events. The user turn's text is
+  the prompt plus an autonomous footer naming the job, so the model and a reader
+  both know why it appeared.
+- **Tool policy (per job):** the tool *list* stays byte-identical (cache
+  alignment); `ToolMode::Cron(policy)` enforces at dispatch. `readonly` (default)
+  refuses `bash`/`read_file`/`write_file` with a self-correcting tool-error
+  naming the fix; `autoapprove` runs them unapproved. Memory / Brave / web tools
+  are always allowed. The cron-management tools are allowed too, so a job can
+  reschedule or disable itself. The job's policy is authoritative — it does not
+  inherit the global YOLO switch, and `readonly` is not overridden by it.
+- **Schedule format:** a preset token (`hourly`, `daily@HH:MM`,
+  `weekly@mon:HH:MM`) or a raw **5-field** cron expression, resolved in the
+  device's local wall clock (`cron::schedule`, `croner`). Input is normalized on
+  write; a 6-field/seconds expression is rejected, so the floor is once a minute.
+  `cron_preview` gives the UI live validation + next-run text as you type.
+- **Bookkeeping:** `cron_runs` is the audit trail (scheduled slot, started/
+  finished, stop reason, usage, frozen cost, error). It is inserted at start with
+  an empty `trigger_message_id` and updated when the turn's user row exists; the
+  timeline maps that id to the job title as a **"scheduled" chip**, without a new
+  column on `messages`. A run that cannot start (no model or no provider key)
+  moves the slot forward silently — no run row, no counter bump — so it does not
+  retry every 20 s.
+- **Notifications:** `tauri-plugin-notification` (pinned `=2.4.0`: 2.5+ requires
+  tauri 2.12, which would drop the vendored `tauri-runtime-wry` patch). On
+  completion/failure a job with `notify` raises an OS notification (title = job
+  title, body = reply snippet or error), suppressed while the window is focused
+  *and* the run's conversation is the open one (`cron_set_active` is fed by the
+  UI). The `cron-updated` event drives the in-app badge and thread refresh.
+  Desktop-first: Android needs a notification channel + `POST_NOTIFICATIONS`
+  (same deferred-device pattern as the other mobile work); the event/badge path
+  is platform-neutral.
+- **UI:** `src/components/CronPage.tsx` (Header → Cron) lists jobs (schedule,
+  next/last run, count, enabled/notify toggles, policy badge, Run now / Edit /
+  Delete), hosts the create/edit form (preset + raw cron, live preview, prompt,
+  policy, notify) and the recent-runs audit trail. Sidebar conversations owning
+  an enabled job get a clock glyph; the transcript shows the "scheduled" chip.
+
 ## Tool surface
 
 Introduced through the same loop, so they're visible, gateable, and aborted like
@@ -529,6 +610,14 @@ fetch_image(url)                  // raster only (png/jpg/gif/webp/bmp; capped a
                                   //   part when the turn's model is vision-capable
                                   //   and PERSISTED on the assistant row, so the
                                   //   attachment is still there after a reload.
+
+// Cron management — app-local, read/write to local DB (ungated; live + cron
+// modes only, refused by reflection/extraction by mode)
+create_cron(prompt, schedule, title?, conversation_id?, tool_policy?, notify?)
+list_crons()
+update_cron(id, prompt?, schedule?, title?, tool_policy?, notify?, enabled?)
+delete_cron(id)
+run_cron_now(id)                  // queues an immediate fire (~20 s tick)
 ```
 
 The tool list is byte-identical for live and reflection turns so the prompt-cache
@@ -823,7 +912,8 @@ and the app is byte-identical to before. Never blocks the UI.
 │  ├─ index.css        # Tailwind import + typography + class-based dark variant
 │  ├─ App.tsx          # thin shell: shared chat/settings state + mounts the surfaces
 │  ├─ components/      # surfaces split out of App.tsx (Sidebar, Header, MessageList,
-│  │                   #   Timeline, ImageLightbox, Composer, MemoryPage, SettingsDialog)
+│  │                   #   Timeline, ImageLightbox, Composer, MemoryPage, CronPage,
+│  │                   #   SettingsDialog)
 │  └─ lib/
 │     ├─ api.ts        # typed invoke wrappers over Tauri commands
 │     ├─ platform.ts   # Android bridge: isAndroid / onBack / exitApp / readAttachmentFromUri
@@ -858,6 +948,11 @@ and the app is byte-identical to before. Never blocks the UI.
       ├─ memory.rs     # Plain-Markdown memory: core files, listing, save/read/write, migration
       ├─ import.rs     # Anthropic-export importer (timestamp-preserving, backfill-only)
       ├─ reflection.rs # Idle memory-consolidation scheduler + per-conversation pass
+      ├─ cron.rs       # Cron scheduler (due selection, catch-up, interlock), run
+      │                 #   path (run_job), cron agent tools + UI commands
+      ├─ cron/
+      │  ├─ schedule.rs # 5-field cron / preset parsing + next-fire (local wall clock)
+      │  └─ tests.rs    # cron DB/scheduler tests (due selection, run state, cascade)
       ├─ sync.rs       # Supabase sync engine + auth commands + 60s scheduler
       └─ sync/
          └─ tests.rs   # sync tests (revision, LWW, tombstones, re-index, mock PostgREST)
@@ -1078,3 +1173,19 @@ are inert unless the user enables it (`sync_enabled` + a stored key).
 
 **Known gaps:** the per-conversation scratch workspace for `read_file`/`write_file`
 is not implemented — host tools operate on real paths with per-call approval.
+
+**Cron residuals (v1):**
+
+- **The scheduler only runs while the process lives.** There is no OS-level
+  alarm/background service: desktop close-to-tray and Android's `KeepAliveService`
+  keep it alive, but if the app is fully killed a due job fires on the **next
+  launch** (catch-up max 1), not at its wall-clock time. A true background
+  scheduler would need platform work (WorkManager on Android, a systemd
+  user timer / launchd agent on desktop).
+- **No retries.** A failed run is recorded (`cron_runs.error`) and notified; the
+  schedule moves on. Transient provider errors therefore cost that slot.
+- **Android notifications are deferred** (channel + `POST_NOTIFICATIONS` +
+  manifest). The plugin is registered and desktop works today; the in-app
+  `cron-updated` badge/refresh path is platform-neutral.
+- Job definitions are local-only by design, so two devices each run their own
+  copy of a job; the *threads* sync, so runs from both devices interleave.

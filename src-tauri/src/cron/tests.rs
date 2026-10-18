@@ -1,0 +1,190 @@
+//! Cron DB/scheduler unit tests. Schedule parsing/computation lives in
+//! `cron::schedule` and is tested there; the turn-level integration (a mocked
+//! run persisting rows, tool-policy gating) is in `chat::tests`.
+
+use super::*;
+use crate::db::Db;
+use std::sync::{Arc, Mutex};
+
+fn open_db(name: &str) -> Db {
+    let mut p = std::env::temp_dir();
+    p.push(format!("pi-chat-cron-{name}-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    let conn = crate::db::open(&p).unwrap();
+    Db(Arc::new(Mutex::new(conn)))
+}
+
+fn insert_conv(db: &Db, id: &str) {
+    let conn = db.0.lock().unwrap();
+    conn.execute(
+        "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?1, 'test', 0, 0)",
+        [id],
+    )
+    .unwrap();
+}
+
+fn job(db: &Db, cid: &str, schedule: &str, next: i64) -> db::CronJob {
+    db::insert_cron_job(
+        db,
+        cid.to_string(),
+        "Test job".into(),
+        schedule.into(),
+        "do the thing".into(),
+        "readonly".into(),
+        true,
+        next,
+    )
+    .unwrap()
+}
+
+/// Due selection is `enabled = 1 AND (run_requested = 1 OR next_run_at <= now)`,
+/// oldest slot first, and a paused job is never selected even when overdue.
+#[test]
+fn due_jobs_selects_enabled_and_ordered_by_slot() {
+    let db = open_db("due");
+    insert_conv(&db, "c1");
+    let past = 1_000;
+    let later = 2_000;
+    let future = 9_000;
+
+    let older = job(&db, "c1", "0 * * * *", past);
+    let newer = job(&db, "c1", "0 * * * *", later);
+    let future_job = job(&db, "c1", "0 * * * *", future);
+    let paused = job(&db, "c1", "0 * * * *", past);
+    db::set_cron_job_enabled(&db, &paused.id, false).unwrap();
+
+    let due = db::due_cron_jobs(&db, 5_000).unwrap();
+    let ids: Vec<&str> = due.iter().map(|j| j.id.as_str()).collect();
+    assert_eq!(ids, vec![older.id.as_str(), newer.id.as_str()]);
+    assert!(!ids.contains(&future_job.id.as_str()));
+    assert!(!ids.contains(&paused.id.as_str()));
+
+    // An explicit one-shot request fires even when the slot is in the future.
+    db::request_cron_run(&db, &future_job.id).unwrap();
+    let due = db::due_cron_jobs(&db, 5_000).unwrap();
+    assert!(due
+        .iter()
+        .any(|j| j.id == future_job.id && j.run_requested));
+}
+
+/// Firing advances the slot, stamps `last_run_at`, and bumps the counter only
+/// for a real scheduled fire (a manual fire must not inflate `run_count`).
+#[test]
+fn run_state_advances_slot_and_counts_only_scheduled_fires() {
+    let db = open_db("state");
+    insert_conv(&db, "c1");
+    let j = job(&db, "c1", "0 * * * *", 1_000);
+
+    db::set_cron_job_run_state(&db, &j.id, 5_000, 4_000, true).unwrap();
+    let after = db::get_cron_job(&db, &j.id).unwrap().unwrap();
+    assert_eq!(after.next_run_at, 5_000);
+    assert_eq!(after.last_run_at, Some(4_000));
+    assert_eq!(after.run_count, 1);
+
+    db::set_cron_job_run_state(&db, &j.id, 9_000, 8_000, false).unwrap();
+    let after = db::get_cron_job(&db, &j.id).unwrap().unwrap();
+    assert_eq!(after.next_run_at, 9_000);
+    assert_eq!(after.last_run_at, Some(8_000));
+    assert_eq!(after.run_count, 1, "a manual run must not bump the counter");
+}
+
+/// A run row starts with an empty trigger id and gains it when the turn's user
+/// row lands; `list_cron_triggers` then maps that message to the job title (the
+/// timeline "scheduled" chip) and skips unfinished runs.
+#[test]
+fn run_rows_and_triggers() {
+    let db = open_db("runs");
+    insert_conv(&db, "c1");
+    let j = job(&db, "c1", "0 * * * *", 1_000);
+
+    let finished = db::insert_cron_run(&db, &j, 1_000).unwrap();
+    db::finish_cron_run(
+        &db,
+        &finished,
+        Some("msg-1"),
+        "stop",
+        None,
+        Some(r#"{"prompt_tokens":1}"#),
+        Some(0.002),
+    )
+    .unwrap();
+    let pending = db::insert_cron_run(&db, &j, 1_000).unwrap();
+
+    let triggers = db::list_cron_triggers(&db).unwrap();
+    assert_eq!(triggers.len(), 1, "only finished runs carry a trigger");
+    assert_eq!(triggers[0].message_id, "msg-1");
+    assert_eq!(triggers[0].job_id, j.id);
+    assert_eq!(triggers[0].title, "Test job");
+
+    let runs = db::list_cron_runs(&db, Some(&j.id), 10).unwrap();
+    assert_eq!(runs.len(), 2);
+    let finished_row = runs.iter().find(|r| r.id == finished).unwrap();
+    assert_eq!(finished_row.stop_reason.as_deref(), Some("stop"));
+    assert_eq!(finished_row.cost, Some(0.002));
+    assert!(finished_row.finished_at.is_some());
+    let pending_row = runs.iter().find(|r| r.id == pending).unwrap();
+    assert!(pending_row.finished_at.is_none());
+    assert_eq!(pending_row.trigger_message_id, "");
+}
+
+/// Deleting a conversation cascades to its jobs (and their runs), so a deleted
+/// chat cannot leave a scheduler entry pointing at a missing thread.
+#[test]
+fn conversation_delete_cascades_jobs_and_runs() {
+    let db = open_db("cascade");
+    insert_conv(&db, "c1");
+    let j = job(&db, "c1", "0 * * * *", 1_000);
+    db::insert_cron_run(&db, &j, 1_000).unwrap();
+
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute("DELETE FROM conversations WHERE id = 'c1'", [])
+            .unwrap();
+    }
+    assert!(db::list_cron_jobs(&db).unwrap().is_empty());
+    assert!(db::list_cron_runs(&db, None, 10).unwrap().is_empty());
+}
+
+/// The fired user turn carries the prompt plus an autonomous footer naming the
+/// job, so both the model and a reader know why it appeared.
+#[test]
+fn run_prompt_has_autonomous_footer() {
+    let db = open_db("prompt");
+    insert_conv(&db, "c1");
+    let j = job(&db, "c1", "30 8 * * *", 1_000);
+    let text = run_prompt(&j);
+    assert!(text.starts_with("do the thing"));
+    assert!(text.contains("Automated scheduled run of \"Test job\""));
+    assert!(text.contains("30 8 * * *"));
+}
+
+/// Policy parsing tolerates the spellings an agent may emit, and rejects
+/// anything else instead of silently defaulting.
+#[test]
+fn policy_normalization() {
+    assert_eq!(normalize_policy(None).unwrap(), "readonly");
+    assert_eq!(normalize_policy(Some("autoapprove")).unwrap(), "autoapprove");
+    assert_eq!(normalize_policy(Some("auto-approve")).unwrap(), "autoapprove");
+    assert_eq!(normalize_policy(Some("auto_approve")).unwrap(), "autoapprove");
+    assert_eq!(normalize_policy(Some("readonly")).unwrap(), "readonly");
+    assert!(normalize_policy(Some("yolo")).is_err());
+}
+
+#[test]
+fn snippet_flattens_and_caps() {
+    assert_eq!(snippet("  hello\n\nworld  "), "hello world");
+    assert_eq!(snippet("   "), "Run finished with no reply.");
+    let long = "x".repeat(300);
+    let out = snippet(&long);
+    assert_eq!(out.chars().count(), 201); // 200 + ellipsis
+    assert!(out.ends_with('…'));
+}
+
+#[test]
+fn cron_tool_names_are_recognized() {
+    for name in CRON_TOOLS {
+        assert!(is_cron_tool(name));
+    }
+    assert!(!is_cron_tool("bash"));
+    assert!(!is_cron_tool("save_memory"));
+}

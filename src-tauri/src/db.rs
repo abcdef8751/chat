@@ -2218,7 +2218,7 @@ pub fn list_cron_triggers(db: &Db) -> Result<Vec<CronTrigger>, String> {
             "SELECT r.trigger_message_id, r.job_id, j.title, r.scheduled_for
              FROM cron_runs r JOIN cron_jobs j ON j.id = r.job_id
              WHERE r.trigger_message_id != ''
-             ORDER BY r.started_at DESC",
+             ORDER BY r.started_at DESC LIMIT 1000",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt

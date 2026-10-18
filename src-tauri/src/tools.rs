@@ -1596,14 +1596,26 @@ mod tests {
     #[test]
     fn tool_specs_shape() {
         let with = tool_specs(true);
-        // 9 host/memory/web tools + 6 native Brave tools.
-        assert_eq!(with.len(), 15);
+        // 14 host/memory/web/cron tools + 6 native Brave tools.
+        assert_eq!(with.len(), 20);
         let without = tool_specs(false);
-        assert_eq!(without.len(), 9);
+        assert_eq!(without.len(), 14);
         // The list is identical for live and reflection (cache alignment);
         // access is enforced by mode at execution time, not by the list.
         for name in ["write_memory", "memory_str_replace", "web_fetch", "fetch_image"] {
             assert!(without.iter().any(|t| tool_name(t) == name), "missing {name}");
+        }
+        // Cron management is app-local and ungated, and present in every mode
+        // (the list is shared; dispatch enforces access).
+        for name in [
+            "create_cron",
+            "list_crons",
+            "update_cron",
+            "delete_cron",
+            "run_cron_now",
+        ] {
+            assert!(without.iter().any(|t| tool_name(t) == name), "missing {name}");
+            assert!(!is_gated(name));
         }
         assert!(is_gated("bash"));
         assert!(!is_gated("brave_web_search"));
