@@ -521,13 +521,25 @@ device just sees the thread continue.
 - **Interlock:** a conversation is claimed through `StreamRegistry`
   (`try_register`, not `register` — a live turn may start in the window since the
   due check, and replacing its cancel token would make Stop abort the wrong
-  turn). A busy chat defers the job to the next tick **without advancing its
-  slot**. The registry records whether the holder is a cron run or a live turn:
-  a live send is refused ("a scheduled run is in progress — wait for it") while a
-  cron run owns the chat, while a Stop-then-resend may still replace an earlier
-  *live* turn. The reflection scheduler already skips `is_streaming`
-  conversations and aborts an in-flight pass when one appears, so cron, live and
-  reflection never overlap; Stop in the UI also aborts a runaway scheduled reply.
+  turn). The registry records whether the holder is a cron run or a live turn:
+  a live send (and an inline message edit, enforced again in `edit_user_message`)
+  is refused while a cron run owns the chat, while a Stop-then-resend may still
+  replace an earlier *live* turn. The run's two claims are released by an RAII
+  guard, so even a panic cannot leave a chat permanently "streaming". A busy chat
+  defers the job to the next tick **without advancing its slot**. The reflection
+  scheduler already skips `is_streaming` conversations and aborts an in-flight
+  pass when one appears, so cron, live and reflection never overlap. Stop in the
+  UI aborts a runaway scheduled reply too: the `cron-updated` started/finished/
+  error events drive a client-side "cron running" set, which is folded into the
+  composer's busy state (`isBusy` = live streaming OR cron running) even though a
+  scheduled run has no stream channel of its own. A run also has a 15-minute
+  watchdog that cancels its token, so a wedged provider connection cannot lock
+  the chat out of new sends.
+- **Approvals are turn-scoped.** `run_tool_loop` tracks only the call ids it
+  parked on an approval and releases exactly those when the turn ends
+  (`ApprovalRegistry::deny_calls`). A background cron run finishing therefore
+  cannot answer a pending approve/deny prompt the user is looking at in another
+  conversation (the old global `deny_all` could).
 - **Catch-up is max one.** The overdue slot fires once, then `next_run_at` is
   recomputed from **now**, so a device that slept for a day resyncs forward
   instead of replaying every missed slot. A manual "Run now" never touches the
@@ -546,6 +558,13 @@ device just sees the thread continue.
   are always allowed. The cron-management tools are allowed too, so a job can
   reschedule or disable itself. The job's policy is authoritative — it does not
   inherit the global YOLO switch, and `readonly` is not overridden by it.
+  **Privilege escalation is gated:** `create_cron`/`update_cron` are ungated for
+  ordinary use, but a call whose `tool_policy` is `autoapprove` is treated as a
+  **gated** call (`chat::grants_autoapprove`) — the model may freely create
+  readonly jobs, while granting unattended host-tool access needs the user's
+  click in a live turn. A `readonly` run cannot mint an `autoapprove` job at all
+  (its mode gate refuses the call before dispatch), so a prompt-injected page
+  cannot bootstrap a persistent shell through the cron tools.
 - **Schedule format:** a preset token (`hourly`, `daily@HH:MM`,
   `weekly@mon:HH:MM`) or a raw **5-field** cron expression, resolved in the
   device's local wall clock (`cron::schedule`, `croner`). Input is normalized on
@@ -665,8 +684,12 @@ outbound data smuggled in tool *arguments* (a `web_fetch` URL or a search query)
 which stays bounded because `read_file` and the keychain are gated. Note also
 that un-gating `write_memory` means an ordinary (non-injected) live turn may
 overwrite curated files by accident — the trade that removed the old
-"consolidation-only" gate. Revisit (gate `web_fetch`/the memory writes, or pin
-the validated IP) if this ever ships to a wider audience.
+"consolidation-only" gate. The cron tools widen this surface: an injected page
+could also create/update/delete scheduled jobs and queue runs. Creating a
+*readonly* job is low-impact (it posts into a thread and spends tokens); granting
+`autoapprove` is the dangerous one and is **gated** (see "Cron jobs"), while a
+readonly run cannot mint an autoapprove job. Revisit (gate `web_fetch`/the memory
+writes, or pin the validated IP) if this ever ships to a wider audience.
 
 ---
 

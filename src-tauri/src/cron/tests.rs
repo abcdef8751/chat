@@ -65,6 +65,11 @@ fn due_jobs_selects_enabled_and_ordered_by_slot() {
     assert!(due
         .iter()
         .any(|j| j.id == future_job.id && j.run_requested));
+
+    // ...and on a PAUSED job: "Run now" must not silently do nothing.
+    db::request_cron_run(&db, &paused.id).unwrap();
+    let due = db::due_cron_jobs(&db, 5_000).unwrap();
+    assert!(due.iter().any(|j| j.id == paused.id && j.run_requested));
 }
 
 /// Firing advances the slot, stamps `last_run_at`, and bumps the counter only
@@ -168,6 +173,45 @@ fn catch_up_fires_once_and_resyncs_forward() {
     );
     assert_eq!(after.run_count, 1);
     assert!(db::due_cron_jobs(&db, now + 1).unwrap().is_empty());
+}
+
+/// A manual fire never bumps the run counter, and it must satisfy an already
+/// overdue slot — otherwise the scheduler would fire the same slot on its next
+/// tick and the job would run twice.
+#[test]
+fn manual_advance_satisfies_an_overdue_slot() {
+    let db = open_db("manual-advance");
+    insert_conv(&db, "c1");
+    let now = db::now_ms();
+    let j = job(&db, "c1", "0 * * * *", now - 3_600_000);
+
+    advance(&db, &j, now, true).unwrap();
+    let after = db::get_cron_job(&db, &j.id).unwrap().unwrap();
+    assert!(
+        after.next_run_at > now,
+        "an overdue slot must be satisfied, not left due"
+    );
+    assert_eq!(after.run_count, 0, "a manual fire is not a scheduled run");
+    assert_eq!(after.last_run_at, Some(now));
+    assert!(db::due_cron_jobs(&db, now + 1).unwrap().is_empty());
+}
+
+/// The per-conversation claim and the global concurrency cap: a duplicate claim
+/// fails, the cap holds, and releasing a slot admits a new conversation.
+#[test]
+fn cron_state_claims_are_exclusive_and_capped() {
+    let state = CronState::default();
+    assert!(state.try_begin("a"));
+    assert!(!state.try_begin("a"), "a chat must have at most one cron run");
+    for i in 1..MAX_CONCURRENT_RUNS {
+        assert!(state.try_begin(&format!("c{i}")), "slot {i} should be free");
+    }
+    assert!(
+        !state.try_begin("overflow"),
+        "the global cap must refuse an extra chat"
+    );
+    state.end("a");
+    assert!(state.try_begin("fresh"), "a released slot is reusable");
 }
 
 /// The fired user turn carries the prompt plus an autonomous footer naming the

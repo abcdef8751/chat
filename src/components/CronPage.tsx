@@ -32,8 +32,8 @@ export function CronPage(props: {
   cronBusy: boolean;
   cronError: string | null;
   setCronError: (value: string | null) => void;
-  onCreateCron: (payload: CreateCronPayload) => Promise<void>;
-  onUpdateCron: (id: string, patch: Omit<UpdateCronPayload, "id">) => Promise<void>;
+  onCreateCron: (payload: CreateCronPayload) => Promise<boolean>;
+  onUpdateCron: (id: string, patch: Omit<UpdateCronPayload, "id">) => Promise<boolean>;
   onDeleteCron: (id: string) => Promise<void>;
   onRunCronNow: (id: string) => Promise<void>;
   /// The open conversation — every new job is pinned to it (the backend
@@ -222,17 +222,17 @@ export function CronPage(props: {
       notify: formNotify(),
     };
     const jobId = editingJobId();
-    if (jobId) {
-      await props.onUpdateCron(jobId, base);
-    } else {
-      // The backend requires the owning conversation: always send the active
-      // chat's id (a null is rejected).
-      await props.onCreateCron({
-        conversationId: props.activeId ?? null,
-        ...base,
-      });
-    }
-    closeForm();
+    const ok = jobId
+      ? await props.onUpdateCron(jobId, base)
+      : await props.onCreateCron({
+          // The backend requires the owning conversation: always send the active
+          // chat's id (a null is rejected).
+          conversationId: props.activeId ?? null,
+          ...base,
+        });
+    // Keep the form (and the typed prompt/title) open when the backend rejected
+    // the save; the error banner above explains why.
+    if (ok) closeForm();
   }
 
   async function runNow(jobId: string) {
@@ -543,11 +543,13 @@ export function CronPage(props: {
                 <For each={props.cronJobs}>
                   {(job) => {
                     const desc = describeSchedule(job.schedule);
-                    const selected = props.cronSelectedId === job.id;
+                    // Must be a getter: `<For>`'s mapper runs untracked, so a
+                    // plain `const selected = …` would freeze at first render.
+                    const isSelected = () => props.cronSelectedId === job.id;
                     return (
                       <div
                         class={`rounded-lg border p-3 transition ${
-                          selected
+                          isSelected()
                             ? "border-neutral-400 dark:border-neutral-600"
                             : "border-neutral-200 dark:border-neutral-700"
                         }`}
@@ -556,10 +558,10 @@ export function CronPage(props: {
                           {/* Clicking the info selects the job (shows its runs). */}
                           <button
                             onClick={() =>
-                              props.setCronSelectedId(selected ? null : job.id)
+                              props.setCronSelectedId(isSelected() ? null : job.id)
                             }
                             class="min-w-0 flex-1 text-left"
-                            title={selected ? "Hide runs" : "Show recent runs"}
+                            title={isSelected() ? "Hide runs" : "Show recent runs"}
                           >
                             <span class="flex items-center gap-1.5">
                               <span class="truncate text-xs font-medium">{job.title}</span>

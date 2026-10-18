@@ -166,6 +166,13 @@ export default function App() {
     liveTools: LiveTool[];
   }
   const [streamingIds, setStreamingIds] = createSignal<ReadonlySet<string>>(new Set());
+  // Conversations with a **scheduled run** in flight. A cron run has no UI
+  // channel, so `streamingIds` (populated by live stream events) cannot know
+  // about it; the `cron-updated` started/finished/error events drive this set.
+  // It is part of `isBusy`, so Stop, send and edit are gated on it — without
+  // that, a scheduled run is invisible and un-abortable (and editing mid-run
+  // would fork the transcript).
+  const [cronRunning, setCronRunning] = createSignal<ReadonlySet<string>>(new Set());
   const [liveTurns, setLiveTurns] = createSignal<Record<string, LiveTurn>>({});
   // Per-conversation turn tokens: a resend/Stop→resend only supersedes the same
   // conversation's events, never another conversation's stream.
@@ -178,6 +185,19 @@ export default function App() {
       prev.has(id) ? new Set([...prev].filter((x) => x !== id)) : prev,
     );
   const isStreaming = (id: string | null | undefined) => !!id && streamingIds().has(id);
+  const setCronRun = (id: string, running: boolean) =>
+    setCronRunning((prev) => {
+      if (running === prev.has(id)) return prev;
+      const next = new Set(prev);
+      if (running) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  // "A turn of any kind is using this chat": live streaming OR a scheduled run.
+  // UI gates (send / Stop / inline edit) must use this, not `isStreaming`, or a
+  // cron run becomes invisible and un-abortable.
+  const isBusy = (id: string | null | undefined) =>
+    isStreaming(id) || (!!id && cronRunning().has(id));
   // Live tool cards for the ACTIVE conversation (derived, so no shared array):
   const liveTools = () => liveTurns()[activeId() ?? ""]?.liveTools ?? [];
 
@@ -632,15 +652,20 @@ export default function App() {
     // the dialog is closed — opening it clears the flag.
     const unlistenCron = await listen<CronUpdateEvent>("cron-updated", (event) => {
       const { jobId, conversationId, status } = event.payload;
+      // A scheduled run has no stream channel, so this event is the only signal
+      // that the chat is occupied: feed the busy set first, then refresh.
+      setCronRun(conversationId, status === "started");
       void refreshCrons();
       void refreshCronTriggers();
       if (status === "finished" || status === "error") {
         if (!cronOpen()) setCronUnseen(true);
+        // A run appends messages and bumps `updated_at`, so the sidebar order
+        // must refresh even when the chat is not the open one.
+        void refreshConversations();
       }
       const id = activeId();
       if (id && conversationId === id && !isStreaming(id)) {
         listMessages(id).then(setMessages);
-        void refreshConversations();
       }
       // Keep the selected job's run history live while the dialog is open.
       if (cronSelectedId() && cronSelectedId() === jobId) void loadCronRuns(jobId);
@@ -816,28 +841,35 @@ export default function App() {
     }
   }
 
-  async function createCronJob(payload: CreateCronPayload) {
+  async function createCronJob(payload: CreateCronPayload): Promise<boolean> {
     setCronBusy(true);
     setCronError(null);
     try {
       await createCron(payload);
       await refreshCrons();
+      return true;
     } catch (e) {
       setCronError(String(e));
+      return false;
     } finally {
       setCronBusy(false);
     }
   }
 
   /// Patch a job (enabled/notify toggles and the edit form all land here).
-  async function patchCron(id: string, patch: Omit<UpdateCronPayload, "id">) {
+  async function patchCron(
+    id: string,
+    patch: Omit<UpdateCronPayload, "id">,
+  ): Promise<boolean> {
     setCronBusy(true);
     setCronError(null);
     try {
       await updateCron({ id, ...patch });
       await refreshCrons();
+      return true;
     } catch (e) {
       setCronError(String(e));
+      return false;
     } finally {
       setCronBusy(false);
     }
@@ -1005,6 +1037,10 @@ export default function App() {
     setConfirmDeleteId(null);
     await deleteConversation(id);
     await refreshConversations();
+    // Its cron jobs cascade away with the conversation row: refresh so a ghost
+    // job disappears from the (possibly open) Cron dialog and sidebar glyphs.
+    void refreshCrons();
+    void refreshCronTriggers();
     if (activeId() === id) {
       const next = conversations()[0];
       setActiveId(next ? next.id : null);
@@ -1766,6 +1802,10 @@ export default function App() {
         dropLiveTurn(id, token);
         if (activeId() === id) listMessages(id).then(setMessages);
         refreshConversations().catch(() => {});
+        // A live turn may have created / changed / deleted cron jobs through the
+        // agent tools (which have no event emitter of their own).
+        void refreshCrons();
+        void refreshCronTriggers();
         return;
       }
       // Everything below updates the per-conversation live record — which must
@@ -1875,7 +1915,7 @@ export default function App() {
   async function send() {
     const staged = pendingAttachments();
     let id = activeId();
-    if (isStreaming(id) || (!draft().trim() && staged.length === 0)) return;
+    if (isBusy(id) || (!draft().trim() && staged.length === 0)) return;
     if (!id) {
       const created = await createConversation();
       setConversations([created, ...conversations()]);
@@ -1909,7 +1949,7 @@ export default function App() {
 
   async function stop() {
     const id = activeId();
-    if (!id || !isStreaming(id)) return;
+    if (!id || !isBusy(id)) return;
     // Close the abort race exactly as before: keep the live turn (temp row +
     // accumulated content) until the backend's terminal event arrives — its
     // handler drops the record and reloads the persisted rows. The turn token
@@ -1930,7 +1970,7 @@ export default function App() {
   // --- Inline editing of user messages (Item 13) --------------------------
 
   function startEditMessage(m: Message) {
-    if (isStreaming(activeId())) return;
+    if (isBusy(activeId())) return;
     // Only persisted rows are editable; a `tmp-` row hasn't been written yet.
     if (m.id.startsWith("tmp-")) return;
     setEditingId(m.id);
@@ -1972,7 +2012,7 @@ export default function App() {
   async function saveEditMessage() {
     const id = activeId();
     const messageId = editingId();
-    if (!id || !messageId || isStreaming(id)) return;
+    if (!id || !messageId || isBusy(id)) return;
     const text = editDraft().trim();
     const atts = editAttachments();
     if (!text && atts.length === 0) return;
@@ -2520,7 +2560,7 @@ export default function App() {
             <MessageList
               turns={turns()}
               empty={messages().length === 0}
-              streaming={isStreaming(activeId())}
+              streaming={isBusy(activeId())}
               thinkingOpenId={thinkingOpenId()}
               onToggleThought={toggleThought}
               onApprove={approveLiveTool}
@@ -2550,8 +2590,8 @@ export default function App() {
           onRemoveAttachment={removeAttachment}
           contextNote={contextNote()}
           attachmentWarning={attachmentWarning()}
-          streaming={isStreaming(activeId())}
-          busy={isStreaming(activeId())}
+          streaming={isBusy(activeId())}
+          busy={isBusy(activeId())}
           onPickAttachments={pickAttachments}
           draft={draft()}
           setDraft={setDraft}

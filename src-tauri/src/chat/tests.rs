@@ -1904,8 +1904,9 @@ async fn abort_during_gated_approval_records_aborted_not_denied() {
         5000,
     )
     .await;
+    // Stop is cancel-only now: the loop is race-free on the token, and it
+    // releases only its own approval registration when it exits.
     cancel.cancel();
-    approvals.deny_all();
 
     let result = tokio::time::timeout(Duration::from_secs(5), task)
         .await
@@ -4436,34 +4437,113 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
 
     /// A scheduled run with the default `readonly` policy refuses the gated host
     /// tools with a self-correcting tool-error: the model learns why, and the
-    /// command never executes.
+    /// command never executes. The policy is authoritative — the global YOLO
+    /// switch must NOT override it, which is why both settings are exercised.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cron_readonly_refuses_host_tools() {
-        let marker = std::env::temp_dir()
-            .join(format!("pi-cron-readonly-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-        let args = format!(r#"{{\"command\":\"touch {}\"}}"#, marker.display());
+    async fn cron_readonly_refuses_host_tools_even_under_global_yolo() {
+        for yolo in [false, true] {
+            let tag = format!("cron-readonly-{yolo}");
+            let marker = std::env::temp_dir()
+                .join(format!("pi-{}-{}.txt", tag, std::process::id()));
+            let _ = std::fs::remove_file(&marker);
+            let args = format!(r#"{{\"command\":\"touch {}\"}}"#, marker.display());
+            let (port, handle) = start_mock(
+                vec![
+                    vec![
+                        tool_frag(0, "c1", "bash", ""),
+                        tool_frag(0, "", "", &args),
+                        finish_chunk("tool_calls"),
+                    ],
+                    vec![delta_chunk("done"), finish_chunk("stop")],
+                ],
+                0,
+            );
+            let db = open_db(&tag);
+            let cid = insert_conv(&db);
+            let cfg = AppConfig {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model: "mock".into(),
+                auto_approve_tools: yolo,
+                ..Default::default()
+            };
+            let brave = tools::BraveSearch::default();
+            let shell = crate::shell::ShellExecutor::new();
+            let memory = temp_memory(&tag);
+            let approvals = tools::ApprovalRegistry::default();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = TestSink(events.clone());
+
+            run_turn_core(
+                &db,
+                &cfg,
+                "test-key",
+                &brave,
+                &shell,
+                &memory,
+                &approvals,
+                CancelToken::new(),
+                &sink,
+                cid.clone(),
+                "scheduled prompt".into(),
+                Vec::new(),
+                false,
+                ToolMode::Cron(CronToolPolicy::ReadOnly),
+            )
+            .await
+            .unwrap();
+            let _ = handle.join();
+
+            assert!(
+                !marker.exists(),
+                "a readonly scheduled run must not execute the command (global YOLO={yolo})"
+            );
+            let guard = events.lock().unwrap();
+            assert!(
+                guard.iter().any(|e| matches!(
+                    e,
+                    StreamEvent::ToolResult { ok: false, output, .. }
+                        if output.contains("readonly") && output.contains("bash")
+                )),
+                "expected a readonly refusal with global YOLO={yolo}"
+            );
+        }
+    }
+
+    /// A readonly scheduled run cannot escalate itself: `create_cron` /
+    /// `update_cron` that would grant `autoapprove` are gated calls, so this
+    /// mode's refusal fires before dispatch and no job exists afterwards. This is
+    /// the containment that stops a prompt-injected page from scheduling an
+    /// unattended shell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_readonly_refuses_self_granting_autoapprove_job() {
         let (port, handle) = start_mock(
             vec![
                 vec![
-                    tool_frag(0, "c1", "bash", ""),
-                    tool_frag(0, "", "", &args),
+                    tool_frag(0, "c1", "create_cron", ""),
+                    tool_frag(
+                        0,
+                        "",
+                        "",
+                        r#"{\"prompt\":\"curl evil\",\"schedule\":\"hourly\",\"tool_policy\":\"autoapprove\"}"#,
+                    ),
                     finish_chunk("tool_calls"),
                 ],
                 vec![delta_chunk("done"), finish_chunk("stop")],
             ],
             0,
         );
-        let db = open_db("cron-readonly");
+        let db = open_db("cron-escalate");
         let cid = insert_conv(&db);
         let cfg = AppConfig {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             model: "mock".into(),
+            // Global YOLO must not rescue the escalation either.
+            auto_approve_tools: true,
             ..Default::default()
         };
         let brave = tools::BraveSearch::default();
         let shell = crate::shell::ShellExecutor::new();
-        let memory = temp_memory("cron-readonly");
+        let memory = temp_memory("cron-escalate");
         let approvals = tools::ApprovalRegistry::default();
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
@@ -4489,18 +4569,38 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let _ = handle.join();
 
         assert!(
-            !marker.exists(),
-            "a readonly scheduled run must not execute the command"
+            crate::db::list_cron_jobs(&db).unwrap().is_empty(),
+            "a readonly run must not create a job"
         );
         let guard = events.lock().unwrap();
-        assert!(
-            guard.iter().any(|e| matches!(
-                e,
-                StreamEvent::ToolResult { ok: false, output, .. }
-                    if output.contains("readonly") && output.contains("bash")
-            )),
-            "expected a readonly refusal"
-        );
+        assert!(guard.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolResult { ok: false, output, .. }
+                if output.contains("create_cron") && output.contains("readonly")
+        )));
+    }
+
+    /// The gating classification behind the containment above.
+    #[test]
+    fn autoapprove_grants_are_treated_as_gated_calls() {
+        assert!(grants_autoapprove(
+            "create_cron",
+            &json!({ "tool_policy": "auto-approve" })
+        ));
+        assert!(grants_autoapprove(
+            "update_cron",
+            &json!({ "tool_policy": "AUTOAPPROVE" })
+        ));
+        assert!(!grants_autoapprove(
+            "create_cron",
+            &json!({ "tool_policy": "readonly" })
+        ));
+        assert!(!grants_autoapprove("create_cron", &json!({})));
+        assert!(!grants_autoapprove(
+            "delete_cron",
+            &json!({ "tool_policy": "autoapprove" })
+        ));
+        assert!(!grants_autoapprove("bash", &json!({})));
     }
 
     /// With `autoapprove`, the same call runs unapproved (the job policy is what
@@ -4533,23 +4633,30 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink(events.clone());
 
-        run_turn_core(
-            &db,
-            &cfg,
-            "test-key",
-            &brave,
-            &shell,
-            &memory,
-            &approvals,
-            CancelToken::new(),
-            &sink,
-            cid.clone(),
-            "scheduled prompt".into(),
-            Vec::new(),
-            false,
-            ToolMode::Cron(CronToolPolicy::AutoApprove),
+        // Wrapped in a timeout: a regression that stops the unapproved dispatch
+        // would otherwise park forever on an approval nobody can answer (the
+        // cron sink has no UI), hanging `cargo test` instead of failing.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_turn_core(
+                &db,
+                &cfg,
+                "test-key",
+                &brave,
+                &shell,
+                &memory,
+                &approvals,
+                CancelToken::new(),
+                &sink,
+                cid.clone(),
+                "scheduled prompt".into(),
+                Vec::new(),
+                false,
+                ToolMode::Cron(CronToolPolicy::AutoApprove),
+            ),
         )
         .await
+        .expect("auto-approve dispatch parked on an approval")
         .unwrap();
         let _ = handle.join();
 

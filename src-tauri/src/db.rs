@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use tauri::Manager;
 use uuid::Uuid;
 
 /// Shared database state installed into Tauri via `manage`.
@@ -935,12 +936,26 @@ pub fn apply_user_message_edit(
 /// later message). Registered in `lib.rs`'s `invoke_handler`.
 #[tauri::command]
 pub async fn edit_user_message(
+    app: tauri::AppHandle,
     db: tauri::State<'_, Db>,
     conversation_id: String,
     message_id: String,
     content: String,
     attachments: Option<Vec<crate::attachments::Attachment>>,
 ) -> Result<(), String> {
+    // Editing truncates every later row, so it must not race a turn that is
+    // still writing rows into this chat (a live turn OR a scheduled run). The UI
+    // already blocks this; the guard is the source of truth against a stale
+    // window/event.
+    if app
+        .state::<crate::chat::StreamRegistry>()
+        .is_streaming(&conversation_id)
+    {
+        return Err(
+            "A turn is still running in this chat — stop it or wait for it to finish before editing."
+                .into(),
+        );
+    }
     apply_user_message_edit(&db, &conversation_id, &message_id, &content, attachments)
 }
 
@@ -2219,7 +2234,7 @@ pub fn list_cron_triggers(db: &Db) -> Result<Vec<CronTrigger>, String> {
             "SELECT r.trigger_message_id, r.job_id, j.title, r.scheduled_for
              FROM cron_runs r JOIN cron_jobs j ON j.id = r.job_id
              WHERE r.trigger_message_id != ''
-             ORDER BY r.started_at DESC LIMIT 1000",
+             ORDER BY r.started_at DESC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt

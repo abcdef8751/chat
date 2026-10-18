@@ -1419,11 +1419,22 @@ impl ApprovalRegistry {
         }
     }
 
-    /// Deny everything pending (used on abort/stop).
-    pub fn deny_all(&self) {
+    /// Deny only the calls **this turn** registered.
+    ///
+    /// A global "deny everything" is wrong here: a background cron run (or a
+    /// second chat's turn) finishing would silently answer another
+    /// conversation's pending prompt with "denied" — a denial the user never
+    /// made. Each tool loop therefore cleans up its own call ids and leaves
+    /// everyone else's alone.
+    pub fn deny_calls(&self, call_ids: &[String]) {
+        if call_ids.is_empty() {
+            return;
+        }
         let mut map = self.pending.lock().unwrap();
-        for (_, tx) in map.drain() {
-            let _ = tx.send(false);
+        for id in call_ids {
+            if let Some(tx) = map.remove(id) {
+                let _ = tx.send(false);
+            }
         }
     }
 }
@@ -1591,6 +1602,25 @@ mod tests {
         assert!(reg.resolve("call-1", true));
         assert!(!reg.resolve("call-1", true)); // already resolved
         assert!(rx.blocking_recv().unwrap());
+    }
+
+    /// Turn-scoped approval cleanup: a cron run finishing (or any turn ending)
+    /// must never answer a prompt the user is looking at in another chat.
+    #[test]
+    fn deny_calls_leaves_other_turns_approvals_alone() {
+        let reg = ApprovalRegistry::default();
+        let mut mine = reg.register("mine".into());
+        let mut theirs = reg.register("theirs".into());
+
+        reg.deny_calls(&["mine".into()]);
+        assert!(!mine.try_recv().unwrap());
+        assert!(
+            theirs.try_recv().is_err(),
+            "another turn's pending approval was touched"
+        );
+
+        reg.deny_calls(&["theirs".into()]);
+        assert!(!theirs.try_recv().unwrap());
     }
 
     #[test]

@@ -1502,6 +1502,25 @@ fn aborted_tool_output() -> ToolOutput {
     ToolOutput::err("The user aborted this tool call.".into())
 }
 
+/// Whether a cron-management call would **grant** the `autoapprove` tool policy
+/// (create a new job with it, or switch an existing job to it).
+///
+/// Treating that as *gated* is what keeps a prompt-injected page from turning an
+/// ungated tool into a persistent unattended shell: the model may freely create
+/// `readonly` jobs, but granting auto-approval needs the user's click in a live
+/// turn. A `readonly` scheduled run cannot escalate (its gate refuses gated
+/// calls), and an `autoapprove` run is already privileged.
+fn grants_autoapprove(name: &str, arguments: &Value) -> bool {
+    if !matches!(name, "create_cron" | "update_cron") {
+        return false;
+    }
+    arguments
+        .get("tool_policy")
+        .and_then(Value::as_str)
+        .map(|p| p.trim().to_ascii_lowercase().replace(['-', '_'], "") == "autoapprove")
+        .unwrap_or(false)
+}
+
 /// Handle a `read_file` call for an image path. Multimodal models get a short
 /// text result plus the image (returned for injection); text-only models get a
 /// result telling them they cannot view it, so they can relay that to the user.
@@ -1711,6 +1730,9 @@ pub(crate) async fn run_tool_loop(
     // final assistant row, so they are collected before the loop can break on an
     // abort or an error (a partial turn keeps whatever it already produced).
     let mut attachments: Vec<crate::attachments::Attachment> = Vec::new();
+    // Call ids this turn parked on an approval. Cleaned up on every exit so a
+    // background run can never answer another conversation's pending prompt.
+    let mut gated_ids: Vec<String> = Vec::new();
 
     loop {
         let body = completion_body(
@@ -1838,8 +1860,15 @@ pub(crate) async fn run_tool_loop(
             for call in &acc.tool_calls {
                 // YOLO mode treats a gated call as ungated: it runs immediately
                 // and is announced with `gated: false` so the UI never renders
-                // (or waits on) the approve/deny prompt.
-                let host_gated = tools::is_gated(&call.name);
+                // (or waits on) the approve/deny prompt. A cron call that would
+                // *grant* auto-approval is gated even though the tool name is
+                // app-local: that click is the boundary against a prompt-injected
+                // page scheduling an unattended shell (see `grants_autoapprove`).
+                let host_gated =
+                    tools::is_gated(&call.name) || grants_autoapprove(&call.name, &call.arguments);
+                if host_gated {
+                    gated_ids.push(call.id.clone());
+                }
                 let yolo = cfg.auto_approve_tools;
                 sink.emit(StreamEvent::ToolCall {
                     call_id: call.id.clone(),
@@ -2047,6 +2076,11 @@ pub(crate) async fn run_tool_loop(
         stop_reason = acc.finish.unwrap_or_else(|| "stop".to_string());
         break;
     }
+
+    // This turn is done: release any approval it registered (an aborted wait
+    // leaves its sender behind). Only OUR call ids — a background run must not
+    // deny a prompt the user is looking at in another conversation.
+    approvals.deny_calls(&gated_ids);
 
     Ok(ToolLoopResult {
         usage: usage_total,
@@ -2258,8 +2292,6 @@ pub(crate) async fn run_turn_core(
     )
     .await?;
 
-    approvals.deny_all();
-
     // Freeze the turn's price at the model/rates in effect now, so switching
     // models later never retroactively re-prices turns already billed.
     if result.usage.get("prompt_tokens").is_some()
@@ -2432,7 +2464,6 @@ pub async fn stream_chat(
     .await;
 
     app.state::<StreamRegistry>().remove(&conversation_id, &token);
-    approvals.deny_all();
     result
 }
 
@@ -2442,7 +2473,6 @@ pub async fn stream_chat(
 #[tauri::command]
 pub fn stop_chat(app: tauri::AppHandle, conversation_id: String) -> Result<(), String> {
     app.state::<StreamRegistry>().cancel(&conversation_id);
-    app.state::<tools::ApprovalRegistry>().deny_all();
     Ok(())
 }
 

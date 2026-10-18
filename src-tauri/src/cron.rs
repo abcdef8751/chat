@@ -55,15 +55,25 @@ pub struct CronState {
     active_conversation: Mutex<Option<String>>,
 }
 
+/// Hard cap on one run, a backstop for a wedged provider connection: the token
+/// is cancelled (which drops the in-flight request/tool and persists partial
+/// text as `aborted`), so a chat cannot be locked out of new turns forever.
+const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 impl CronState {
     /// Claim the right to run a job in `conversation_id`. False when that chat
     /// already has a cron run, or the global concurrency cap is reached.
     fn try_begin(&self, conversation_id: &str) -> bool {
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        if running.len() >= MAX_CONCURRENT_RUNS {
+        // Check for an existing claim explicitly: `insert`'s bool is false in
+        // that case but must not be read as success, and the claim must stay
+        // held until `end` (a new launch may not start in the window between the
+        // registry entry being removed and the slot being released).
+        if running.contains(conversation_id) || running.len() >= MAX_CONCURRENT_RUNS {
             return false;
         }
-        running.insert(conversation_id.to_string())
+        running.insert(conversation_id.to_string());
+        true
     }
 
     fn end(&self, conversation_id: &str) {
@@ -157,6 +167,25 @@ async fn tick(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Releases a run's two claims (the conversation's stream registration and its
+/// `CronState` slot) when it finishes — including on a panic in the task, which
+/// would otherwise leave the chat permanently "streaming" (blocking live sends
+/// and reflection) with no way to recover but a restart.
+struct RunSlot {
+    app: AppHandle,
+    conversation_id: String,
+    token: CancelToken,
+}
+
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        self.app
+            .state::<chat::StreamRegistry>()
+            .remove(&self.conversation_id, &self.token);
+        self.app.state::<CronState>().end(&self.conversation_id);
+    }
+}
+
 /// Register and spawn one run. Returns `false` when the conversation is busy or
 /// the concurrency cap is reached (the caller leaves the slot alone).
 fn launch(app: &AppHandle, job: &db::CronJob, manual: bool) -> Result<bool, String> {
@@ -177,14 +206,17 @@ fn launch(app: &AppHandle, job: &db::CronJob, manual: bool) -> Result<bool, Stri
 
     let app = app.clone();
     let job = job.clone();
-    let tail_token = token.clone();
+    let slot = RunSlot {
+        app: app.clone(),
+        conversation_id: job.conversation_id.clone(),
+        token: token.clone(),
+    };
     tauri::async_runtime::spawn(async move {
+        // `_slot` releases both claims when this task ends (normally or not).
+        let _slot = slot;
         if let Err(e) = run_job(&app, &job, manual, token).await {
             eprintln!("cron: run of {} failed: {e}", job.id);
         }
-        app.state::<chat::StreamRegistry>()
-            .remove(&job.conversation_id, &tail_token);
-        app.state::<CronState>().end(&job.conversation_id);
     });
     Ok(true)
 }
@@ -254,6 +286,16 @@ async fn run_job(
     let approvals = app.state::<crate::tools::ApprovalRegistry>();
     let sink = NullSink;
 
+    // Backstop: a provider connection that never yields a byte (or a wedged
+    // tool) is cancelled after RUN_TIMEOUT, which aborts the turn and releases
+    // the conversation instead of locking it out of new sends forever.
+    let watchdog = {
+        let token = token.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(RUN_TIMEOUT).await;
+            token.cancel();
+        })
+    };
     let result = chat::run_turn_core(
         &db,
         &turn_cfg,
@@ -271,7 +313,7 @@ async fn run_job(
         ToolMode::Cron(policy),
     )
     .await;
-    approvals.deny_all();
+    watchdog.abort();
 
     let now = db::now_ms();
     let (stop_reason, error, usage, cost, trigger, reply) = match &result {
@@ -294,20 +336,38 @@ async fn run_job(
         usage.as_deref(),
         cost,
     )?;
-    advance(&db, job, now, manual)?;
+
+    // Re-read the job: the user may have rescheduled, paused or deleted it while
+    // a long run was in flight. Advancing/notifying from the pre-run snapshot
+    // would clobber the edit (one wrong fire) or notify for a deleted job.
+    let latest = db::get_cron_job(&db, &job.id)?;
+    let Some(latest) = latest else {
+        // Deleted mid-run: the transcript stays, but there is no schedule left
+        // to advance and nothing to notify about.
+        let _ = app.emit(
+            "cron-updated",
+            json!({
+                "jobId": job.id,
+                "conversationId": job.conversation_id,
+                "status": if stop_reason == "error" { "error" } else { "finished" },
+            }),
+        );
+        return Ok(());
+    };
+    advance(&db, &latest, now, manual)?;
 
     let failed = stop_reason == "error";
     let body = if failed {
         format!(
             "Run failed: {}",
-            error.as_deref().unwrap_or("unknown error")
+            clip(error.as_deref().unwrap_or("unknown error"), 200)
         )
     } else if stop_reason == "aborted" {
         "Run stopped before it finished.".to_string()
     } else {
         snippet(&reply)
     };
-    notify(app, job, &body);
+    notify(app, &latest, &body);
     let _ = app.emit(
         "cron-updated",
         json!({
@@ -376,17 +436,22 @@ fn skip_slot(db: &db::Db, job: &db::CronJob, manual: bool) -> Result<(), String>
     }
 }
 
+/// Truncate to `max` chars, appending an ellipsis when anything was dropped.
+fn clip(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
 /// One-line notification body: the reply's first ~200 characters, flattened.
 fn snippet(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut out: String = flat.chars().take(200).collect();
-    if flat.chars().count() > 200 {
-        out.push('…');
-    }
-    if out.is_empty() {
+    if flat.is_empty() {
         "Run finished with no reply.".to_string()
     } else {
-        out
+        clip(&flat, 200)
     }
 }
 

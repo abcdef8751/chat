@@ -44,10 +44,11 @@ pub fn normalize(raw: &str) -> Result<String, String> {
     // Raw expression: exactly 5 fields.
     let fields: Vec<&str> = trimmed.split_whitespace().collect();
     if fields.len() > 5 {
-        return Err(
-            "sub-minute schedules (a seconds field) are not supported; the floor is once per minute"
-                .to_string(),
-        );
+        return Err(format!(
+            "expected a 5-field cron expression, found {} (sub-minute and year fields are \
+             not supported; the floor is once per minute)",
+            fields.len()
+        ));
     }
     if fields.len() < 5 {
         return Err(format!(
