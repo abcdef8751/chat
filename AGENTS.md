@@ -65,7 +65,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **325 passed, 3 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **327 passed, 3 ignored** (the opt-in live reasoning-echo
 check, the real-export import, and the real models.dev catalog parse). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
@@ -282,7 +282,9 @@ cron_jobs(                        -- local-only scheduled runs
   -- the job's own `scheduled` thread (created with the job, deleted with it);
   -- never one of the user's chats.
   id, conversation_id REFERENCES conversations(id) ON DELETE CASCADE,
-  title, schedule, prompt, enabled, tool_policy, notify,
+  title, schedule, prompt, enabled, tool_policy,
+  context_mode,                 -- 'fresh' | 'recent' | 'full' (what a run replays)
+  notify,
   next_run_at, last_run_at, run_count, run_requested, created_at)
 
 cron_runs(                        -- per-fire audit trail
@@ -526,6 +528,17 @@ push, first-sync seed, tombstones and edit-time truncation all exclude
 `kind = 'scheduled'`. On startup the app opens the newest *chat*, not a
 scheduled thread that happened to fire most recently.
 
+**Context is bounded per job.** A thread grows by one exchange per fire, so
+replaying all of it makes a frequent job's prompt grow without limit (and forces
+compaction, whose summary + ~15k-token tail is still a large floor). Each job has
+`context_mode` — **`recent` (default): the last 2 user turns**, whole turns only so
+a tool round can never be split; **`fresh`:** nothing (system prompt + memory +
+the new prompt; cross-run state belongs in memory files); **`full`:** the whole
+thread with normal compaction. The transcript itself is always complete — this
+only bounds what is *sent*. `chat::HistoryMode` (`apply_history_mode`) slices at a
+`user` row, and compaction is skipped for the bounded modes (injecting the
+thread's summary into a fresh run would smuggle the history back in).
+
 **Migration:** a database from before job-owned threads has jobs pinned to user
 chats. `db::open` moves each such job to a fresh `scheduled` thread (once; the
 old chat and past runs stay where they are).
@@ -621,9 +634,10 @@ old chat and past runs stay where they are).
   (same deferred-device pattern as the other mobile work); the event/badge path
   is platform-neutral.
 - **UI:** `src/components/CronPage.tsx` (Header → Cron) lists jobs (schedule,
-  next/last run, count, enabled/notify toggles, policy badge, Thread / Run now /
-  Edit / Delete), hosts the create/edit form (preset + raw cron, live preview,
-  prompt, policy, notify) and the recent-runs audit trail. The Sidebar splits
+  next/last run, count, enabled/notify toggles, policy + context badges, Thread /
+  Run now / Edit / Delete), hosts the create/edit form (preset + raw cron, live
+  preview, prompt, policy, context window, notify) and the recent-runs audit
+  trail. The Sidebar splits
   `kind = 'scheduled'` threads into a collapsible **Scheduled** section (with a
   clock glyph) instead of the chat list; the transcript shows the "scheduled"
   chip. The form needs no open chat — a job always owns its thread.
@@ -672,9 +686,9 @@ fetch_image(url)                  // raster only (png/jpg/gif/webp/bmp; capped a
 
 // Cron management — app-local, read/write to local DB (ungated; live + cron
 // modes only, refused by reflection/extraction by mode)
-create_cron(prompt, schedule, title?, tool_policy?, notify?)   // own thread
+create_cron(prompt, schedule, title?, tool_policy?, context?, notify?)   // own thread
 list_crons()
-update_cron(id, prompt?, schedule?, title?, tool_policy?, notify?, enabled?)
+update_cron(id, prompt?, schedule?, title?, tool_policy?, context?, notify?, enabled?)
 delete_cron(id)
 run_cron_now(id)                  // queues an immediate fire (~20 s tick)
 ```

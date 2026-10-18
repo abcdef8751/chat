@@ -30,6 +30,7 @@ fn job(db: &Db, schedule: &str, next: i64) -> db::CronJob {
         schedule.into(),
         "do the thing".into(),
         "readonly".into(),
+        "recent".into(),
         true,
         next,
     )
@@ -522,4 +523,46 @@ fn opening_an_old_db_moves_jobs_off_user_chats() {
         db::get_cron_job(&db, "j1").unwrap().unwrap().conversation_id,
         moved
     );
+}
+
+
+/// The per-job context window persists, is exposed to the tool/UI, and is
+/// validated the same way from both entry points.
+#[test]
+fn job_context_mode_round_trips_and_validates() {
+    let db = open_db("context-mode");
+    let j = job(&db, "0 * * * *", 1_000);
+    assert_eq!(j.context_mode, "recent", "new jobs default to the few-runs window");
+
+    let updated = execute_tool(
+        &tool_call("update_cron", json!({ "id": j.id, "context": "fresh" })),
+        &db,
+    );
+    assert!(!updated.is_error, "update failed: {}", updated.content);
+    assert_eq!(
+        db::get_cron_job(&db, &j.id).unwrap().unwrap().context_mode,
+        "fresh"
+    );
+
+    let created = execute_tool(
+        &tool_call(
+            "create_cron",
+            json!({ "prompt": "p", "schedule": "hourly", "context": "full" }),
+        ),
+        &db,
+    );
+    assert!(!created.is_error, "create failed: {}", created.content);
+    let value: Value = serde_json::from_str(&created.content).unwrap();
+    assert_eq!(value["contextMode"], "full");
+
+    assert_eq!(normalize_context(Some("Full")).unwrap(), "full");
+    assert_eq!(normalize_context(Some("last-few")).unwrap(), "recent");
+    assert_eq!(normalize_context(None).unwrap(), "recent");
+    assert!(normalize_context(Some("nonsense")).is_err());
+
+    // The mapper that feeds the turn loop agrees with the stored vocabulary.
+    assert_eq!(chat::HistoryMode::from_context("fresh"), chat::HistoryMode::Fresh);
+    assert_eq!(chat::HistoryMode::from_context("full"), chat::HistoryMode::Full);
+    assert_eq!(chat::HistoryMode::from_context("recent"), chat::HistoryMode::Recent);
+    assert_eq!(chat::HistoryMode::from_context("garbage"), chat::HistoryMode::Recent);
 }

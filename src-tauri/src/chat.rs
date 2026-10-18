@@ -1702,6 +1702,63 @@ pub(crate) enum ToolMode {
     Cron(CronToolPolicy),
 }
 
+/// How much of a conversation's stored history a turn sends upstream.
+///
+/// A cron job owns a thread that grows by one exchange per fire, so replaying
+/// all of it makes a frequent job's context grow without bound (and forces
+/// compaction, whose summary + ~15k-token tail is still a large floor). The
+/// transcript stays complete for reading/audit; only what is *sent* is bounded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HistoryMode {
+    /// The whole thread, with compaction as usual (live chat, reflection).
+    Full,
+    /// No prior turns — only the system prompt, memory, the clock note and the
+    /// new prompt. Cross-run state belongs in the memory files.
+    Fresh,
+    /// The last [`RECENT_USER_TURNS`] user turns (whole turns, so a tool round
+    /// is never split), then the new prompt.
+    Recent,
+}
+
+impl HistoryMode {
+    /// Map a job's stored `context_mode` (`fresh` | `recent` | `full`). Anything
+    /// unrecognized falls back to `Recent`, the default for new jobs.
+    pub(crate) fn from_context(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fresh" => Self::Fresh,
+            "full" => Self::Full,
+            _ => Self::Recent,
+        }
+    }
+}
+
+/// A "few runs" window: this many prior user turns.
+const RECENT_USER_TURNS: usize = 2;
+
+/// Drop all but the tail `mode` allows, slicing at a `user` row so a turn's
+/// assistant tool-call row and its tool results stay adjacent (an orphaned tool
+/// result is an invalid request).
+fn apply_history_mode(history: &mut Vec<db::MessageRow>, mode: HistoryMode) {
+    let keep = match mode {
+        HistoryMode::Full => return,
+        HistoryMode::Fresh => 0,
+        HistoryMode::Recent => RECENT_USER_TURNS,
+    };
+    let mut seen = 0usize;
+    let mut cut = history.len();
+    for (i, m) in history.iter().enumerate().rev() {
+        if m.role != "user" {
+            continue;
+        }
+        seen += 1;
+        if seen > keep {
+            break;
+        }
+        cut = i;
+    }
+    history.drain(..cut);
+}
+
 /// Per-job host-tool access for a cron run. The tool *list* is unchanged (cache
 /// alignment); only dispatch differs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2140,10 +2197,15 @@ pub(crate) async fn run_turn_core(
     attachments: Vec<crate::attachments::Attachment>,
     regenerate: bool,
     mode: ToolMode,
+    history_mode: HistoryMode,
 ) -> Result<TurnOutcome, String> {
     let conversation = db::get_conversation(db, &conversation_id)?
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
     let mut history = db::read_messages(db, &conversation_id)?;
+    // Bound what a scheduled run replays (see [`HistoryMode`]). The current
+    // clock note and prompt are appended explicitly below, so a `Fresh` turn
+    // still carries the time and the instruction.
+    apply_history_mode(&mut history, history_mode);
 
     // Resolve this conversation's provider and model once, falling back to the
     // active provider and the app's configured model when unset. The override is
@@ -2246,7 +2308,14 @@ pub(crate) async fn run_turn_core(
     // verbatim history → [time note] → the new turn. If the request would cross
     // the threshold of the model's window, force a compaction and rebuild from
     // its result.
-    let (mut summary, mut keep_start) = compacted_history(&conversation, &history);
+    // Compaction only applies to the full thread: a bounded window is already
+    // small, and injecting the thread's summary into a `Fresh`/`Recent` run would
+    // smuggle the history back in.
+    let (mut summary, mut keep_start) = if history_mode == HistoryMode::Full {
+        compacted_history(&conversation, &history)
+    } else {
+        (None, 0)
+    };
     let mut messages = {
         let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
         msgs.push(time_note.clone());
@@ -2274,7 +2343,10 @@ pub(crate) async fn run_turn_core(
         Some(reported) => reported + estimate_turn_tokens(&content, &attachments),
         None => estimate_context_tokens(&messages),
     };
-    if window > 0 && current as f64 >= window as f64 * COMPACTION_THRESHOLD {
+    if history_mode == HistoryMode::Full
+        && window > 0
+        && current as f64 >= window as f64 * COMPACTION_THRESHOLD
+    {
         if let Some((new_summary, new_start)) = compact_now(
             db,
             &conversation,
@@ -2416,6 +2488,7 @@ pub(crate) async fn run_chat_turn(
         attachments,
         regenerate,
         ToolMode::Live,
+        HistoryMode::Full,
     )
     .await
     .map(|_| ())

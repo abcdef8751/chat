@@ -270,6 +270,7 @@ fn cron_tools() -> Vec<ChatCompletionTools> {
                     "schedule": { "type": "string", "description": "Preset token or 5-field cron expression" },
                     "title": { "type": "string", "description": "Short human label; derived from the prompt when omitted. Also titles the job's thread." },
                     "tool_policy": { "type": "string", "description": "`readonly` (default: bash/read_file/write_file refused) or `autoapprove` (run host tools without asking)" },
+                    "context": { "type": "string", "description": "How much of the job's own thread each run replays: `recent` (last few turns, default), `fresh` (nothing — use memory for state), or `full` (the whole thread)" },
                     "notify": { "type": "boolean", "description": "Send an OS notification when the run finishes (default true)" }
                 },
                 "required": ["prompt", "schedule"]

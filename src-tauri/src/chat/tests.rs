@@ -3056,6 +3056,44 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         }
     }
 
+    /// A scheduled run replays only what its context setting allows, and always
+    /// slices at a `user` row so a tool round-trip is never split (an orphaned
+    /// tool result is an invalid request).
+    #[test]
+    fn history_mode_bounds_a_scheduled_runs_replay() {
+        let history = vec![
+            row("u1", "user", "first"),
+            row("a1", "assistant", "first reply"),
+            row("u2", "user", "second"),
+            row("c2", "assistant", "{\"tool_calls\":[]}"),
+            row("t2", "tool", "{\"output\":\"x\"}"),
+            row("a2", "assistant", "second reply"),
+            row("u3", "user", "third"),
+            row("a3", "assistant", "third reply"),
+        ];
+
+        let mut full = history.clone();
+        apply_history_mode(&mut full, HistoryMode::Full);
+        assert_eq!(full.len(), history.len(), "Full is untouched");
+
+        let mut fresh = history.clone();
+        apply_history_mode(&mut fresh, HistoryMode::Fresh);
+        assert!(fresh.is_empty(), "Fresh sends no prior turns");
+
+        let mut recent = history.clone();
+        apply_history_mode(&mut recent, HistoryMode::Recent);
+        assert_eq!(recent.len(), 6, "the last two user turns survive");
+        assert_eq!(recent[0].id, "u2");
+        assert_eq!(recent[0].role, "user", "a window never starts mid-tool-round");
+        assert!(recent.iter().any(|m| m.id == "t2"));
+
+        // A history with no user row yet (e.g. an imported assistant-only stub)
+        // has nothing to anchor a window on.
+        let mut orphans = vec![row("a1", "assistant", "hi")];
+        apply_history_mode(&mut orphans, HistoryMode::Recent);
+        assert!(orphans.is_empty());
+    }
+
     fn conversation_with(
         summary: Option<&str>,
         through: Option<&str>,
@@ -4489,6 +4527,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
                 Vec::new(),
                 false,
                 ToolMode::Cron(CronToolPolicy::ReadOnly),
+                HistoryMode::Full,
             )
             .await
             .unwrap();
@@ -4564,6 +4603,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             Vec::new(),
             false,
             ToolMode::Cron(CronToolPolicy::ReadOnly),
+            HistoryMode::Full,
         )
         .await
         .unwrap();
@@ -4594,6 +4634,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             "0 * * * *".into(),
             "trusted work".into(),
             "autoapprove".into(),
+            "recent".into(),
             true,
             0,
         )
@@ -4604,6 +4645,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             "0 * * * *".into(),
             "read work".into(),
             "readonly".into(),
+            "recent".into(),
             true,
             0,
         )
@@ -4715,6 +4757,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
                 Vec::new(),
                 false,
                 ToolMode::Cron(CronToolPolicy::AutoApprove),
+                HistoryMode::Full,
             ),
         )
         .await
@@ -4743,6 +4786,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             "0 * * * *".into(),
             "trusted prompt".into(),
             "autoapprove".into(),
+            "recent".into(),
             true,
             0,
         )
@@ -4789,6 +4833,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             Vec::new(),
             false,
             ToolMode::Cron(CronToolPolicy::ReadOnly),
+            HistoryMode::Full,
         )
         .await
         .unwrap();
@@ -4857,6 +4902,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
                 Vec::new(),
                 false,
                 ToolMode::Cron(CronToolPolicy::AutoApprove),
+                HistoryMode::Full,
             ),
         )
         .await
@@ -4928,6 +4974,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             Vec::new(),
             false,
             ToolMode::Cron(CronToolPolicy::ReadOnly),
+            HistoryMode::Full,
         )
         .await
         .unwrap();

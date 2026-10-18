@@ -2,6 +2,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "so
 import { Dialog } from "@kobalte/core/dialog";
 import type {
   CreateCronPayload,
+  CronContext,
   CronJob,
   CronPreview,
   CronRun,
@@ -56,6 +57,9 @@ export function CronPage(props: {
   const [formToolPolicy, setFormToolPolicy] = createSignal<"readonly" | "autoapprove">(
     "readonly",
   );
+  // How much of the job's own thread each run replays (bounded by default:
+  // a frequent job would otherwise grow its context without limit).
+  const [formContext, setFormContext] = createSignal<CronContext>("recent");
   const [formNotify, setFormNotify] = createSignal(true);
   const [confirmDeleteId, setConfirmDeleteId] = createSignal<string | null>(null);
   // Live validation + next-run preview (`cron_preview`, debounced below).
@@ -151,6 +155,7 @@ export function CronPage(props: {
     setFormTitle("");
     setFormPrompt("");
     setFormToolPolicy("readonly");
+    setFormContext("recent");
     setFormNotify(true);
     setEditingJobId(null);
     setPreview(null);
@@ -191,6 +196,7 @@ export function CronPage(props: {
     setFormTitle(job.title);
     setFormPrompt(job.prompt);
     setFormToolPolicy(job.toolPolicy);
+    setFormContext(job.contextMode);
     setFormNotify(job.notify);
     setEditingJobId(job.id);
     setPreview(null); // let the debounced preview refill
@@ -217,6 +223,7 @@ export function CronPage(props: {
       schedule: effectiveSchedule(),
       prompt,
       toolPolicy: formToolPolicy(),
+      context: formContext(),
       notify: formNotify(),
     };
     const jobId = editingJobId();
@@ -470,6 +477,25 @@ export function CronPage(props: {
                 </label>
               </div>
 
+              <div class="mt-3 rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+                <p class="text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                  Context sent to each run
+                </p>
+                <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                  The thread keeps every run for reading; this only bounds what the
+                  model sees on the next fire.
+                </p>
+                <select
+                  class="mt-2 w-full rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-[11px] outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200"
+                  value={formContext()}
+                  onChange={(e) => setFormContext(e.currentTarget.value as CronContext)}
+                >
+                  <option value="fresh">Fresh — each run starts clean</option>
+                  <option value="recent">Last few runs — a little continuity (default)</option>
+                  <option value="full">Full thread — the whole job history</option>
+                </select>
+              </div>
+
               <label class="mt-3 flex items-center gap-2 text-[11px] text-neutral-600 dark:text-neutral-300">
                 <input
                   type="checkbox"
@@ -564,6 +590,13 @@ export function CronPage(props: {
                                 {job.toolPolicy === "readonly"
                                   ? "no host tools"
                                   : "auto-approve tools"}
+                              </span>
+                              <span class={badgeClass}>
+                                {job.contextMode === "fresh"
+                                  ? "fresh context"
+                                  : job.contextMode === "full"
+                                    ? "full thread"
+                                    : "last 2 runs"}
                               </span>
                             </span>
                             <span class="mt-1 flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">

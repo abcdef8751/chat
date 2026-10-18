@@ -140,6 +140,10 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
   prompt TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   tool_policy TEXT NOT NULL DEFAULT 'readonly',
+  -- How much of the job's own thread a run replays: 'fresh' (nothing),
+  -- 'recent' (the last few turns, the default) or 'full' (the whole thread,
+  -- with compaction as usual). The transcript itself is always complete.
+  context_mode TEXT NOT NULL DEFAULT 'recent',
   notify INTEGER NOT NULL DEFAULT 1,
   next_run_at INTEGER NOT NULL,
   last_run_at INTEGER,
@@ -229,6 +233,11 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     // Older databases predate per-conversation provider selection.
     let _ = conn.execute(
         "ALTER TABLE conversations ADD COLUMN provider_id TEXT",
+        [],
+    );
+    // Older databases predate the per-job context window.
+    let _ = conn.execute(
+        "ALTER TABLE cron_jobs ADD COLUMN context_mode TEXT NOT NULL DEFAULT 'recent'",
         [],
     );
     // Older databases predate job-owned threads (`kind`). A cron job used to be
@@ -1966,6 +1975,8 @@ pub struct CronJob {
     pub enabled: bool,
     /// `readonly` (host tools refused) or `autoapprove` (host tools run unasked).
     pub tool_policy: String,
+    /// `fresh` | `recent` | `full` — how much of the thread a run replays.
+    pub context_mode: String,
     pub notify: bool,
     pub next_run_at: i64,
     pub last_run_at: Option<i64>,
@@ -2018,11 +2029,13 @@ fn cron_job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         run_count: r.get(10)?,
         run_requested: r.get::<_, i64>(11)? != 0,
         created_at: r.get(12)?,
+        context_mode: r.get(13)?,
     })
 }
 
 const CRON_JOB_COLUMNS: &str = "id, conversation_id, title, schedule, prompt, enabled, \
-     tool_policy, notify, next_run_at, last_run_at, run_count, run_requested, created_at";
+     tool_policy, notify, next_run_at, last_run_at, run_count, run_requested, created_at, \
+     context_mode";
 
 pub fn list_cron_jobs(db: &Db) -> Result<Vec<CronJob>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -2117,6 +2130,7 @@ pub fn insert_cron_job(
     schedule: String,
     prompt: String,
     tool_policy: String,
+    context_mode: String,
     notify: bool,
     next_run_at: i64,
 ) -> Result<CronJob, String> {
@@ -2131,6 +2145,7 @@ pub fn insert_cron_job(
         prompt,
         enabled: true,
         tool_policy,
+        context_mode,
         notify,
         next_run_at,
         last_run_at: None,
@@ -2139,8 +2154,8 @@ pub fn insert_cron_job(
         created_at: now_ms(),
     };
     tx.execute(
-        "INSERT INTO cron_jobs (id, conversation_id, title, schedule, prompt, enabled, tool_policy, notify, next_run_at, last_run_at, run_count, run_requested, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
+        "INSERT INTO cron_jobs (id, conversation_id, title, schedule, prompt, enabled, tool_policy, context_mode, notify, next_run_at, last_run_at, run_count, run_requested, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13)",
         params![
             job.id,
             job.conversation_id,
@@ -2149,6 +2164,7 @@ pub fn insert_cron_job(
             job.prompt,
             job.enabled as i64,
             job.tool_policy,
+            job.context_mode,
             job.notify as i64,
             job.next_run_at,
             job.last_run_at,
@@ -2167,7 +2183,7 @@ pub fn update_cron_job(db: &Db, job: &CronJob) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE cron_jobs SET title = ?2, schedule = ?3, prompt = ?4, enabled = ?5,
-             tool_policy = ?6, notify = ?7, next_run_at = ?8
+             tool_policy = ?6, notify = ?7, next_run_at = ?8, context_mode = ?9
          WHERE id = ?1",
         params![
             job.id,
@@ -2177,7 +2193,8 @@ pub fn update_cron_job(db: &Db, job: &CronJob) -> Result<(), String> {
             job.enabled as i64,
             job.tool_policy,
             job.notify as i64,
-            job.next_run_at
+            job.next_run_at,
+            job.context_mode
         ],
     )
     .map_err(|e| e.to_string())?;

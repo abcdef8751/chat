@@ -598,6 +598,9 @@ export function syncRemoveEncryption(): Promise<SyncStatus> {
 
 // --- Scheduled jobs (cron) ---
 
+/** How much of a job's own thread each run replays. */
+export type CronContext = "fresh" | "recent" | "full";
+
 /** A scheduled run: carries out `prompt` in its own thread (`conversationId`)
  * on `schedule`. The thread is created with the job, not picked from chats. */
 export interface CronJob {
@@ -609,6 +612,8 @@ export interface CronJob {
   prompt: string;
   enabled: boolean;
   toolPolicy: "readonly" | "autoapprove";
+  /** `fresh` = no prior runs, `recent` = last few (default), `full` = thread. */
+  contextMode: CronContext;
   notify: boolean;
   /** Epoch ms of the next scheduled run. */
   nextRunAt: number;
@@ -656,6 +661,7 @@ export type CreateCronPayload = {
   schedule: string;
   prompt: string;
   toolPolicy?: "readonly" | "autoapprove" | null;
+  context?: CronContext | null;
   notify?: boolean | null;
 };
 
@@ -667,6 +673,7 @@ export type UpdateCronPayload = {
   prompt?: string | null;
   enabled?: boolean | null;
   toolPolicy?: "readonly" | "autoapprove" | null;
+  context?: CronContext | null;
   notify?: boolean | null;
 };
 

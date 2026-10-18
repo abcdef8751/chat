@@ -356,6 +356,9 @@ async fn run_job(
         Vec::new(),
         false,
         ToolMode::Cron(policy),
+        // The job's context setting bounds how much of its own thread is
+        // replayed (the transcript itself stays complete).
+        chat::HistoryMode::from_context(&job.context_mode),
     )
     .await;
     watchdog.abort();
@@ -540,6 +543,20 @@ pub(crate) fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Normalize a job's context window (`fresh` | `recent` | `full`), tolerating
+/// the obvious synonyms. Defaults to `recent`.
+pub(crate) fn normalize_context(raw: Option<&str>) -> Result<String, String> {
+    let raw = raw.unwrap_or("recent").trim().to_ascii_lowercase();
+    match raw.replace(['-', '_'], " ").as_str() {
+        "" | "recent" | "last" | "last few" | "last few runs" | "few" => Ok("recent".into()),
+        "fresh" | "none" | "empty" => Ok("fresh".into()),
+        "full" | "thread" | "all" | "everything" => Ok("full".into()),
+        other => Err(format!(
+            "context must be `fresh`, `recent` or `full`, got `{other}`"
+        )),
+    }
+}
+
 fn arg_bool(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(Value::as_bool)
 }
@@ -568,6 +585,7 @@ fn job_json(job: &db::CronJob) -> Value {
         "prompt": job.prompt,
         "enabled": job.enabled,
         "toolPolicy": job.tool_policy,
+        "contextMode": job.context_mode,
         "notify": job.notify,
         "nextRunAt": job.next_run_at,
         "nextRun": chat::format_date_time(job.next_run_at),
@@ -592,6 +610,10 @@ fn tool_create(db: &db::Db, args: &Value) -> ToolOutput {
         Ok(p) => p,
         Err(e) => return ToolOutput::err(e),
     };
+    let context = match normalize_context(arg_str(args, "context")) {
+        Ok(c) => c,
+        Err(e) => return ToolOutput::err(e),
+    };
     let title = arg_str(args, "title")
         .map(str::to_string)
         .unwrap_or_else(|| db::derive_title(prompt));
@@ -606,6 +628,7 @@ fn tool_create(db: &db::Db, args: &Value) -> ToolOutput {
         normalized,
         prompt.to_string(),
         policy,
+        context,
         notify,
         next_run_at,
     ) {
@@ -660,6 +683,9 @@ fn apply_updates(db: &db::Db, mut job: db::CronJob, args: &Value) -> Result<db::
     }
     if let Some(policy) = arg_str(args, "tool_policy") {
         job.tool_policy = normalize_policy(Some(policy))?;
+    }
+    if let Some(context) = arg_str(args, "context") {
+        job.context_mode = normalize_context(Some(context))?;
     }
     if let Some(notify) = arg_bool(args, "notify") {
         job.notify = notify;
@@ -789,6 +815,7 @@ pub fn create_cron(
     schedule: String,
     prompt: String,
     tool_policy: Option<String>,
+    context: Option<String>,
     notify: Option<bool>,
 ) -> Result<db::CronJob, String> {
     let prompt = prompt.trim().to_string();
@@ -798,6 +825,7 @@ pub fn create_cron(
     let normalized = schedule::normalize(&schedule)?;
     let next_run_at = schedule::next_after_ms(&normalized, db::now_ms())?;
     let policy = normalize_policy(tool_policy.as_deref())?;
+    let context = normalize_context(context.as_deref())?;
     let title = title
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
@@ -808,6 +836,7 @@ pub fn create_cron(
         normalized,
         prompt,
         policy,
+        context,
         notify.unwrap_or(true),
         next_run_at,
     )
@@ -823,6 +852,7 @@ pub fn update_cron(
     prompt: Option<String>,
     enabled: Option<bool>,
     tool_policy: Option<String>,
+    context: Option<String>,
     notify: Option<bool>,
 ) -> Result<db::CronJob, String> {
     let job = db::get_cron_job(&db, &id)?.ok_or_else(|| format!("cron job not found: {id}"))?;
@@ -843,6 +873,9 @@ pub fn update_cron(
     }
     if let Some(policy) = tool_policy {
         args.insert("tool_policy".into(), json!(policy));
+    }
+    if let Some(context) = context {
+        args.insert("context".into(), json!(context));
     }
     if let Some(notify) = notify {
         args.insert("notify".into(), json!(notify));
