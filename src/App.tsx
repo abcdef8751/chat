@@ -1961,6 +1961,11 @@ export default function App() {
       // noop — the backend still settles the aborted turn.
     }
     removeStreaming(id);
+    // A cron run has no stream channel of its own: clear its busy marker
+    // optimistically too, so a failed/missed terminal event cannot leave the
+    // composer permanently showing Stop. If the run somehow keeps going, the
+    // backend refuses the next send with an explicit message.
+    setCronRun(id, false);
     // The user message is persisted by the backend *before* streaming starts, so
     // it is already in the transcript. Handing the draft back here would
     // duplicate it on the next send, so Stop simply returns the composer to its
