@@ -2031,6 +2031,24 @@ async fn abort_mid_multi_call_round_leaves_one_result_per_call() {
     assert_eq!(tool_rows[2]["output"], "The user aborted this tool call.");
     assert_eq!(tool_rows[1]["error"], true);
     assert_eq!(tool_rows[2]["error"], true);
+
+    // Every call must also have been *announced* as finished. A call skipped by
+    // Stop was the one path that pushed a result row without emitting a result
+    // event, which left its card at `running` until the turn's terminal event
+    // cleared the live list.
+    let result_events: Vec<String> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolResult { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        result_events, calls,
+        "every call in an aborted round needs a ToolResult event, in order"
+    );
     let last = rows.last().unwrap();
     assert_eq!(last.role, "assistant");
     assert_eq!(last.stop_reason.as_deref(), Some("aborted"));

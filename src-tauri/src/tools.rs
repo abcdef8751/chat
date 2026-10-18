@@ -799,13 +799,17 @@ async fn fetch_image_url(
         // vision APIs reject those, failing the whole turn — so this is a
         // positive allow-list, not the broader user-picker predicate
         // (`is_viewable_image`, which must keep accepting device images).
-        if !crate::attachments::is_raster_image_mime(&content_type) {
-            return Err(format!(
-                "fetch_image: {url} is a '{content_type}', which cannot be attached; \
-                 only raster images (PNG, JPEG, GIF, WebP, BMP) are supported"
-            ));
+        match crate::attachments::canonical_raster_mime(&content_type) {
+            // Normalise a tolerated alias (`image/jpg`, `image/x-ms-bmp`, …) so
+            // the `data:` URL we attach uses a subtype providers and WebKit accept.
+            Some(canonical) => canonical.to_string(),
+            None => {
+                return Err(format!(
+                    "fetch_image: {url} is a '{content_type}', which cannot be attached; \
+                     only raster images (PNG, JPEG, GIF, WebP, BMP) are supported"
+                ));
+            }
         }
-        content_type
     } else if crate::attachments::is_raster_image_ext(&url_ext) {
         // Some hosts serve images as `application/octet-stream`; trust a raster
         // extension on the URL then, and derive the MIME from it.
@@ -1951,22 +1955,28 @@ mod tests {
             );
         }
         // The five advertised types still pass the guard, and so do the
-        // real-world aliases servers use for the same raster bodies.
-        for (mime, ext) in [
-            ("image/png", "png"),
-            ("image/jpeg", "jpg"),
-            ("image/gif", "gif"),
-            ("image/webp", "webp"),
-            ("image/bmp", "bmp"),
-            ("image/jpg", "jpg"),
-            ("image/x-ms-bmp", "bmp"),
-            ("image/x-png", "png"),
+        // real-world aliases servers use for the same raster bodies — but an
+        // alias is normalised, so what we attach is always the canonical subtype.
+        for (mime, ext, canonical) in [
+            ("image/png", "png", "image/png"),
+            ("image/jpeg", "jpg", "image/jpeg"),
+            ("image/gif", "gif", "image/gif"),
+            ("image/webp", "webp", "image/webp"),
+            ("image/bmp", "bmp", "image/bmp"),
+            ("image/jpg", "jpg", "image/jpeg"),
+            ("image/x-ms-bmp", "bmp", "image/bmp"),
+            ("image/x-png", "png", "image/png"),
         ] {
             let (port, handle) = start_http_mock("200 OK", mime, "IMAGEDATA");
             let url = format!("http://127.0.0.1:{port}/photo.{ext}");
             let att = fetch_image_url(&url, true).await.unwrap();
             let _ = handle.join();
-            assert_eq!(att.mime, mime);
+            assert_eq!(att.mime, canonical, "{mime} should attach as {canonical}");
+            let data_url = att.data_url.unwrap_or_default();
+            assert!(
+                data_url.starts_with(&format!("data:{canonical};base64,")),
+                "{mime} leaked its alias onto the wire: {data_url}"
+            );
         }
     }
 

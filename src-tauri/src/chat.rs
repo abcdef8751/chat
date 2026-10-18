@@ -1756,10 +1756,19 @@ pub(crate) async fn run_tool_loop(
 
                 // Stop reached this call before it was dispatched (an earlier
                 // call's dispatch was cancelled, or the stop landed between the
-                // rounds). It still owes the transcript a result row.
+                // rounds). It owes the transcript a result row AND the UI a
+                // result event — otherwise its card sits at `running` until the
+                // turn's terminal event clears the live list.
                 if token.is_cancelled() {
                     aborted_mid_tools = true;
-                    outcomes.push(DispatchedTool::plain(aborted_tool_output()));
+                    let output = aborted_tool_output();
+                    sink.emit(StreamEvent::ToolResult {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        ok: !output.is_error,
+                        output: output.content.clone(),
+                    });
+                    outcomes.push(DispatchedTool::plain(output));
                     continue;
                 }
 

@@ -152,7 +152,8 @@ pub(crate) fn is_raster_image_ext(ext: &str) -> bool {
 /// The positive allow-list of raster MIME types the vision path actually
 /// promises to support (PNG, JPEG, GIF, WebP, BMP), plus the aliases servers
 /// use in practice for those same formats — notably the classic `image/jpg`
-/// typo, and `image/x-ms-bmp` / `image/x-png`.
+/// typo, and `image/x-ms-bmp` / `image/x-png`. Returns the **canonical** subtype
+/// for an accepted input, or `None` when it is not raster.
 ///
 /// [`is_viewable_image`] is deliberately broader — it also accepts formats a
 /// user may legitimately *pick* locally (`image/heic`, `image/avif`, …) — but a
@@ -160,18 +161,22 @@ pub(crate) fn is_raster_image_ext(ext: &str) -> bool {
 /// must not be attached: most vision APIs reject it, which would fail the whole
 /// turn provider-side. `fetch_image` promises only these five formats, so it
 /// uses this positive check.
-pub(crate) fn is_raster_image_mime(mime: &str) -> bool {
-    matches!(
-        mime,
-        "image/png"
-            | "image/jpeg"
-            | "image/jpg"
-            | "image/gif"
-            | "image/webp"
-            | "image/bmp"
-            | "image/x-ms-bmp"
-            | "image/x-png"
-    )
+///
+/// The two roles are split on purpose: **detection** is permissive, because an
+/// alias still carries a valid raster body, while **what we attach** must be
+/// canonical — the MIME ends up in the `data:` URL handed to the provider and
+/// rendered by the UI, where an unknown subtype can be rejected by a vision API
+/// (the very failure this list exists to prevent) or refuse to render in the
+/// lightbox.
+pub(crate) fn canonical_raster_mime(mime: &str) -> Option<&'static str> {
+    Some(match mime {
+        "image/png" | "image/x-png" => "image/png",
+        "image/jpeg" | "image/jpg" => "image/jpeg",
+        "image/gif" => "image/gif",
+        "image/webp" => "image/webp",
+        "image/bmp" | "image/x-ms-bmp" => "image/bmp",
+        _ => return None,
+    })
 }
 
 /// Whether a file should be treated as a viewable image, given what we know
@@ -405,7 +410,7 @@ mod tests {
 
     #[test]
     fn raster_mime_allow_list_accepts_common_alias_mislabels() {
-        // The canonical types.
+        // The canonical types map to themselves.
         for mime in [
             "image/png",
             "image/jpeg",
@@ -413,12 +418,17 @@ mod tests {
             "image/webp",
             "image/bmp",
         ] {
-            assert!(is_raster_image_mime(mime), "{mime}");
+            assert_eq!(canonical_raster_mime(mime), Some(mime), "{mime}");
         }
         // Real-world aliases whose body is a valid raster image: the classic
-        // `image/jpg` typo for `image/jpeg`, plus the MS/PNG shorthands.
-        for mime in ["image/jpg", "image/x-ms-bmp", "image/x-png"] {
-            assert!(is_raster_image_mime(mime), "{mime}");
+        // `image/jpg` typo for `image/jpeg`, plus the MS/PNG shorthands. They are
+        // accepted, but normalised so the alias never reaches the wire.
+        for (mime, canonical) in [
+            ("image/jpg", "image/jpeg"),
+            ("image/x-ms-bmp", "image/bmp"),
+            ("image/x-png", "image/png"),
+        ] {
+            assert_eq!(canonical_raster_mime(mime), Some(canonical), "{mime}");
         }
         // Everything the allow-list exists to keep out.
         for mime in [
@@ -432,7 +442,7 @@ mod tests {
             "application/octet-stream",
             "",
         ] {
-            assert!(!is_raster_image_mime(mime), "{mime}");
+            assert_eq!(canonical_raster_mime(mime), None, "{mime}");
         }
     }
 
