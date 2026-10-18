@@ -150,7 +150,9 @@ pub(crate) fn is_raster_image_ext(ext: &str) -> bool {
 }
 
 /// The positive allow-list of raster MIME types the vision path actually
-/// promises to support (PNG, JPEG, GIF, WebP, BMP).
+/// promises to support (PNG, JPEG, GIF, WebP, BMP), plus the aliases servers
+/// use in practice for those same formats — notably the classic `image/jpg`
+/// typo, and `image/x-ms-bmp` / `image/x-png`.
 ///
 /// [`is_viewable_image`] is deliberately broader — it also accepts formats a
 /// user may legitimately *pick* locally (`image/heic`, `image/avif`, …) — but a
@@ -161,7 +163,14 @@ pub(crate) fn is_raster_image_ext(ext: &str) -> bool {
 pub(crate) fn is_raster_image_mime(mime: &str) -> bool {
     matches!(
         mime,
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "image/x-ms-bmp"
+            | "image/x-png"
     )
 }
 
@@ -392,6 +401,39 @@ mod tests {
     fn rejects_directories() {
         let dir = std::env::temp_dir();
         assert!(read_attachment(&dir).is_err());
+    }
+
+    #[test]
+    fn raster_mime_allow_list_accepts_common_alias_mislabels() {
+        // The canonical types.
+        for mime in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/bmp",
+        ] {
+            assert!(is_raster_image_mime(mime), "{mime}");
+        }
+        // Real-world aliases whose body is a valid raster image: the classic
+        // `image/jpg` typo for `image/jpeg`, plus the MS/PNG shorthands.
+        for mime in ["image/jpg", "image/x-ms-bmp", "image/x-png"] {
+            assert!(is_raster_image_mime(mime), "{mime}");
+        }
+        // Everything the allow-list exists to keep out.
+        for mime in [
+            "image/svg+xml",
+            "image/heic",
+            "image/avif",
+            "image/tiff",
+            "image/jxl",
+            "image/x-icon",
+            "text/plain",
+            "application/octet-stream",
+            "",
+        ] {
+            assert!(!is_raster_image_mime(mime), "{mime}");
+        }
     }
 
     #[test]

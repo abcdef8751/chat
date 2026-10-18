@@ -1950,13 +1950,17 @@ mod tests {
                 "{mime}: {err}"
             );
         }
-        // The five advertised types still pass the guard.
+        // The five advertised types still pass the guard, and so do the
+        // real-world aliases servers use for the same raster bodies.
         for (mime, ext) in [
             ("image/png", "png"),
             ("image/jpeg", "jpg"),
             ("image/gif", "gif"),
             ("image/webp", "webp"),
             ("image/bmp", "bmp"),
+            ("image/jpg", "jpg"),
+            ("image/x-ms-bmp", "bmp"),
+            ("image/x-png", "png"),
         ] {
             let (port, handle) = start_http_mock("200 OK", mime, "IMAGEDATA");
             let url = format!("http://127.0.0.1:{port}/photo.{ext}");
