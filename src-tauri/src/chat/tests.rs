@@ -633,6 +633,50 @@
         assert!(matches!(guard.last(), Some(StreamEvent::Done { stop_reason }) if stop_reason == "stop"));
     }
 
+    /// The level a turn runs at is recorded on the rows it writes, so a later
+    /// consolidation pass can use the conversation's own level rather than the
+    /// current global one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_records_the_thinking_level_it_ran_at() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![vec![delta_chunk("Hello"), finish_chunk("stop")]],
+            0,
+        );
+        let db = Arc::new(open_db("thinking-level"));
+        let approvals = Arc::new(tools::ApprovalRegistry::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let cid = insert_conv(&db);
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            thinking_level: "high".into(),
+            ..Default::default()
+        };
+        let mcp = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let (db2, approvals2, cid2) = (db.clone(), approvals.clone(), cid.clone());
+        let memory = temp_memory("thinking-level");
+        let task = tokio::spawn(async move {
+            run_chat_turn(
+                &db2, &cfg, "test-key", &mcp, &shell, &memory, &approvals2, CancelToken::new(),
+                &sink, cid2, "hi".into(), Vec::new(), false,
+            )
+            .await
+        });
+        task.await.unwrap().unwrap();
+        let _ = handle.join();
+
+        let rows = msgs(&db, &cid);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[0].thinking_level.as_deref(), Some("high"));
+        assert_eq!(rows[1].role, "assistant");
+        assert_eq!(rows[1].thinking_level.as_deref(), Some("high"));
+        // ...and it was the level actually sent upstream.
+        let sent = bodies.lock().unwrap();
+        assert_eq!(request_body(&sent[0])["reasoning_effort"], "high");
+    }
+
     /// A conversation pinned to a non-active provider + its own model must run the
     /// turn against THAT provider (base URL) and model, not the active one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

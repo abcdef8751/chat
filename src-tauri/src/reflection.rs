@@ -51,7 +51,11 @@ pub fn spawn(app: AppHandle) {
 
 async fn tick(app: &AppHandle) -> Result<(), String> {
     let cfg = app.state::<ConfigState>().get();
-    if !cfg.memory_reflection_enabled || cfg.model.trim().is_empty() {
+    // Deliberately no `cfg.model` check here: a conversation may pin its own
+    // model, and `reflect_conversation` resolves (and guards) that per
+    // conversation. Bailing on the *global* model would silently skip pinned
+    // chats forever on an install whose global default is blank.
+    if !sweep_enabled(&cfg) {
         return Ok(());
     }
     let idle_ms = (cfg.memory_reflection_idle_minutes.max(1) as i64) * 60_000;
@@ -74,6 +78,46 @@ async fn tick(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the idle sweep should look for due conversations at all. Model
+/// availability is *not* part of this decision: a conversation may pin its own
+/// model, so a blank global default must not stop the sweep (the per-conversation
+/// pass resolves the model itself and no-ops when it too is blank).
+fn sweep_enabled(cfg: &AppConfig) -> bool {
+    cfg.memory_reflection_enabled
+}
+
+/// The model a conversation's reflection pass runs on: the model the
+/// conversation pins, else the app-wide default. `None` when neither is set, in
+/// which case there is nothing to run.
+pub(crate) fn conversation_model(
+    cfg: &AppConfig,
+    conversation: &db::Conversation,
+) -> Option<String> {
+    conversation
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| Some(cfg.model.clone()).filter(|m| !m.trim().is_empty()))
+}
+
+/// The reasoning level a conversation's consolidation pass should use: the one
+/// recorded on the conversation's newest message that has one (see the live
+/// turn's inserts in `chat::run_chat_turn`), falling back to the app-wide level.
+///
+/// Rows written before the level was recorded carry `None`, so an older chat
+/// behaves exactly as before. A recorded *empty* level is not skipped: it means
+/// "no reasoning for this conversation", which must win over the global setting.
+pub(crate) fn conversation_thinking_level(
+    history: &[db::MessageRow],
+    cfg: &AppConfig,
+) -> String {
+    history
+        .iter()
+        .rev()
+        .find_map(|m| m.thinking_level.clone())
+        .unwrap_or_else(|| cfg.thinking_level.clone())
+}
+
 /// Run one reflection pass over a conversation. Public so the "Consolidate now"
 /// button / a test can trigger it directly.
 pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Result<(), String> {
@@ -85,16 +129,11 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     let conversation = db::get_conversation(&db, conversation_id)?
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
     let provider = cfg.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
-    let model = conversation
-        .model
-        .clone()
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| cfg.model.clone());
     // Guard on the actual model the conversation would run on (it may pin one
     // even when the global default is unset).
-    if model.trim().is_empty() {
+    let Some(model) = conversation_model(&cfg, &conversation) else {
         return Ok(());
-    }
+    };
     let Some(api_key) = crate::providers::resolve(&provider.id)? else {
         return Ok(());
     };
@@ -120,6 +159,10 @@ pub async fn reflect_conversation(app: &AppHandle, conversation_id: &str) -> Res
     }
 
     let history = db::read_messages(&db, conversation_id)?;
+    // Run at the level this conversation last ran at, not the current global
+    // one: thinking levels are per-model choices, and the chat may have been
+    // recorded under a different setting since.
+    turn_cfg.thinking_level = conversation_thinking_level(&history, &cfg);
     let before = snapshot_files(&memory);
     // Recent consolidation notes (across chats) so the model doesn't repeat work.
     let recent = db::recent_reflections(&db, 8).unwrap_or_default();
@@ -1382,6 +1425,94 @@ mod tests {
         assert_eq!(inherited.thinking_level, "", "global reasoning level must not be inherited");
         let picked = active_turn_cfg(&chat, None, Some("low"));
         assert_eq!(picked.thinking_level, "low");
+    }
+
+    /// A conversation that pins its own model must be consolidated even when the
+    /// global default model is blank: the sweep must not bail on `cfg.model`,
+    /// because the per-conversation pass resolves (and guards) its own model.
+    #[test]
+    fn a_pinned_conversation_is_due_with_a_blank_global_model() {
+        let mut cfg = AppConfig::default();
+        cfg.model = String::new();
+        cfg.memory_reflection_enabled = true;
+        assert!(sweep_enabled(&cfg), "a blank global model must not stop the sweep");
+
+        let pinned = conversation(Some("pinned-model"));
+        assert_eq!(
+            conversation_model(&cfg, &pinned).as_deref(),
+            Some("pinned-model")
+        );
+
+        // Loosening it is still possible: an unpinned chat with no global model
+        // has nothing to run, and a disabled sweep never looks at all.
+        assert_eq!(conversation_model(&cfg, &conversation(None)), None);
+        cfg.model = "global-model".into();
+        assert_eq!(
+            conversation_model(&cfg, &conversation(None)).as_deref(),
+            Some("global-model")
+        );
+        cfg.memory_reflection_enabled = false;
+        assert!(!sweep_enabled(&cfg));
+    }
+
+    /// Consolidation runs at the level the conversation's own last turn used, so
+    /// a chat recorded under "high" is not reflected at a later global default.
+    #[test]
+    fn conversation_thinking_level_prefers_the_newest_recorded_level() {
+        let mut cfg = AppConfig::default();
+        cfg.thinking_level = "low".into();
+
+        let msgs = vec![
+            message(None),
+            message(Some("high")),
+            message(None), // later rows without a level are skipped
+        ];
+        assert_eq!(conversation_thinking_level(&msgs, &cfg), "high");
+
+        // Nothing recorded (rows written before the level was stored, or a chat
+        // that never ran) → the app-wide level, exactly as before.
+        assert_eq!(
+            conversation_thinking_level(&[message(None)], &cfg),
+            "low"
+        );
+        assert_eq!(conversation_thinking_level(&[], &cfg), "low");
+
+        // A recorded *empty* level means "no reasoning for this conversation"
+        // and must win over the global one.
+        cfg.thinking_level = "high".into();
+        assert_eq!(conversation_thinking_level(&[message(Some(""))], &cfg), "");
+    }
+
+    fn conversation(model: Option<&str>) -> db::Conversation {
+        db::Conversation {
+            id: "c1".into(),
+            title: "t".into(),
+            model: model.map(str::to_string),
+            provider_id: None,
+            system_prompt: None,
+            compaction_summary: None,
+            compaction_through: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn message(thinking_level: Option<&str>) -> db::MessageRow {
+        db::MessageRow {
+            id: "m".into(),
+            conversation_id: "c1".into(),
+            role: "assistant".into(),
+            index: 0,
+            content: "hi".into(),
+            model: None,
+            provider: None,
+            thinking_level: thinking_level.map(str::to_string),
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+            attachments: None,
+            created_at: 0,
+        }
     }
 
     /// One pass is the default: it sees every summary at once, which resolves
