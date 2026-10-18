@@ -3,8 +3,9 @@
 // Talks W3C WebDriver to tauri-driver/WebKitWebDriver and drives the real
 // webview against the mock LLM. Assertions cover the P0 UX fixes:
 //   - streaming reply is not truncated (unterminated final SSE chunk)
-//   - the reasoning trace button's DOM node survives stream updates and the
-//     trace opens live and after completion
+//   - the reasoning trace button's DOM node survives stream updates, and the
+//     trace opens live and after completion (reasoning renders as inline
+//     containers, not one auto-collapsing activity row)
 //   - the message list auto-scrolls to the bottom and short chats are
 //     bottom-anchored
 //   - the context readout uses the 0.8x / 200k allowed budget
@@ -130,7 +131,8 @@ const popupText = () =>
   );
 const closePopup = () =>
   exec(
-    "const b=document.querySelector(\"button[title='Close']\"); if(b){b.click();return true;} return false;",
+    `const b=document.querySelector('[aria-label="Reasoning trace"] button[title="Close"]');
+if(b){b.click();return true;} return false;`,
   );
 
 async function main() {
@@ -198,10 +200,14 @@ async function main() {
   );
   await sleep(1000);
   const stable = await exec(
-    "const b=document.querySelector(\"button[title='Show the reasoning trace']\"); return {same: !!window.__traceBtn && window.__traceBtn === b, streaming: document.body.innerText.includes('Stop')};",
+    "const b=document.querySelector(\"button[title='Show the reasoning trace']\"); return {same: !!window.__traceBtn && window.__traceBtn === b, streaming: document.body.innerText.includes('Stop'), container: !!document.querySelector(\"button[title='Show reasoning text']\")};",
   );
   assert(stable.streaming, "still streaming while checking node identity (mid-stream)");
   assert(stable.same, "trace button DOM node survived a streamed update (<Index> fix)");
+  assert(
+    stable.container,
+    "the reasoning container is present (and toggleable) mid-stream, not hidden behind a global toggle",
+  );
 
   await click(traceXp);
   const livePopup = await waitFor("live trace popup", async () => (await popupText()) || null, 6000);
@@ -222,18 +228,40 @@ async function main() {
   assert(true, "reply complete incl. unterminated final SSE chunk (no cut-off)");
   await shot("05-reply-complete");
 
-  // --- The reasoning + tools compact into one collapsible timeline row ---
+  // --- The turn reads as ONE continuous reply: a reasoning container plus the
+  // output segment, in stream order. There is no single auto-collapsing
+  // "activity" row any more, so nothing may hide behind one global toggle. ---
   assert(
-    await exists("xpath", "//button[@title='Show activity timeline']"),
-    "activity timeline toggle is present after the turn",
+    (await bodyText()).includes(EXPECT_TEXT),
+    "the reply renders as assistant output prose",
   );
   assert(
-    !(await exists("xpath", "//button[@title='Show the reasoning trace']")),
-    "activity timeline auto-collapses after the turn",
+    await exists("xpath", "//button[@title='Show reasoning text']"),
+    "the turn's reasoning container is present after the turn",
+  );
+  assert(
+    !(await bodyText()).includes(EXPECT_THINK),
+    "the reasoning body stays collapsed by default (the output is not)",
   );
 
-  // --- Trace clickable after completion too (the timeline auto-collapses) ---
-  await click("//button[@title='Show activity timeline']");
+  // --- The container's own chevron toggles the reasoning inline, both ways ---
+  await click("//button[@title='Show reasoning text']");
+  await waitFor(
+    "inline reasoning text",
+    async () => ((await bodyText()).includes(EXPECT_THINK) ? true : null),
+    6000,
+  );
+  assert(true, "chevron expands the reasoning inline");
+  await shot("06-inline-reasoning");
+  await click("//button[@title='Hide reasoning text']");
+  await waitFor(
+    "inline reasoning hidden again",
+    async () => ((await bodyText()).includes(EXPECT_THINK) ? null : true),
+    6000,
+  );
+  assert(true, "chevron collapses the reasoning inline again");
+
+  // --- Trace popup still reachable after completion ---
   await click("//button[@title='Show the reasoning trace']");
   const finalPopup = await waitFor("final trace popup", async () => (await popupText()) || null, 6000);
   assert(finalPopup.includes(EXPECT_THINK), "final trace popup contains the reasoning trace");
@@ -256,7 +284,7 @@ async function main() {
   assert(anchor.jc === "flex-end", "empty/short chat is bottom-anchored (justify-content: flex-end)");
   await shot("07-empty-bottom-anchored");
 
-  // --- Tool calls + reasoning compress into one collapsible timeline ---
+  // --- Tool calls + reasoning interleave inline, in stream order ---
   await setInputCss("footer textarea", "tooltest");
   await click("//button[normalize-space(.)='Send']");
   await waitFor(
@@ -264,15 +292,17 @@ async function main() {
     () => find("xpath", "//button[normalize-space(.)='Approve']").catch(() => null),
     10000,
   );
-  // While live the timeline is open and shows the reasoning + the tool call.
+  // Tool calls and reasoning interleave inline, in stream order — no expand.
   assert(
-    await exists("xpath", "//button[@title='Show activity timeline']"),
-    "live tool turn renders one activity timeline",
+    await exists("xpath", "//button[@title='Show the reasoning trace']"),
+    "the tool round's reasoning container renders inline while live",
   );
+  const liveTool = await bodyText();
   assert(
-    (await bodyText()).includes("approval needed"),
-    "gated tool shows its approval state inside the timeline",
+    liveTool.includes("approval needed"),
+    "the gated call card is inline (no expand needed)",
   );
+  assert(liveTool.includes("bash"), "the inline call card names the tool");
   await shot("08-tool-approval");
 
   await click("//button[normalize-space(.)='Approve']");
@@ -282,23 +312,34 @@ async function main() {
     20000,
   );
   assert(true, "tool round completed after approval");
-  assert(
-    !(await exists("xpath", "//button[@title='Show the reasoning trace']")),
-    "tool timeline auto-collapses after the turn",
-  );
 
-  // Expanding the collapsed timeline reveals the paired call + result.
-  await click("//button[@title='Show activity timeline']");
+  // The call card and its paired result stay inline after the turn: nothing
+  // auto-collapses, and the final answer follows them as output prose.
   const toolBody = await waitFor(
-    "tool timeline contents",
+    "inline tool card + result",
     async () => {
       const text = await bodyText();
       return text.includes("timeline-ok") ? text : null;
     },
     6000,
   );
-  assert(toolBody.includes("bash"), "tool call name is shown in the timeline");
-  assert(toolBody.includes("timeline-ok"), "tool result is paired into the timeline");
+  assert(toolBody.includes("bash"), "tool call card is inline in the transcript");
+  assert(toolBody.includes("timeline-ok"), "tool result is paired with its call, inline");
+  assert(
+    toolBody.includes("TOOL DONE"),
+    "the final answer renders as assistant output after the tool card",
+  );
+  assert(
+    await exists("xpath", "//button[@title='Show the reasoning trace']"),
+    "the reasoning container persists after the turn",
+  );
+  const containers = await exec(
+    "return document.querySelectorAll(\"button[title='Show the reasoning trace']\").length;",
+  );
+  assert(
+    containers === 1,
+    `the turn's single run of reasoning is grouped into one container (got ${containers})`,
+  );
   await shot("09-tool-timeline");
 
   // --- Memory consolidation: manual trigger writes files + leaves a note ---
