@@ -1,79 +1,45 @@
-import { createMemo, createSignal, For, Index, Match, Show, Switch } from "solid-js";
+import { createEffect, createSignal, For, Index, Match, Show, Switch } from "solid-js";
 import type { Message } from "../lib/api";
 import { DocIcon } from "../lib/icons";
 import Markdown from "../lib/Markdown";
 import {
   formatBytes,
-  groupBlocks,
   parseAttachments,
   type CallEntry,
   type ProcessEntry,
-  type ThoughtBlock,
+  type TextEntry,
   type ThoughtEntry,
 } from "../lib/turns";
 
-/// One collapsible container for a run of consecutive reasoning entries.
+/// The reasoning affordance: a pill that opens the full reasoning popup.
 ///
-/// Two controls, deliberately separate:
-///   · the chevron toggles the trace inline — local state, so it can be opened
-///     and closed at any time, mid-stream included (it is never auto-collapsed
-///     or auto-expanded under the user);
-///   · the "Thinking…"/"Thought" pill keeps the existing affordance and opens
-///     the full reasoning popup.
-function ThoughtGroup(props: {
-  entries: ThoughtEntry[];
+/// It is deliberately a BUTTON and never the raw trace — the trace lives in the
+/// popup, so a turn's activity stays scannable and the container's height does
+/// not grow with the model's private reasoning.
+function ThoughtRow(props: {
+  id: string;
+  text: string;
   live: boolean;
-  openId: string | null;
-  onOpenTrace: (id: string, text: string) => void;
+  open: boolean;
+  onOpen: (id: string, text: string) => void;
 }) {
-  const [expanded, setExpanded] = createSignal(false);
-  const last = () => props.entries[props.entries.length - 1];
-  const open = () => !!last() && props.openId === last()!.id;
   return (
-    <div class="text-sm">
-      <div class="flex items-center gap-1">
-        <button
-          onClick={() => setExpanded((o) => !o)}
-          title={expanded() ? "Hide reasoning text" : "Show reasoning text"}
-          aria-expanded={expanded()}
-          class="rounded-md px-1 py-0.5 text-[11px] leading-none text-neutral-500 transition hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
-        >
-          {expanded() ? "▾" : "▸"}
-        </button>
-        <button
-          onClick={() => {
-            const entry = last();
-            if (entry) props.onOpenTrace(entry.id, entry.text);
-          }}
-          title="Show the reasoning trace"
-          class={`flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
-            open()
-              ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-100"
-              : "text-neutral-500 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
-          }`}
-        >
-          <span
-            class={`inline-block h-1.5 w-1.5 rounded-full ${
-              props.live
-                ? "animate-pulse bg-amber-500"
-                : "bg-neutral-400 dark:bg-neutral-500"
-            }`}
-          />
-          {props.live ? "Thinking…" : "Thought"}
-        </button>
-      </div>
-      <Show when={expanded()}>
-        <div class="mt-1 space-y-2 border-l-2 border-neutral-200 pl-3 dark:border-neutral-800">
-          <Index each={props.entries}>
-            {(entry) => (
-              <div class="whitespace-pre-wrap break-words text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
-                {entry().text}
-              </div>
-            )}
-          </Index>
-        </div>
-      </Show>
-    </div>
+    <button
+      onClick={() => props.onOpen(props.id, props.text)}
+      title="Show the reasoning trace"
+      class={`flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
+        props.open
+          ? "bg-neutral-200 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-100"
+          : "text-neutral-500 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
+      }`}
+    >
+      <span
+        class={`inline-block h-1.5 w-1.5 rounded-full ${
+          props.live ? "animate-pulse bg-amber-500" : "bg-neutral-400 dark:bg-neutral-500"
+        }`}
+      />
+      {props.live ? "Thinking…" : "Thought"}
+    </button>
   );
 }
 
@@ -125,11 +91,100 @@ function CallRow(props: {
   );
 }
 
-/// One turn's assistant side, in stream order: reasoning containers, output
-/// segments and tool cards interleaved exactly as they were produced, so the
-/// whole thing reads as ONE continuous reply instead of a hidden activity log
-/// plus a single answer bubble. The final text (the answer row) closes the
-/// sequence, carrying the stop-reason annotation and the streaming caret.
+/// One collapsible activity container for a turn: the Thought button(s) that
+/// open the reasoning popup, the tool cards, and any interim text the model
+/// emitted between them, all in stream order. It opens itself while the turn
+/// streams and closes when it finishes; the user can toggle it at any time,
+/// mid-stream included.
+///
+/// Interim text belongs in here — not out with the answer — because some models
+/// reuse their pre-tool narration as a draft and restate it in the final answer.
+/// Inline, that duplicated the reply; folded in here it is still visible while
+/// the turn runs (the container is open) and is gone once the turn ends. The
+/// system prompt also asks the model not to restate it, but that is a nudge, not
+/// a guarantee — this is the part that always holds.
+function ActivityGroup(props: {
+  entries: ProcessEntry[];
+  live: boolean;
+  openThoughtId: string | null;
+  onOpenThought: (id: string, text: string) => void;
+  onApprove: (callId: string) => void;
+  onDeny: (callId: string) => void;
+}) {
+  const [open, setOpen] = createSignal(props.live);
+  let prevLive = false;
+  createEffect(() => {
+    const live = props.live;
+    if (live) setOpen(true);
+    else if (prevLive) setOpen(false);
+    prevLive = live;
+  });
+
+  const summary = () => {
+    const thoughts = props.entries.filter((e) => e.kind === "thought").length;
+    const calls = props.entries.filter((e) => e.kind === "call").length;
+    const parts: string[] = [];
+    if (thoughts) parts.push("Thought");
+    if (calls) parts.push(`${calls} tool${calls === 1 ? "" : "s"}`);
+    return parts.join(" · ") || "Activity";
+  };
+
+  return (
+    <div>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        title="Show activity timeline"
+        aria-expanded={open()}
+        class={`flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
+          open()
+            ? "text-neutral-600 dark:text-neutral-300"
+            : "text-neutral-500 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:bg-neutral-800"
+        }`}
+      >
+        <span
+          class={`inline-block h-1.5 w-1.5 rounded-full ${
+            props.live ? "animate-pulse bg-amber-500" : "bg-neutral-400 dark:bg-neutral-500"
+          }`}
+        />
+        <span>{summary()}</span>
+        <span class="opacity-60">{open() ? "▾" : "▸"}</span>
+      </button>
+      <Show when={open()}>
+        <div class="mt-1 space-y-2 border-l-2 border-neutral-200 pl-3 dark:border-neutral-800">
+          <Index each={props.entries}>
+            {(entry) => (
+              <Switch>
+                <Match when={entry().kind === "thought"}>
+                  <ThoughtRow
+                    id={entry().id}
+                    text={(entry() as ThoughtEntry).text}
+                    live={props.live}
+                    open={props.openThoughtId === entry().id}
+                    onOpen={props.onOpenThought}
+                  />
+                </Match>
+                <Match when={entry().kind === "text"}>
+                  <Markdown text={(entry() as TextEntry).text} />
+                </Match>
+                <Match when={entry().kind === "call"}>
+                  <CallRow
+                    entry={entry() as CallEntry}
+                    onApprove={props.onApprove}
+                    onDeny={props.onDeny}
+                  />
+                </Match>
+              </Switch>
+            )}
+          </Index>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+/// One turn's assistant side: a single collapsible activity container (thought
+/// buttons + tool cards + interim text) followed by the final answer, which
+/// closes the sequence carrying the stop-reason annotation and streaming caret.
 export function Timeline(props: {
   entries: ProcessEntry[];
   answer: Message | null;
@@ -139,7 +194,6 @@ export function Timeline(props: {
   onApprove: (callId: string) => void;
   onDeny: (callId: string) => void;
 }) {
-  const blocks = createMemo(() => groupBlocks(props.entries));
   const answer = () => props.answer;
   const answerLive = () => props.live && !!answer()?.id.startsWith("tmp-assistant-");
   const shownAnswer = () => {
@@ -155,30 +209,16 @@ export function Timeline(props: {
   return (
     <div class="flex justify-start">
       <div class="w-full min-w-0 space-y-2 text-sm">
-        <Index each={blocks()}>
-          {(block, index) => (
-            <Switch>
-              <Match when={block().kind === "thoughts"}>
-                <ThoughtGroup
-                  entries={(block() as ThoughtBlock).entries}
-                  live={props.live && index === blocks().length - 1}
-                  openId={props.openThoughtId}
-                  onOpenTrace={props.onOpenThought}
-                />
-              </Match>
-              <Match when={block().kind === "text"}>
-                <Markdown text={(block() as { kind: "text"; entry: { text: string } }).entry.text} />
-              </Match>
-              <Match when={block().kind === "call"}>
-                <CallRow
-                  entry={(block() as { kind: "call"; entry: CallEntry }).entry}
-                  onApprove={props.onApprove}
-                  onDeny={props.onDeny}
-                />
-              </Match>
-            </Switch>
-          )}
-        </Index>
+        <Show when={props.entries.length > 0}>
+          <ActivityGroup
+            entries={props.entries}
+            live={props.live}
+            openThoughtId={props.openThoughtId}
+            onOpenThought={props.onOpenThought}
+            onApprove={props.onApprove}
+            onDeny={props.onDeny}
+          />
+        </Show>
 
         <Show when={shownAnswer()}>
           {(a) => (
