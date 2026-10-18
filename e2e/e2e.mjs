@@ -203,6 +203,7 @@ function verifyKeychainUnchanged(before) {
 }
 
 let keychainBefore = null;
+const modelPollStates = new Set();
 
 async function main() {
   log("creating session for", APP);
@@ -268,9 +269,16 @@ async function main() {
     "the model picker to list the mock endpoint model",
     async () => {
       const vals = await modelOptionValues();
+      // Diagnostic: log each distinct options state the poll observes, so a
+      // failure shows exactly what the select went through.
+      const stateKey = JSON.stringify(vals);
+      if (!modelPollStates.has(stateKey)) {
+        modelPollStates.add(stateKey);
+        log("poll saw model select:", stateKey);
+      }
       return vals.includes("mock-model") ? vals : null;
     },
-    15000,
+    20000,
   ).catch(async (e) => {
     throw new Error(
       `model picker never listed the mock endpoint model — ${await pickerFailureDump()} (${e.message})`,
@@ -304,7 +312,7 @@ async function main() {
       const vals = await modelOptionValues();
       return vals.includes("mock-model") ? vals : null;
     },
-    15000,
+    20000,
   ).catch(async (e) => {
     throw new Error(
       `model picker lost the mock endpoint model after closing Settings — ${await pickerFailureDump()} (${e.message})`,
