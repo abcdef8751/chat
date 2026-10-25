@@ -2921,6 +2921,584 @@ fn build_system_prompt_omits_empty_preferences() {
     assert!(!prompt.contains("Explicit user preferences (set directly"));
 }
 
+// ---------- structured system-prompt parts + change diffs ----------
+
+/// The historical renderer, copied verbatim into the test so the structured
+/// parts can be pinned against it: any drift in order or separators fails here.
+fn legacy_build_system_prompt(
+    base: &str,
+    model_label: &str,
+    preferences: &str,
+    block: &str,
+    conversation_started: Option<i64>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !preferences.trim().is_empty() {
+        parts.push(format!(
+            "Explicit user preferences (set directly by the user; authoritative — these take \
+             precedence over anything inferred in long-term memory):\n{}",
+            preferences.trim()
+        ));
+    }
+    parts.push(base.trim().to_string());
+    if !model_label.trim().is_empty() {
+        parts.push(format!(
+            "You are currently running as the model \"{}\".",
+            model_label.trim()
+        ));
+    }
+    parts.push(
+        "Host tools (bash, read_file, write_file) execute on the user's own device — the machine \
+         they are sending from — not on a remote server."
+            .to_string(),
+    );
+    parts.push(
+        "Text you emit before a tool call is shown to the user as part of the transcript. Treat \
+         it as a short work note, not a draft of the answer: do not restate it after the tool \
+         result. Write the user-facing answer once, after the last tool call."
+            .to_string(),
+    );
+    if let Some(ms) = conversation_started {
+        parts.push(format!(
+            "This conversation started on {} ({}) UTC.",
+            format_date(ms),
+            weekday_name(ms)
+        ));
+    }
+    let mut prompt = parts.join("\n\n");
+    if !block.trim().is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(block);
+    }
+    prompt
+}
+
+#[test]
+fn system_prompt_parts_render_identically_to_the_legacy_renderer() {
+    let memory = temp_memory("prompt-identity");
+    memory.write("profile.md", "Name is Ravi.").unwrap();
+    memory.write("preferences.md", "User prefers dark mode.").unwrap();
+    let block = memory.context_block();
+
+    let cases: [(&str, &str, &str, Option<i64>); 6] = [
+        ("BASE", "DeepSeek V4 Pro", "Talk like a pirate.", Some(1_700_000_000_000)),
+        ("BASE", "mock", "", None),
+        ("BASE", "", "   ", Some(0)),
+        // An empty base prompt is still a segment: the legacy renderer pushed it
+        // unconditionally, so the separator survives.
+        ("   ", "mock", "", None),
+        ("", "", "", None),
+        ("BASE\nsecond line", "mock", "multi\nline\nprefs", None),
+    ];
+    for (base, label, prefs, started) in cases {
+        let expected = legacy_build_system_prompt(base, label, prefs, &block, started);
+        let parts = SystemPromptParts::new(base, label, prefs, &memory, started);
+        assert_eq!(
+            parts.rendered(),
+            expected,
+            "parts drifted from the legacy renderer for {base:?}/{label:?}/{prefs:?}"
+        );
+        // `build_system_prompt` is a thin wrapper and must stay byte-identical.
+        assert_eq!(build_system_prompt(base, label, prefs, &memory, started), expected);
+    }
+
+    // ...and with no memory block at all.
+    let empty_memory = temp_memory("prompt-identity-empty");
+    let block = empty_memory.context_block();
+    let expected = legacy_build_system_prompt("BASE", "mock", "", &block, None);
+    assert_eq!(
+        SystemPromptParts::new("BASE", "mock", "", &empty_memory, None).rendered(),
+        expected
+    );
+    assert_eq!(build_system_prompt("BASE", "mock", "", &empty_memory, None), expected);
+}
+
+#[test]
+fn unified_diff_identical_input_is_empty() {
+    assert_eq!(unified_diff_lines("a\nb\nc", "a\nb\nc"), "");
+    assert_eq!(unified_diff_lines("", ""), "");
+}
+
+#[test]
+fn unified_diff_reports_added_removed_and_changed_lines() {
+    let added = unified_diff_lines("a\nb", "a\nb\nc");
+    assert!(added.contains("+c"), "{added}");
+    assert!(!added.contains("\n-a"), "{added}");
+
+    let removed = unified_diff_lines("a\nb\nc", "a\nc");
+    assert!(removed.contains("-b"), "{removed}");
+    assert!(!removed.contains("\n+b"), "{removed}");
+
+    let changed = unified_diff_lines("a\nOLD\nc", "a\nNEW\nc");
+    assert!(changed.contains("-OLD"), "{changed}");
+    assert!(changed.contains("+NEW"), "{changed}");
+
+    // A hunk header locates the change.
+    assert!(changed.starts_with("@@ "), "{changed}");
+}
+
+#[test]
+fn unified_diff_keeps_exactly_three_lines_of_context() {
+    let old: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+    let mut new = old.clone();
+    new[10] = "CHANGED".to_string();
+    let diff = unified_diff_lines(&old.join("\n"), &new.join("\n"));
+    let context_lines = diff.lines().filter(|l| l.starts_with(' ')).count();
+    assert_eq!(context_lines, 6, "3 either side of the single change:\n{diff}");
+    assert!(diff.contains("-line 10"), "{diff}");
+    assert!(diff.contains("+CHANGED"), "{diff}");
+    // Nothing outside the context window leaks in.
+    assert!(!diff.contains("line 3\n"), "{diff}");
+    assert!(!diff.contains("line 17\n"), "{diff}");
+}
+
+#[test]
+fn unified_diff_truncates_long_diffs_at_the_cap() {
+    let old: Vec<String> = (0..300).map(|i| format!("old {i}")).collect();
+    let new: Vec<String> = (0..300).map(|i| format!("new {i}")).collect();
+    let diff = unified_diff_lines(&old.join("\n"), &new.join("\n"));
+    let body = diff
+        .lines()
+        .filter(|l| l.starts_with(' ') || l.starts_with('-') || l.starts_with('+'))
+        .count();
+    assert_eq!(body, MAX_PROMPT_DIFF_LINES, "diff body must be capped");
+    assert!(
+        diff.ends_with(&format!(
+            "... ({} more lines changed)",
+            600 - MAX_PROMPT_DIFF_LINES
+        )),
+        "{diff}"
+    );
+    assert!(MAX_PROMPT_DIFF_LINES <= 200);
+}
+
+#[test]
+fn message_row_for_role() {
+    // Tiny helper exercised by the prompt-state tests below.
+    let row = test_message_row("prompt_update", "diff");
+    assert_eq!(row.role, "prompt_update");
+    assert_eq!(row.content, "diff");
+}
+
+fn test_message_row(role: &str, content: &str) -> crate::db::MessageRow {
+    crate::db::MessageRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        conversation_id: "conv".into(),
+        role: role.into(),
+        index: 0,
+        content: content.into(),
+        model: None,
+        provider: None,
+        thinking_level: None,
+        thinking: None,
+        usage: None,
+        stop_reason: None,
+        attachments: None,
+        created_at: 0,
+    }
+}
+
+/// Run one live turn against `cfg`'s endpoint, discarding events. The prompt
+/// tests drive several turns through one DB, so the per-call plumbing lives
+/// here.
+async fn run_turn_once(
+    db: &Arc<Db>,
+    cfg: &AppConfig,
+    cid: &str,
+    content: &str,
+    memory: &crate::memory::MemoryState,
+) {
+    let approvals = tools::ApprovalRegistry::default();
+    let shell = crate::shell::ShellExecutor::new();
+    let brave = tools::BraveSearch::default();
+    let sink = TestSink(Arc::new(Mutex::new(Vec::new())));
+    run_chat_turn(
+        db,
+        cfg,
+        "test-key",
+        &brave,
+        &shell,
+        memory,
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.to_string(),
+        content.to_string(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+}
+
+fn ok_turn(text: &str) -> Vec<String> {
+    vec![delta_chunk(text), finish_chunk("stop")]
+}
+
+fn prompt_update_rows(db: &Db, cid: &str) -> Vec<crate::db::MessageRow> {
+    raw_msgs(db, cid)
+        .into_iter()
+        .filter(|m| m.role == "prompt_update")
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_turn_snapshots_the_system_prompt_without_an_update_note() {
+    let (port, bodies, handle) = start_mock_capture(vec![ok_turn("Hi")], 0);
+    let db = Arc::new(open_db("prompt-first"));
+    let cid = insert_conv(&db);
+    let memory = temp_memory("prompt-first");
+    memory.write("profile.md", "Name is Ravi.").unwrap();
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        preferences: "Prefer short answers.".into(),
+        ..Default::default()
+    };
+    run_turn_once(&db, &cfg, &cid, "hi", &memory).await;
+    let _ = handle.join();
+
+    // No update on the first-ever turn: there was no previous instruction state.
+    assert!(prompt_update_rows(&db, &cid).is_empty());
+
+    let raw = crate::db::prompt_state(&db, &cid)
+        .unwrap()
+        .expect("the first turn must store a snapshot");
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let system = v["system"].as_str().expect("snapshot.system");
+    // The rendered prompt is exactly what the legacy renderer produces for these
+    // inputs (conversation created_at == 0 in the fixture, no cached model name).
+    assert_eq!(
+        system,
+        build_system_prompt(
+            DEFAULT_SYSTEM_PROMPT,
+            "mock",
+            "Prefer short answers.",
+            &memory,
+            Some(0)
+        )
+    );
+    // Snapshot shape: system + the seven parts.
+    let parts = v["parts"].as_object().expect("snapshot.parts");
+    for key in [
+        "preferences",
+        "base",
+        "model",
+        "tools",
+        "style",
+        "started",
+        "memory",
+    ] {
+        assert!(parts.contains_key(key), "missing part {key}");
+    }
+    assert!(parts["preferences"]
+        .as_str()
+        .unwrap()
+        .contains("Prefer short answers."));
+    assert!(parts["memory"].as_str().unwrap().contains("Name is Ravi."));
+    assert_eq!(parts["base"].as_str().unwrap(), DEFAULT_SYSTEM_PROMPT);
+
+    // The request's top-level system message is that same text.
+    let sent = bodies.lock().unwrap();
+    assert_eq!(request_body(&sent[0])["messages"][0]["content"], system);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_second_turn_keeps_the_prefix_and_sends_no_update() {
+    let (port, bodies, handle) = start_mock_capture(vec![ok_turn("one"), ok_turn("two")], 0);
+    let db = Arc::new(open_db("prompt-unchanged"));
+    let cid = insert_conv(&db);
+    let memory = temp_memory("prompt-unchanged");
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        preferences: "Prefer short answers.".into(),
+        ..Default::default()
+    };
+    run_turn_once(&db, &cfg, &cid, "hi", &memory).await;
+    run_turn_once(&db, &cfg, &cid, "again", &memory).await;
+    let _ = handle.join();
+
+    assert!(prompt_update_rows(&db, &cid).is_empty());
+    let sent = bodies.lock().unwrap();
+    assert_eq!(
+        request_body(&sent[1])["messages"][0]["content"],
+        request_body(&sent[0])["messages"][0]["content"],
+        "the cacheable prefix must not change between turns"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_preferences_produce_one_diff_note_and_keep_the_prefix() {
+    let (port, bodies, handle) = start_mock_capture(vec![ok_turn("one"), ok_turn("two")], 0);
+    let db = Arc::new(open_db("prompt-prefs"));
+    let cid = insert_conv(&db);
+    let memory = temp_memory("prompt-prefs");
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    run_turn_once(&db, &cfg, &cid, "hi", &memory).await;
+
+    let mut changed = cfg.clone();
+    changed.preferences = "Talk like a pirate.".into();
+    run_turn_once(&db, &changed, &cid, "again", &memory).await;
+    let _ = handle.join();
+
+    let updates = prompt_update_rows(&db, &cid);
+    assert_eq!(updates.len(), 1, "exactly one prompt_update note");
+    let note = &updates[0].content;
+    assert!(note.starts_with("Your operating instructions changed"), "{note}");
+    assert!(note.contains("+Explicit user preferences"), "{note}");
+    assert!(note.contains("+Talk like a pirate."), "{note}");
+
+    let sent = bodies.lock().unwrap();
+    // The top-level system message is still the OLD text.
+    assert_eq!(
+        request_body(&sent[1])["messages"][0]["content"],
+        request_body(&sent[0])["messages"][0]["content"],
+        "the update must not re-inject the prompt at the top"
+    );
+    // ...and the diff rides as a system message *before* the clock note.
+    let msgs = request_body(&sent[1])["messages"].as_array().unwrap().clone();
+    let update_at = msgs
+        .iter()
+        .position(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("Your operating instructions changed"))
+        })
+        .expect("update note in the request");
+    let clock_at = msgs
+        .iter()
+        .rposition(|m| m["content"].as_str().is_some_and(|c| c.starts_with("Current time: ")))
+        .expect("clock note in the request");
+    assert_eq!(msgs[update_at]["role"], "system");
+    assert!(update_at < clock_at, "update must precede the clock note");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_memory_block_shows_up_in_the_diff() {
+    let (port, _bodies, handle) = start_mock_capture(vec![ok_turn("one"), ok_turn("two")], 0);
+    let db = Arc::new(open_db("prompt-memory"));
+    let cid = insert_conv(&db);
+    let memory = temp_memory("prompt-memory");
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    run_turn_once(&db, &cfg, &cid, "hi", &memory).await;
+    // Memory is curated between turns (e.g. by an idle reflection pass).
+    memory.write("profile.md", "Name is Ravi.").unwrap();
+    run_turn_once(&db, &cfg, &cid, "again", &memory).await;
+    let _ = handle.join();
+
+    let updates = prompt_update_rows(&db, &cid);
+    assert_eq!(updates.len(), 1);
+    assert!(
+        updates[0].content.contains("+Name is Ravi."),
+        "memory change must appear as an added line: {}",
+        updates[0].content
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_model_label_shows_up_in_the_diff() {
+    let (port, _bodies, handle) = start_mock_capture(vec![ok_turn("one"), ok_turn("two")], 0);
+    let db = Arc::new(open_db("prompt-model"));
+    let cid = insert_conv(&db);
+    let memory = temp_memory("prompt-model");
+    let base = format!("http://127.0.0.1:{port}/v1");
+    let first = AppConfig {
+        base_url: base.clone(),
+        model: "mock-a".into(),
+        ..Default::default()
+    };
+    run_turn_once(&db, &first, &cid, "hi", &memory).await;
+    let second = AppConfig {
+        base_url: base,
+        model: "mock-b".into(),
+        ..Default::default()
+    };
+    run_turn_once(&db, &second, &cid, "again", &memory).await;
+    let _ = handle.join();
+
+    let updates = prompt_update_rows(&db, &cid);
+    assert_eq!(updates.len(), 1);
+    assert!(
+        updates[0]
+            .content
+            .contains("-You are currently running as the model \"mock-a\"."),
+        "{}",
+        updates[0].content
+    );
+    assert!(
+        updates[0]
+            .content
+            .contains("+You are currently running as the model \"mock-b\"."),
+        "{}",
+        updates[0].content
+    );
+}
+
+#[test]
+fn build_history_messages_surfaces_prompt_updates_as_system_messages() {
+    let db = open_db("prompt-history");
+    let cid = insert_conv(&db);
+    crate::db::insert_message_full(
+        &db,
+        cid.clone(),
+        "prompt_update".into(),
+        "INSTRUCTION DIFF".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let msgs = build_history_messages(&raw_msgs(&db, &cid)).unwrap();
+    assert_eq!(msgs.len(), 1);
+    let v = serde_json::to_value(&msgs[0]).unwrap();
+    assert_eq!(v["role"], "system");
+    assert_eq!(v["content"], "INSTRUCTION DIFF");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_system_prompt_replays_the_snapshot_without_writing_one() {
+    let (port, _bodies, handle) = start_mock_capture(vec![ok_turn("one")], 0);
+    let db = Arc::new(open_db("prompt-snapshot-replay"));
+    let cid = insert_conv(&db);
+    let memory = temp_memory("prompt-snapshot-replay");
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    // Before any turn there is no snapshot: the freshly rendered prompt is used
+    // and nothing is written.
+    let conversation = crate::db::get_conversation(&db, &cid).unwrap().unwrap();
+    let fresh = conversation_system_prompt(
+        &db,
+        &cfg,
+        &conversation,
+        &cfg.base_url,
+        &cfg.model,
+        &memory,
+    );
+    assert!(crate::db::prompt_state(&db, &cid).unwrap().is_none());
+    assert_eq!(
+        fresh,
+        build_system_prompt(DEFAULT_SYSTEM_PROMPT, "mock", "", &memory, Some(0))
+    );
+
+    run_turn_once(&db, &cfg, &cid, "hi", &memory).await;
+    let _ = handle.join();
+    let stored = crate::db::prompt_state(&db, &cid).unwrap().unwrap();
+
+    // Settings change afterwards: reflection (and any other reader) still gets the
+    // frozen prefix, so its request matches the live turn's cacheable head.
+    let mut changed = cfg.clone();
+    changed.preferences = "Talk like a pirate.".into();
+    let conversation = crate::db::get_conversation(&db, &cid).unwrap().unwrap();
+    let replay = conversation_system_prompt(
+        &db,
+        &changed,
+        &conversation,
+        &changed.base_url,
+        &changed.model,
+        &memory,
+    );
+    let snapshot: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(replay, snapshot["system"].as_str().unwrap());
+    assert!(!replay.contains("Talk like a pirate."));
+    assert_eq!(
+        crate::db::prompt_state(&db, &cid).unwrap().unwrap(),
+        stored,
+        "conversation_system_prompt must never write a snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summarize_history_excludes_clock_and_prompt_update_rows() {
+    let (port, bodies, handle) = start_mock_capture(vec![ok_turn("SUMMARY")], 0);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let fold = vec![
+        test_message_row("user", "hello there"),
+        test_message_row("clock", "CLOCK NOTE"),
+        test_message_row("prompt_update", "INSTRUCTION DIFF"),
+    ];
+    let token = CancelToken::new();
+    let (text, _usage) = summarize_history(&cfg, "test-key", None, &fold, &token)
+        .await
+        .unwrap();
+    let _ = handle.join();
+    assert_eq!(text.trim(), "SUMMARY");
+
+    let sent = bodies.lock().unwrap();
+    let dump = request_body(&sent[0]).to_string();
+    assert!(dump.contains("hello there"));
+    assert!(!dump.contains("CLOCK NOTE"), "clock notes are not folded");
+    assert!(
+        !dump.contains("INSTRUCTION DIFF"),
+        "prompt-update notes are not folded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_thinking_level_overrides_the_global_one() {
+    let (port, bodies, handle) = start_mock_capture(vec![ok_turn("one"), ok_turn("two")], 0);
+    let db = Arc::new(open_db("thinking-conv-level"));
+    let memory = temp_memory("thinking-conv-level");
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        thinking_level: "high".into(),
+        ..Default::default()
+    };
+
+    // A conversation-level "no reasoning" (empty string) must beat the global
+    // level verbatim, not be treated as unset.
+    let cid = insert_conv(&db);
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET thinking_level = ?2 WHERE id = ?1",
+            (&cid, ""),
+        )
+        .unwrap();
+    }
+    run_turn_once(&db, &cfg, &cid, "hi", &memory).await;
+
+    // ...and a conversation with no level falls back to the global one.
+    let cid_default = insert_conv(&db);
+    run_turn_once(&db, &cfg, &cid_default, "hi", &memory).await;
+    let _ = handle.join();
+
+    let rows = msgs(&db, &cid);
+    assert_eq!(rows[0].thinking_level.as_deref(), Some(""));
+    assert_eq!(rows[1].thinking_level.as_deref(), Some(""));
+
+    let sent = bodies.lock().unwrap();
+    let first = request_body(&sent[0]);
+    assert!(
+        first.get("reasoning_effort").is_none(),
+        "an empty conversation level means no reasoning: {first}"
+    );
+    let second = request_body(&sent[1]);
+    assert_eq!(second["reasoning_effort"], "high");
+    let fallback_rows = msgs(&db, &cid_default);
+    assert_eq!(fallback_rows[0].thinking_level.as_deref(), Some("high"));
+}
+
 // ---------- live provider smoke test (opt-in) ----------
 
 /// Live smoke test against a real OpenAI-compatible provider: run a tool-call

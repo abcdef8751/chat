@@ -910,13 +910,15 @@ pub(crate) fn build_history_messages(
                         .into(),
                 );
             }
-            // Consolidation notes and clock notes are bookkeeping, but both surface
-            // to the model as lightweight system messages: `memory` so it knows
-            // memory was updated (and doesn't re-save), `clock` so the current time
-            // and the device's UTC offset are in context on every turn. Live and
-            // reflection build history through here, so the shared prefix stays
-            // identical.
-            "memory" | "clock" => {
+            // Consolidation notes, clock notes and prompt-update notes are
+            // bookkeeping, but all surface to the model as lightweight system
+            // messages: `memory` so it knows memory was updated (and doesn't
+            // re-save), `clock` so the current time and the device's UTC offset
+            // are in context on every turn, and `prompt_update` so a change to
+            // the system prompt is replayed as the diff that was sent (the
+            // top-level prompt itself never changes). Live and reflection build
+            // history through here, so the shared prefix stays identical.
+            "memory" | "clock" | "prompt_update" => {
                 out.push(
                     ChatCompletionRequestSystemMessageArgs::default()
                         .content(row.content.clone())
@@ -1156,10 +1158,12 @@ async fn summarize_history(
             .into(),
     ];
     // Clock notes are per-turn bookkeeping: folding them into the summary would
-    // spend tokens to record that the model was told the time, repeatedly.
+    // spend tokens to record that the model was told the time, repeatedly. The
+    // same goes for prompt-update notes: the summary keeps the *instructions*'
+    // effect, not a transcript of which diff was delivered when.
     let fold: Vec<db::MessageRow> = fold
         .iter()
-        .filter(|m| m.role != "clock")
+        .filter(|m| m.role != "clock" && m.role != "prompt_update")
         .cloned()
         .collect();
     messages.extend(build_history_messages(&fold)?);
@@ -1383,11 +1387,454 @@ pub(crate) fn clock_note_message(text: &str) -> Result<ChatCompletionRequestMess
         .into())
 }
 
+/// The system prompt as its independently-changeable components, in render
+/// order. Splitting it this way is what makes a change to one component a
+/// *line diff* rather than a whole-prompt re-injection (see
+/// [`prepare_system_prompt`]): the prompt is the cacheable prefix, so it must
+/// stay byte-stable for the conversation's life while the model is still told
+/// about edits.
+///
+/// Rendering (`rendered`) reproduces the historical `build_system_prompt` output
+/// byte-for-byte — the regression test
+/// `system_prompt_parts_render_identically` pins that.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SystemPromptParts {
+    /// Explicit user preferences block; `""` when unset.
+    pub preferences: String,
+    /// The conversation's base prompt (or [`DEFAULT_SYSTEM_PROMPT`]).
+    pub base: String,
+    /// "You are currently running as the model …"; `""` when there is no label.
+    pub model: String,
+    /// Host-tools note (constant).
+    pub tools: String,
+    /// Work-note/duplicate-text nudge (constant).
+    pub style: String,
+    /// "This conversation started on …"; `""` when unknown.
+    pub started: String,
+    /// The bounded memory block (`MemoryState::context_block`); `""` if empty.
+    pub memory: String,
+}
+
+impl SystemPromptParts {
+    /// Build the parts from the same inputs `build_system_prompt` historically
+    /// took.
+    pub(crate) fn new(
+        base: &str,
+        model_label: &str,
+        preferences: &str,
+        memory: &crate::memory::MemoryState,
+        conversation_started: Option<i64>,
+    ) -> Self {
+        let preferences = if preferences.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Explicit user preferences (set directly by the user; authoritative — these take \
+                 precedence over anything inferred in long-term memory):\n{}",
+                preferences.trim()
+            )
+        };
+        let model = if model_label.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "You are currently running as the model \"{}\".",
+                model_label.trim()
+            )
+        };
+        let started = match conversation_started {
+            Some(ms) => format!(
+                "This conversation started on {} ({}) UTC.",
+                format_date(ms),
+                weekday_name(ms)
+            ),
+            None => String::new(),
+        };
+        Self {
+            preferences,
+            // The base part is always present, even when empty: the historical
+            // renderer pushed it unconditionally, so an empty base left the
+            // joining separators in place. Preserved for byte identity.
+            base: base.trim().to_string(),
+            model,
+            // Host tools run on the user's own device, not on a server.
+            tools: "Host tools (bash, read_file, write_file) execute on the user's own device — \
+                    the machine they are sending from — not on a remote server."
+                .to_string(),
+            // The transcript shows the text a model emits *before* a tool call,
+            // and models tend to reuse that as a draft and restate it in the
+            // answer, so the user sees the same thing twice. Naming the boundary
+            // is the documented fix (LangChain's duplicate-plan issue took the
+            // same route); it is a nudge, not a guarantee, which is why the UI
+            // also folds that text into the collapsed activity container. Kept in
+            // the shared prefix so the prompt-cache hash is unchanged between live
+            // and reflection turns.
+            style: "Text you emit before a tool call is shown to the user as part of the \
+                    transcript. Treat it as a short work note, not a draft of the answer: do not \
+                    restate it after the tool result. Write the user-facing answer once, after the \
+                    last tool call."
+                .to_string(),
+            started,
+            memory: memory.context_block(),
+        }
+    }
+
+    /// Render the prompt exactly as the app has always rendered it: the segments
+    /// in order joined by a blank line, then the memory block appended.
+    pub(crate) fn rendered(&self) -> String {
+        let mut segments: Vec<String> = Vec::new();
+        if !self.preferences.trim().is_empty() {
+            segments.push(self.preferences.clone());
+        }
+        segments.push(self.base.clone());
+        if !self.model.trim().is_empty() {
+            segments.push(self.model.clone());
+        }
+        segments.push(self.tools.clone());
+        segments.push(self.style.clone());
+        if !self.started.trim().is_empty() {
+            segments.push(self.started.clone());
+        }
+        let mut prompt = segments.join("\n\n");
+        if !self.memory.trim().is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.memory);
+        }
+        prompt
+    }
+
+    /// Serialize for `conversations.prompt_state`.
+    fn to_json(&self) -> Value {
+        json!({
+            "preferences": self.preferences,
+            "base": self.base,
+            "model": self.model,
+            "tools": self.tools,
+            "style": self.style,
+            "started": self.started,
+            "memory": self.memory,
+        })
+    }
+
+    /// Parse a stored parts object; `None` when the shape is not one of ours
+    /// (which makes the caller fall back to diffing the whole stored system
+    /// text).
+    fn from_json(v: &Value) -> Option<Self> {
+        let get = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            preferences: get("preferences")?,
+            base: get("base")?,
+            model: get("model")?,
+            tools: get("tools")?,
+            style: get("style")?,
+            started: get("started")?,
+            memory: get("memory")?,
+        })
+    }
+
+    /// Whether this state and `other` render to the same prompt (the only thing
+    /// the model can observe).
+    fn same_rendering(&self, other: &Self) -> bool {
+        self.rendered() == other.rendered()
+    }
+}
+
+/// What `conversations.prompt_state` holds: the literal top-level system message
+/// this conversation was started with (kept for its life, so the provider's
+/// prefix cache keeps matching) plus the newest instruction state the model has
+/// been told about.
+#[derive(Clone, Debug)]
+struct PromptSnapshot {
+    /// The exact text sent as the top-level system message. Never changes once
+    /// written.
+    system: String,
+    /// The newest component state (the prefix plus all diff notes so far).
+    parts: Option<SystemPromptParts>,
+}
+
+impl PromptSnapshot {
+    fn to_json(&self) -> String {
+        let mut v = json!({ "system": self.system });
+        if let Some(parts) = &self.parts {
+            v["parts"] = parts.to_json();
+        }
+        v.to_string()
+    }
+
+    /// Parse a stored snapshot. An unparseable blob or a missing/non-string
+    /// `system` yields `None` (the caller then behaves as if there were no
+    /// snapshot at all and starts a fresh prefix).
+    fn from_json(raw: &str) -> Option<Self> {
+        let v: Value = serde_json::from_str(raw).ok()?;
+        let system = v.get("system").and_then(Value::as_str)?.to_string();
+        let parts = v.get("parts").and_then(SystemPromptParts::from_json);
+        Some(Self { system, parts })
+    }
+}
+
+/// The result of preparing a turn's system prompt: the (stable) top-level system
+/// message and, when the instructions changed, the diff note to append.
+pub(crate) struct PreparedPrompt {
+    pub system: String,
+    pub update: Option<String>,
+}
+
+/// Maximum number of changed/context lines a prompt-update diff may carry. The
+/// tail is elided with a count, because this note rides every request from the
+/// turn it was written on.
+const MAX_PROMPT_DIFF_LINES: usize = 200;
+/// Context lines kept either side of a change in the prompt-update diff.
+const PROMPT_DIFF_CONTEXT: usize = 3;
+
+/// The lead-in sentence of a prompt-update note, followed by the unified diff.
+const PROMPT_UPDATE_PREAMBLE: &str = "Your operating instructions changed since they were last \
+     given. Apply only these changes; everything else from the original instructions still holds.";
+
+/// Line-level unified diff (3 lines of context, `@@` hunk headers), used to tell
+/// the model how its instructions changed without re-sending the prompt.
+///
+/// Bounded: at most [`MAX_PROMPT_DIFF_LINES`] context/changed lines are emitted,
+/// followed by `... (<n> more lines changed)` when the diff was longer. Pure and
+/// allocation-only, so it is unit-tested directly.
+fn unified_diff_lines(old: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    if old_lines == new_lines {
+        return String::new();
+    }
+    // A pathological pair of very long documents: skip the quadratic LCS and
+    // describe the whole thing as replaced. The output is truncated anyway.
+    if old_lines.len().saturating_mul(new_lines.len()) > 4_000_000 {
+        return format!(
+            "@@ -1,{} +1,{} @@\n{}\n{}",
+            old_lines.len(),
+            new_lines.len(),
+            old_lines
+                .iter()
+                .map(|l| format!("-{l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            new_lines
+                .iter()
+                .map(|l| format!("+{l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    // Classic LCS table over lines (no new crates). Small inputs, so the O(n·m)
+    // memory is fine.
+    let (n, m) = (old_lines.len(), new_lines.len());
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if old_lines[i] == new_lines[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    // Flatten to ops. `old_before`/`new_before` remember the 1-based line number
+    // of the next old/new line at each position, for the hunk headers.
+    let mut ops: Vec<(char, &str)> = Vec::new();
+    let mut old_before: Vec<usize> = Vec::new();
+    let mut new_before: Vec<usize> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        old_before.push(i + 1);
+        new_before.push(j + 1);
+        if old_lines[i] == new_lines[j] {
+            ops.push((' ', old_lines[i]));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            ops.push(('-', old_lines[i]));
+            i += 1;
+        } else {
+            ops.push(('+', new_lines[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        old_before.push(i + 1);
+        new_before.push(j + 1);
+        ops.push(('-', old_lines[i]));
+        i += 1;
+    }
+    while j < m {
+        old_before.push(i + 1);
+        new_before.push(j + 1);
+        ops.push(('+', new_lines[j]));
+        j += 1;
+    }
+    old_before.push(n + 1);
+    new_before.push(m + 1);
+
+    // Group changes into hunks: two changes at most 2·context apart share one.
+    let changes: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, (kind, _))| *kind != ' ')
+        .map(|(idx, _)| idx)
+        .collect();
+    if changes.is_empty() {
+        return String::new();
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for idx in changes {
+        let start = idx.saturating_sub(PROMPT_DIFF_CONTEXT);
+        let end = (idx + PROMPT_DIFF_CONTEXT + 1).min(ops.len());
+        match ranges.last_mut() {
+            Some(last) if start <= last.1 => last.1 = end,
+            _ => ranges.push((start, end)),
+        }
+    }
+
+    let body_total: usize = ranges.iter().map(|(s, e)| e - s).sum();
+    let mut out: Vec<String> = Vec::new();
+    let mut emitted = 0usize;
+    'hunks: for (start, end) in ranges {
+        if emitted >= MAX_PROMPT_DIFF_LINES {
+            break;
+        }
+        let old_count = ops[start..end].iter().filter(|(k, _)| *k != '+').count();
+        let new_count = ops[start..end].iter().filter(|(k, _)| *k != '-').count();
+        out.push(format!(
+            "@@ -{},{} +{},{} @@",
+            old_before[start], old_count, new_before[start], new_count
+        ));
+        for (kind, line) in &ops[start..end] {
+            if emitted >= MAX_PROMPT_DIFF_LINES {
+                break 'hunks;
+            }
+            out.push(format!("{kind}{line}"));
+            emitted += 1;
+        }
+    }
+    if body_total > MAX_PROMPT_DIFF_LINES {
+        out.push(format!(
+            "... ({} more lines changed)",
+            body_total - MAX_PROMPT_DIFF_LINES
+        ));
+    }
+    out.join("\n")
+}
+
+/// The complete text of a `prompt_update` note: the preamble plus the diff.
+fn prompt_update_text(old: &str, new: &str) -> Option<String> {
+    let diff = unified_diff_lines(old, new);
+    if diff.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{PROMPT_UPDATE_PREAMBLE}\n{diff}"))
+}
+
+/// Prepare this turn's system prompt and advance the conversation's prompt
+/// snapshot.
+///
+/// The conversation's top-level system message is **frozen** the first time a
+/// turn runs: it is the cacheable prefix, so re-rendering it in place would
+/// break the provider's prefix cache on every settings change. Instead the
+/// newest instruction state is tracked separately:
+///
+/// - no snapshot yet → send the freshly rendered prompt and store it;
+/// - snapshot matches the current components → send the stored prefix, no note;
+/// - snapshot differs → send the stored prefix plus a line-diff note.
+///
+/// The snapshot (and its parts) is written *before* the request, which is a
+/// deliberate best-effort trade: if the request then fails at the transport
+/// level (never reaching the model), that update is not re-sent on the next
+/// turn. A provider error that did reach the model, or an abort, still had the
+/// note in its context, so the parts are correct in the common cases. Re-sending
+/// would need an ack channel the loop does not have; a duplicate diff is more
+/// damaging to the transcript than dropping one.
+pub(crate) fn prepare_system_prompt(
+    db: &db::Db,
+    cfg: &AppConfig,
+    conversation: &db::Conversation,
+    base_url: &str,
+    model: &str,
+    memory: &crate::memory::MemoryState,
+) -> PreparedPrompt {
+    let parts_now = conversation_prompt_parts(db, cfg, conversation, base_url, model, memory);
+    let rendered_now = parts_now.rendered();
+    let stored = db::prompt_state(db, &conversation.id)
+        .ok()
+        .flatten()
+        .and_then(|raw| PromptSnapshot::from_json(&raw));
+
+    let (system, update, save) = match stored {
+        None => (rendered_now, None, true),
+        Some(snap) => match &snap.parts {
+            Some(stored_parts) => {
+                if stored_parts.same_rendering(&parts_now) {
+                    // Nothing to tell the model; the prefix still stands.
+                    (snap.system, None, false)
+                } else {
+                    let update = prompt_update_text(&stored_parts.rendered(), &rendered_now);
+                    (snap.system, update, true)
+                }
+            }
+            // Parts unavailable (older/hand-edited snapshot): diff the whole
+            // stored system text against what it would render to now.
+            None => {
+                let update = if snap.system != rendered_now {
+                    prompt_update_text(&snap.system, &rendered_now)
+                } else {
+                    None
+                };
+                (snap.system, update, true)
+            }
+        },
+    };
+
+    if save {
+        let snapshot = PromptSnapshot {
+            system: system.clone(),
+            parts: Some(parts_now),
+        };
+        if let Err(e) = db::set_prompt_state(db, &conversation.id, &snapshot.to_json()) {
+            // Best-effort bookkeeping: the turn still runs with the right prompt.
+            eprintln!("prompt snapshot: {e}");
+        }
+    }
+
+    PreparedPrompt { system, update }
+}
+
+/// The current component state for a conversation's system prompt.
+fn conversation_prompt_parts(
+    db: &db::Db,
+    cfg: &AppConfig,
+    conversation: &db::Conversation,
+    base_url: &str,
+    model: &str,
+    memory: &crate::memory::MemoryState,
+) -> SystemPromptParts {
+    let base_prompt = conversation
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let model_label = crate::pricing::cached_model_name(db, base_url, model)
+        .unwrap_or_else(|| model.to_string());
+    SystemPromptParts::new(
+        &base_prompt,
+        &model_label,
+        &cfg.preferences,
+        memory,
+        Some(conversation.created_at),
+    )
+}
+
 /// Base system prompt, with explicit user preferences injected at the top and
 /// the active model named, then the bounded memory block appended. The
 /// preferences field is user-authored in Settings, so it is labelled as
 /// authoritative — distinct from anything inferred into memory. Memory bodies
 /// for non-core files stay out of context until `read_memory` is called.
+///
+/// Thin wrapper over [`SystemPromptParts`], kept for existing callers and tests.
 pub(crate) fn build_system_prompt(
     base: &str,
     model_label: &str,
@@ -1395,60 +1842,25 @@ pub(crate) fn build_system_prompt(
     memory: &crate::memory::MemoryState,
     conversation_started: Option<i64>,
 ) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if !preferences.trim().is_empty() {
-        parts.push(format!(
-            "Explicit user preferences (set directly by the user; authoritative — these take \
-             precedence over anything inferred in long-term memory):\n{}",
-            preferences.trim()
-        ));
-    }
-    parts.push(base.trim().to_string());
-    if !model_label.trim().is_empty() {
-        parts.push(format!(
-            "You are currently running as the model \"{}\".",
-            model_label.trim()
-        ));
-    }
-    // Host tools run on the user's own device, not on a server.
-    parts.push(
-        "Host tools (bash, read_file, write_file) execute on the user's own device — the machine \
-         they are sending from — not on a remote server."
-            .to_string(),
-    );
-    // The transcript shows the text a model emits *before* a tool call, and models
-    // tend to reuse that as a draft and restate it in the answer, so the user sees
-    // the same thing twice. Naming the boundary is the documented fix (LangChain's
-    // duplicate-plan issue took the same route); it is a nudge, not a guarantee,
-    // which is why the UI also folds that text into the collapsed activity
-    // container. Kept in the shared prefix so the prompt-cache hash is unchanged
-    // between live and reflection turns.
-    parts.push(
-        "Text you emit before a tool call is shown to the user as part of the transcript. Treat \
-         it as a short work note, not a draft of the answer: do not restate it after the tool \
-         result. Write the user-facing answer once, after the last tool call."
-            .to_string(),
-    );
-    if let Some(ms) = conversation_started {
-        parts.push(format!(
-            "This conversation started on {} ({}) UTC.",
-            format_date(ms),
-            weekday_name(ms)
-        ));
-    }
-    let mut prompt = parts.join("\n\n");
-    let block = memory.context_block();
-    if !block.trim().is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&block);
-    }
-    prompt
+    SystemPromptParts::new(
+        base,
+        model_label,
+        preferences,
+        memory,
+        conversation_started,
+    )
+    .rendered()
 }
 
 /// The system prompt shared by a live turn and a reflection pass: the
 /// conversation's own base prompt (falling back to the default), the resolved
 /// model label, the explicit preferences, the memory block and the conversation
 /// start date. One function, so the two paths cannot drift apart.
+///
+/// When a snapshot exists, the **stored** system text is returned — that is the
+/// frozen, cacheable prefix — so reflection sends exactly what the live turn
+/// sends instead of a re-rendered prompt. Never writes a snapshot; only
+/// [`prepare_system_prompt`] does that, inside a live/cron turn.
 pub(crate) fn conversation_system_prompt(
     db: &db::Db,
     cfg: &AppConfig,
@@ -1457,19 +1869,19 @@ pub(crate) fn conversation_system_prompt(
     model: &str,
     memory: &crate::memory::MemoryState,
 ) -> String {
-    let base_prompt = conversation
-        .system_prompt
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    let model_label = crate::pricing::cached_model_name(db, base_url, model)
-        .unwrap_or_else(|| model.to_string());
-    build_system_prompt(
-        &base_prompt,
-        &model_label,
-        &cfg.preferences,
-        memory,
-        Some(conversation.created_at),
-    )
+    if let Some(snap) = db::prompt_state(db, &conversation.id)
+        .ok()
+        .flatten()
+        .and_then(|raw| PromptSnapshot::from_json(&raw))
+    {
+        return snap.system;
+    }
+    conversation_prompt_parts(db, cfg, conversation, base_url, model, memory).rendered()
+}
+
+/// Wrap a prompt-update diff in a system message (same shape as a clock note).
+fn prompt_update_message(text: &str) -> Result<ChatCompletionRequestMessage, String> {
+    clock_note_message(text)
 }
 
 /// The tool list every turn advertises. Live, reflection and extraction share it
@@ -2274,6 +2686,43 @@ pub(crate) async fn run_turn_core(
     let mut turn_cfg = cfg.clone();
     turn_cfg.base_url = provider.base_url.clone();
     turn_cfg.model = model.clone();
+    // Per-conversation reasoning effort wins over the device default, verbatim:
+    // an empty string is a real value ("no reasoning"), not "unset". Live turns
+    // must honour the synced column the same way reflection and cron already do.
+    if let Some(level) = conversation.thinking_level.as_ref() {
+        turn_cfg.thinking_level = level.clone();
+    }
+
+    // The top-level system message is frozen at its first value (the cacheable
+    // prefix); a change to any of its components is delivered as a line-diff note
+    // instead. This must run before the rows below, because it decides whether a
+    // `prompt_update` row is written for this turn.
+    let prepared = prepare_system_prompt(
+        db,
+        &turn_cfg,
+        &conversation,
+        &turn_cfg.base_url,
+        &turn_cfg.model,
+        memory,
+    );
+    // Stored before the clock and user rows so the transcript replays in the same
+    // order the request used: prompt-update note, clock note, user turn. Written
+    // even on the `regenerate` path (it goes through here too).
+    if let Some(update) = prepared.update.as_deref() {
+        db::insert_message_full(
+            db,
+            conversation_id.clone(),
+            "prompt_update".into(),
+            update.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+    }
 
     // Clock note (persisted, hidden from the timeline): written *before* the user
     // turn so it replays verbatim on every later turn and each request stays an
@@ -2343,19 +2792,17 @@ pub(crate) async fn run_turn_core(
         user_message_id = Some(row.id);
     }
 
-    let system_prompt = conversation_system_prompt(
-        db,
-        cfg,
-        &conversation,
-        &turn_cfg.base_url,
-        &turn_cfg.model,
-        memory,
-    );
+    let system_prompt = prepared.system.clone();
 
     // The note row was written above, before the user turn; the request still
-    // appends it explicitly because `history` was read before it existed. It must
-    // survive the compaction rebuild below.
+    // appends it explicitly because `history` was read before it existed. The
+    // same goes for the prompt-update note, which is appended *before* the clock
+    // note so the live request and the stored rows replay in the same order.
     let time_note = clock_note_message(&note_text)?;
+    let update_note = match prepared.update.as_deref() {
+        Some(update) => Some(prompt_update_message(update)?),
+        None => None,
+    };
 
     // Context layout: system prompt → compaction summary (when one exists) →
     // verbatim history → [time note] → the new turn. If the request would cross
@@ -2371,6 +2818,9 @@ pub(crate) async fn run_turn_core(
     };
     let mut messages = {
         let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
+        if let Some(update) = &update_note {
+            msgs.push(update.clone());
+        }
         msgs.push(time_note.clone());
         msgs.push(user_request_message(&content, &attachments)?);
         msgs
@@ -2415,6 +2865,9 @@ pub(crate) async fn run_turn_core(
             keep_start = new_start;
             messages = {
                 let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
+                if let Some(update) = &update_note {
+                    msgs.push(update.clone());
+                }
                 msgs.push(time_note.clone());
                 msgs.push(user_request_message(&content, &attachments)?);
                 msgs
