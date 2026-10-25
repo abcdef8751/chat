@@ -198,6 +198,7 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
             // Kotlin already produced the base64; no need to decode/re-encode.
             data_url: Some(format!("data:{};base64,{}", mime, out.data)),
             text: None,
+            remote_path: None,
         });
     }
 
@@ -212,6 +213,7 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
                     kind: "file".into(),
                     data_url: None,
                     text: Some(text),
+                    remote_path: None,
                 });
             }
         }
@@ -225,6 +227,7 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
         kind: "file".into(),
         data_url: None,
         text: None,
+        remote_path: None,
     })
 }
 

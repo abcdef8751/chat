@@ -1021,6 +1021,7 @@
                 kind: "file".into(),
                 data_url: None,
                 text: Some("hello".into()),
+                remote_path: None,
             },
             Attachment {
                 id: "a2".into(),
@@ -1030,6 +1031,7 @@
                 kind: "image".into(),
                 data_url: Some("data:image/png;base64,AAECAw==".into()),
                 text: None,
+                remote_path: None,
             },
         ];
 
@@ -3450,6 +3452,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             kind: "file".into(),
             data_url: None,
             text: Some("new context".into()),
+            remote_path: None,
         };
         crate::db::apply_user_message_edit(&db, &cid, &ids[0], "edited", Some(vec![att])).unwrap();
 
@@ -4048,6 +4051,56 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
     }
 
     #[test]
+    fn user_request_message_never_silently_drops_an_attachment() {
+        use crate::attachments::Attachment;
+        // Nothing inline + an offloaded copy: name, size and the remote path.
+        let offloaded = Attachment {
+            id: "a".into(),
+            name: "report.pdf".into(),
+            mime: "application/pdf".into(),
+            size: 42_000,
+            kind: "file".into(),
+            remote_path: Some("user-1/uuid-report.pdf".into()),
+            ..Default::default()
+        };
+        // Nothing inline and no upload (sync off/signed out).
+        let stranded = Attachment {
+            id: "b".into(),
+            name: "big.txt".into(),
+            mime: "text/plain".into(),
+            size: 2_000_000,
+            kind: "file".into(),
+            ..Default::default()
+        };
+        let msg = user_request_message("look", &[offloaded, stranded]).unwrap();
+        // Serialize instead of matching the message enum: the rendered text is
+        // what the provider sees.
+        let text = serde_json::to_string(&msg).unwrap();
+        // Both attachments are named, sized and addressed — none is omitted.
+        assert!(text.contains("report.pdf (42000 bytes, application/pdf)"), "{text}");
+        assert!(text.contains("remote path is: user-1/uuid-report.pdf"), "{text}");
+        assert!(text.contains("fetch_file"), "{text}");
+        assert!(text.contains("big.txt (2000000 bytes, text/plain)"), "{text}");
+        assert!(text.contains("could not be uploaded"), "{text}");
+        assert!(text.contains("Tell the user"), "{text}");
+        // An attachment with contents inline gets no offload note.
+        let inline = Attachment {
+            id: "c".into(),
+            name: "notes.txt".into(),
+            mime: "text/plain".into(),
+            size: 5,
+            kind: "file".into(),
+            text: Some("hello".into()),
+            ..Default::default()
+        };
+        let msg = user_request_message("hi", &[inline]).unwrap();
+        let text = serde_json::to_string(&msg).unwrap();
+        assert!(text.contains("--- File: notes.txt ---"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(!text.contains("could not be uploaded"), "{text}");
+    }
+
+    #[test]
     fn clock_note_carries_utc_and_local_time() {
         let ms = 1_789_603_200_000; // 2026-09-17 00:00 UTC, a Thursday
         let content = clock_note_text(ms);
@@ -4137,6 +4190,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
                     kind: "image".into(),
                     data_url: Some(format!("data:image/png;base64,{large_b64}")),
                     text: None,
+                    remote_path: None,
                 };
                 let att_json = serde_json::to_string(&vec![att]).unwrap();
                 crate::db::insert_message_full(&db, cid.clone(), role.into(), content, None, None, None, None, None, None, Some(att_json)).unwrap();

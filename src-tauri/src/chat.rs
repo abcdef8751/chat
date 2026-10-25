@@ -732,6 +732,33 @@ pub(crate) fn user_request_message(
                 images.push(url.clone());
             }
         }
+        // An attachment with nothing inline (oversized text, an oversized image,
+        // a PDF/zip/binary) is never silently dropped: name it, size it, and say
+        // where it went. `fetch_file` is the way to read it; when the offload
+        // could not happen (sync off/signed out/failed) the model is told so it
+        // can say the file exists but is unreadable rather than inventing
+        // contents or ignoring that it was sent.
+        if a.text.is_none() && a.data_url.is_none() {
+            if !combined.trim().is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&format!(
+                "--- File: {} ({} bytes, {}) ---\n",
+                a.name, a.size, a.mime
+            ));
+            match &a.remote_path {
+                Some(key) => combined.push_str(&format!(
+                    "This file is too large or not text, so it was not included inline. \
+                     Its remote path is: {key}\nUse fetch_file with that remote path to \
+                     download it, then read_file to inspect the local copy."
+                )),
+                None => combined.push_str(
+                    "This file could not be uploaded (cloud sync is off or not signed in), \
+                     so its contents are not available to you. Tell the user the file was \
+                     attached but you cannot read it in this conversation.",
+                ),
+            }
+        }
     }
 
     if images.is_empty() {
@@ -787,6 +814,7 @@ fn image_request_message(
         kind: "image".into(),
         data_url: Some(data_url),
         text: None,
+        remote_path: None,
     };
     user_request_message("", &[attachment])
 }
@@ -1544,6 +1572,9 @@ fn grants_autoapprove(name: &str, arguments: &Value, db: Option<&db::Db>) -> boo
 /// text result plus the image (returned for injection); text-only models get a
 /// result telling them they cannot view it, so they can relay that to the user.
 fn read_file_image(path: &str, cfg: &AppConfig, db: Option<&db::Db>) -> DispatchedTool {
+    // Terminal semantics for a leading `~`, matching `execute_host_tool` and the
+    // shell executor: the image is read from the real path, not a literal "~".
+    let path = &crate::shell::expand_tilde(path);
     // Oversized images are never read (no data URL, no injection): base64
     // inflation plus re-sending on every remaining round of the turn makes a
     // huge image expensive, and most providers cap the request body anyway.
@@ -1652,6 +1683,28 @@ async fn dispatch_tool(
         return match tools::execute_fetch_image(call).await {
             Ok(attachment) => fetched_image_result(attachment, cfg, db),
             Err(e) => DispatchedTool::plain(ToolOutput::err(e)),
+        };
+    }
+    if call.name == "fetch_file" {
+        // An offloaded attachment: pull it into the local downloads folder and
+        // hand back the path (the model then uses `read_file`). Read-only and
+        // ungated like `web_fetch`; reflection/extraction refuse it by mode.
+        return match call.arguments.get("remote_path").and_then(Value::as_str) {
+            Some(key) => match crate::storage::fetch_file(key).await {
+                Ok(path) => DispatchedTool::plain(ToolOutput::ok(format!(
+                    "fetch_file: downloaded \"{}\" to {} ({} bytes). Use read_file to \
+                     inspect it.",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "file".into()),
+                    path.display(),
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+                ))),
+                Err(e) => DispatchedTool::plain(ToolOutput::err(e)),
+            },
+            None => DispatchedTool::plain(ToolOutput::err(
+                "fetch_file: missing 'remote_path' argument".into(),
+            )),
         };
     }
     let output = if call.name.starts_with("brave_") {

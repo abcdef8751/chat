@@ -14,6 +14,7 @@ mod providers;
 mod reflection;
 mod secrets;
 mod shell;
+mod storage;
 mod sync;
 mod tools;
 
@@ -55,6 +56,9 @@ pub fn run() {
             // no Android backend); seed the store with the app data dir. No-op
             // on every other platform, where the OS keychain is used instead.
             crate::secrets::init_android(dir.clone());
+            // The `fetch_file` tool runs inside the tool loop (no AppHandle), so
+            // publish the app data dir once here for its downloads folder.
+            crate::storage::init_app_data_dir(dir.clone());
             let conn = db::open(&dir.join("chat.sqlite"))
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) })?;
             let conn = std::sync::Arc::new(std::sync::Mutex::new(conn));

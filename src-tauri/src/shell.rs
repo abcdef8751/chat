@@ -20,6 +20,59 @@ use crate::tools::truncate;
 /// Default per-call timeout (matches the old persistent session's).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The user's home directory, honouring the platform's own variable: `HOME`
+/// everywhere, with `USERPROFILE` as the Windows fallback. An empty value is
+/// treated as unset (a blank `HOME` must not expand `~/x` to `/x`).
+fn home_dir() -> Option<String> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Expand a **leading** `~` to the user's home directory, with terminal
+/// semantics.
+///
+/// Exactly `~`, or a path starting with `~/` or `~\`, expands; `~user/x` is
+/// deliberately left **untouched** — resolving another user's home needs the
+/// passwd database (and has no meaning on Android), so this helper never
+/// guesses. Anything without a leading `~` is returned unchanged, as is `~`
+/// itself when no home directory can be resolved.
+///
+/// This is for **path arguments** only. Command strings handed to `bash` are
+/// never expanded here: bash expands a `~` itself, and doing it twice (or in
+/// the middle of a quoted command) would corrupt the command.
+pub fn expand_tilde(path: &str) -> String {
+    expand_tilde_with(path, home_dir().as_deref())
+}
+
+/// [`expand_tilde`] with an explicit home, so the behaviour is testable without
+/// mutating the process environment (which would race other tests).
+fn expand_tilde_with(path: &str, home: Option<&str>) -> String {
+    // Only a *leading* `~` is a home reference, and only when it is the whole
+    // path or is immediately followed by a separator.
+    let rest = if path == "~" {
+        ""
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        rest
+    } else if let Some(rest) = path.strip_prefix("~\\") {
+        rest
+    } else {
+        return path.to_string();
+    };
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return path.to_string();
+    };
+    if rest.is_empty() {
+        home.to_string()
+    } else {
+        PathBuf::from(home)
+            .join(rest)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 /// One-shot host-shell executor, platform-agnostic.
 ///
 /// A single managed state so `tools.rs` / `chat.rs` / `reflection.rs` share one
@@ -95,7 +148,12 @@ impl ShellExecutor {
 
     /// Read a file as text. Desktop reads the host filesystem directly;
     /// Android routes through Termux so the same namespace as `bash` is used.
+    /// A leading `~` is expanded here as well as in `tools.rs`, so every caller
+    /// (including the Android `shq`-quoted branch, where single quotes would
+    /// otherwise suppress the shell's own expansion) agrees on the real path.
     pub async fn read_file(&self, path: &str) -> ToolOutput {
+        let path = expand_tilde(path);
+        let path = path.as_str();
         #[cfg(not(target_os = "android"))]
         {
             match tokio::fs::read_to_string(path).await {
@@ -110,8 +168,11 @@ impl ShellExecutor {
     }
 
     /// Write text to a file. Desktop writes the host filesystem directly;
-    /// Android routes through Termux.
+    /// Android routes through Termux. A leading `~` is expanded first, for the
+    /// same reason as [`ShellExecutor::read_file`].
     pub async fn write_file(&self, path: &str, content: &str) -> ToolOutput {
+        let path = expand_tilde(path);
+        let path = path.as_str();
         #[cfg(not(target_os = "android"))]
         {
             match tokio::fs::write(path, content).await {
@@ -250,5 +311,79 @@ mod tests {
         let out = ex.run("pwd").await;
         assert_eq!(out.content.trim(), dir.to_str().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- tilde expansion ---------------------------------------------------
+
+    #[test]
+    fn expand_tilde_handles_home_prefixes() {
+        // `~/x` and a bare `~` resolve against the given home.
+        assert_eq!(expand_tilde_with("~/notes.txt", Some("/home/rp")), "/home/rp/notes.txt");
+        assert_eq!(expand_tilde_with("~", Some("/home/rp")), "/home/rp");
+        // Nested and trailing-slash forms.
+        assert_eq!(expand_tilde_with("~/a/b/c", Some("/home/rp")), "/home/rp/a/b/c");
+        assert_eq!(expand_tilde_with("~/a/", Some("/home/rp")), "/home/rp/a/");
+        // Windows separator form is accepted too.
+        assert_eq!(expand_tilde_with("~\\notes.txt", Some("/home/rp")), "/home/rp/notes.txt");
+    }
+
+    #[test]
+    fn expand_tilde_leaves_absolute_relative_and_user_paths_alone() {
+        for path in [
+            "/absolute/path",
+            "relative/path",
+            "./here",
+            "../up",
+            "",
+            // `~user` needs the passwd database: deliberately not expanded.
+            "~user/x",
+            "~user",
+            // A `~` that is not the first character is literal.
+            "/tmp/~",
+            "/tmp/~/x",
+            "a~b",
+        ] {
+            assert_eq!(expand_tilde_with(path, Some("/home/rp")), path, "{path}");
+        }
+    }
+
+    #[test]
+    fn expand_tilde_without_home_returns_the_input() {
+        // Missing HOME (and USERPROFILE) must not turn `~/x` into `/x`.
+        assert_eq!(expand_tilde_with("~/x", None), "~/x");
+        assert_eq!(expand_tilde_with("~", None), "~");
+        // An empty home is treated as unset rather than as the filesystem root.
+        assert_eq!(expand_tilde_with("~/x", Some("")), "~/x");
+        assert_eq!(expand_tilde_with("~", Some("")), "~");
+    }
+
+    #[test]
+    fn expand_tilde_uses_the_process_home() {
+        // The public helper reads HOME (USERPROFILE as the Windows fallback).
+        let Some(home) = home_dir() else {
+            // No home in this environment: `~` must survive untouched.
+            assert_eq!(expand_tilde("~/x"), "~/x");
+            return;
+        };
+        assert_eq!(expand_tilde("~/x"), format!("{home}/x"));
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("/abs"), "/abs");
+    }
+
+    #[tokio::test]
+    async fn read_file_expands_tilde() {
+        // End-to-end through the desktop executor: a `~/…` path must resolve to
+        // the real file (a literal "~" directory would fail to read).
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let name = format!(".pi-tilde-test-{}", std::process::id());
+        let full = PathBuf::from(&home).join(&name);
+        std::fs::write(&full, "tilde works").unwrap();
+        let ex = ShellExecutor::new();
+        let out = ex.read_file(&format!("~/{name}")).await;
+        let _ = std::fs::remove_file(&full);
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "tilde works");
     }
 }

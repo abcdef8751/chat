@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use uuid::Uuid;
 
 /// Text files larger than this are attached by name only (keeps messages sane).
@@ -38,6 +39,20 @@ pub struct Attachment {
     /// Decoded contents for text-like files.
     #[serde(default)]
     pub text: Option<String>,
+    /// Supabase Storage object key when the file was offloaded (it had nothing
+    /// inline to send: oversized text, an oversized image, or a binary). The
+    /// model is told this key so it can call `fetch_file`; `None` means the
+    /// file was not uploaded (sync off/signed out, or the upload failed).
+    #[serde(default)]
+    pub remote_path: Option<String>,
+}
+
+/// Whether this attachment has **nothing inline** to hand the model — the
+/// offload trigger. Text files carry `text`, images carry a `data_url`; anything
+/// with neither is invisible to the model unless it is uploaded and named in the
+/// prompt (see `chat::user_request_message` + the `fetch_file` tool).
+pub(crate) fn needs_offload(a: &Attachment) -> bool {
+    a.text.is_none() && a.data_url.is_none()
 }
 
 pub(crate) fn mime_for(ext: &str) -> &'static str {
@@ -256,6 +271,7 @@ pub fn image_attachment(name: String, mime: &str, bytes: &[u8]) -> Attachment {
         kind: "image".into(),
         data_url: Some(format!("data:{};base64,{}", mime, base64_encode(bytes))),
         text: None,
+        remote_path: None,
     }
 }
 
@@ -292,6 +308,7 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
             kind: "image".into(),
             data_url: Some(data_url),
             text: None,
+            remote_path: None,
         });
     }
     // An oversized raster image deliberately falls through: producing a data URL
@@ -313,6 +330,7 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
                 kind: "file".into(),
                 data_url: None,
                 text: Some(text),
+                remote_path: None,
             });
         }
     }
@@ -325,22 +343,70 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
         kind: "file".into(),
         data_url: None,
         text: None,
+        remote_path: None,
     })
 }
 
 /// Read a batch of absolute paths (from the file picker or a drop) into
 /// attachments. Paths that fail to read are skipped rather than failing the
 /// whole batch. Runs on the blocking pool so large reads don't stall the UI.
+///
+/// An attachment with **nothing inline** (oversized text, an oversized image, a
+/// PDF/zip/other binary) is offloaded to Supabase Storage when cloud sync is
+/// signed in, and its object key is recorded in [`Attachment::remote_path`].
+/// Every step of that is best-effort: signed out, sync unconfigured, an upload
+/// failure, or a file past [`crate::storage::MAX_UPLOAD_BYTES`] all leave
+/// `remote_path` as `None` and the attachment in the batch, because the prompt
+/// then tells the model the file exists but could not be uploaded (see
+/// `chat::user_request_message`) — silently dropping it is the bug this exists
+/// to fix.
 #[tauri::command]
-pub async fn read_attachments(paths: Vec<String>) -> Vec<Attachment> {
-    tokio::task::spawn_blocking(move || {
+pub async fn read_attachments(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Vec<Attachment> {
+    let read: Vec<(String, Attachment)> = tokio::task::spawn_blocking(move || {
         paths
-            .iter()
-            .filter_map(|p| read_attachment(Path::new(p)).ok())
+            .into_iter()
+            .filter_map(|p| read_attachment(Path::new(&p)).ok().map(|a| (p, a)))
             .collect()
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+
+    // `fetch_file` runs inside the tool loop, which has no app handle; publish
+    // the downloads root from here as a second chance (setup already does it).
+    if let Ok(dir) = app.path().app_data_dir() {
+        crate::storage::init_app_data_dir(dir);
+    }
+
+    // Only ask the keychain/network for credentials when something actually
+    // needs offloading, so an ordinary text/image attach stays entirely local.
+    let mut creds: Option<Option<crate::storage::Credentials>> = None;
+    let mut out = Vec::with_capacity(read.len());
+    for (path, mut a) in read {
+        if needs_offload(&a) {
+            if creds.is_none() {
+                creds = Some(crate::storage::credentials().await.unwrap_or(None));
+            }
+            if let Some(Some((_, _, _, user_id))) = creds.as_ref() {
+                let key = crate::storage::object_key(user_id, &a.name);
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => match crate::storage::upload(&key, &bytes, &a.mime).await {
+                        Ok(()) => a.remote_path = Some(key),
+                        Err(e) => {
+                            // Keep the attachment; the prompt says it is not
+                            // readable so the model can tell the user.
+                            eprintln!("attachments: offload of {path} failed: {e}");
+                        }
+                    },
+                    Err(e) => eprintln!("attachments: re-reading {path} for offload failed: {e}"),
+                }
+            }
+        }
+        out.push(a);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -399,6 +465,49 @@ mod tests {
         assert!(a.data_url.is_none());
         assert_eq!(a.mime, "image/png");
         assert_eq!(a.size, MAX_IMAGE_BYTES + 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn needs_offload_tracks_whether_anything_is_inline() {
+        // Text and images have something to send; those never need offloading.
+        let text = Attachment {
+            name: "a.txt".into(),
+            text: Some("hi".into()),
+            ..Default::default()
+        };
+        assert!(!needs_offload(&text));
+        let image = Attachment {
+            name: "a.png".into(),
+            data_url: Some("data:image/png;base64,AA==".into()),
+            ..Default::default()
+        };
+        assert!(!needs_offload(&image));
+        // A metadata-only attachment (oversized text/image, PDF, zip) has
+        // neither, so it must be offloaded or the model never learns it exists.
+        let bare = Attachment {
+            name: "a.pdf".into(),
+            size: 1234,
+            ..Default::default()
+        };
+        assert!(needs_offload(&bare));
+    }
+
+    #[test]
+    fn oversized_text_file_needs_offload() {
+        // A real file past MAX_TEXT_BYTES: read_attachment degrades it to
+        // metadata-only, which is exactly the offload trigger. Sparse file, so
+        // the test does not write 1 MB.
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-attach-big-{}.txt", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_TEXT_BYTES + 1).unwrap();
+        drop(f);
+        let a = read_attachment(&p).unwrap();
+        assert!(a.text.is_none() && a.data_url.is_none());
+        assert!(needs_offload(&a));
+        // Nothing is known about the remote copy until an upload happens.
+        assert!(a.remote_path.is_none());
         let _ = std::fs::remove_file(&p);
     }
 

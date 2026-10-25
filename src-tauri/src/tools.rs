@@ -172,6 +172,29 @@ fn web_fetch_tool() -> ChatCompletionTools {
     )
 }
 
+/// `fetch_file`: pull an offloaded attachment down to the local filesystem so
+/// `read_file` can inspect it. Ungated (read-only, like `web_fetch`).
+fn fetch_file_tool() -> ChatCompletionTools {
+    fn_tool(
+        "fetch_file",
+        "Download a file that was attached to this conversation but could not be included \
+         inline (too large or binary). The attachment note names its remote path; pass that \
+         here. The file is written to the app's local downloads folder and the absolute path \
+         is returned — use read_file (or bash) to inspect it. Fails when cloud sync is not \
+         signed in, because the file lives in the user's private storage bucket.",
+        json!({
+            "type": "object",
+            "properties": {
+                "remote_path": {
+                    "type": "string",
+                    "description": "The remote path shown in the attachment note (e.g. \"<user-id>/<uuid>-report.pdf\")"
+                }
+            },
+            "required": ["remote_path"]
+        }),
+    )
+}
+
 /// `fetch_image`: load an image from an http(s) URL so it can be attached to the
 /// assistant's reply (and, on a vision model, shown to the model).
 fn fetch_image_tool() -> ChatCompletionTools {
@@ -238,6 +261,7 @@ pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
         memory_str_replace_tool(),
         web_fetch_tool(),
         fetch_image_tool(),
+        fetch_file_tool(),
     ];
     tools.extend(cron_tools());
     if brave {
@@ -428,7 +452,10 @@ pub async fn execute_host_tool(call: &ToolCall, shell: &crate::shell::ShellExecu
             let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
                 return ToolOutput::err("read_file: missing 'path' argument".into());
             };
-            shell.read_file(path).await
+            // Expand a leading `~` here so the executor (desktop *and* the
+            // Android `shq`-quoted Termux branch) acts on the real path.
+            let path = crate::shell::expand_tilde(path);
+            shell.read_file(&path).await
         }
         "write_file" => {
             let (Some(path), Some(content)) = (
@@ -437,7 +464,8 @@ pub async fn execute_host_tool(call: &ToolCall, shell: &crate::shell::ShellExecu
             ) else {
                 return ToolOutput::err("write_file: missing 'path' or 'content' argument".into());
             };
-            shell.write_file(path, content).await
+            let path = crate::shell::expand_tilde(path);
+            shell.write_file(&path, content).await
         }
         other => ToolOutput::err(format!("unknown tool: {other}")),
     }
@@ -1626,13 +1654,19 @@ mod tests {
     #[test]
     fn tool_specs_shape() {
         let with = tool_specs(true);
-        // 14 host/memory/web/cron tools + 6 native Brave tools.
-        assert_eq!(with.len(), 20);
+        // 15 host/memory/web/cron tools + 6 native Brave tools.
+        assert_eq!(with.len(), 21);
         let without = tool_specs(false);
-        assert_eq!(without.len(), 14);
+        assert_eq!(without.len(), 15);
         // The list is identical for live and reflection (cache alignment);
         // access is enforced by mode at execution time, not by the list.
-        for name in ["write_memory", "memory_str_replace", "web_fetch", "fetch_image"] {
+        for name in [
+            "write_memory",
+            "memory_str_replace",
+            "web_fetch",
+            "fetch_image",
+            "fetch_file",
+        ] {
             assert!(without.iter().any(|t| tool_name(t) == name), "missing {name}");
         }
         // Cron management is app-local and ungated, and present in every mode
