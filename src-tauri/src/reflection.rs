@@ -100,22 +100,29 @@ pub(crate) fn conversation_model(
         .or_else(|| Some(cfg.model.clone()).filter(|m| !m.trim().is_empty()))
 }
 
-/// The reasoning level a conversation's consolidation pass should use: the one
-/// recorded on the conversation's newest message that has one (see the live
-/// turn's inserts in `chat::run_chat_turn`), falling back to the app-wide level.
+/// The reasoning level a conversation's consolidation pass should use: the level
+/// **stored on the conversation** (`conversations.thinking_level`, the user's
+/// per-chat choice, synced across devices), else the one recorded on the
+/// conversation's newest message that has one (see the live turn's inserts in
+/// `chat::run_chat_turn`), falling back to the app-wide level.
 ///
-/// This is a **snapshot of the global `cfg.thinking_level` taken when that
-/// chat's last turn ran**, not a stored per-conversation preference: turning the
-/// global level off does not change an existing chat's recorded level until the
-/// user sends another turn in it.
+/// The stored column is authoritative and outlives any single turn: it is what
+/// the user picked in the composer for this chat. The recorded-message level is
+/// the legacy snapshot (a chat that predates the column still behaves as before),
+/// so the resolution stays backward compatible. Turning the global level off does
+/// not change a chat's level until the user sends another turn in it.
 ///
 /// Rows written before the level was recorded carry `None`, so an older chat
 /// behaves exactly as before. A recorded *empty* level is not skipped: it means
 /// "no reasoning for this conversation", which must win over the global setting.
 pub(crate) fn conversation_thinking_level(
+    conv: &db::Conversation,
     history: &[db::MessageRow],
     cfg: &AppConfig,
 ) -> String {
+    if let Some(level) = conv.thinking_level.as_ref() {
+        return level.clone();
+    }
     history
         .iter()
         .rev()
@@ -177,7 +184,7 @@ pub(crate) fn reflection_request(
     // of the global setting at that moment (not a per-chat preference), so it
     // can legitimately differ from the current global level — and stays stale
     // until the user sends another turn in this chat.
-    turn_cfg.thinking_level = conversation_thinking_level(&history, cfg);
+    turn_cfg.thinking_level = conversation_thinking_level(conversation, &history, cfg);
     let system_prompt = chat::conversation_system_prompt(
         db,
         cfg,
@@ -1531,32 +1538,49 @@ mod tests {
         assert!(!sweep_enabled(&cfg));
     }
 
-    /// Consolidation runs at the level the conversation's own last turn used, so
-    /// a chat recorded under "high" is not reflected at a later global default.
+    /// Consolidation runs at the conversation's own level: the stored per-chat
+    /// choice first, then the level its last turn recorded (legacy), then the
+    /// app-wide default.
     #[test]
-    fn conversation_thinking_level_prefers_the_newest_recorded_level() {
+    fn conversation_thinking_level_prefers_the_stored_and_then_recorded_level() {
         let mut cfg = AppConfig::default();
         cfg.thinking_level = "low".into();
 
+        let mut conv = conversation(None);
         let msgs = vec![
             message(None),
             message(Some("high")),
             message(None), // later rows without a level are skipped
         ];
-        assert_eq!(conversation_thinking_level(&msgs, &cfg), "high");
+        // No stored level yet (a chat that predates the column) → the newest
+        // level its turns recorded, exactly as before.
+        assert_eq!(conversation_thinking_level(&conv, &msgs, &cfg), "high");
 
-        // Nothing recorded (rows written before the level was stored, or a chat
-        // that never ran) → the app-wide level, exactly as before.
+        // The stored per-conversation level OUTRANKS any recorded message level.
+        conv.thinking_level = Some("medium".into());
+        assert_eq!(conversation_thinking_level(&conv, &msgs, &cfg), "medium");
+
+        // A stored *empty* level means "no reasoning for this conversation" and
+        // must win over both the recorded and the global level.
+        conv.thinking_level = Some(String::new());
+        assert_eq!(conversation_thinking_level(&conv, &msgs, &cfg), "");
+
+        // Nothing stored and nothing recorded (rows written before the level was
+        // stored, or a chat that never ran) → the app-wide level, as before.
+        conv.thinking_level = None;
         assert_eq!(
-            conversation_thinking_level(&[message(None)], &cfg),
+            conversation_thinking_level(&conv, &[message(None)], &cfg),
             "low"
         );
-        assert_eq!(conversation_thinking_level(&[], &cfg), "low");
+        assert_eq!(conversation_thinking_level(&conv, &[], &cfg), "low");
 
         // A recorded *empty* level means "no reasoning for this conversation"
         // and must win over the global one.
         cfg.thinking_level = "high".into();
-        assert_eq!(conversation_thinking_level(&[message(Some(""))], &cfg), "");
+        assert_eq!(
+            conversation_thinking_level(&conv, &[message(Some(""))], &cfg),
+            ""
+        );
     }
 
     fn conversation(model: Option<&str>) -> db::Conversation {

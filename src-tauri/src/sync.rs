@@ -869,7 +869,8 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, model, provider_id, system_prompt, compaction_summary,
-                        last_reflected_index, imported, import_batch, created_at, updated_at, revision
+                        last_reflected_index, imported, import_batch, created_at, updated_at,
+                        revision, thinking_level
                  FROM conversations WHERE dirty = 1 AND kind = 'chat'",
             )
             .map_err(|e| e.to_string())?;
@@ -889,6 +890,9 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                     "created_at": r.get::<_, i64>(9)?,
                     "updated_at": r.get::<_, i64>(10)?,
                     "revision": r.get::<_, i64>(11)?,
+                    // Per-conversation reasoning level (structural, never encrypted:
+                    // it is a short enum token and other devices need it as-is).
+                    "thinking_level": r.get::<_, Option<String>>(12)?,
                     "deleted_at": Value::Null,
                 }))
             })
@@ -918,6 +922,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                 "id": id, "title": "", "model": Value::Null, "provider_id": Value::Null,
                 "system_prompt": Value::Null, "compaction_summary": Value::Null,
                 "last_reflected_index": Value::Null, "imported": false, "import_batch": 0,
+                "thinking_level": Value::Null,
                 "created_at": now, "updated_at": now, "revision": rev, "deleted_at": now,
             }));
         }
@@ -1707,6 +1712,10 @@ struct RemoteConversation {
     last_reflected_index: Option<i64>,
     imported: Option<bool>,
     import_batch: Option<i64>,
+    /// Per-conversation reasoning level. Nullable: a device that never recorded
+    /// one (or an older payload without the column) simply has no preference.
+    #[serde(default)]
+    thinking_level: Option<String>,
     created_at: Option<i64>,
     updated_at: Option<i64>,
     revision: i64,
@@ -2020,12 +2029,12 @@ async fn apply_conversations(db: &Db, rows: &[Value]) -> Result<(), String> {
             tx.execute(
                 "INSERT INTO conversations
                    (id, title, model, provider_id, system_prompt, compaction_summary, last_reflected_index,
-                    imported, import_batch, created_at, updated_at, revision, dirty)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
+                    imported, import_batch, created_at, updated_at, revision, thinking_level, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
                 rusqlite::params![
                     r.id, title, r.model, r.provider_id, r.system_prompt, r.compaction_summary,
                     r.last_reflected_index, imported, import_batch, created_at, updated_at,
-                    r.revision
+                    r.revision, r.thinking_level
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -2034,12 +2043,12 @@ async fn apply_conversations(db: &Db, rows: &[Value]) -> Result<(), String> {
                 "UPDATE conversations SET title = ?2, model = ?3, provider_id = ?4,
                         system_prompt = ?5, compaction_summary = ?6, last_reflected_index = ?7,
                         imported = ?8, import_batch = ?9, created_at = ?10, updated_at = ?11,
-                        revision = ?12, dirty = 0
+                        revision = ?12, thinking_level = ?13, dirty = 0
                  WHERE id = ?1",
                 rusqlite::params![
                     r.id, title, r.model, r.provider_id, r.system_prompt, r.compaction_summary,
                     r.last_reflected_index, imported, import_batch, created_at, updated_at,
-                    r.revision
+                    r.revision, r.thinking_level
                 ],
             )
             .map_err(|e| e.to_string())?;

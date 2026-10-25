@@ -3847,3 +3847,212 @@ async fn push_emits_message_tombstones_for_edit_truncation() {
     // Successful push retires the tombstones and clears every dirty flag.
     assert_eq!(db::pending_rows(&db).unwrap(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// per-conversation thinking level (synced, nullable) + capability overrides
+// ---------------------------------------------------------------------------
+
+/// A conversation's `thinking_level` is a synced structural column: it rides the
+/// push payload as-is and lands on a second device through an ordinary pull.
+#[tokio::test]
+async fn conversation_thinking_level_roundtrips_to_a_second_device() {
+    let srv = MockRest::spawn();
+    let db = temp_db("think-push");
+    let mem = temp_memory("think-push", &db);
+    let cfg = temp_config("think-push");
+    let cid = insert_conv(&db);
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET thinking_level = 'high' WHERE id = ?1",
+            [&cid],
+        )
+        .unwrap();
+    }
+
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+
+    // The pushed row carries the level (structural, never encrypted).
+    let pushed = srv
+        .posted("conversations")
+        .into_iter()
+        .find(|v| v["id"] == cid)
+        .expect("conversation pushed");
+    assert_eq!(pushed["thinking_level"], "high", "level not pushed: {pushed}");
+
+    // Second, blank device pulls exactly what the first pushed.
+    let db2 = temp_db("think-pull");
+    let mem2 = temp_memory("think-pull", &db2);
+    let cfg2 = temp_config("think-pull");
+    let ctx2 = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db2,
+        memory: &mem2,
+        config: &cfg2,
+        key: None,
+    };
+    srv.set_get("conversations", vec![pushed.clone()]);
+    srv.set_get("messages", vec![]);
+    srv.set_get("memory_files", vec![]);
+    pull(&ctx2, "user-123", "tok", None).await.unwrap();
+
+    let level: Option<String> = {
+        let conn = db2.0.lock().unwrap();
+        conn.query_row(
+            "SELECT thinking_level FROM conversations WHERE id = ?1",
+            [&cid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(level.as_deref(), Some("high"), "level not applied on pull");
+}
+
+/// A remote change to `thinking_level` merges by row revision exactly like every
+/// other conversation column: a newer remote row wins, an older one is ignored.
+#[tokio::test]
+async fn conversation_thinking_level_merges_by_row_revision() {
+    let db = temp_db("think-lww");
+    let cid = insert_conv(&db);
+    let local_rev = rev_of(
+        &db,
+        &format!("SELECT revision FROM conversations WHERE id = '{cid}'"),
+    );
+
+    // Older remote row: local wins, the level is untouched (absent).
+    let older = vec![json!({
+        "id": cid, "title": "t", "thinking_level": "low", "revision": local_rev - 1,
+        "created_at": 1, "updated_at": 1, "deleted_at": Value::Null
+    })];
+    apply_conversations(&db, &older).await.unwrap();
+    let level: Option<String> = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT thinking_level FROM conversations WHERE id = ?1", [&cid], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(level, None, "an older remote row must not overwrite the level");
+
+    // Newer remote row: remote wins and its level is applied.
+    let newer = vec![json!({
+        "id": cid, "title": "t", "thinking_level": "medium",
+        "revision": local_rev + 1_000_000,
+        "created_at": 1, "updated_at": 2, "deleted_at": Value::Null
+    })];
+    apply_conversations(&db, &newer).await.unwrap();
+    let level: Option<String> = {
+        let conn = db.0.lock().unwrap();
+        conn.query_row("SELECT thinking_level FROM conversations WHERE id = ?1", [&cid], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(level.as_deref(), Some("medium"), "newer remote level must win");
+}
+
+/// `model_overrides` carries the WHOLE `ModelOverride`, so capability toggles
+/// (`reasoning`, `input_modalities`, `output_modalities`) survive push→pull on a
+/// second device — not just prices/context window. Regression test for a
+/// capability override being dropped in the user_config payload.
+#[tokio::test]
+async fn capability_model_override_roundtrips_to_a_second_device() {
+    use crate::config::ModelOverride;
+
+    let srv = MockRest::spawn();
+    let db = temp_db("cap-push");
+    let mem = temp_memory("cap-push", &db);
+    let cfg = temp_config("cap-push");
+
+    let mut c = cfg.get();
+    c.model_overrides.insert(
+        "model-a".into(),
+        ModelOverride {
+            context_window: Some(200_000),
+            input_modalities: Some(vec!["text".into(), "image".into()]),
+            output_modalities: Some(vec!["text".into()]),
+            reasoning: Some(true),
+            ..Default::default()
+        },
+    );
+    cfg.set(c).unwrap();
+    {
+        let conn = db.0.lock().unwrap();
+        db::sync_user_config(&conn, &cfg.get()).unwrap();
+    }
+
+    let client = reqwest::Client::new();
+    let ctx = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db,
+        memory: &mem,
+        config: &cfg,
+        key: None,
+    };
+    push(&ctx, "tok", &SyncState::new()).await.unwrap();
+    let posts = srv.posted("user_config");
+    let payload = posts[0]["payload"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(
+        parsed["modelOverrides"]["model-a"]["inputModalities"],
+        json!(["text", "image"]),
+        "capability modalities missing from the pushed payload: {parsed}"
+    );
+    assert_eq!(parsed["modelOverrides"]["model-a"]["reasoning"], json!(true));
+    assert_eq!(parsed["modelOverrides"]["model-a"]["outputModalities"], json!(["text"]));
+    assert_eq!(parsed["modelOverrides"]["model-a"]["contextWindow"], json!(200_000));
+
+    // Second, blank device adopts the override verbatim.
+    let db2 = temp_db("cap-pull");
+    let mem2 = temp_memory("cap-pull", &db2);
+    let cfg2 = temp_config("cap-pull");
+    let ctx2 = SyncCtx {
+        client: &client,
+        base_url: &srv.addr,
+        anon: "anon",
+        db: &db2,
+        memory: &mem2,
+        config: &cfg2,
+        key: None,
+    };
+    srv.set_get(
+        "user_config",
+        vec![json!({
+            "id": "main",
+            "payload": payload,
+            "revision": 500,
+            "deleted_at": Value::Null,
+        })],
+    );
+    srv.set_get("conversations", vec![]);
+    srv.set_get("messages", vec![]);
+    srv.set_get("memory_files", vec![]);
+    pull(&ctx2, "user-123", "tok", None).await.unwrap();
+
+    let got = cfg2
+        .get()
+        .model_overrides
+        .get("model-a")
+        .cloned()
+        .expect("override must arrive on the second device");
+    assert_eq!(got.reasoning, Some(true), "reasoning capability lost");
+    assert_eq!(
+        got.input_modalities.as_deref(),
+        Some(["text".to_string(), "image".to_string()].as_slice()),
+        "input modalities capability lost"
+    );
+    assert_eq!(
+        got.output_modalities.as_deref(),
+        Some(["text".to_string()].as_slice()),
+        "output modalities capability lost"
+    );
+    assert_eq!(got.context_window, Some(200_000));
+}

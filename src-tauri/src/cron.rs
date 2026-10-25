@@ -317,7 +317,8 @@ async fn run_job(
     let mut turn_cfg = cfg.clone();
     turn_cfg.base_url = provider.base_url;
     turn_cfg.model = model;
-    turn_cfg.thinking_level = crate::reflection::conversation_thinking_level(&history, &cfg);
+    turn_cfg.thinking_level =
+        crate::reflection::conversation_thinking_level(&conversation, &history, &cfg);
     // The job's policy is the single source of truth, and it is carried as the
     // *mode*: a cron run never enters the approval pipeline (it has no UI to
     // answer a prompt). `ReadOnly` refuses gated calls; `AutoApprove` runs them.
