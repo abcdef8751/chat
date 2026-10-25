@@ -606,6 +606,28 @@ fn session_from_value(v: &Value) -> Result<Session, String> {
     })
 }
 
+/// Credentials for Supabase Storage, used to offload attachments that are too
+/// large to inline. Returns `(base_url, anon, access_token, user_id)` when the
+/// build is configured AND a session is stored; `None` when signed out. Reuses
+/// the same token-refresh path as a sync round, so an upload can't outlive the
+/// session. Lives here so the storage module and the sync engine share one
+/// definition of "signed in".
+pub(crate) async fn storage_credentials(
+    sync: &SyncState,
+) -> Result<Option<(String, String, String, String)>, String> {
+    ensure_configured(&sync.base_url)?;
+    let Some(session) = load_session()? else {
+        return Ok(None);
+    };
+    let token = valid_access_token(sync, &session).await?;
+    Ok(Some((
+        sync.base_url.clone(),
+        sync.anon.clone(),
+        token,
+        session.user_id,
+    )))
+}
+
 /// Return a valid access token, refreshing from `refresh_token` if the stored
 /// one is expired or about to expire. The refreshed session is persisted.
 async fn valid_access_token(sync: &SyncState, session: &Session) -> Result<String, String> {
