@@ -28,7 +28,15 @@ CREATE TABLE IF NOT EXISTS conversations (
   kind TEXT NOT NULL DEFAULT 'chat',
   model TEXT,
   provider_id TEXT,
+  -- The reasoning effort the chat runs at. Synced (unlike the per-message
+  -- record, which is audit data); NULL falls back to the global config.
+  thinking_level TEXT,
   system_prompt TEXT,
+  -- Local-only JSON snapshot of the system prompt last SENT to the model
+  -- (`{"system": "...", "parts": {...}}`). Used to emit line-diff updates
+  -- instead of re-injecting a changed prompt at the top, which would break
+  -- the provider's prefix cache. Never synced.
+  prompt_state TEXT,
   compaction_summary TEXT,
   compaction_through TEXT,
   last_reflected_index INTEGER,
@@ -235,6 +243,16 @@ pub fn open(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE conversations ADD COLUMN provider_id TEXT",
         [],
     );
+    // Older databases predate the per-conversation thinking level (synced) and
+    // the local-only system-prompt snapshot used to send line diffs.
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN thinking_level TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN prompt_state TEXT",
+        [],
+    );
     // Older databases predate the per-job context window.
     let _ = conn.execute(
         "ALTER TABLE cron_jobs ADD COLUMN context_mode TEXT NOT NULL DEFAULT 'recent'",
@@ -338,6 +356,8 @@ pub struct Conversation {
     pub kind: String,
     pub model: Option<String>,
     pub provider_id: Option<String>,
+    /// Per-chat reasoning effort; `None` means "use the global config".
+    pub thinking_level: Option<String>,
     pub system_prompt: Option<String>,
     pub compaction_summary: Option<String>,
     pub compaction_through: Option<String>,
@@ -396,7 +416,7 @@ pub fn get_conversation(
     let mut stmt = conn
         .prepare(
             "SELECT id, title, kind, model, provider_id, system_prompt, compaction_summary,
-                    compaction_through, created_at, updated_at
+                    compaction_through, created_at, updated_at, thinking_level
              FROM conversations WHERE id = ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -413,6 +433,7 @@ pub fn get_conversation(
                 compaction_through: r.get(7)?,
                 created_at: r.get(8)?,
                 updated_at: r.get(9)?,
+                thinking_level: r.get(10)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -665,7 +686,7 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
     let mut stmt = conn
         .prepare(
             "SELECT id, title, kind, model, provider_id, system_prompt, compaction_summary,
-                    compaction_through, created_at, updated_at
+                    compaction_through, created_at, updated_at, thinking_level
              FROM conversations ORDER BY updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -682,6 +703,7 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
                 compaction_through: r.get(7)?,
                 created_at: r.get(8)?,
                 updated_at: r.get(9)?,
+                thinking_level: r.get(10)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -714,6 +736,7 @@ pub fn create_conversation(
         kind: "chat".into(),
         model: None,
         provider_id: None,
+        thinking_level: None,
         system_prompt: None,
         compaction_summary: None,
         compaction_through: None,
@@ -797,6 +820,25 @@ pub fn set_conversation_model(
     conn.execute(
         "UPDATE conversations SET model = ?2, updated_at = ?3, revision = ?4, dirty = 1 WHERE id = ?1",
         params![conversation_id, model, now(), rev],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Set (or clear) a conversation's thinking level. `None`/empty clears it back
+/// to the global config's level. Synced like the model column.
+#[tauri::command]
+pub fn set_conversation_thinking_level(
+    db: tauri::State<'_, Db>,
+    conversation_id: String,
+    thinking_level: Option<String>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let rev = bump_revision_c(&conn)?;
+    let level = thinking_level.filter(|l| !l.is_empty());
+    conn.execute(
+        "UPDATE conversations SET thinking_level = ?2, updated_at = ?3, revision = ?4, dirty = 1 WHERE id = ?1",
+        params![conversation_id, level, now(), rev],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1029,7 +1071,8 @@ pub fn search_conversations(
     let mut stmt = conn
         .prepare(
             "SELECT DISTINCT c.id, c.title, c.kind, c.model, c.provider_id, c.system_prompt,
-                    c.compaction_summary, c.compaction_through, c.created_at, c.updated_at
+                    c.compaction_summary, c.compaction_through, c.created_at, c.updated_at,
+                    c.thinking_level
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              WHERE lower(c.title) LIKE ?1
@@ -1050,6 +1093,7 @@ pub fn search_conversations(
                 compaction_through: r.get(7)?,
                 created_at: r.get(8)?,
                 updated_at: r.get(9)?,
+                thinking_level: r.get(10)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1058,6 +1102,32 @@ pub fn search_conversations(
         out.push(row.map_err(|e| e.to_string())?);
     }
     Ok(out)
+}
+
+/// Read the local-only system-prompt snapshot (`None` = never sent one).
+pub fn prompt_state(db: &Db, conversation_id: &str) -> Result<Option<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT prompt_state FROM conversations WHERE id = ?1")
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([conversation_id]).map_err(|e| e.to_string())?;
+    match rows.next().map_err(|e| e.to_string())? {
+        Some(row) => Ok(row.get(0).map_err(|e| e.to_string())?),
+        None => Ok(None),
+    }
+}
+
+/// Store the system-prompt snapshot. Local-only bookkeeping: never synced and
+/// never bumps `updated_at`, so it cannot reset the reflection idle timer or
+/// reorder the sidebar.
+pub fn set_prompt_state(db: &Db, conversation_id: &str, state: &str) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE conversations SET prompt_state = ?2 WHERE id = ?1",
+        params![conversation_id, state],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Current wall-clock time in milliseconds since the epoch.

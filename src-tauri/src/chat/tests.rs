@@ -3104,6 +3104,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             kind: "chat".into(),
             model: None,
             provider_id: None,
+            thinking_level: None,
             system_prompt: None,
             compaction_summary: summary.map(str::to_string),
             compaction_through: through.map(str::to_string),

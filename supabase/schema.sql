@@ -23,6 +23,7 @@ create table if not exists conversations (
   title text not null,
   model text,
   provider_id text,
+  thinking_level text,
   system_prompt text,
   compaction_summary text,
   last_reflected_index bigint,

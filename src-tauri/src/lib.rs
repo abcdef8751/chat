@@ -153,6 +153,7 @@ pub fn run() {
             db::rename_conversation,
             db::set_conversation_provider,
             db::set_conversation_model,
+            db::set_conversation_thinking_level,
             db::delete_conversation,
             db::search_conversations,
             config::get_config,

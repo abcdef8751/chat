@@ -1566,6 +1566,7 @@ mod tests {
             kind: "chat".into(),
             model: model.map(str::to_string),
             provider_id: None,
+            thinking_level: None,
             system_prompt: None,
             compaction_summary: None,
             compaction_through: None,
