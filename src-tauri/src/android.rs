@@ -231,6 +231,56 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
     })
 }
 
+// --- All-files storage access (`MANAGE_EXTERNAL_STORAGE`) ------------------
+//
+// The app declares MANAGE_EXTERNAL_STORAGE so host tools can work on the user's
+// real shared-storage files. That permission is **not** a runtime prompt: the
+// user grants it from a system Settings screen. Kotlin (`StorageAccessPlugin`)
+// checks `Environment.isExternalStorageManager()` and opens that screen; Rust
+// exposes it to the frontend through the `android_storage_status` /
+// `android_request_storage_access` commands.
+
+/// Managed state: the Android plugin handle for the all-files access bridge.
+pub struct StorageAccessHandle(pub PluginHandle<tauri::Wry>);
+
+/// Register Kotlin's `StorageAccessPlugin` and store its handle for
+/// [`storage_status`] / [`request_storage_access`].
+pub fn storage_plugin() -> TauriPlugin<tauri::Wry> {
+    // Fourth distinct plugin name (`run_command` / `file_bridge` / `picker` /
+    // `storage_access`): the Kotlin PluginManager routes by plugin name.
+    Builder::new("storage_access")
+        .setup(move |app, api| {
+            let handle = api.register_android_plugin("com.rp.chat", "StorageAccessPlugin")?;
+            app.manage(StorageAccessHandle(handle));
+            Ok(())
+        })
+        .build()
+}
+
+/// Whether all-files access is granted, plus whether this OS can grant it at all
+/// (`canRequest` is true only on Android API 30+, the version that introduced
+/// `MANAGE_EXTERNAL_STORAGE`).
+pub async fn storage_status(app: &AppHandle) -> Result<crate::StorageStatus, String> {
+    let handle = app.state::<StorageAccessHandle>();
+    handle
+        .0
+        .run_mobile_plugin_async("status", json!({}))
+        .await
+        .map_err(|e| format!("android_storage_status: {e}"))
+}
+
+/// Open the system "All files access" screen for this app. Resolves as soon as
+/// the screen is launched; the user grants it there, and the frontend re-checks
+/// [`storage_status`] when the app comes back to the foreground.
+pub async fn request_storage_access(app: &AppHandle) -> Result<(), String> {
+    let handle = app.state::<StorageAccessHandle>();
+    handle
+        .0
+        .run_mobile_plugin_async::<()>("requestAccess", json!({}))
+        .await
+        .map_err(|e| format!("android_request_storage_access: {e}"))
+}
+
 /// Resolve the working directory for a call: the user's configured workspace,
 /// else the documented shared-storage default.
 fn workspace(app: &AppHandle) -> String {

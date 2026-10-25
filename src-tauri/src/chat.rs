@@ -2961,8 +2961,10 @@ pub(crate) struct TurnOutcome {
     pub text: String,
 }
 
-/// The live chat turn: [`run_turn_core`] in [`ToolMode::Live`], ignoring the
-/// bookkeeping outcome (the UI follows the stream events).
+/// The live chat turn: [`run_turn_core`] in [`ToolMode::Live`].
+///
+/// Returns the turn's bookkeeping outcome so [`stream_chat`] can raise a
+/// background-finish notification; the UI itself follows the stream events.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_chat_turn(
     db: &db::Db,
@@ -2978,7 +2980,7 @@ pub(crate) async fn run_chat_turn(
     content: String,
     attachments: Vec<crate::attachments::Attachment>,
     regenerate: bool,
-) -> Result<(), String> {
+) -> Result<TurnOutcome, String> {
     run_turn_core(
         db,
         cfg,
@@ -2997,7 +2999,6 @@ pub(crate) async fn run_chat_turn(
         HistoryMode::Full,
     )
     .await
-    .map(|_| ())
 }
 
 /// Stream an assistant reply for the given conversation: read config + key,
@@ -3067,7 +3068,32 @@ pub async fn stream_chat(
     .await;
 
     app.state::<StreamRegistry>().remove(&conversation_id, &token);
-    result
+
+    // Background-finish notification: only when the window is unfocused (the
+    // module checks that), the turn was not stopped by the user (a Stop means
+    // they are present), and this is not a scheduled thread (cron.rs already
+    // notifies for runs; a live turn in a scheduled thread is rare, but it must
+    // not double-notify). Reasoning traces are never part of the body.
+    if let Ok(outcome) = &result {
+        let is_scheduled = conversation.kind == "scheduled";
+        if !is_scheduled && outcome.stop_reason != "aborted" {
+            let notify_outcome = if outcome.stop_reason == "error" {
+                crate::notifications::TurnOutcome::Failed(
+                    outcome.error.as_deref().unwrap_or("unknown error"),
+                )
+            } else {
+                crate::notifications::TurnOutcome::Reply(&outcome.text)
+            };
+            crate::notifications::notify_turn_finished(
+                &app,
+                &conversation_id,
+                &conversation.title,
+                notify_outcome,
+            );
+        }
+    }
+
+    result.map(|_| ())
 }
 
 /// Abort a running stream for a conversation, immediately: in-flight requests

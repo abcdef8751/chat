@@ -639,3 +639,73 @@ fn opening_a_db_purges_orphan_scheduled_threads() {
     assert_eq!(orphan_messages, 0, "its messages cascade away too");
     assert!(db::get_conversation(&db, "chat-1").unwrap().is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Deadline-aware scheduler sleep
+// ---------------------------------------------------------------------------
+
+fn wake(next_run_at: i64, enabled: bool) -> Wake {
+    Wake {
+        next_run_at,
+        enabled,
+        run_requested: false,
+    }
+}
+
+/// No job at all: the idle cadence (the upper clamp), never a 1 s busy loop.
+#[test]
+fn sleep_with_no_jobs_is_the_idle_cadence() {
+    assert_eq!(sleep_deadline(1_000, &[]), MAX_SLEEP);
+    // A paused job is not a reason to wake early either.
+    assert_eq!(sleep_deadline(1_000, &[wake(1_000, false)]), MAX_SLEEP);
+}
+
+/// An overdue slot must fire on the next tick: the lower clamp (1 s) even when
+/// the deadline was minutes ago.
+#[test]
+fn sleep_for_overdue_job_is_the_minimum() {
+    assert_eq!(sleep_deadline(60_000, &[wake(1_000, true)]), MIN_SLEEP);
+    // Exactly due is the same case.
+    assert_eq!(sleep_deadline(60_000, &[wake(60_000, true)]), MIN_SLEEP);
+}
+
+/// A slot a few seconds out is slept to exactly; a distant one is clamped to
+/// the idle cadence so clock skew / a far-future slot cannot park the loop.
+#[test]
+fn sleep_matches_near_deadline_and_clamps_far_one() {
+    assert_eq!(
+        sleep_deadline(10_000, &[wake(15_000, true)]),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        sleep_deadline(10_000, &[wake(10_000 + 120_000, true)]),
+        MAX_SLEEP
+    );
+    // Sub-second gaps round up to the minimum, so the loop never spins.
+    assert_eq!(
+        sleep_deadline(10_000, &[wake(10_500, true)]),
+        MIN_SLEEP
+    );
+}
+
+/// The earliest eligible job wins; paused jobs are ignored.
+#[test]
+fn sleep_uses_the_earliest_enabled_job() {
+    let jobs = [
+        wake(90_000, true),
+        wake(12_000, true), // winner: 2 s out
+        wake(11_000, false),
+    ];
+    assert_eq!(sleep_deadline(10_000, &jobs), Duration::from_secs(2));
+}
+
+/// A queued "Run now" fires next tick even on a paused job with a future slot.
+#[test]
+fn sleep_for_queued_run_is_immediate() {
+    let jobs = [Wake {
+        next_run_at: 999_999,
+        enabled: false,
+        run_requested: true,
+    }];
+    assert_eq!(sleep_deadline(10_000, &jobs), MIN_SLEEP);
+}

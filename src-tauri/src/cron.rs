@@ -5,13 +5,26 @@
 //! thread: full history, memory notes, clock note, compaction summary) and
 //! records an audit row in `cron_runs`.
 //!
-//! The scheduler mirrors `reflection::spawn`: a background task that ticks often
-//! enough for 1-minute jobs to feel right, with one immediate pass at startup so
-//! a run missed while the app was closed catches up. Firing is capped in three
-//! ways — at most [`MAX_FIRES_PER_TICK`] launches per tick, at most
-//! [`MAX_CONCURRENT_RUNS`] in flight overall, and one run per conversation (the
-//! same `StreamRegistry` slot a live turn or a reflection pass uses, so the three
-//! cannot overlap).
+//! The scheduler mirrors `reflection::spawn`: a background task with one
+//! immediate pass at startup so a run missed while the app was closed catches
+//! up, then a **deadline-aware** sleep until the next job's slot (clamped to
+//! [`MIN_SLEEP`]..=[`MAX_SLEEP`]) instead of a fixed poll. A due job therefore
+//! fires within ~1 s of `next_run_at` rather than up to a tick interval late.
+//! Firing is capped in three ways — at most [`MAX_FIRES_PER_TICK`] launches per
+//! tick, at most [`MAX_CONCURRENT_RUNS`] in flight overall, and one run per
+//! conversation (the same `StreamRegistry` slot a live turn or a reflection pass
+//! uses, so the three cannot overlap).
+//!
+//! The scheduler needs **no window**: it is spawned on the async runtime from
+//! `setup`, and a tick only reads the DB/config. Desktop close-to-tray (the
+//! window is hidden, the process lives) and Android's `KeepAliveService`
+//! (foreground service, `stopWithTask=false`) both keep it running with no
+//! foreground UI.
+//!
+//! **Residual:** the process must be alive. There is no OS-level alarm (no
+//! WorkManager, systemd timer or launchd agent), so if the app is fully killed a
+//! due job fires on the **next launch** (catch-up max one), not at its
+//! wall-clock time.
 //!
 //! Job definitions are **local-only** (never synced); the messages a run produces
 //! are ordinary `user`/`assistant` rows and sync normally, so another device just
@@ -35,11 +48,16 @@ pub mod schedule;
 #[cfg(test)]
 mod tests;
 
-/// How often the scheduler looks for due jobs. Finer than reflection's 60 s so a
-/// `* * * * *` job does not visibly drift.
-const TICK: Duration = Duration::from_secs(20);
+/// Lower bound on the scheduler's inter-tick sleep: a due (or queued) job fires
+/// within a second of its slot.
+const MIN_SLEEP: Duration = Duration::from_secs(1);
+/// Upper bound on the sleep: also the idle poll cadence when nothing is
+/// scheduled, so a newly created job is noticed promptly.
+const MAX_SLEEP: Duration = Duration::from_secs(15);
 /// Let startup (DB, config, UI) settle before the first pass; the pass then runs
-/// immediately so a slot missed while the app was closed catches up.
+/// immediately so a slot missed while the app was closed catches up. Kept at 3 s
+/// so the first tick cannot race DB setup / config load (both happen in `setup`
+/// before `spawn`, but the UI and the provider keychain are still warming up).
 const STARTUP_DELAY: Duration = Duration::from_secs(3);
 /// Hard cap on launches per tick, so a long backlog cannot flood the provider.
 const MAX_FIRES_PER_TICK: usize = 5;
@@ -83,6 +101,14 @@ impl CronState {
             .remove(conversation_id);
     }
 
+    /// Whether a cron run currently holds this conversation.
+    fn is_running(&self, conversation_id: &str) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(conversation_id)
+    }
+
     fn set_active(&self, conversation_id: Option<String>) {
         *self
             .active_conversation
@@ -121,7 +147,8 @@ pub fn is_cron_tool(name: &str) -> bool {
     CRON_TOOLS.contains(&name)
 }
 
-/// Start the background scheduler. One immediate pass, then every [`TICK`].
+/// Start the background scheduler. One immediate pass, then sleep until the
+/// next scheduled slot (clamped to [`MIN_SLEEP`]..=[`MAX_SLEEP`]).
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(STARTUP_DELAY).await;
@@ -129,9 +156,80 @@ pub fn spawn(app: AppHandle) {
             if let Err(e) = tick(&app).await {
                 eprintln!("cron: tick failed: {e}");
             }
-            tokio::time::sleep(TICK).await;
+            tokio::time::sleep(next_wake(&app)).await;
         }
     });
+}
+
+/// One job's scheduling inputs for [`sleep_deadline`].
+#[derive(Clone, Copy, Debug)]
+struct Wake {
+    next_run_at: i64,
+    enabled: bool,
+    run_requested: bool,
+}
+
+/// How long the scheduler should sleep after a tick: until the earliest due /
+/// queued job, clamped to [`MIN_SLEEP`]..=[`MAX_SLEEP`]. With no job there is
+/// nothing to wait for, so the full idle cadence applies.
+///
+/// Pure so the clamping and the overdue case can be unit-tested without a
+/// Tauri app or a live DB.
+fn sleep_deadline(now_ms: i64, jobs: &[Wake]) -> Duration {
+    let earliest = jobs
+        .iter()
+        .filter_map(|j| {
+            if j.run_requested {
+                // A queued "Run now" fires on the very next tick, even on a
+                // paused job.
+                Some(now_ms)
+            } else if j.enabled {
+                Some(j.next_run_at)
+            } else {
+                None
+            }
+        })
+        .min();
+    let Some(at) = earliest else {
+        return MAX_SLEEP;
+    };
+    let ms = at.saturating_sub(now_ms);
+    let ms = ms.clamp(
+        MIN_SLEEP.as_millis() as i64,
+        MAX_SLEEP.as_millis() as i64,
+    );
+    Duration::from_millis(ms as u64)
+}
+
+/// Resolve the sleep for the real job table: jobs with a run already in flight
+/// (cron run or live/reflection turn in the same chat) are excluded, so a long
+/// run cannot make the loop re-tick every second for its whole duration. They
+/// are re-examined at the next wake — their `next_run_at` is only advanced when
+/// the run actually finishes.
+fn next_wake(app: &AppHandle) -> Duration {
+    // A paused scheduler still polls at the idle cadence so flipping the
+    // kill-switch back on takes effect without a restart.
+    if !app.state::<ConfigState>().get().cron_enabled {
+        return MAX_SLEEP;
+    }
+    let Ok(jobs) = db::list_cron_jobs(&app.state::<db::Db>()) else {
+        return MAX_SLEEP;
+    };
+    let registry = app.state::<chat::StreamRegistry>();
+    let cron_state = app.state::<CronState>();
+    let wakes: Vec<Wake> = jobs
+        .iter()
+        .filter(|j| {
+            !cron_state.is_running(&j.conversation_id)
+                && !registry.is_streaming(&j.conversation_id)
+        })
+        .map(|j| Wake {
+            next_run_at: j.next_run_at,
+            enabled: j.enabled,
+            run_requested: j.run_requested,
+        })
+        .collect();
+    sleep_deadline(db::now_ms(), &wakes)
 }
 
 async fn tick(app: &AppHandle) -> Result<(), String> {
@@ -592,7 +690,7 @@ pub async fn request_notification_permission(app: AppHandle) -> Result<bool, Str
 /// session bus, a rejected notification) looked exactly like success. notify-rust
 /// is the same backend the plugin uses, called synchronously so the result is
 /// real (and the "Send test notification" button can report it).
-fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+pub(crate) fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let _ = app;
@@ -849,7 +947,7 @@ fn tool_run_now(db: &db::Db, args: &Value) -> ToolOutput {
     }
     match db::request_cron_run(db, id) {
         Ok(()) => ToolOutput::ok(format!(
-            "Queued cron job {id} to run now; the scheduler picks it up within ~20 seconds."
+            "Queued cron job {id} to run now; the scheduler picks it up within ~1 second."
         )),
         Err(e) => ToolOutput::err(e),
     }

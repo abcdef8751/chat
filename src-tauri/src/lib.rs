@@ -9,6 +9,7 @@ mod db;
 mod import;
 mod memory;
 mod models;
+mod notifications;
 mod pricing;
 mod providers;
 mod reflection;
@@ -32,7 +33,8 @@ pub fn run() {
     let builder = builder
         .plugin(crate::android::plugin())
         .plugin(crate::android::file_plugin())
-        .plugin(crate::android::picker_plugin());
+        .plugin(crate::android::picker_plugin())
+        .plugin(crate::android::storage_plugin());
     // Linux: "close to tray". Clicking the X hides the window instead of quitting,
     // so the process (and its background sync/reflection schedulers) keep running.
     // The tray menu is the only reliable reopen path on Linux (tray click events
@@ -205,6 +207,8 @@ pub fn run() {
             attachments::read_attachments,
             read_attachment_from_uri,
             pick_attachment_uris,
+            android_storage_status,
+            android_request_storage_access,
             db::edit_user_message,
             import::import_conversations,
             sync::sync_sign_in,
@@ -309,4 +313,56 @@ async fn pick_attachment_uris(app: tauri::AppHandle) -> Result<Vec<String>, Stri
 #[tauri::command]
 async fn pick_attachment_uris() -> Result<Vec<String>, String> {
     Err("pick_attachment_uris is only available on Android".into())
+}
+
+/// All-files storage access status (the frozen frontend contract):
+/// `{ granted, canRequest }`.
+///
+/// `canRequest` is true **only on Android API 30+** (where
+/// `MANAGE_EXTERNAL_STORAGE` / `Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`
+/// exist) and false everywhere else, so the Settings UI can hide the button.
+/// `granted` is false on desktop, where shared-storage gating does not apply.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatus {
+    pub granted: bool,
+    pub can_request: bool,
+}
+
+/// Check whether the app has all-files shared-storage access.
+///
+/// **Async on purpose:** a synchronous Tauri command runs on the main thread,
+/// and the Android mobile-plugin bridge blocks that thread — the same deadlock
+/// that froze the app when the notification commands were synchronous.
+#[cfg(target_os = "android")]
+#[tauri::command]
+async fn android_storage_status(app: tauri::AppHandle) -> Result<StorageStatus, String> {
+    crate::android::storage_status(&app).await
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+async fn android_storage_status() -> Result<StorageStatus, String> {
+    Ok(StorageStatus {
+        granted: false,
+        can_request: false,
+    })
+}
+
+/// Open the system "All files access" settings screen (Android API 30+ only).
+///
+/// This is not a runtime prompt: MANAGE_EXTERNAL_STORAGE is granted from a
+/// system Settings screen, so the command resolves once the screen launches and
+/// the frontend re-checks `android_storage_status` on return.
+#[cfg(target_os = "android")]
+#[tauri::command]
+async fn android_request_storage_access(app: tauri::AppHandle) -> Result<(), String> {
+    crate::android::request_storage_access(&app).await
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+async fn android_request_storage_access() -> Result<(), String> {
+    // No such thing off Android; the status already reports `canRequest: false`.
+    Ok(())
 }
