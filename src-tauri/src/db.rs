@@ -482,7 +482,7 @@ pub fn read_messages(db: &Db, conversation_id: &str) -> Result<Vec<MessageRow>, 
 /// consolidation notes and `clock` time notes. They are never synced, never bump
 /// the conversation's revision/updated_at, and are skipped by the timeline.
 fn is_internal_role(role: &str) -> bool {
-    matches!(role, "memory" | "clock")
+    matches!(role, "memory" | "clock" | "prompt_update")
 }
 
 /// Insert a message row, assigning the next monotonic index. Used by both the
