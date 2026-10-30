@@ -257,12 +257,15 @@ export function Sidebar(props: {
           may transition, or the chat column reflows mid-slide. At `lg` the panel
           is static, so the transition is switched off with `!` (a plain
           `lg:transition-none` lost to the unprefixed declaration and let a
-          breakpoint change animate a one-off slide). */}
+          breakpoint change animate a one-off slide). `will-change` is likewise
+          dropped at `lg`: only the drawer animates, and keeping the whole
+          subtree on a promoted compositing layer wastes GPU memory.
+          (Tailwind v4 spells the important marker as a `!` suffix.) */}
       <aside
         id="app-sidebar"
         inert={drawerHidden()}
         aria-hidden={drawerHidden() ? "true" : undefined}
-        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform duration-200 ease-out will-change-transform motion-reduce:transition-none lg:static lg:z-auto lg:translate-x-0 lg:!transition-none dark:border-neutral-800 dark:bg-neutral-900 ${
+        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform duration-200 ease-out will-change-transform motion-reduce:transition-none lg:static lg:z-auto lg:translate-x-0 lg:transition-none! lg:will-change-auto dark:border-neutral-800 dark:bg-neutral-900 ${
           props.sidebarOpen ? "translate-x-0" : "-translate-x-full"
         }`}
         style={{

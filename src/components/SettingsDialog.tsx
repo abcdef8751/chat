@@ -184,17 +184,29 @@ export function SettingsDialog(props: {
       return;
     }
     try {
-      setStorage(await androidStorageStatus());
+      const status = await androidStorageStatus();
+      // The dialog may have closed while the query was in flight: drop the
+      // result instead of caching it, or the next open renders it for a frame
+      // before the fresh check lands (the exact stale-flash we clear on close).
+      if (!props.settingsOpen) return;
+      setStorage(status);
       setStorageError(null);
     } catch {
       // Command unavailable / platform said no: hide the row rather than show a
       // broken state inside Settings.
-      setStorage(null);
+      if (props.settingsOpen) setStorage(null);
     }
   };
 
   createEffect(() => {
-    if (!props.settingsOpen) return;
+    if (!props.settingsOpen) {
+      // Drop the cached status on close: reopening would otherwise render the
+      // previous session's "Granted" for a frame (before the fresh check lands),
+      // which is exactly the state the user may have just revoked.
+      setStorage(null);
+      setStorageError(null);
+      return;
+    }
     setStorageError(null);
     void refreshStorage();
   });

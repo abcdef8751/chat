@@ -2016,8 +2016,10 @@ export default function App() {
       if (ev.type === "done" || ev.type === "error") {
         if (ev.type === "error" && activeId() === id) setStreamError(ev.message);
         // Settled off-screen: mark the row (and the hamburger) so the user knows
-        // there is output to read. OS notifications are the backend's job.
-        if (activeId() !== id) markUnseen(id);
+        // there is output to read. OS notifications are the backend's job. A
+        // turn that errored before producing anything has nothing to read, so it
+        // must not light a "New activity" dot (a partial answer still counts).
+        if (activeId() !== id && (ev.type === "done" || received.current)) markUnseen(id);
         removeStreaming(id);
         dropLiveTurn(id, token);
         if (activeId() === id) listMessages(id).then(setMessages);
