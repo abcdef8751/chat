@@ -5239,6 +5239,86 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let _ = std::fs::remove_file(&img);
     }
 
+    /// `read_file` must recognise an image by its **content**, not only its
+    /// extension: a `fetch_file` download or a saved screenshot often has no
+    /// `.png` suffix, and used to be fed to the UTF-8 text path (opaque error).
+    #[test]
+    fn read_file_extensionless_image_dispatches_by_content() {
+        let img = std::env::temp_dir().join(format!(
+            "pi-read-image-sniff-{}-screenshot",
+            std::process::id()
+        ));
+        // A PNG signature is all the sniffer needs; the data URL carries it on.
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+        let path = img.to_str().unwrap().to_string();
+        assert!(
+            crate::attachments::is_image_file(&path),
+            "the extensionless PNG must be routed to the image path"
+        );
+
+        // Vision-capable model: the image is returned for injection.
+        let db = open_db("read-image-sniff");
+        let vision_base = "http://127.0.0.1:1/v1".to_string();
+        mark_model_vision(&db, &vision_base);
+        let vision_cfg = AppConfig {
+            base_url: vision_base,
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let d = read_file_image(&path, &vision_cfg, Some(&db));
+        assert!(d.attachment.is_none());
+        assert!(
+            d.image
+                .as_deref()
+                .is_some_and(|u| u.starts_with("data:image/png;base64,")),
+            "expected a PNG data URL"
+        );
+        assert!(
+            d.output.content.contains("loaded image"),
+            "{}",
+            d.output.content
+        );
+
+        // Text-only model (unknown provider): a plain "cannot view" result.
+        let text_cfg = AppConfig {
+            base_url: "http://127.0.0.1:2/v1".into(),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let d = read_file_image(&path, &text_cfg, Some(&db));
+        assert!(d.image.is_none());
+        assert!(
+            d.output.content.contains("cannot view"),
+            "{}",
+            d.output.content
+        );
+
+        let _ = std::fs::remove_file(&img);
+    }
+
+    /// A binary non-image (or an SVG) makes `read_image` fail; the tool result
+    /// must be a clear error the model can act on, not a UTF-8 decoder message.
+    #[test]
+    fn read_file_binary_non_image_reports_an_actionable_error() {
+        let bin = std::env::temp_dir().join(format!(
+            "pi-read-nonimage-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&bin, [0u8, 159, 146, 150, 255]).unwrap();
+        let cfg = AppConfig {
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let d = read_file_image(bin.to_str().unwrap(), &cfg, None);
+        assert!(d.output.is_error);
+        assert!(
+            d.output.content.contains("not a supported image"),
+            "{}",
+            d.output.content
+        );
+        let _ = std::fs::remove_file(&bin);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_file_oversized_image_is_not_injected() {
         // Sparse file: metadata reports the length without writing the bytes.

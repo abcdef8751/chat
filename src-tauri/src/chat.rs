@@ -1493,9 +1493,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// two constant notes, separated by `0x1f` so adjacent strings cannot collide by
 /// concatenation.
 pub(crate) fn prompt_hash() -> String {
-    let joined = format!(
-        "{DEFAULT_SYSTEM_PROMPT}\u{1f}{HOST_TOOLS_NOTE}\u{1f}{STYLE_NOTE}"
-    );
+    let joined = format!("{DEFAULT_SYSTEM_PROMPT}\u{1f}{HOST_TOOLS_NOTE}\u{1f}{STYLE_NOTE}");
     let hex = format!("{:016x}", fnv1a64(joined.as_bytes()));
     hex[..8].to_string()
 }
@@ -2290,7 +2288,10 @@ async fn dispatch_tool(
 ) -> DispatchedTool {
     if call.name == "read_file" {
         if let Some(path) = call.arguments.get("path").and_then(Value::as_str) {
-            if crate::attachments::is_image_path(path) {
+            // Extension *or* content: an extensionless screenshot (`fetch_file`
+            // downloads, saved screenshots) is still an image. A non-image falls
+            // through to the ordinary text path.
+            if crate::attachments::is_image_file(path) {
                 return read_file_image(path, cfg, db);
             }
         }
