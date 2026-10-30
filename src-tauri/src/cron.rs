@@ -637,8 +637,13 @@ fn notify(app: &AppHandle, job: &db::CronJob, body: &str) {
     if !job.notify {
         return;
     }
-    let foreground = crate::notifications::app_is_foreground(app);
-    if foreground && app.state::<CronState>().is_active(&job.conversation_id) {
+    // OS notifications are for a backgrounded app only. In the foreground the
+    // in-app dots (hamburger + chat row) are the signal — including for a
+    // scheduled thread that settled while another chat was open.
+    if crate::notifications::app_is_foreground(app) {
+        if app.state::<CronState>().is_active(&job.conversation_id) {
+            eprintln!("cron: notification suppressed (foreground, thread on screen)");
+        }
         return;
     }
     // Android 13+ silently drops a post without POST_NOTIFICATIONS, so check

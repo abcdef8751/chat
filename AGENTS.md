@@ -764,9 +764,12 @@ old chat and past runs stay where they are).
   retry every 20 s.
 - **Notifications:** on completion/failure a job with `notify` raises an OS
   notification (title = job title, body = reply snippet or error). It is
-  suppressed only while the user can actually see the thread: the window is
-  focused, no Cron/Memory/Settings dialog is open, and that thread is the active
-  conversation (`cron_set_active` is fed by the UI; an open dialog sends `null`).
+  suppressed whenever the app is **in the foreground** — desktop window focused,
+  or Android Activity started (`notifications::app_is_foreground`) — because the
+  in-app dots already signal a settled thread, including one that is not on
+  screen. A backgrounded app (tray-hidden window, paused Android Activity) gets
+  the OS notification. `cron_set_active` is still fed by the UI for the
+  suppression log/state, but no longer decides delivery on its own.
   On **Linux** the send bypasses `tauri-plugin-notification` and calls
   `notify-rust` directly: the plugin's `show()` spawns the D-Bus call and
   discards its error, so a broken path looked like success. The direct call
