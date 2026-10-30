@@ -816,23 +816,23 @@ pub(crate) fn user_request_message(
                      Its remote path is: {key}\nUse fetch_file with that remote path to \
                      download it, then read_file to inspect the local copy."
                 )),
-                // Over the offload cap (`attachments::read_attachments` refuses to
-                // read such a file into memory at all), so say *why* it is
-                // unreadable rather than blaming cloud sync. The file is still
-                // named and sized above, so it is never silently dropped.
-                None if a.size > crate::storage::MAX_UPLOAD_BYTES => combined.push_str(&format!(
-                    "This file is too large to upload for remote access ({} bytes; the limit \
-                     is {} bytes), so its contents are not available to you. Tell the user \
-                     the file was attached but is too large for you to read in this \
-                     conversation.",
-                    a.size,
-                    crate::storage::MAX_UPLOAD_BYTES
-                )),
-                None => combined.push_str(
-                    "This file could not be uploaded (cloud sync is off or not signed in), \
-                     so its contents are not available to you. Tell the user the file was \
-                     attached but you cannot read it in this conversation.",
-                ),
+                None => {
+                    // Prefer the recorded reason. Rows persisted before
+                    // `upload_error` existed carry none, so fall back to the
+                    // size cap before blaming cloud sync.
+                    let reason = match (&a.upload_error, a.size > crate::storage::MAX_UPLOAD_BYTES)
+                    {
+                        (Some(e), _) => e.clone(),
+                        (None, true) => "file is too large to upload".to_string(),
+                        (None, false) => "cloud sync is off or not signed in".to_string(),
+                    };
+                    combined.push_str(&format!(
+                        "This file could not be uploaded ({reason}), so its contents are not \
+                         available to you. Tell the user the file was attached but you cannot \
+                         read it in this conversation; they can retry the upload from the \
+                         warning next to the file's name."
+                    ));
+                }
             }
         }
     }
@@ -891,6 +891,8 @@ fn image_request_message(
         data_url: Some(data_url),
         text: None,
         remote_path: None,
+        source_path: None,
+        upload_error: None,
     };
     user_request_message("", &[attachment])
 }

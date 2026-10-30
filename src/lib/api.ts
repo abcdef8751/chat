@@ -50,6 +50,10 @@ export interface Attachment {
    * "stored remotely" badge instead of the contents.
    */
   remotePath?: string | null;
+  /** Local path of the original file, present only when an offload was attempted. */
+  sourcePath?: string | null;
+  /** Why the remote upload did not happen (surfaced with a retry action). */
+  uploadError?: string | null;
 }
 
 export interface ModelOverride {
@@ -490,6 +494,23 @@ export function streamChat(
 
 export function readAttachments(paths: string[]): Promise<Attachment[]> {
   return invoke<Attachment[]>("read_attachments", { paths });
+}
+
+/**
+ * Retry the remote offload of an attachment whose upload failed or was skipped.
+ *
+ * Pass `messageId` when the attachment belongs to a persisted user row; the
+ * backend rewrites that row's attachment JSON (and re-syncs it) on success.
+ * Returns the updated attachment (remotePath set, or a fresh `uploadError`).
+ */
+export function retryAttachmentUpload(
+  attachment: Attachment,
+  messageId?: string | null,
+): Promise<Attachment> {
+  return invoke<Attachment>("retry_attachment_upload", {
+    attachment,
+    messageId: messageId ?? null,
+  });
 }
 
 /**

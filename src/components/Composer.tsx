@@ -16,6 +16,9 @@ export function Composer(props: {
   streaming: boolean;
   busy?: boolean;
   onPickAttachments: () => void;
+  /// Retry a failed remote upload for a staged attachment (shown as a warning
+  /// next to the file name when it has nothing inline and no remote path).
+  onRetryAttachment?: (attachment: Attachment) => void;
   draft: string;
   setDraft: (value: string) => void;
   onSend: () => void;
@@ -90,8 +93,9 @@ export function Composer(props: {
                       <DocIcon />
                       <span class="max-w-52 truncate">{a.name}</span>
                       <span class="opacity-60">{formatBytes(a.size)}</span>
-                      {/* Nothing inline to send: the file is stored remotely and
-                          the model fetches it through a tool on demand. */}
+                      {/* Nothing inline to send: either it is stored remotely and
+                          the model fetches it through a tool, or the upload
+                          failed and the user can retry from here. */}
                       <Show when={a.remotePath && !a.text && !a.dataUrl}>
                         <span
                           title="Stored remotely — the assistant downloads it on demand"
@@ -99,6 +103,32 @@ export function Composer(props: {
                         >
                           remote
                         </span>
+                      </Show>
+                      <Show when={!a.remotePath && !a.text && !a.dataUrl}>
+                        <Show
+                          when={a.sourcePath}
+                          fallback={
+                            <span
+                              title={a.uploadError ?? "This file could not be uploaded"}
+                              class="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-950/50 dark:text-amber-300"
+                            >
+                              ⚠ not uploaded
+                            </span>
+                          }
+                        >
+                          <button
+                            type="button"
+                            onClick={() => props.onRetryAttachment?.(a)}
+                            title={
+                              a.uploadError
+                                ? `Upload failed: ${a.uploadError} — click to retry`
+                                : "Not uploaded — click to retry"
+                            }
+                            class="shrink-0 rounded-full border border-amber-400/70 bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 transition hover:bg-amber-200 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-300 dark:hover:bg-amber-900/60"
+                          >
+                            ⚠ retry
+                          </button>
+                        </Show>
                       </Show>
                     </div>
                   }

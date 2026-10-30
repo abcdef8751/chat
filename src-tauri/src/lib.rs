@@ -206,6 +206,7 @@ pub fn run() {
             pricing::refresh_pricing,
             pricing::thinking_options,
             attachments::read_attachments,
+            attachments::retry_attachment_upload,
             read_attachment_from_uri,
             pick_attachment_uris,
             android_storage_status,

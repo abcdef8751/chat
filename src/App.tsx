@@ -38,6 +38,7 @@ import {
   reflectNow,
   removeProvider,
   renameConversation,
+  retryAttachmentUpload,
   runCronNow,
   searchConversations,
   setActiveProvider,
@@ -2070,6 +2071,34 @@ export default function App() {
     }
   }
 
+  // Retry a failed remote offload from the composer's attachment chip.
+  async function retryPendingAttachment(a: Attachment) {
+    const id = activeId();
+    try {
+      const updated = await retryAttachmentUpload(a);
+      setPendingAttachments((prev) =>
+        prev.map((x) => (x.id === updated.id ? updated : x)),
+      );
+    } catch (e) {
+      setStreamErrorFor(id, String(e));
+    }
+  }
+
+  // Retry a failed offload from a persisted user message. The backend rewrites
+  // the row's attachment JSON on success; reload so the chip shows "remote".
+  async function retryMessageAttachment(messageId: string, a: Attachment) {
+    const id = activeId();
+    try {
+      await retryAttachmentUpload(a, messageId);
+      if (id) {
+        const rows = await listMessages(id);
+        if (activeId() === id) setMessages(rows);
+      }
+    } catch (e) {
+      setStreamErrorFor(id, String(e));
+    }
+  }
+
   // File explorer button: native picker. Android goes through our own plugin
   // (see `pickAttachmentPaths`); desktop through the dialog plugin.
   async function pickAttachments() {
@@ -2958,6 +2987,7 @@ export default function App() {
               onDeny={denyLiveTool}
               onStartEdit={startEditMessage}
               editingId={editingId()}
+              onRetryAttachment={(m, a) => retryMessageAttachment(m.id, a)}
               cronTriggers={cronTriggers()}
             />
           </Show>
@@ -2977,6 +3007,7 @@ export default function App() {
           streaming={isBusy(activeId())}
           busy={isBusy(activeId())}
           onPickAttachments={pickAttachments}
+          onRetryAttachment={retryPendingAttachment}
           draft={draft()}
           setDraft={setDraft}
           onSend={send}

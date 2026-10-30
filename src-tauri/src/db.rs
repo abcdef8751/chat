@@ -478,6 +478,36 @@ pub fn read_messages(db: &Db, conversation_id: &str) -> Result<Vec<MessageRow>, 
     Ok(out)
 }
 
+/// The serialized attachment JSON of one message row (`None` when the row or
+/// its attachment list is absent). Used by the retried-upload path.
+pub fn message_attachments(db: &Db, message_id: &str) -> Result<Option<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT attachments FROM messages WHERE id = ?1",
+        [message_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// Replace a message's attachment JSON after a retried upload. Bumps the row's
+/// sync revision/dirty flag so the new `remotePath` reaches other devices.
+pub fn set_message_attachments(
+    db: &Db,
+    message_id: &str,
+    attachments: &str,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let rev = bump_revision_c(&conn)?;
+    conn.execute(
+        "UPDATE messages SET attachments = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
+        params![message_id, attachments, rev],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Roles that live in `messages` but are not conversation turns: `memory`
 /// consolidation notes and `clock` time notes. They are never synced, never bump
 /// the conversation's revision/updated_at, and are skipped by the timeline.

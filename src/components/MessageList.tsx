@@ -1,5 +1,5 @@
 import { createEffect, For, Index, Show } from "solid-js";
-import type { Message } from "../lib/api";
+import type { Attachment, Message } from "../lib/api";
 import { ClockIcon, DocIcon, EditIcon } from "../lib/icons";
 import { formatBytes, parseAttachments, type Turn } from "../lib/turns";
 import { openImage } from "./ImageLightbox";
@@ -20,6 +20,8 @@ export function MessageList(props: {
   /// Editing no longer happens inline: the composer owns the text, the
   /// attachments and the send/Cancel affordances.
   onStartEdit: (m: Message) => void;
+  /// Retry a failed remote upload on a persisted message attachment.
+  onRetryAttachment?: (m: Message, a: Attachment) => void;
   /// The id of the user row currently loaded into the composer, if any. Drives
   /// the pen's active state so the affordance shows WHICH message is being
   /// edited (and gives the GUI e2e a stable `aria-pressed` hook).
@@ -103,6 +105,34 @@ export function MessageList(props: {
                                         >
                                           remote
                                         </span>
+                                      </Show>
+                                      <Show when={!a.remotePath && !a.text && !a.dataUrl}>
+                                        <Show
+                                          when={a.sourcePath}
+                                          fallback={
+                                            <span
+                                              title={a.uploadError ?? "This file could not be uploaded"}
+                                              class="shrink-0 rounded-full bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-200 dark:bg-amber-500/20 dark:text-amber-300"
+                                            >
+                                              ⚠ not uploaded
+                                            </span>
+                                          }
+                                        >
+                                          <button
+                                            type="button"
+                                            onClick={() =>
+                                              props.onRetryAttachment?.(u(), a)
+                                            }
+                                            title={
+                                              a.uploadError
+                                                ? `Upload failed: ${a.uploadError} — click to retry`
+                                                : "Not uploaded — click to retry"
+                                            }
+                                            class="shrink-0 rounded-full border border-amber-300/60 bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-100 transition hover:bg-amber-400/30 dark:border-amber-600/60 dark:text-amber-300"
+                                          >
+                                            ⚠ retry
+                                          </button>
+                                        </Show>
                                       </Show>
                                     </div>
                                   )
