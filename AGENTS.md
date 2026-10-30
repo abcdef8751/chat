@@ -32,7 +32,12 @@ A general-purpose AI chat app (not a coding agent) with:
   finishes; the final answer renders below it. Its open state is keyed by the
   turn, not the component instance, so streamed re-derives, a mid-turn
   re-mount, or a background transcript refresh can neither close it nor lose a
-  manual toggle; only the live→finished edge auto-collapses. Interim text lives
+  manual toggle; only the live→finished edge auto-collapses. Its **entries** are
+  likewise rebuilt for every turn on every delta, and the trailing
+  answer-reasoning entry is appended for *all* turns (not only when idle) —
+  otherwise a finished turn whose only activity was its final-answer reasoning
+  lost its sole entry and its container vanished while a newer turn streamed.
+  Interim text lives
   *inside* it rather than between the answer's segments because some models
   reuse their pre-tool narration as a draft and restate it in the answer (the
   system prompt also asks them not to, but that is only a nudge)
@@ -951,6 +956,7 @@ npm run build          # Vite production build (outputs to dist/)
 npm run tauri dev      # compile Rust + launch the app window
 npm run tauri build    # compile + bundle an installer
 npm run e2e            # GUI end-to-end test (mock LLM + WebDriver; see below)
+npm run test:turns     # pure turn-grouping unit tests (node --test, no deps)
 ```
 
 Rust-only:
@@ -1208,6 +1214,7 @@ and the app is byte-identical to before. Never blocks the UI.
 │     ├─ api.ts        # typed invoke wrappers over Tauri commands
 │     ├─ platform.ts   # Android bridge: isAndroid / onBack / exitApp / readAttachmentFromUri
 │     ├─ turns.ts      # pure turn/timeline helpers + types (groupTurns/buildEntries/parsers)
+│     ├─ turns.test.ts # node --test unit tests for groupTurns (excluded from tsc)
 │     ├─ icons.tsx     # inline SVG icons
 │     └─ Markdown.tsx  # marked + DOMPurify renderer (prose + dark:prose-invert)
 └─ src-tauri/

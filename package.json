@@ -10,6 +10,7 @@
     "serve": "vite preview",
     "tauri": "tauri",
     "e2e": "bash e2e/run.sh",
+    "test:turns": "node --test src/lib/turns.test.ts",
     "android:release": "bash scripts/android-release.sh",
     "android:debug": "bash scripts/android-debug.sh"
   },
