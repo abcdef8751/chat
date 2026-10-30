@@ -28,19 +28,20 @@ use crate::attachments::{
     MAX_TEXT_BYTES,
 };
 
-/// Whether a Pi Chat Activity is currently resumed (i.e. the app is visible).
+/// Whether a Pi Chat Activity is currently **visible** (started: between
+/// `onStart` and `onStop`).
 ///
-/// Defaults to `true`: before the first `onResume` there is no finished turn to
-/// notify about, and a `false` default would let a startup-adjacent completion
-/// post a notification while the app is visibly opening. The Kotlin side sets
-/// this from `onResume`/`onPause` (`nativeSetForeground`).
+/// Defaults to `true`: the app is opening, so a completion in the first moments
+/// must not notify, and `onStart` (which runs before the cron catch-up pass on a
+/// cold start) corrects it immediately. The Kotlin side sets this from
+/// `onStart`/`onStop` via `nativeSetForeground`.
 static APP_FOREGROUND: AtomicBool = AtomicBool::new(true);
 
 /// Whether the app is in the foreground.
 ///
 /// Android's **window focus** is not a reliable proxy: the single WebView window
-/// can report `is_focused() == true` while the Activity is paused (so background
-/// completions never notified) and `false` while it is visibly resumed (so
+/// can report `is_focused() == true` while the Activity is stopped (so background
+/// completions never notified) and `false` while it is visibly started (so
 /// foreground completions *did* notify). The Activity lifecycle is the source of
 /// truth, published through [`Java_com_rp_chat_MainActivity_nativeSetForeground`].
 pub(crate) fn is_foreground() -> bool {

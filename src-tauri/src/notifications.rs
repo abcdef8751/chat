@@ -8,13 +8,13 @@
 //! unfocused/hidden to the tray on desktop, or the Activity is stopped on
 //! Android.
 //!
-//! Suppression is therefore **foreground-only**: unlike a cron run (which is
-//! suppressed when the app is in the foreground *and* the run's thread is on
-//! screen), a live turn still notifies while the app is in the background even
-//! if its conversation happens to be the active one — the user is not watching.
-//! The frontend's in-app dots cover the "foreground app, another conversation"
-//! case. See [`app_is_foreground`] for why Android uses the Activity lifecycle
-//! rather than window focus.
+//! Suppression is therefore **foreground-only** and shared with the cron path: a
+//! live turn still notifies while the app is in the background even if its
+//! conversation happens to be the active one — the user is not watching. (A cron
+//! run uses the same predicate; it only additionally logs whether its thread was
+//! on screen.) The frontend's in-app dots cover the "foreground app, another
+//! conversation" case. See [`app_is_foreground`] for why Android uses the
+//! Activity lifecycle rather than window focus.
 //!
 //! The posting path is deliberately the same one `cron::notify` uses
 //! ([`crate::cron::notifications_allowed`] + [`crate::cron::send_notification`]):
@@ -23,7 +23,9 @@
 //! POST_NOTIFICATIONS runtime-permission check, logging a blocked post rather
 //! than pretending it was sent.
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
+use tauri::Manager;
 
 /// Whether the user can currently see the app.
 ///

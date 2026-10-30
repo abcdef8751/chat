@@ -5629,6 +5629,22 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert!(text.contains("too large to upload"), "{text}");
         assert!(!text.contains("cloud sync is off"), "{text}");
         assert!(text.contains("retry the upload"), "{text}");
+        // A recorded failure reason is quoted verbatim rather than guessed from
+        // the size, so the model can tell the user what actually went wrong.
+        let failed = Attachment {
+            id: "e".into(),
+            name: "movie.mp4".into(),
+            mime: "video/mp4".into(),
+            size: 3_000_000,
+            kind: "file".into(),
+            source_path: Some("/tmp/movie.mp4".into()),
+            upload_error: Some("upload failed: connection reset".into()),
+            ..Default::default()
+        };
+        let msg = user_request_message("watch", &[failed]).unwrap();
+        let text = serde_json::to_string(&msg).unwrap();
+        assert!(text.contains("upload failed: connection reset"), "{text}");
+        assert!(!text.contains("cloud sync is off"), "{text}");
         // An attachment with contents inline gets no offload note.
         let inline = Attachment {
             id: "c".into(),

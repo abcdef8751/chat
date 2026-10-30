@@ -73,7 +73,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **402 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **403 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
@@ -781,9 +781,10 @@ old chat and past runs stay where they are).
   suppressed whenever the app is **in the foreground** — desktop window focused,
   or Android Activity started (`notifications::app_is_foreground`) — because the
   in-app dots already signal a settled thread, including one that is not on
-  screen. A backgrounded app (tray-hidden window, paused Android Activity) gets
-  the OS notification. `cron_set_active` is still fed by the UI for the
-  suppression log/state, but no longer decides delivery on its own.
+  screen. A backgrounded app (tray-hidden window, stopped Android Activity) gets
+  the OS notification. `cron_set_active` is still fed by the UI, but it now only
+  decides whether the suppression is logged — the foreground check alone decides
+  delivery.
   On **Linux** the send bypasses `tauri-plugin-notification` and calls
   `notify-rust` directly: the plugin's `show()` spawns the D-Bus call and
   discards its error, so a broken path looked like success. The direct call
@@ -811,8 +812,9 @@ old chat and past runs stay where they are).
   **not in the foreground** raises an OS notification (title = conversation
   title, body = the final answer collapsed and truncated to ~200 chars, or a
   short failure snippet; reasoning is never included). Suppression is
-  **foreground-only** — unlike a cron run, a background app means the user is not
-  watching even if that chat is the one selected. On desktop "foreground" is the
+  **foreground-only**, and the cron path uses the same helper: a background app
+  means the user is not watching even if that chat is the one selected. On
+  desktop "foreground" is the
   main window being focused (a hidden close-to-tray window is background). On
   **Android** window focus is unreliable — the single webview may report focused
   while backgrounded (suppressing everything) or unfocused while visibly open
@@ -1188,12 +1190,19 @@ and the app is byte-identical to before. Never blocks the UI.
   `<app data>/downloads/`. A failed or skipped upload records `sourcePath` (the
   local original, so it can be retried) and `uploadError` (the reason), keeps the
   attachment, and tells the model it cannot read the file — never a silent drop.
-  The UI shows an amber **⚠ retry** warning next to that file's name (composer
-  and transcript); clicking it calls `retry_attachment_upload`, which re-checks
-  the file and either records `remotePath` or refreshes `uploadError`. For a
-  persisted message the command also rewrites that row's attachment JSON and
-  re-syncs it. An Android `content://` attachment has no local path, so it shows
-  a non-clickable "not uploaded" warning instead.
+  `sourcePath` is dropped again once the upload lands, so only an outstanding
+  retry carries a local path. The UI shows an amber **⚠ retry** warning next to
+  that file's name (composer and transcript); clicking it calls
+  `retry_attachment_upload`, which re-checks the file (a missing one clears
+  `sourcePath` and reports that) and either records `remotePath` or refreshes
+  `uploadError`. A failed retry never writes: the row already carries an accurate
+  warning, and rewriting it from another device would clobber the `sourcePath`
+  that only the original device can use. A *successful* retry rewrites the row's
+  attachment JSON (chat rows only bump the sync revision — a `scheduled` thread
+  never syncs, so marking it dirty would leave an undrainable pending count) and
+  reloads through `reloadTranscript`, never a bare `setMessages`. An Android
+  `content://` attachment has no local path, so it shows a non-clickable "not
+  uploaded" warning instead.
 
 > **Production blocker — email confirmation is currently OFF.** For a personal
 > local-first tool we run Supabase Auth with the **"Confirm email"** toggle off
@@ -1476,7 +1485,7 @@ Residuals from this batch:
   after a pull is safe. The bucket and policies exist on the personal project.
 - **GUI e2e could not run in the last session** (the other worktree's dev server
   held port 1420, and the harness fails fast by design); `tsc` + production build
-  + 402 Rust tests are green. The retry/edit flows are compiler-verified only.
+  + 403 Rust tests are green. The retry/edit flows are compiler-verified only.
 
 **Recent backlog (landed):** a 13-item pass — drawer-open keyboard, memory page
 list→detail on mobile, Enter=newline on Android, live↔persisted timeline

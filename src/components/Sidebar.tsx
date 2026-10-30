@@ -241,10 +241,11 @@ export function Sidebar(props: {
   return (
     <>
       {/* Sidebar backdrop — narrow viewports only, closes the drawer on tap.
-          Kept mounted and faded with the drawer's own duration: mounting it only
-          while open made it pop in/out instantly while the panel slid, which
-          read as a jolt. `pointer-events-none` when closed keeps it inert, and
-          nothing about it is a layout property, so there is no reflow. */}
+          Always mounted and faded (150 ms): mounting it only while open made it
+          pop in instantly next to the panel, which read as a jolt. The panel
+          itself does not animate (see <aside>), so nothing here can shimmer its
+          text. `pointer-events-none` when closed keeps it inert, and opacity is
+          not a layout property, so there is no reflow. */}
       <div
         class={`fixed inset-0 z-30 bg-black/40 transition-opacity duration-150 ease-out motion-reduce:transition-none lg:hidden ${
           props.sidebarOpen ? "opacity-100" : "pointer-events-none opacity-0"
