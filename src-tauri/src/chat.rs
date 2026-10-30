@@ -1513,15 +1513,79 @@ pub(crate) fn system_id() -> String {
     format!("pi-chat/{}+{}", env!("CARGO_PKG_VERSION"), prompt_hash())
 }
 
+/// Sanitize one environment value for the prompt line: single line, trimmed,
+/// bounded. A hostile/odd username or hostname must not be able to inject
+/// instructions into the system prompt via a newline.
+fn prompt_safe(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.chars().take(120).collect()
+    }
+}
+
+/// The host name, without a dependency: the Linux/Android proc file first, then
+/// the Windows/macOS environment convention, then a literal "unknown".
+fn host_name() -> String {
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            let first = raw.lines().next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return first.to_string();
+            }
+        }
+    }
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_default()
+}
+
+fn user_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default()
+}
+
+fn home_dir() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default()
+}
+
+/// Where the assistant is running, as one factual line: OS + architecture, the
+/// logged-in user, the host name and the home directory. Host tools operate on
+/// this machine, so the model should know *which* machine it is on (paths,
+/// platform-specific commands, `~` expansion). Values come from the process
+/// environment, so they are only as accurate as that (a service account is not
+/// the interactive user); each is sanitized and bounded by [`prompt_safe`].
+fn system_environment() -> String {
+    format!(
+        "OS: {} ({}); user: {}; host: {}; home: {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        prompt_safe(&user_name()),
+        prompt_safe(&host_name()),
+        prompt_safe(&home_dir()),
+    )
+}
+
 /// The one rendered line carrying [`system_id`] in the system prompt. Kept
 /// factual: the id is what this build and its hashed prompt strings produce, so
-/// it changes when those change (a release bump included). No claim about the
-/// user having updated anything.
+/// it changes when those change (a release bump included). The environment
+/// details describe the device host tools run on. No claim about the user having
+/// updated anything.
 fn system_line() -> String {
     format!(
-        "Running system: {}. This id names the app build and system prompt in use; if the user \
-         asks which system you are running, report it.",
-        system_id()
+        "Running system: {}. Environment: {}. This id names the app build and system prompt in \
+         use; if the user asks which system you are running, report it.",
+        system_id(),
+        system_environment(),
     )
 }
 

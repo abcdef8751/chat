@@ -22,5 +22,7 @@
     "noFallthroughCasesInSwitch": true
   },
   "include": ["src"],
+  // Node-run unit tests (no @types/node in this project).
+  "exclude": ["src/**/*.test.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

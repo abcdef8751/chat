@@ -204,7 +204,7 @@ impl ShellExecutor {
             if !meta.is_file() {
                 return ToolOutput::err(format!("read_file: {path} is not a file"));
             }
-            let mut file = match tokio::fs::File::open(path).await {
+            let file = match tokio::fs::File::open(path).await {
                 Ok(f) => f,
                 Err(e) => return ToolOutput::err(format!("read_file: {e}")),
             };

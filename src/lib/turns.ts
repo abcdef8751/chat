@@ -291,23 +291,25 @@ export function groupTurns(messages: Message[], liveTools: LiveTool[], streaming
         live: t,
       });
     }
-    // The current (not-yet-flushed) round's reasoning trails the flushed ones;
-    // its text stays on the answer bubble ("text remaining at done is the
-    // answer"). Keeping it last means its DOM node survives as later rounds
-    // append entries after it.
-    const thought = live.answer?.id.startsWith("tmp-assistant-")
-      ? live.answer?.thinking?.trim()
-      : null;
-    if (thought && live.answer) {
-      live.entries.push({ kind: "thought", id: live.answer.id, text: thought });
-    }
-  } else {
-    // Persisted turns: the answer row's reasoning is a trailing timeline entry.
-    for (const turn of turns) {
-      if (turn.answer?.thinking?.trim()) {
-        turn.entries.push({ kind: "thought", id: turn.answer.id, text: turn.answer.thinking });
-      }
-    }
+  }
+
+  // The answer row's reasoning trails its turn as a timeline entry — for EVERY
+  // turn, streaming or not. This used to live in an `else` paired with the live
+  // branch above, so while one turn streamed no other turn got its trailing
+  // thought: a turn whose only activity was its final-answer reasoning lost its
+  // sole entry and its whole activity container vanished mid-stream, and a
+  // tool-using turn lost the Thought pill from inside its container. `entries`
+  // was rebuilt per delta, so it reappeared the moment the stream ended.
+  //
+  // The live branch already appended the in-flight answer's thought; skip a
+  // duplicate by id rather than by turn identity (the answer can theoretically
+  // be a persisted row that `buildEntries` already accounted for).
+  for (const turn of turns) {
+    const answer = turn.answer;
+    const text = answer?.thinking?.trim();
+    if (!answer || !text) continue;
+    if (turn.entries.some((e) => e.kind === "thought" && e.id === answer.id)) continue;
+    turn.entries.push({ kind: "thought", id: answer.id, text });
   }
   return turns;
 }
