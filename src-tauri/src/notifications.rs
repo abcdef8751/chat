@@ -73,7 +73,7 @@ pub(crate) fn notify_turn_finished(
     outcome: TurnOutcome<'_>,
 ) {
     // Foreground is the whole predicate: a foreground app means the user can
-    // see the in-app indicators (a hidden window or paused Android Activity
+    // see the in-app indicators (a hidden window or a stopped Android Activity
     // reports false, which is exactly when an OS notification helps).
     if app_is_foreground(app) {
         return;

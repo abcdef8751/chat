@@ -2074,11 +2074,31 @@ export default function App() {
   // Attachments with a retry in flight. Each upload mints a fresh object key, so
   // a double click would upload the file twice and orphan the first object.
   const retryingAttachments = new Set<string>();
+  const retryKey = (a: Attachment, messageId?: string | null) =>
+    messageId ? `message:${messageId}:${a.id}` : `pending:${a.id}`;
+  /** Whether a staged attachment is waiting on an upload retry (blocks `send`). */
+  const attachmentsAreRetrying = (list: Attachment[]) =>
+    list.some((a) => retryingAttachments.has(`pending:${a.id}`));
+  // The banner text a retry set, per attachment. The stream-error banner is the
+  // only carrier of a turn's actionable error text, so a successful retry may
+  // clear it only when it is the very message that retry wrote.
+  const retryBanner = new Map<string, string>();
+  const reportRetryFailure = (key: string, id: string | null, message: string) => {
+    retryBanner.set(key, message);
+    setStreamErrorFor(id, message);
+  };
+  const clearOwnRetryBanner = (key: string, id: string | null) => {
+    const mine = retryBanner.get(key);
+    retryBanner.delete(key);
+    if (mine !== undefined && (streamErrors()[id ?? ""] ?? null) === mine) {
+      clearStreamError(id);
+    }
+  };
 
   // Retry a failed remote offload from the composer's attachment chip.
   async function retryPendingAttachment(a: Attachment) {
     const id = activeId();
-    const key = `pending:${a.id}`;
+    const key = retryKey(a);
     if (retryingAttachments.has(key)) return;
     retryingAttachments.add(key);
     try {
@@ -2086,10 +2106,13 @@ export default function App() {
       setPendingAttachments((prev) =>
         prev.map((x) => (x.id === updated.id ? updated : x)),
       );
-      if (updated.uploadError) setStreamErrorFor(id, updated.uploadError);
-      else clearStreamError(id);
+      if (updated.uploadError) {
+        reportRetryFailure(key, id, `Upload failed: ${updated.uploadError}`);
+      } else {
+        clearOwnRetryBanner(key, id);
+      }
     } catch (e) {
-      setStreamErrorFor(id, String(e));
+      reportRetryFailure(key, id, String(e));
     } finally {
       retryingAttachments.delete(key);
     }
@@ -2102,16 +2125,21 @@ export default function App() {
   // rendered the moment the user row exists, i.e. while the reply still streams).
   async function retryMessageAttachment(messageId: string, a: Attachment) {
     const id = activeId();
-    const key = `message:${a.id}`;
+    // Keyed by message + attachment: one in-flight retry per attachment (two on
+    // the same message must not race the row's JSON), and never two for one.
+    const key = retryKey(a, messageId);
     if (retryingAttachments.has(key)) return;
     retryingAttachments.add(key);
     try {
       const updated = await retryAttachmentUpload(a, messageId);
-      if (updated.uploadError) setStreamErrorFor(id, updated.uploadError);
-      else clearStreamError(id);
+      if (updated.uploadError) {
+        reportRetryFailure(key, id, `Upload failed: ${updated.uploadError}`);
+      } else {
+        clearOwnRetryBanner(key, id);
+      }
       if (id) await reloadTranscript(id);
     } catch (e) {
-      setStreamErrorFor(id, String(e));
+      reportRetryFailure(key, id, String(e));
     } finally {
       retryingAttachments.delete(key);
     }
@@ -2330,6 +2358,10 @@ export default function App() {
     const staged = pendingAttachments();
     let id = activeId();
     if (isBusy(id) || (!draft().trim() && staged.length === 0)) return;
+    // A retry in flight would race this send: the send snapshots the attachment
+    // list before the retry rewrites it, so the message would persist a stale
+    // `uploadError` while the object uploads and ends up orphaned.
+    if (attachmentsAreRetrying(staged)) return;
 
     // Editing an existing user row: rewrite it (truncating later messages) and
     // re-run the reply from it, instead of appending a second user turn.

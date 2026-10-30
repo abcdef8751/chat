@@ -604,8 +604,10 @@ pub async fn retry_attachment_upload(
     };
     // The file can be gone: deleted or moved since it was attached, or a path
     // that never existed here because `sourcePath` came from another device.
-    // Report that and stop offering the retry instead of failing the same way
-    // on every click.
+    // The returned attachment drops `sourcePath` so this view stops offering a
+    // click that cannot work. Nothing is written, though — the persisted row
+    // keeps its path, because only the device that has the file can use it and
+    // a write here would clobber it there.
     let meta = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) => {
@@ -619,6 +621,15 @@ pub async fn retry_attachment_upload(
     // Refresh the size: the file may have been replaced or grown since it was
     // attached, and the cap check must see the current length.
     a.size = meta.len();
+    // Size gate *before* the credentials: retrying an over-cap file must not
+    // build a `SyncState`, read the keychain or refresh a token just to report
+    // the same cap back (the batch path holds the same invariant).
+    if let Some(reason) = offload_size_error(Path::new(&path), a.size).await {
+        eprintln!("attachments: retry for {path} skipped: {reason}");
+        a.remote_path = None;
+        a.upload_error = Some(reason);
+        return Ok(a);
+    }
 
     let resolved = crate::storage::credentials().await;
     let creds = match &resolved {
@@ -637,19 +648,9 @@ pub async fn retry_attachment_upload(
         return Ok(a);
     };
 
-    let saving = |e: String| format!("the file was uploaded, but saving it to the message failed: {e}");
-    let json = crate::db::message_attachments(db.inner(), &mid)
-        .map_err(saving)?
-        .ok_or_else(|| "the file was uploaded, but the message no longer has attachments to update".to_string())?;
-    let mut list: Vec<Attachment> =
-        serde_json::from_str(&json).map_err(|e| saving(e.to_string()))?;
-    let slot = list
-        .iter_mut()
-        .find(|x| x.id == a.id)
-        .ok_or_else(|| "the file was uploaded, but that attachment is no longer on the message".to_string())?;
-    *slot = a.clone();
-    let updated = serde_json::to_string(&list).map_err(|e| saving(e.to_string()))?;
-    crate::db::set_message_attachments(db.inner(), &mid, &updated).map_err(saving)?;
+    crate::db::merge_message_attachment(db.inner(), &mid, &a).map_err(|e| {
+        format!("the file was uploaded, but saving it to the message failed: {e}")
+    })?;
 
     Ok(a)
 }

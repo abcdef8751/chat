@@ -479,7 +479,11 @@ pub fn read_messages(db: &Db, conversation_id: &str) -> Result<Vec<MessageRow>, 
 }
 
 /// The serialized attachment JSON of one message row (`None` when the row is
-/// absent or its attachment column is NULL). Used by the retried-upload path.
+/// absent or its attachment column is NULL).
+///
+/// Test-only: the retried-upload path reads and rewrites under one lock
+/// ([`merge_message_attachment`]), so nothing in the app needs a bare read.
+#[cfg(test)]
 pub fn message_attachments(db: &Db, message_id: &str) -> Result<Option<String>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     conn.query_row(
@@ -492,41 +496,63 @@ pub fn message_attachments(db: &Db, message_id: &str) -> Result<Option<String>, 
     .map(Option::flatten)
 }
 
-/// Replace a message's attachment JSON after a retried upload.
+/// Replace one attachment inside a message's attachment JSON after a successful
+/// retried upload, under **one** connection lock.
 ///
-/// Bumps the row's sync revision/dirty flag so the new `remotePath` reaches
-/// other devices — **except** in a `scheduled` thread, which never syncs: a
-/// dirty row there would show up as permanently pending in Settings, because
-/// the push filters those rows out (`sync::push`).
-pub fn set_message_attachments(
+/// The lock matters: the read-modify-write must be atomic, or two retries on two
+/// attachments of the same message both read the pre-retry JSON and the later
+/// writer restores the earlier one's stale slot (its upload succeeding but the
+/// message still saying it failed, with the object orphaned).
+///
+/// The sync revision/dirty flag is bumped **only** for a `chat` conversation — a
+/// `scheduled` thread never syncs, so marking it dirty would leave a pending
+/// count no push can ever drain (the push filters those rows out).
+pub fn merge_message_attachment(
     db: &Db,
     message_id: &str,
-    attachments: &str,
+    attachment: &crate::attachments::Attachment,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let synced = conn
+    let (json, kind): (Option<String>, String) = conn
         .query_row(
-            "SELECT c.kind = 'chat' FROM messages m
-             JOIN conversations c ON c.id = m.conversation_id WHERE m.id = ?1",
+            "SELECT m.attachments,
+                    (SELECT c.kind FROM conversations c WHERE c.id = m.conversation_id)
+             FROM messages m WHERE m.id = ?1",
             [message_id],
-            |r| r.get::<_, bool>(0),
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?
-        .unwrap_or(false);
-    if synced {
+        .ok_or_else(|| "that message no longer exists".to_string())?;
+    let json = json.ok_or_else(|| "that message has no attachments to update".to_string())?;
+    let mut list: Vec<crate::attachments::Attachment> = serde_json::from_str(&json)
+        .map_err(|e| format!("the message's attachments could not be read: {e}"))?;
+    let slot = list
+        .iter_mut()
+        .find(|x| x.id == attachment.id)
+        .ok_or_else(|| "that attachment is no longer on the message".to_string())?;
+    *slot = attachment.clone();
+    let updated = serde_json::to_string(&list)
+        .map_err(|e| format!("the message's attachments could not be written: {e}"))?;
+
+    let n = if kind == "chat" {
         let rev = bump_revision_c(&conn)?;
         conn.execute(
             "UPDATE messages SET attachments = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
-            params![message_id, attachments, rev],
+            params![message_id, updated, rev],
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
     } else {
         conn.execute(
             "UPDATE messages SET attachments = ?2 WHERE id = ?1",
-            params![message_id, attachments],
+            params![message_id, updated],
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+    };
+    // A concurrent delete between the SELECT and the UPDATE: the file is
+    // uploaded, so this must not be reported as silent success.
+    if n == 0 {
+        return Err("that message no longer exists".to_string());
     }
     Ok(())
 }
@@ -1489,15 +1515,20 @@ pub fn tombstone_messages(
 }
 
 /// Number of rows locally awaiting a push (dirty rows + pending tombstones).
+///
+/// Scoped to what the push actually sends: a `scheduled` thread never syncs, so
+/// its dirty rows (possible on a database written by an older build) are not
+/// "pending" — counting them would show a total that can never drain.
 pub fn pending_rows(db: &Db) -> Result<u64, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let count = |stmt: &str| -> i64 {
         conn.query_row(stmt, [], |r| r.get(0)).unwrap_or(0)
     };
-    let conv = count(
-        "SELECT COUNT(*) FROM conversations WHERE dirty = 1",
+    let conv = count("SELECT COUNT(*) FROM conversations WHERE dirty = 1 AND kind = 'chat'");
+    let msg = count(
+        "SELECT COUNT(*) FROM messages WHERE dirty = 1
+           AND conversation_id IN (SELECT id FROM conversations WHERE kind = 'chat')",
     );
-    let msg = count("SELECT COUNT(*) FROM messages WHERE dirty = 1");
     let mem = count("SELECT COUNT(*) FROM memory_sync WHERE dirty = 1");
     let cfg = count("SELECT COUNT(*) FROM user_config WHERE dirty = 1");
     let tomb = count("SELECT COUNT(*) FROM sync_tombstones");
@@ -1510,13 +1541,18 @@ pub fn pending_rows(db: &Db) -> Result<u64, String> {
 /// (they are never synced by design).
 pub fn mark_all_dirty_for_resync(db: &Db) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    conn.execute("UPDATE conversations SET dirty = 1", [])
+    // Only `chat` conversations sync: a `scheduled` thread is local-only (its job
+    // never reaches another device), so marking one dirty would leave a pending
+    // count in Settings that no push can ever drain.
+    conn.execute("UPDATE conversations SET dirty = 1 WHERE kind = 'chat'", [])
         .map_err(|e| e.to_string())?;
     conn.execute(
-        "UPDATE messages SET dirty = 1 WHERE role NOT IN ('memory', 'clock', 'prompt_update')",
+        "UPDATE messages SET dirty = 1
+           WHERE role NOT IN ('memory', 'clock', 'prompt_update')
+             AND conversation_id IN (SELECT id FROM conversations WHERE kind = 'chat')",
         [],
     )
-        .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?;
     conn.execute("UPDATE memory_sync SET dirty = 1", [])
         .map_err(|e| e.to_string())?;
     conn.execute("UPDATE user_config SET dirty = 1", [])
@@ -2757,7 +2793,7 @@ mod tests {
     /// `scheduled` thread never syncs, so marking it dirty would leave a count
     /// in Settings that no push can ever drain.
     #[test]
-    fn set_message_attachments_marks_only_chat_rows_dirty() {
+    fn merge_message_attachment_marks_only_chat_rows_dirty() {
         let mut p = std::env::temp_dir();
         p.push(format!("pi-chat-att-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
@@ -2785,31 +2821,60 @@ mod tests {
         assert_eq!(message_attachments(&db, "chat1-m").unwrap(), None);
         assert_eq!(message_attachments(&db, "nope").unwrap(), None);
 
-        set_message_attachments(&db, "chat1-m", r#"[{"id":"a"}]"#).unwrap();
-        assert_eq!(
-            message_attachments(&db, "chat1-m").unwrap().as_deref(),
-            Some(r#"[{"id":"a"}]"#)
-        );
-        set_message_attachments(&db, "cron1-m", r#"[{"id":"b"}]"#).unwrap();
-        assert_eq!(
-            message_attachments(&db, "cron1-m").unwrap().as_deref(),
-            Some(r#"[{"id":"b"}]"#)
-        );
-
-        let conn = db.0.lock().unwrap();
-        let row = |id: &str| -> (i64, i64) {
-            conn.query_row(
-                "SELECT revision, dirty FROM messages WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+        // Seed one attachment per row, then merge a retried one into each. The
+        // JSON is produced by the type itself, so it stays complete as fields
+        // are added.
+        for (mid, id) in [("chat1-m", "a"), ("cron1-m", "b")] {
+            let seed = serde_json::to_string(&vec![crate::attachments::Attachment {
+                id: id.into(),
+                name: "f.bin".into(),
+                mime: "application/octet-stream".into(),
+                size: 1,
+                kind: "file".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "UPDATE messages SET attachments = ?2 WHERE id = ?1",
+                params![mid, seed],
             )
-            .unwrap()
+            .unwrap();
+        }
+        let uploaded = |id: &str| crate::attachments::Attachment {
+            id: id.into(),
+            name: "f.bin".into(),
+            remote_path: Some(format!("user-1/{id}.bin")),
+            ..Default::default()
         };
-        let (chat_rev, chat_dirty) = row("chat1-m");
-        assert!(chat_rev > 0, "a chat row must get a sync revision");
-        assert_eq!(chat_dirty, 1, "a chat row must be pushed");
-        assert_eq!(row("cron1-m"), (0, 0), "a scheduled thread must not sync");
-        drop(conn);
+        merge_message_attachment(&db, "chat1-m", &uploaded("a")).unwrap();
+        merge_message_attachment(&db, "cron1-m", &uploaded("b")).unwrap();
+        for (mid, id) in [("chat1-m", "a"), ("cron1-m", "b")] {
+            let json = message_attachments(&db, mid).unwrap().unwrap();
+            assert!(json.contains(&format!(r#""remotePath":"user-1/{id}.bin""#)), "{json}");
+            assert!(!json.contains("uploadError"), "{json}");
+        }
+
+        // A merge that matches no attachment (or no row) is an error, not a
+        // silent success that would leave the object orphaned.
+        assert!(merge_message_attachment(&db, "chat1-m", &uploaded("nope")).is_err());
+        assert!(merge_message_attachment(&db, "missing", &uploaded("a")).is_err());
+
+        let (chat, cron) = {
+            let conn = db.0.lock().unwrap();
+            let rev_dirty = |id: &str| -> (i64, i64) {
+                conn.query_row(
+                    "SELECT revision, dirty FROM messages WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+            };
+            (rev_dirty("chat1-m"), rev_dirty("cron1-m"))
+        };
+        assert!(chat.0 > 0, "a chat row must get a sync revision");
+        assert_eq!(chat.1, 1, "a chat row must be pushed");
+        assert_eq!(cron, (0, 0), "a scheduled thread must not sync");
 
         let _ = std::fs::remove_file(&p);
     }

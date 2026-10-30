@@ -1193,14 +1193,23 @@ and the app is byte-identical to before. Never blocks the UI.
   `sourcePath` is dropped again once the upload lands, so only an outstanding
   retry carries a local path. The UI shows an amber **⚠ retry** warning next to
   that file's name (composer and transcript); clicking it calls
-  `retry_attachment_upload`, which re-checks the file (a missing one clears
-  `sourcePath` and reports that) and either records `remotePath` or refreshes
-  `uploadError`. A failed retry never writes: the row already carries an accurate
-  warning, and rewriting it from another device would clobber the `sourcePath`
-  that only the original device can use. A *successful* retry rewrites the row's
-  attachment JSON (chat rows only bump the sync revision — a `scheduled` thread
-  never syncs, so marking it dirty would leave an undrainable pending count) and
-  reloads through `reloadTranscript`, never a bare `setMessages`. An Android
+  `retry_attachment_upload`, which re-checks the file and either records
+  `remotePath` or refreshes `uploadError`. A file that is gone reports why and
+  the *returned* attachment stops offering the click, but nothing is written —
+  the persisted row keeps its path, because only the device that has the file can
+  use it and a write from another device would clobber it there. A failed retry
+  never writes at all (the row already carries an accurate warning). A
+  *successful* retry merges the attachment into the row's JSON under one lock
+  (`db::merge_message_attachment`, so two retries on one message cannot lose each
+  other's update) and reloads through `reloadTranscript`, never a bare
+  `setMessages` — the chip is visible while the reply still streams, and the
+  reload must re-attach the live row. Only a `chat` row bumps the sync revision:
+  a `scheduled` thread never syncs, so marking it dirty would leave a pending
+  count that no push can drain (the same reason `pending_rows` and
+  `mark_all_dirty_for_resync` are scoped to `kind = 'chat'`). Because the note
+  the model sees is rebuilt from the row at request time, a retried upload
+  changes that turn's text — which is the point (the model can now `fetch_file`)
+  but does invalidate the provider prefix cache from that row onward. An Android
   `content://` attachment has no local path, so it shows a non-clickable "not
   uploaded" warning instead.
 

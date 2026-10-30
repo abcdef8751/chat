@@ -65,8 +65,11 @@ const MAX_FIRES_PER_TICK: usize = 5;
 const MAX_CONCURRENT_RUNS: usize = 3;
 
 /// Runtime state for the scheduler: which conversations have a cron run in
-/// flight, and which conversation the UI currently shows (used to suppress an OS
-/// notification for a run the user is already watching).
+/// flight, and which conversation the UI currently shows.
+///
+/// Delivery of a notification is decided **only** by
+/// `notifications::app_is_foreground`; the on-screen chat merely decides whether
+/// the suppression is logged (`notify`).
 #[derive(Default)]
 pub struct CronState {
     running: Mutex<HashSet<String>>,
@@ -631,8 +634,9 @@ fn snippet(text: &str) -> String {
     }
 }
 
-/// Send an OS notification for a finished run. Suppressed while the app is
-/// focused on that exact conversation (the user is already watching it).
+/// Send an OS notification for a finished run. Suppressed whenever the app is in
+/// the foreground: the in-app dots already signal a settled thread, so an OS
+/// notification there would be noise.
 fn notify(app: &AppHandle, job: &db::CronJob, body: &str) {
     if !job.notify {
         return;
@@ -1047,8 +1051,8 @@ pub fn list_cron_triggers(
     db::list_cron_triggers(&db, conversation_id.as_deref())
 }
 
-/// Tell the backend which chat is on screen, so a finished run in that chat does
-/// not raise an OS notification the user can already see.
+/// Tell the backend which chat is on screen. The foreground check alone decides
+/// whether a finished run notifies; this only labels the suppression log line.
 #[tauri::command]
 pub fn cron_set_active(
     state: tauri::State<'_, CronState>,
