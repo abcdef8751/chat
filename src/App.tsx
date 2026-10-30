@@ -182,7 +182,11 @@ export default function App() {
   const [activeId, setActiveId] = createSignal<string | null>(null);
   const [messages, setMessages] = createSignal<Message[]>([]);
   const [draft, setDraft] = createSignal("");
-  const [streamError, setStreamError] = createSignal<string | null>(null);
+  // Turn/attachment failures are **conversation-scoped**: an error raised in one
+  // chat must not stay on screen after switching to another. Keyed by
+  // conversation id; `""` is the key for failures raised with no conversation
+  // open (a failed attachment pick before a chat exists). See the helpers below.
+  const [streamErrors, setStreamErrors] = createSignal<Record<string, string>>({});
   const [nearBottom, setNearBottom] = createSignal(true);
   let messagesScrollEl: HTMLElement | undefined;
 
@@ -274,6 +278,24 @@ export default function App() {
   // cron run becomes invisible and un-abortable.
   const isBusy = (id: string | null | undefined) =>
     isStreaming(id) || (!!id && cronRunning().has(id));
+  // Set (or clear, with `null`) the error shown for a conversation. A `null` key
+  // is the "no conversation open" bucket. Returning `prev` unchanged when nothing
+  // changes keeps the banner from re-rendering on every harmless clear.
+  const setStreamErrorFor = (id: string | null | undefined, message: string | null) =>
+    setStreamErrors((prev) => {
+      const key = id ?? "";
+      if (message === null) {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      if (prev[key] === message) return prev;
+      return { ...prev, [key]: message };
+    });
+  const clearStreamError = (id: string | null | undefined) => setStreamErrorFor(id, null);
+  // The banner renders only the OPEN conversation's error.
+  const streamError = () => streamErrors()[activeId() ?? ""] ?? null;
   // Live tool cards for the ACTIVE conversation (derived, so no shared array):
   const liveTools = () => liveTurns()[activeId() ?? ""]?.liveTools ?? [];
 
@@ -298,6 +320,83 @@ export default function App() {
       delete next[id];
       return next;
     });
+  }
+
+  // A staged (`tmp-user-*`) row is the local preview of a turn the backend
+  // persists just before streaming starts. Two rows are the same turn when the
+  // text matches and they carry the same attachment ids (unique per picked
+  // file), which is what "the fetched rows already contain this bubble" means.
+  function sameStagedUserRow(persisted: Message, staged: Message): boolean {
+    if (persisted.role !== "user" || persisted.content !== staged.content) return false;
+    const ids = (m: Message) => parseAttachments(m).map((a) => a.id).sort().join(",");
+    return ids(persisted) === ids(staged);
+  }
+
+  /** Single implementation of "refresh the open conversation's transcript".
+   *
+   *  Every reload used to be `listMessages(id).then(setMessages)` guarded by
+   *  `!isStreaming(id)` **before** the await — so a 60s sync pull, a reflection
+   *  finish, a cron event or the chat-switch loader could resolve MID-TURN and
+   *  replace `messages` with the persisted rows, which lack the in-flight
+   *  assistant row (and any staged `tmp-user-*` row). That closed the activity
+   *  panel and froze the answer while the model was still talking. The decision
+   *  is therefore deferred to RESOLUTION time:
+   *
+   *  - the chat is no longer open → discard the snapshot;
+   *  - a live turn exists → re-attach its assistant row (like the switch loader)
+   *    so deltas keep appending to a rendered row;
+   *  - a turn is registered but has no live record (transient) → leave the
+   *    transcript alone; the turn's own terminal reload reconciles it;
+   *  - otherwise → apply the persisted rows, keeping any staged user row the
+   *    snapshot does not contain yet.
+   */
+  async function reloadTranscript(id: string) {
+    let rows: Message[];
+    try {
+      rows = await listMessages(id);
+    } catch {
+      return; // best-effort refresh; the turn's terminal reload reconciles
+    }
+    // The user switched (or closed the chat) while the fetch was in flight: this
+    // snapshot belongs to a conversation that is no longer on screen.
+    if (activeId() !== id) return;
+    const current = messages();
+    const staged = current.filter(
+      (m) =>
+        m.conversation_id === id &&
+        m.id.startsWith("tmp-user-") &&
+        !rows.some((r) => sameStagedUserRow(r, m)),
+    );
+    const live = liveTurns()[id];
+    if (live) {
+      // Re-attach the in-flight assistant row so a reload that raced the start
+      // of a turn cannot hide it. Deltas keep appending to this key.
+      setMessages([
+        ...rows,
+        ...staged,
+        {
+          id: live.assistantKey,
+          conversation_id: id,
+          role: "assistant",
+          index: rows.length + staged.length,
+          content: live.content,
+          model: null,
+          provider: null,
+          thinking_level: null,
+          thinking: live.thinking,
+          usage: null,
+          stop_reason: null,
+          attachments: null,
+          created_at: Date.now(),
+        },
+      ]);
+      return;
+    }
+    // A turn that is registered without a live record yet (or any more) is a
+    // transient state between the streaming flags and the record itself; leave
+    // the visible transcript alone rather than risk dropping its live row.
+    if (isStreaming(id)) return;
+    setMessages([...rows, ...staged]);
   }
 
   // Files staged for the next message (picked or dropped).
@@ -697,8 +796,10 @@ export default function App() {
       (event) => {
         void refreshReflectionStats();
         const id = activeId();
-        if (id && event.payload.conversationId === id && !isStreaming(id)) {
-          listMessages(id).then(setMessages);
+        if (id && event.payload.conversationId === id) {
+          // The note lands in this chat's transcript; the reload must not clobber
+          // a turn that started (or is still running) while the event arrived.
+          void reloadTranscript(id);
         }
         refreshConversations().catch(() => {});
       },
@@ -731,7 +832,7 @@ export default function App() {
       if (!event.payload?.changed) return;
       refreshConversations().catch(() => {});
       const id = activeId();
-      if (id && !isStreaming(id)) listMessages(id).then(setMessages);
+      if (id) void reloadTranscript(id);
     });
     onCleanup(() => unlistenSync);
 
@@ -759,9 +860,7 @@ export default function App() {
         void refreshConversations();
       }
       const id = activeId();
-      if (id && conversationId === id && !isStreaming(id)) {
-        listMessages(id).then(setMessages);
-      }
+      if (id && conversationId === id) void reloadTranscript(id);
       // Keep the selected job's run history live while the dialog is open.
       if (cronSelectedId() && cronSelectedId() === jobId) void loadCronRuns(jobId);
     });
@@ -1113,34 +1212,9 @@ export default function App() {
       setMessages([]);
       return;
     }
-    listMessages(id).then((rows) => {
-      if (activeId() !== id) return; // user switched again while loading
-      const live = liveTurns()[id];
-      if (live) {
-        // Re-attach the in-flight assistant row so a chat switched back to
-        // mid-turn keeps rendering streamed output. Deltas keep appending to it.
-        setMessages([
-          ...rows,
-          {
-            id: live.assistantKey,
-            conversation_id: id,
-            role: "assistant",
-            index: rows.length,
-            content: live.content,
-            model: null,
-            provider: null,
-            thinking_level: null,
-            thinking: live.thinking,
-            usage: null,
-            stop_reason: null,
-            attachments: null,
-            created_at: Date.now(),
-          },
-        ]);
-      } else {
-        setMessages(rows);
-      }
-    });
+    // One implementation of "load this chat's rows and never clobber a live
+    // turn" (re-attaches the in-flight assistant row when there is one).
+    void reloadTranscript(id);
   });
 
   // Keep the newest message in view unless the user has scrolled up or is
@@ -1201,6 +1275,9 @@ export default function App() {
     // A deleted chat can't have unread output any more (it would keep the
     // hamburger dot lit forever).
     clearUnseen(id);
+    // Drop its error banner too: the id can never be active again, but leaving
+    // the entry would leak one string per deleted chat for the session.
+    clearStreamError(id);
     await refreshConversations();
     // Its cron jobs cascade away with the conversation row: refresh so a ghost
     // job disappears from the (possibly open) Cron dialog and sidebar glyphs.
@@ -1847,7 +1924,7 @@ export default function App() {
     try {
       await reflectNow(id);
       await reloadMemory(memorySelected() ?? undefined);
-      if (activeId() === id) listMessages(id).then(setMessages);
+      if (activeId() === id) void reloadTranscript(id);
     } catch (e) {
       setMemoryError(String(e));
     } finally {
@@ -1949,15 +2026,17 @@ export default function App() {
       const atts = await readPickedAttachments(paths);
       if (atts.length === 0) {
         // Every item failed (e.g. an unreadable `content://` URI). Surface it
-        // instead of silently doing nothing.
-        setStreamError(
+        // instead of silently doing nothing. Scoped to the chat the pick was made
+        // in, so it doesn't follow the user into another conversation.
+        setStreamErrorFor(
+          activeId(),
           paths.length === 1 ? "Could not read the selected file." : "Could not read the selected files.",
         );
         return;
       }
       setPendingAttachments((prev) => [...prev, ...atts]);
     } catch (e) {
-      setStreamError(String(e));
+      setStreamErrorFor(activeId(), String(e));
     }
   }
 
@@ -1969,7 +2048,7 @@ export default function App() {
       if (!paths) return;
       await addAttachmentPaths(paths);
     } catch (e) {
-      setStreamError(String(e));
+      setStreamErrorFor(activeId(), String(e));
     }
   }
 
@@ -2010,7 +2089,9 @@ export default function App() {
     setMessages((prev) => [...prev, assistantMsg]);
     setNearBottom(true);
     addStreaming(id);
-    setStreamError(null);
+    // A new turn in this conversation supersedes any earlier failure shown for
+    // it. Other conversations keep their own banners.
+    clearStreamError(id);
     setOpenTrace(null);
 
     const token = (turnTokens[id] = (turnTokens[id] ?? 0) + 1);
@@ -2026,7 +2107,12 @@ export default function App() {
       // forever, which disabled the composer in every chat. Only the visible
       // transcript needs refreshing.
       if (ev.type === "done" || ev.type === "error") {
-        if (ev.type === "error" && activeId() === id) setStreamError(ev.message);
+        // Keyed to THIS turn's conversation (not the visible one): the failure
+        // belongs to the chat it happened in, and the persisted assistant row
+        // carries the same annotation once it is reloaded below.
+        if (ev.type === "error") setStreamErrorFor(id, ev.message);
+        // A successful turn makes any earlier banner for this chat stale.
+        else clearStreamError(id);
         // Settled off-screen: mark the row (and the hamburger) so the user knows
         // there is output to read. OS notifications are the backend's job. A
         // turn that errored before producing anything has nothing to read, so it
@@ -2034,7 +2120,9 @@ export default function App() {
         if (activeId() !== id && (ev.type === "done" || received.current)) markUnseen(id);
         removeStreaming(id);
         dropLiveTurn(id, token);
-        if (activeId() === id) listMessages(id).then(setMessages);
+        // Streaming is already cleared, so this applies the persisted rows (the
+        // assistant row carries the error annotation, if any).
+        if (activeId() === id) void reloadTranscript(id);
         refreshConversations().catch(() => {});
         // A live turn may have created / changed / deleted cron jobs through the
         // agent tools (which have no event emitter of their own).
@@ -2142,7 +2230,7 @@ export default function App() {
       }
       removeStreaming(id);
       dropLiveTurn(id, token);
-      if (activeId() === id) setStreamError(String(e));
+      setStreamErrorFor(id, String(e));
     }
   }
 
@@ -2177,7 +2265,7 @@ export default function App() {
         // Keep the composer in edit mode with the text intact so the user can
         // retry (or Cancel) instead of losing what they typed. The pre-edit
         // stash stays armed, so Cancel still restores their original draft.
-        setStreamError(String(e));
+        setStreamErrorFor(id, String(e));
         return;
       }
       // The user deliberately replaced the composer contents with this edit:
@@ -2188,12 +2276,9 @@ export default function App() {
       setPendingAttachments([]);
       // The edit rewrote the row and deleted everything after it; reload so the
       // transcript matches, then stream a fresh assistant reply for the edit.
-      try {
-        const rows = await listMessages(id);
-        if (activeId() === id) setMessages(rows);
-      } catch {
-        // The stream's `done` reload below still reconciles state.
-      }
+      // `reloadTranscript` swallows a failed fetch — the stream's `done` reload
+      // below still reconciles state.
+      await reloadTranscript(id);
       if (activeId() !== id) return;
       // The edited user row already exists — the backend must not insert a
       // second one, so mark this re-run as a regeneration.
