@@ -27,10 +27,7 @@ WD_PORT="${WD_PORT:-4444}"
 # port and must never silently test a server it did not start.
 VITE_PORT=1420
 
-command -v node >/dev/null || {
-  echo "node not found on PATH" >&2
-  exit 1
-}
+command -v node >/dev/null || { echo "node not found on PATH" >&2; exit 1; }
 command -v tauri-driver >/dev/null || {
   echo "tauri-driver not found. Install it with:" >&2
   echo "  cargo install tauri-driver --version 2.0.6 --locked" >&2
@@ -48,7 +45,7 @@ fi
 # picker after the provider key is set and the endpoint fetch actually ran.
 DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-chat-e2e.XXXXXX")"
 mkdir -p "$DATA_DIR/com.rp.chat" "$DATA_DIR/secrets"
-cat >"$DATA_DIR/com.rp.chat/config.json" <<EOF
+cat > "$DATA_DIR/com.rp.chat/config.json" <<EOF
 {
   "baseUrl": "http://127.0.0.1:${MOCK_PORT}/v1",
   "model": "e2e-never-listed",
@@ -83,7 +80,7 @@ cleanup() {
   # tauri-driver can leave the app as an orphan; only kill instances that use
   # our isolated data dir, never a user's running app.
   for pid in $(pgrep -f "$APP" 2>/dev/null || true); do
-    if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -q "$DATA_DIR"; then
+    if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -q "$DATA_DIR"; then
       kill "$pid" 2>/dev/null || true
     fi
   done
@@ -125,20 +122,17 @@ echo "→ mock LLM on :$MOCK_PORT"
 # still be in flight when they run, and the default 700 ms put the first content
 # chunk inside the same second as those assertions.
 MOCK_PORT="$MOCK_PORT" MOCK_THINK_GAP="${MOCK_THINK_GAP:-1200}" \
-  node "$E2E_DIR/mock-llm.mjs" &
-pids+=($!)
+  node "$E2E_DIR/mock-llm.mjs" & pids+=($!)
 wait_port "$MOCK_PORT"
 
 echo "→ Vite dev server on :$VITE_PORT"
 # --strictPort: vite must exit when the port is taken, never silently move to
 # another port while the app connects to the fixed devUrl.
-node "$ROOT/node_modules/.bin/vite" --port "$VITE_PORT" --strictPort &
-pids+=($!)
+node "$ROOT/node_modules/.bin/vite" --port "$VITE_PORT" --strictPort & pids+=($!)
 wait_port "$VITE_PORT"
 
 echo "→ tauri-driver on :$WD_PORT"
-XDG_DATA_HOME="$DATA_DIR" NO_AT_BRIDGE=1 tauri-driver --port "$WD_PORT" &
-pids+=($!)
+XDG_DATA_HOME="$DATA_DIR" NO_AT_BRIDGE=1 tauri-driver --port "$WD_PORT" & pids+=($!)
 wait_port "$WD_PORT"
 
 echo "→ driving the app (screenshots → e2e/screenshots/)"
