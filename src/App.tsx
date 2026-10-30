@@ -182,7 +182,11 @@ export default function App() {
   const [activeId, setActiveId] = createSignal<string | null>(null);
   const [messages, setMessages] = createSignal<Message[]>([]);
   const [draft, setDraft] = createSignal("");
-  const [streamError, setStreamError] = createSignal<string | null>(null);
+  // Turn/attachment failures are **conversation-scoped**: an error raised in one
+  // chat must not stay on screen after switching to another. Keyed by
+  // conversation id; `""` is the key for failures raised with no conversation
+  // open (a failed attachment pick before a chat exists). See the helpers below.
+  const [streamErrors, setStreamErrors] = createSignal<Record<string, string>>({});
   const [nearBottom, setNearBottom] = createSignal(true);
   let messagesScrollEl: HTMLElement | undefined;
 
@@ -274,6 +278,24 @@ export default function App() {
   // cron run becomes invisible and un-abortable.
   const isBusy = (id: string | null | undefined) =>
     isStreaming(id) || (!!id && cronRunning().has(id));
+  // Set (or clear, with `null`) the error shown for a conversation. A `null` key
+  // is the "no conversation open" bucket. Returning `prev` unchanged when nothing
+  // changes keeps the banner from re-rendering on every harmless clear.
+  const setStreamErrorFor = (id: string | null | undefined, message: string | null) =>
+    setStreamErrors((prev) => {
+      const key = id ?? "";
+      if (message === null) {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      if (prev[key] === message) return prev;
+      return { ...prev, [key]: message };
+    });
+  const clearStreamError = (id: string | null | undefined) => setStreamErrorFor(id, null);
+  // The banner renders only the OPEN conversation's error.
+  const streamError = () => streamErrors()[activeId() ?? ""] ?? null;
   // Live tool cards for the ACTIVE conversation (derived, so no shared array):
   const liveTools = () => liveTurns()[activeId() ?? ""]?.liveTools ?? [];
 
@@ -1201,6 +1223,9 @@ export default function App() {
     // A deleted chat can't have unread output any more (it would keep the
     // hamburger dot lit forever).
     clearUnseen(id);
+    // Drop its error banner too: the id can never be active again, but leaving
+    // the entry would leak one string per deleted chat for the session.
+    clearStreamError(id);
     await refreshConversations();
     // Its cron jobs cascade away with the conversation row: refresh so a ghost
     // job disappears from the (possibly open) Cron dialog and sidebar glyphs.
@@ -1949,15 +1974,17 @@ export default function App() {
       const atts = await readPickedAttachments(paths);
       if (atts.length === 0) {
         // Every item failed (e.g. an unreadable `content://` URI). Surface it
-        // instead of silently doing nothing.
-        setStreamError(
+        // instead of silently doing nothing. Scoped to the chat the pick was made
+        // in, so it doesn't follow the user into another conversation.
+        setStreamErrorFor(
+          activeId(),
           paths.length === 1 ? "Could not read the selected file." : "Could not read the selected files.",
         );
         return;
       }
       setPendingAttachments((prev) => [...prev, ...atts]);
     } catch (e) {
-      setStreamError(String(e));
+      setStreamErrorFor(activeId(), String(e));
     }
   }
 
@@ -1969,7 +1996,7 @@ export default function App() {
       if (!paths) return;
       await addAttachmentPaths(paths);
     } catch (e) {
-      setStreamError(String(e));
+      setStreamErrorFor(activeId(), String(e));
     }
   }
 
@@ -2010,7 +2037,9 @@ export default function App() {
     setMessages((prev) => [...prev, assistantMsg]);
     setNearBottom(true);
     addStreaming(id);
-    setStreamError(null);
+    // A new turn in this conversation supersedes any earlier failure shown for
+    // it. Other conversations keep their own banners.
+    clearStreamError(id);
     setOpenTrace(null);
 
     const token = (turnTokens[id] = (turnTokens[id] ?? 0) + 1);
@@ -2026,7 +2055,12 @@ export default function App() {
       // forever, which disabled the composer in every chat. Only the visible
       // transcript needs refreshing.
       if (ev.type === "done" || ev.type === "error") {
-        if (ev.type === "error" && activeId() === id) setStreamError(ev.message);
+        // Keyed to THIS turn's conversation (not the visible one): the failure
+        // belongs to the chat it happened in, and the persisted assistant row
+        // carries the same annotation once it is reloaded below.
+        if (ev.type === "error") setStreamErrorFor(id, ev.message);
+        // A successful turn makes any earlier banner for this chat stale.
+        else clearStreamError(id);
         // Settled off-screen: mark the row (and the hamburger) so the user knows
         // there is output to read. OS notifications are the backend's job. A
         // turn that errored before producing anything has nothing to read, so it
@@ -2142,7 +2176,7 @@ export default function App() {
       }
       removeStreaming(id);
       dropLiveTurn(id, token);
-      if (activeId() === id) setStreamError(String(e));
+      setStreamErrorFor(id, String(e));
     }
   }
 
@@ -2177,7 +2211,7 @@ export default function App() {
         // Keep the composer in edit mode with the text intact so the user can
         // retry (or Cancel) instead of losing what they typed. The pre-edit
         // stash stays armed, so Cancel still restores their original draft.
-        setStreamError(String(e));
+        setStreamErrorFor(id, String(e));
         return;
       }
       // The user deliberately replaced the composer contents with this edit:
