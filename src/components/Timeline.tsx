@@ -1,4 +1,14 @@
-import { createEffect, createSignal, For, Index, Match, Show, Switch } from "solid-js";
+import {
+  createEffect,
+  createSignal,
+  For,
+  Index,
+  Match,
+  Show,
+  Switch,
+  type Accessor,
+  type Setter,
+} from "solid-js";
 import type { Message } from "../lib/api";
 import { DocIcon } from "../lib/icons";
 import Markdown from "../lib/Markdown";
@@ -91,11 +101,52 @@ function CallRow(props: {
   );
 }
 
+/// Open/closed state for each turn's activity container lives HERE, not in the
+/// component instance. `groupTurns` rebuilds fresh `Turn`/`entries` objects on
+/// every streamed delta, and the live turn's `<Timeline>` can be re-mounted
+/// (e.g. when a stale reload momentarily drops live rows), so an instance-local
+/// signal lost the auto-open and the user's toggle. Keying by the turn's stable
+/// id (`Turn.key`) makes the state survive re-renders and remounts.
+interface ActivityState {
+  get: Accessor<boolean>;
+  set: Setter<boolean>;
+}
+
+const activityOpen = new Map<string, ActivityState>();
+/// The last `live` value observed for a key. The auto-open and the end-of-turn
+/// auto-collapse fire on the live→finished EDGE exactly once, never on every
+/// render, so a manual mid-stream toggle is not clobbered by incoming deltas.
+const activityLive = new Map<string, boolean>();
+
+function activityState(key: string, initial: boolean): ActivityState {
+  let state = activityOpen.get(key);
+  if (!state) {
+    const [get, set] = createSignal(initial);
+    state = { get, set };
+    activityOpen.set(key, state);
+  }
+  return state;
+}
+
+/// Drop remembered state for turns that are neither live nor rendered. Called
+/// from `MessageList` after each transcript rebuild so the map stays bounded by
+/// the visible transcript instead of growing with every turn ever opened.
+export function pruneActivityState(renderedKeys: readonly string[]): void {
+  if (activityOpen.size === 0) return;
+  const keep = new Set(renderedKeys);
+  for (const key of activityOpen.keys()) {
+    if (!keep.has(key) && activityLive.get(key) !== true) {
+      activityOpen.delete(key);
+      activityLive.delete(key);
+    }
+  }
+}
+
 /// One collapsible activity container for a turn: the Thought button(s) that
 /// open the reasoning popup, the tool cards, and any interim text the model
 /// emitted between them, all in stream order. It opens itself while the turn
-/// streams and closes when it finishes; the user can toggle it at any time,
-/// mid-stream included.
+/// streams and closes once when it finishes; the user can toggle it at any
+/// time, mid-stream included.
 ///
 /// Interim text belongs in here — not out with the answer — because some models
 /// reuse their pre-tool narration as a draft and restate it in the final answer.
@@ -104,6 +155,7 @@ function CallRow(props: {
 /// system prompt also asks the model not to restate it, but that is a nudge, not
 /// a guarantee — this is the part that always holds.
 function ActivityGroup(props: {
+  turnKey: string;
   entries: ProcessEntry[];
   live: boolean;
   openThoughtId: string | null;
@@ -111,14 +163,40 @@ function ActivityGroup(props: {
   onApprove: (callId: string) => void;
   onDeny: (callId: string) => void;
 }) {
-  const [open, setOpen] = createSignal(props.live);
-  let prevLive = false;
+  const open = () => activityState(props.turnKey, props.live).get();
+
+  // Track the key this instance last rendered: a live turn's temp user row is
+  // replaced by its persisted id when the turn completes, so the component at
+  // this index sees the key change. Retire the temp entry instead of leaking it
+  // (the new key starts closed, which is exactly the post-turn default).
+  let observedKey: string | null = null;
   createEffect(() => {
+    const key = props.turnKey;
     const live = props.live;
-    if (live) setOpen(true);
-    else if (prevLive) setOpen(false);
-    prevLive = live;
+    if (observedKey !== null && observedKey !== key && observedKey.startsWith("tmp-")) {
+      // The live turn's optimistic `tmp-user-*` row was replaced by its
+      // persisted id on the completion reload. Retire the temp entry (the new
+      // key starts closed, which is exactly the post-turn default); a real→real
+      // key change is left alone, since only a temp key is unique to this turn.
+      activityOpen.delete(observedKey);
+      activityLive.delete(observedKey);
+    }
+    observedKey = key;
+    const state = activityState(key, live);
+    const was = activityLive.get(key);
+    if (was === live) return;
+    activityLive.set(key, live);
+    // Auto-open on the finished→live edge; auto-collapse once on live→finished,
+    // even if the user expanded or collapsed it mid-stream. A click AFTER the
+    // turn finished is a later state change and simply persists.
+    if (live) state.set(true);
+    else if (was === true) state.set(false);
   });
+
+  const toggle = () => {
+    const state = activityState(props.turnKey, props.live);
+    state.set((v) => !v);
+  };
 
   const summary = () => {
     const thoughts = props.entries.filter((e) => e.kind === "thought").length;
@@ -132,7 +210,7 @@ function ActivityGroup(props: {
   return (
     <div>
       <button
-        onClick={() => setOpen((o) => !o)}
+        onClick={toggle}
         title="Show activity timeline"
         aria-expanded={open()}
         class={`flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] transition ${
@@ -182,10 +260,31 @@ function ActivityGroup(props: {
   );
 }
 
+/// Stop-reason annotations rendered under the answer. `length` is the model's
+/// output limit; `tool_limit` is the harness's tool-round cap (the backend used
+/// to report the latter as `length`).
+function stopNote(reason: string | null): string | null {
+  switch (reason) {
+    case "aborted":
+      return "(aborted)";
+    case "error":
+      return "(error)";
+    case "length":
+      return "(output limit reached)";
+    case "tool_limit":
+      return "(tool-round limit reached)";
+    default:
+      return null;
+  }
+}
+
 /// One turn's assistant side: a single collapsible activity container (thought
 /// buttons + tool cards + interim text) followed by the final answer, which
 /// closes the sequence carrying the stop-reason annotation and streaming caret.
 export function Timeline(props: {
+  /// Stable per-turn id (`Turn.key`): scopes the activity container's open
+  /// state across re-renders and remounts.
+  turnKey: string;
   entries: ProcessEntry[];
   answer: Message | null;
   live: boolean;
@@ -196,22 +295,48 @@ export function Timeline(props: {
 }) {
   const answer = () => props.answer;
   const answerLive = () => props.live && !!answer()?.id.startsWith("tmp-assistant-");
+
+  // Keep the last non-empty entry list while the turn is live. `groupTurns`
+  // rebuilds `entries` from scratch on every delta, and a momentary empty pass
+  // (a round boundary, or a reload that is about to re-add the live rows) must
+  // not unmount the panel — that would drop the open state and the tool cards.
+  // Only the transient empty pass is covered: a finished turn renders exactly
+  // what `groupTurns` emits, and a key change (temp user row → persisted id)
+  // resets the retained list so nothing leaks between turns.
+  const [retained, setRetained] = createSignal<ProcessEntry[]>([]);
+  let retainedKey: string | null = null;
+  createEffect(() => {
+    const key = props.turnKey;
+    const entries = props.entries;
+    if (key !== retainedKey) {
+      retainedKey = key;
+      setRetained([]);
+    }
+    if (entries.length > 0) setRetained(entries);
+  });
+  const activityEntries = () => {
+    const entries = props.entries;
+    if (entries.length > 0) return entries;
+    return props.live ? retained() : entries;
+  };
+
   const shownAnswer = () => {
     const a = answer();
     if (!a) return null;
     const hasText = !!a.content.trim();
     const hasAttachments = parseAttachments(a).length > 0;
-    // An aborted/errored turn keeps its annotation even with no text left.
-    const stopped = a.stop_reason === "aborted" || a.stop_reason === "error";
+    // An aborted/errored/stopped turn keeps its annotation even with no text.
+    const stopped = stopNote(a.stop_reason) !== null;
     return hasText || hasAttachments || stopped || answerLive() ? a : null;
   };
 
   return (
     <div class="flex justify-start">
       <div class="w-full min-w-0 space-y-2 text-sm">
-        <Show when={props.entries.length > 0}>
+        <Show when={activityEntries().length > 0}>
           <ActivityGroup
-            entries={props.entries}
+            turnKey={props.turnKey}
+            entries={activityEntries()}
             live={props.live}
             openThoughtId={props.openThoughtId}
             onOpenThought={props.onOpenThought}
@@ -247,10 +372,10 @@ export function Timeline(props: {
               <Show when={a().content.trim()}>
                 <Markdown text={a().content} />
               </Show>
-              <Show when={a().stop_reason === "aborted" || a().stop_reason === "error"}>
-                <p class="text-[11px] text-neutral-500 dark:text-neutral-400">
-                  {a().stop_reason === "aborted" ? "(aborted)" : "(error)"}
-                </p>
+              <Show when={stopNote(a().stop_reason)}>
+                {(note) => (
+                  <p class="text-[11px] text-neutral-500 dark:text-neutral-400">{note()}</p>
+                )}
               </Show>
               <Show when={answerLive()}>
                 <span class="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-neutral-400 align-text-bottom" />

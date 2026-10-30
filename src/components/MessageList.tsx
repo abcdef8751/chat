@@ -1,9 +1,9 @@
-import { For, Index, Show } from "solid-js";
+import { createEffect, For, Index, Show } from "solid-js";
 import type { Message } from "../lib/api";
 import { ClockIcon, DocIcon, EditIcon } from "../lib/icons";
 import { formatBytes, parseAttachments, type Turn } from "../lib/turns";
 import { openImage } from "./ImageLightbox";
-import { Timeline } from "./Timeline";
+import { pruneActivityState, Timeline } from "./Timeline";
 
 /// The per-turn rendering: user bubble, then the assistant side as one ordered
 /// stream of reasoning containers / output segments / tool cards, and any
@@ -28,6 +28,10 @@ export function MessageList(props: {
   /// Rendered as a small pill beside the bubble; purely informational.
   cronTriggers?: Record<string, string>;
 }) {
+  // Keep the per-turn activity-container state map bounded by the transcript
+  // that is actually rendered (a still-live turn is retained by the pruner).
+  createEffect(() => pruneActivityState(props.turns.map((t) => t.key)));
+
   /// Expand any image in the transcript (attachment images and images rendered
   /// by markdown prose) in the lightbox. Delegated here so the shared markdown
   /// renderer needs no change; a click on the edit strip's "remove attachment"
@@ -134,8 +138,9 @@ export function MessageList(props: {
                 )}
               </Show>
 
-              <Show when={t().entries.length > 0 || !!t().answer}>
+              <Show when={t().entries.length > 0 || !!t().answer || t().live}>
                 <Timeline
+                  turnKey={t().key}
                   entries={t().entries}
                   answer={t().answer}
                   live={t().live}
