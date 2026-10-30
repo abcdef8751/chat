@@ -3709,6 +3709,22 @@ fn system_id_is_stable_and_shaped_like_a_build_id() {
 }
 
 #[test]
+fn system_info_serializes_the_frozen_contract() {
+    let info = system_info();
+    assert_eq!(info.id, system_id());
+    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(info.prompt_hash, prompt_hash());
+    let v = serde_json::to_value(&info).unwrap();
+    assert_eq!(v["id"], info.id);
+    assert_eq!(v["version"], info.version);
+    assert_eq!(v["promptHash"], info.prompt_hash);
+    assert!(
+        v.get("prompt_hash").is_none(),
+        "the frontend contract uses camelCase"
+    );
+}
+
+#[test]
 fn two_identical_parts_render_the_same_system_id() {
     let memory = temp_memory("prompt-id-stable");
     let a = SystemPromptParts::new("BASE", "mock", "", &memory, None);
