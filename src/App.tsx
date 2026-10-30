@@ -888,6 +888,28 @@ export default function App() {
     // sidebar row (flicker, lost hover/focus).
     setConversations((prev) => mergeConversations(prev, rows));
     setVisibleConversations((prev) => mergeConversations(prev, rows));
+    // Drop visible-inbox ids whose conversation no longer exists. A chat can
+    // disappear without being opened or deleted by the user: a sync pull applies
+    // a remote tombstone, `db::open` prunes an orphaned scheduled thread, or a
+    // pull rewrites/renumbers rows. Such an id has no row to open, so the
+    // hamburger dot would stay amber until a restart with no way to clear it.
+    // Only prune from a COMPLETE list: during a search `rows` is a filtered
+    // subset, so intersecting would wrongly drop the dot for live chats.
+    // Return the previous Set when nothing was pruned, keeping the signal
+    // stable (no re-render of the sidebar / hamburger).
+    if (!q) {
+      setCompletedUnseen((prev) => {
+        if (prev.size === 0) return prev;
+        const live = new Set(rows.map((c) => c.id));
+        const next = new Set<string>();
+        let pruned = false;
+        for (const id of prev) {
+          if (live.has(id)) next.add(id);
+          else pruned = true;
+        }
+        return pruned ? next : prev;
+      });
+    }
   }
 
   // --- Scheduled jobs (cron) handlers ---
