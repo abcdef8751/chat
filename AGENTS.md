@@ -68,7 +68,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **399 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **400 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
@@ -92,7 +92,7 @@ empty); fixing them is a separate cleanup.
 | Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; per-model price **and capability (modality) overrides** |
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline, **edit in the central composer** (pen under the bubble → draft → truncate → re-run), per-chat **model + thinking level** |
 | Tools             | ✅    | `bash` (one-shot shell, **`~` paths expanded for read/write, not for command strings**), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` + `fetch_image` + **`fetch_file`** (remote-stored attachment download; ungated) |
-| UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; **unseen-activity dots (hamburger + chat row)**; stable sidebar rows |
+| UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; **unseen-activity dots (hamburger + chat row)**; stable sidebar rows; drawer appears instantly (no transform animation — WebKitGTK shimmered its text) with a stable scrollbar gutter |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
 | Cron jobs         | ✅    | Each job owns a local-only thread (kept out of the chat list); per-job tool policy; **deadline-aware scheduler (~1 s)**; catch-up max 1; OS notification (desktop) + badge |
 | Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
@@ -790,18 +790,26 @@ old chat and past runs stay where they are).
   already-granted permission leaves the plugin's `requestPermissions` invoke
   unresolved, which hung the Test button. The event/badge path is
   platform-neutral.
-- **Live-turn notifications.** A normal chat turn that finishes while the
-  **window is unfocused** also raises an OS notification (title = conversation
+- **Live-turn notifications.** A normal chat turn that finishes while the app is
+  **not in the foreground** raises an OS notification (title = conversation
   title, body = the final answer collapsed and truncated to ~200 chars, or a
   short failure snippet; reasoning is never included). Suppression is
-  **focus-only** — unlike a cron run, an unfocused window means the user is not
-  watching even if that chat is the one selected. Aborted turns and scheduled
-  threads are skipped (cron has its own notification path). `notifications.rs`
-  reuses the same platform send/permission path as cron, and the hook lives in
-  `chat::stream_chat` so the turn has already persisted its row when it fires.
-  When the window *is* focused but a different chat settled, there is no OS
-  notification — the UI shows an amber dot on the hamburger and beside that
-  chat's row instead.
+  **foreground-only** — unlike a cron run, a background app means the user is not
+  watching even if that chat is the one selected. On desktop "foreground" is the
+  main window being focused (a hidden close-to-tray window is background). On
+  **Android** window focus is unreliable — the single webview may report focused
+  while backgrounded (suppressing everything) or unfocused while visibly open
+  (notifying in the user's face) — so `MainActivity` publishes Activity
+  visibility (`onStart`/`onStop` → the `nativeSetForeground` JNI export →
+  `android::is_foreground()`), and a dialog-driven `onPause` does not count as
+  background. Aborted turns and scheduled threads are skipped (cron has its own
+  notification path). `notifications.rs` reuses the same platform send/permission
+  path as cron, and the hook lives in `chat::stream_chat` so the turn has already
+  persisted its row when it fires. When the app *is* in the foreground but a
+  different chat settled, there is no OS notification — the UI shows an amber dot
+  on the hamburger and beside that chat's row instead. The cron path uses the
+  same foreground helper, so a backgrounded Android app no longer suppresses a
+  cron notification just because the thread happens to be selected.
 - **UI:** `src/components/CronPage.tsx` (Header → Cron) lists jobs (schedule,
   next/last run, count, enabled/notify toggles, policy + context badges, Thread /
   Run now / Edit / Delete), hosts the create/edit form (preset + raw cron, live
@@ -1159,8 +1167,15 @@ and the app is byte-identical to before. Never blocks the UI.
   `{user_id}/{uuid}-{name}`, AES-256-GCM encrypted when the sync key exists
   (marked with a `PIENC1\0` magic prefix), capped at 100 MB, and listed on the
   message's `attachments` JSON as `remotePath`; `fetch_file` downloads them to
-  `<app data>/downloads/`. Upload failures (signed out, no bucket, over cap) keep
-  the attachment and tell the model it cannot read the file — never a silent drop.
+  `<app data>/downloads/`. A failed or skipped upload records `sourcePath` (the
+  local original, so it can be retried) and `uploadError` (the reason), keeps the
+  attachment, and tells the model it cannot read the file — never a silent drop.
+  The UI shows an amber **⚠ retry** warning next to that file's name (composer
+  and transcript); clicking it calls `retry_attachment_upload`, which re-checks
+  the file and either records `remotePath` or refreshes `uploadError`. For a
+  persisted message the command also rewrites that row's attachment JSON and
+  re-syncs it. An Android `content://` attachment has no local path, so it shows
+  a non-clickable "not uploaded" warning instead.
 
 > **Production blocker — email confirmation is currently OFF.** For a personal
 > local-first tool we run Supabase Auth with the **"Confirm email"** toggle off
@@ -1380,6 +1395,17 @@ and the app is byte-identical to before. Never blocks the UI.
 
 ## Next / open items
 
+**Latest batch (three fixes):** the sidebar drawer no longer animates its
+transform (the WebKitGTK text shimmer behind the old "jitter") and reserves a
+stable scrollbar gutter; Android completion notifications now use Activity
+visibility (`onStart`/`onStop` → JNI → `android::is_foreground()`) instead of the
+unreliable window focus, so they no longer fire in the foreground and still fire
+in the background (cron uses the same helper); failed/skipped remote uploads keep
+`sourcePath` + `uploadError` and show a click-to-retry **⚠ retry** warning next
+to the file name (composer and transcript), with
+`retry_attachment_upload` re-checking the file and rewriting a persisted row's
+attachment JSON on success.
+
 **Batch landed (five changes):** output-limit truncation that can no longer
 silently drop or execute a cut-off tool call (`length` / `tool_limit` /
 invalid-JSON handling); a distinctive running-system id in the prompt
@@ -1407,18 +1433,18 @@ Residuals from this batch:
 - **Device verification still needed:** Android all-files grant + Settings row,
   Termux shared-storage access, and the notification grant on a device with no
   notifying cron job. Kotlin is not compiled off-device.
-- **Android live-turn notifications may not fire while backgrounded.** The
-  suppression predicate is "main window focused", but Android reports the single
-  window as focused even when the Activity is paused; a lifecycle signal is
-  needed for correct background detection. Cron notifications use the explicit
-  active-conversation registry and are unaffected.
-- **`fetch_file` only covers path-based attachments.** A `content://` attachment
-  picked on Android still degrades to metadata-only (the offload path is the
-  path-based `read_attachments`). Route the URI reader through the same
-  offload/`remotePath` logic.
+- **`fetch_file`/retry only cover path-based attachments.** A `content://`
+  attachment picked on Android still degrades to metadata-only (the offload path
+  is the path-based `read_attachments`), so it shows a non-clickable "not
+  uploaded" warning rather than a retry button. Route the URI reader through the
+  same offload/`remotePath` logic (and copy it to a real path so retry works).
 - **Row-level LWW can clear a thinking level.** A conversation row written by an
   older client (no `thinking_level`) wins on the mirror and nulls the level. Same
   clock-skew/LWW caveat as other columns.
+- **`sourcePath` rides the synced attachment JSON** for offloaded files (it is
+  what makes a post-send retry possible). It is a local absolute path; the mirror
+  is private/RLS-scoped and the field is encrypted when sync encryption is on,
+  but it is metadata worth knowing about.
 - **`prompt_state` is device-local while `prompt_update` rows are too**, so two
   devices with different Settings legitimately send different instruction
   updates for the same chat. The frozen prefix is per device; that is intentional
@@ -1429,9 +1455,9 @@ Residuals from this batch:
 - **`supabase/storage.sql` / `supabase/schema.sql` are applied via the CLI** now
   (`supabase db query --linked --file …`); both are idempotent, so re-running
   after a pull is safe. The bucket and policies exist on the personal project.
-- **GUI e2e was not re-run** for this batch (needs a display); `tsc` + production
-  build + 382 Rust tests are green. The inline-editor → composer flow is
-  compiler-verified only.
+- **GUI e2e could not run in the last session** (the other worktree's dev server
+  held port 1420, and the harness fails fast by design); `tsc` + production build
+  + 400 Rust tests are green. The retry/edit flows are compiler-verified only.
 
 **Recent backlog (landed):** a 13-item pass — drawer-open keyboard, memory page
 list→detail on mobile, Enter=newline on Android, live↔persisted timeline
