@@ -1458,6 +1458,87 @@ pub(crate) fn clock_note_message(text: &str) -> Result<ChatCompletionRequestMess
         .into())
 }
 
+/// The host-tools note. Host tools run on the user's own device, not on a
+/// server. A named constant because [`system_id`] hashes the shipped prompt
+/// strings — a change here must change the id.
+const HOST_TOOLS_NOTE: &str = "Host tools (bash, read_file, write_file) execute on the user's own \
+     device — the machine they are sending from — not on a remote server.";
+
+/// The work-note/duplicate-text nudge.
+///
+/// The transcript shows the text a model emits *before* a tool call, and models
+/// tend to reuse that as a draft and restate it in the answer, so the user sees
+/// the same thing twice. Naming the boundary is the documented fix (LangChain's
+/// duplicate-plan issue took the same route); it is a nudge, not a guarantee,
+/// which is why the UI also folds that text into the collapsed activity
+/// container. Kept in the shared prefix so the prompt-cache hash is unchanged
+/// between live and reflection turns.
+const STYLE_NOTE: &str = "Text you emit before a tool call is shown to the user as part of the \
+     transcript. Treat it as a short work note, not a draft of the answer: do not restate it after \
+     the tool result. Write the user-facing answer once, after the last tool call.";
+
+/// FNV-1a (64-bit), implemented here so the id needs no dependency. Stable
+/// across runs and platforms; only the bytes fed to it matter.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The 8 lowercase hex characters identifying the shipped system-prompt
+/// revision: the FNV-1a 64-bit hash (high half) of the default prompt plus the
+/// two constant notes, separated by `0x1f` so adjacent strings cannot collide by
+/// concatenation.
+pub(crate) fn prompt_hash() -> String {
+    let joined = format!(
+        "{DEFAULT_SYSTEM_PROMPT}\u{1f}{HOST_TOOLS_NOTE}\u{1f}{STYLE_NOTE}"
+    );
+    let hex = format!("{:016x}", fnv1a64(joined.as_bytes()));
+    hex[..8].to_string()
+}
+
+/// The running system's stable identifier: `pi-chat/<version>+<prompt hash>`.
+///
+/// It identifies the app build *and* the system-prompt revision, and changes
+/// when either does — the model can quote it when reporting a problem, and a
+/// prompt change is visible to the model as a `prompt_update` diff (the line is
+/// part of the rendered prompt).
+pub(crate) fn system_id() -> String {
+    format!("pi-chat/{}+{}", env!("CARGO_PKG_VERSION"), prompt_hash())
+}
+
+/// The one rendered line carrying [`system_id`] in the system prompt.
+fn system_line() -> String {
+    format!(
+        "Running system: {}. This id identifies the app build and system-prompt revision and \
+         changes when either is updated.",
+        system_id()
+    )
+}
+
+/// Version and prompt identity of the running build, exposed to the frontend
+/// (bug reports, diagnostics). The JSON shape is frozen: `id`, `version`,
+/// `promptHash`.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInfo {
+    pub id: String,
+    pub version: String,
+    pub prompt_hash: String,
+}
+
+#[tauri::command]
+pub fn system_info() -> SystemInfo {
+    SystemInfo {
+        id: system_id(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        prompt_hash: prompt_hash(),
+    }
+}
+
 /// The system prompt as its independently-changeable components, in render
 /// order. Splitting it this way is what makes a change to one component a
 /// *line diff* rather than a whole-prompt re-injection (see
@@ -1476,6 +1557,8 @@ pub(crate) struct SystemPromptParts {
     pub base: String,
     /// "You are currently running as the model …"; `""` when there is no label.
     pub model: String,
+    /// "Running system: <id>." — identifies the build and prompt revision.
+    pub system: String,
     /// Host-tools note (constant).
     pub tools: String,
     /// Work-note/duplicate-text nudge (constant).
@@ -1528,23 +1611,9 @@ impl SystemPromptParts {
             // joining separators in place. Preserved for byte identity.
             base: base.trim().to_string(),
             model,
-            // Host tools run on the user's own device, not on a server.
-            tools: "Host tools (bash, read_file, write_file) execute on the user's own device — \
-                    the machine they are sending from — not on a remote server."
-                .to_string(),
-            // The transcript shows the text a model emits *before* a tool call,
-            // and models tend to reuse that as a draft and restate it in the
-            // answer, so the user sees the same thing twice. Naming the boundary
-            // is the documented fix (LangChain's duplicate-plan issue took the
-            // same route); it is a nudge, not a guarantee, which is why the UI
-            // also folds that text into the collapsed activity container. Kept in
-            // the shared prefix so the prompt-cache hash is unchanged between live
-            // and reflection turns.
-            style: "Text you emit before a tool call is shown to the user as part of the \
-                    transcript. Treat it as a short work note, not a draft of the answer: do not \
-                    restate it after the tool result. Write the user-facing answer once, after the \
-                    last tool call."
-                .to_string(),
+            system: system_line(),
+            tools: HOST_TOOLS_NOTE.to_string(),
+            style: STYLE_NOTE.to_string(),
             started,
             memory: memory.context_block(),
         }
@@ -1560,6 +1629,9 @@ impl SystemPromptParts {
         segments.push(self.base.clone());
         if !self.model.trim().is_empty() {
             segments.push(self.model.clone());
+        }
+        if !self.system.trim().is_empty() {
+            segments.push(self.system.clone());
         }
         segments.push(self.tools.clone());
         segments.push(self.style.clone());
@@ -1580,6 +1652,7 @@ impl SystemPromptParts {
             "preferences": self.preferences,
             "base": self.base,
             "model": self.model,
+            "system": self.system,
             "tools": self.tools,
             "style": self.style,
             "started": self.started,
@@ -1589,13 +1662,16 @@ impl SystemPromptParts {
 
     /// Parse a stored parts object; `None` when the shape is not one of ours
     /// (which makes the caller fall back to diffing the whole stored system
-    /// text).
+    /// text). Every key is required — notably `system`: a pre-`system` snapshot
+    /// must NOT parse as current, or the model would never be told about the new
+    /// id line. Returning `None` here routes it through the whole-text diff.
     fn from_json(v: &Value) -> Option<Self> {
         let get = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         Some(Self {
             preferences: get("preferences")?,
             base: get("base")?,
             model: get("model")?,
+            system: get("system")?,
             tools: get("tools")?,
             style: get("style")?,
             started: get("started")?,

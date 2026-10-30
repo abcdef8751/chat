@@ -178,6 +178,7 @@ pub fn run() {
             models::list_models,
             chat::stream_chat,
             chat::stop_chat,
+            chat::system_info,
             tools::approve_tool,
             tools::deny_tool,
             memory::list_memory_files,

@@ -3291,6 +3291,11 @@ fn legacy_build_system_prompt(
             model_label.trim()
         ));
     }
+    parts.push(format!(
+        "Running system: {}. This id identifies the app build and system-prompt revision and \
+         changes when either is updated.",
+        system_id()
+    ));
     parts.push(
         "Host tools (bash, read_file, write_file) execute on the user's own device — the machine \
          they are sending from — not on a remote server."
@@ -3522,12 +3527,13 @@ async fn first_turn_snapshots_the_system_prompt_without_an_update_note() {
             Some(0)
         )
     );
-    // Snapshot shape: system + the seven parts.
+    // Snapshot shape: system + the eight parts.
     let parts = v["parts"].as_object().expect("snapshot.parts");
     for key in [
         "preferences",
         "base",
         "model",
+        "system",
         "tools",
         "style",
         "started",
@@ -3685,6 +3691,89 @@ async fn changed_model_label_shows_up_in_the_diff() {
         "{}",
         updates[0].content
     );
+}
+
+#[test]
+fn system_id_is_stable_and_shaped_like_a_build_id() {
+    let id = system_id();
+    assert_eq!(id, system_id(), "the id must be deterministic across calls");
+    let (head, hash) = id.rsplit_once('+').expect("pi-chat/<version>+<hex>");
+    assert_eq!(head, format!("pi-chat/{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(hash.len(), 8, "{id}");
+    assert!(
+        hash.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "the hash must be lowercase hex: {id}"
+    );
+    assert_eq!(prompt_hash(), hash);
+}
+
+#[test]
+fn two_identical_parts_render_the_same_system_id() {
+    let memory = temp_memory("prompt-id-stable");
+    let a = SystemPromptParts::new("BASE", "mock", "", &memory, None);
+    let b = SystemPromptParts::new("BASE", "mock", "", &memory, None);
+    assert_eq!(a.system, b.system);
+    assert_eq!(a.rendered(), b.rendered());
+    assert!(a.system.contains(&system_id()), "{}", a.system);
+}
+
+/// A changed id alone must reach the model as a prompt-update diff naming both
+/// the old and the new id — that is the only way a shipped prompt revision is
+/// communicated to an existing conversation.
+#[test]
+fn changing_only_the_system_id_yields_a_diff_naming_both_ids() {
+    let memory = temp_memory("prompt-id-diff");
+    let parts = SystemPromptParts::new("BASE", "mock", "", &memory, None);
+    let old_id = system_id();
+    let mut changed = parts.clone();
+    changed.system = "Running system: pi-chat/9.9.9+deadbeef. This id identifies the app build \
+                      and system-prompt revision and changes when either is updated."
+        .to_string();
+    let note = prompt_update_text(&parts.rendered(), &changed.rendered()).expect("a diff");
+    assert!(note.contains(&old_id), "{note}");
+    assert!(note.contains("pi-chat/9.9.9+deadbeef"), "{note}");
+}
+
+/// A snapshot written before the `system` part existed must not parse as
+/// current (that would silently hide the new id line forever). It falls back to
+/// the whole-text diff, which must carry the new id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_system_snapshot_produces_a_diff_with_the_new_id() {
+    let (port, _bodies, handle) = start_mock_capture(vec![ok_turn("one"), ok_turn("two")], 0);
+    let db = Arc::new(open_db("prompt-legacy-snapshot"));
+    let cid = insert_conv(&db);
+    let memory = temp_memory("prompt-legacy-snapshot");
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    run_turn_once(&db, &cfg, &cid, "hi", &memory).await;
+
+    // Rewrite the stored snapshot into the pre-`system` shape: the top-level text
+    // without the running-system line, and parts without the `system` key.
+    let raw = crate::db::prompt_state(&db, &cid)
+        .unwrap()
+        .expect("first turn stores a snapshot");
+    let mut v: Value = serde_json::from_str(&raw).unwrap();
+    let system = v["system"].as_str().unwrap();
+    let line = system
+        .lines()
+        .find(|l| l.starts_with("Running system: "))
+        .expect("the new snapshot carries the id line");
+    v["system"] = json!(system.replace(&format!("\n\n{line}"), ""));
+    v["parts"].as_object_mut().unwrap().remove("system");
+    crate::db::set_prompt_state(&db, &cid, &v.to_string()).unwrap();
+
+    run_turn_once(&db, &cfg, &cid, "again", &memory).await;
+    let _ = handle.join();
+
+    let updates = prompt_update_rows(&db, &cid);
+    assert_eq!(updates.len(), 1, "exactly one prompt_update note");
+    let note = &updates[0].content;
+    assert!(note.contains("+Running system: "), "{note}");
+    assert!(note.contains(&system_id()), "{note}");
 }
 
 #[test]
