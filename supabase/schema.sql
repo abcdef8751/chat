@@ -173,3 +173,16 @@ create index if not exists conversations_user_revision_idx on conversations(user
 create index if not exists messages_user_revision_idx on messages(user_id, revision);
 create index if not exists memory_files_user_revision_idx on memory_files(user_id, revision);
 create index if not exists user_config_user_revision_idx on user_config(user_id, revision);
+
+-- ---------------------------------------------------------------------------
+-- Idempotent migrations
+--
+-- `create table if not exists` above is a no-op on a project that already has
+-- the table, so a column added to the CREATE body later never reaches a
+-- deployed project. Every column that was introduced after the initial schema
+-- must also be added here, or the push fails with PGRST204 ("column not
+-- found") and sync stalls one-way (pull still works, push never recovers).
+-- Re-run this file in the Supabase SQL editor after pulling a release that
+-- adds a column.
+-- ---------------------------------------------------------------------------
+alter table conversations add column if not exists thinking_level text;
