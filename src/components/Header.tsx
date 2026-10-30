@@ -186,7 +186,8 @@ export function Header(props: {
         <div>
           <select
             class="max-w-[9rem] pr-7 truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-60 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
-            title={props.modelsLoading ? "Loading models…" : "Model"}
+            title="Model"
+            data-loading={props.modelsLoading ? "true" : undefined}
             aria-busy={props.modelsLoading}
             // Only "no provider at all" makes the picker unusable. A refresh in
             // flight must NOT disable it: a fetch for the newly opened chat's
