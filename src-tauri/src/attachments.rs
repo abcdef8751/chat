@@ -460,30 +460,47 @@ async fn offload_size_error(path: &Path, known: u64) -> Option<String> {
     crate::storage::check_upload_size(len).err()
 }
 
+/// Already-resolved storage credentials. Resolving them is **not** free — it
+/// builds a `SyncState` (and its `reqwest` client), reads the session from the
+/// keychain, and may refresh the token over the network — so a batch resolves
+/// once and passes the result down. `Err` carries why they are unavailable.
+type CredsResult<'a> = Result<Option<&'a crate::storage::Credentials>, &'a str>;
+
 /// Try to upload an attachment that has **nothing inline**, recording either the
 /// remote object key or a user-facing reason it could not be uploaded.
 ///
 /// Shared by attach-time offload and [`retry_attachment_upload`]. Never fails:
 /// the attachment always survives, and `upload_error` is what the UI turns into
 /// a click-to-retry warning next to the file name.
-async fn offload_file(path: &Path, a: &mut Attachment) {
+///
+/// `source_path` is recorded **only while the upload has not landed**: it is
+/// what makes a retry possible, and a successfully uploaded file has nothing
+/// left to retry (so the absolute local path does not ride the synced
+/// attachment JSON forever).
+async fn offload_file(path: &Path, a: &mut Attachment, creds: CredsResult<'_>) {
     a.remote_path = None;
     a.upload_error = None;
     a.source_path = Some(path.to_string_lossy().into_owned());
+    let display = path.display();
 
     // Metadata gate before any read: an over-cap file must never be buffered
-    // just to be rejected (see `offload_size_error`).
+    // just to be rejected (see `offload_size_error`). The path stays recorded,
+    // so the warning is clickable — a retry re-checks the size and reports the
+    // same reason unless the file (or the cap) changed.
     if let Some(reason) = offload_size_error(path, a.size).await {
+        eprintln!("attachments: offload of {display} skipped: {reason}");
         a.upload_error = Some(reason);
         return;
     }
-    let creds = match crate::storage::credentials().await {
+    let creds = match creds {
         Ok(Some(c)) => c,
         Ok(None) => {
+            eprintln!("attachments: offload of {display} skipped: cloud sync is off");
             a.upload_error = Some("cloud sync is off or not signed in".into());
             return;
         }
         Err(e) => {
+            eprintln!("attachments: offload of {display} skipped: cloud sync is unavailable: {e}");
             a.upload_error = Some(format!("cloud sync is unavailable: {e}"));
             return;
         }
@@ -491,10 +508,20 @@ async fn offload_file(path: &Path, a: &mut Attachment) {
     let key = crate::storage::object_key(&creds.3, &a.name);
     match tokio::fs::read(path).await {
         Ok(bytes) => match crate::storage::upload(&key, &bytes, &a.mime).await {
-            Ok(()) => a.remote_path = Some(key),
-            Err(e) => a.upload_error = Some(format!("upload failed: {e}")),
+            Ok(()) => {
+                a.remote_path = Some(key);
+                // Uploaded: nothing left to retry, so drop the local path.
+                a.source_path = None;
+            }
+            Err(e) => {
+                eprintln!("attachments: offload of {display} failed: {e}");
+                a.upload_error = Some(format!("upload failed: {e}"));
+            }
         },
-        Err(e) => a.upload_error = Some(format!("could not re-read the file: {e}")),
+        Err(e) => {
+            eprintln!("attachments: re-reading {display} for offload failed: {e}");
+            a.upload_error = Some(format!("could not re-read the file: {e}"));
+        }
     }
 }
 
@@ -532,9 +559,19 @@ pub async fn read_attachments(
     }
 
     let mut out = Vec::with_capacity(read.len());
+    // Resolved at most once per batch, and only when a file actually needs it.
+    let mut creds: Option<Result<Option<crate::storage::Credentials>, String>> = None;
     for (path, mut a) in read {
         if needs_offload(&a) {
-            offload_file(Path::new(&path), &mut a).await;
+            if creds.is_none() {
+                creds = Some(crate::storage::credentials().await);
+            }
+            let cached = match creds.as_ref().expect("just resolved") {
+                Ok(Some(c)) => Ok(Some(c)),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.as_str()),
+            };
+            offload_file(Path::new(&path), &mut a, cached).await;
         }
         out.push(a);
     }
@@ -548,6 +585,12 @@ pub async fn read_attachments(
 /// cap). Returns the updated attachment; the caller replaces it in the composer,
 /// or — when `message_id` names a persisted user row — the row's attachment JSON
 /// is rewritten (and re-synced) here as well.
+///
+/// A failed retry returns `Ok` with a refreshed [`Attachment::upload_error`] and
+/// leaves the persisted row alone (so nothing is pushed and another device's
+/// `sourcePath` is never overwritten). A *successful* upload that cannot be
+/// written back is an error: the object exists but the message still says it was
+/// not uploaded, and saying nothing would strand it.
 #[tauri::command]
 pub async fn retry_attachment_upload(
     db: tauri::State<'_, crate::db::Db>,
@@ -559,29 +602,54 @@ pub async fn retry_attachment_upload(
         a.upload_error = Some("the original file path is no longer known".into());
         return Ok(a);
     };
-    // Refresh the size from disk: the file may have been replaced or grown since
-    // it was attached, and the cap check must see the current length.
-    if let Ok(meta) = tokio::fs::metadata(&path).await {
-        a.size = meta.len();
-    }
-    offload_file(Path::new(&path), &mut a).await;
-
-    if let Some(mid) = message_id {
-        if let Ok(Some(json)) = crate::db::message_attachments(db.inner(), &mid) {
-            if let Ok(mut list) = serde_json::from_str::<Vec<Attachment>>(&json) {
-                if let Some(slot) = list.iter_mut().find(|x| x.id == a.id) {
-                    *slot = a.clone();
-                    if let Ok(updated) = serde_json::to_string(&list) {
-                        if let Err(e) =
-                            crate::db::set_message_attachments(db.inner(), &mid, &updated)
-                        {
-                            eprintln!("attachments: persisting retried upload failed: {e}");
-                        }
-                    }
-                }
-            }
+    // The file can be gone: deleted or moved since it was attached, or a path
+    // that never existed here because `sourcePath` came from another device.
+    // Report that and stop offering the retry instead of failing the same way
+    // on every click.
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("attachments: retry for {path} skipped: {e}");
+            a.remote_path = None;
+            a.source_path = None;
+            a.upload_error = Some(format!("the original file is not available: {e}"));
+            return Ok(a);
         }
+    };
+    // Refresh the size: the file may have been replaced or grown since it was
+    // attached, and the cap check must see the current length.
+    a.size = meta.len();
+
+    let resolved = crate::storage::credentials().await;
+    let creds = match &resolved {
+        Ok(Some(c)) => Ok(Some(c)),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e.as_str()),
+    };
+    offload_file(Path::new(&path), &mut a, creds).await;
+
+    // Nothing was uploaded: keep the stored state (the row already carries an
+    // accurate warning), so this is not a write.
+    if a.remote_path.is_none() {
+        return Ok(a);
     }
+    let Some(mid) = message_id else {
+        return Ok(a);
+    };
+
+    let saving = |e: String| format!("the file was uploaded, but saving it to the message failed: {e}");
+    let json = crate::db::message_attachments(db.inner(), &mid)
+        .map_err(saving)?
+        .ok_or_else(|| "the file was uploaded, but the message no longer has attachments to update".to_string())?;
+    let mut list: Vec<Attachment> =
+        serde_json::from_str(&json).map_err(|e| saving(e.to_string()))?;
+    let slot = list
+        .iter_mut()
+        .find(|x| x.id == a.id)
+        .ok_or_else(|| "the file was uploaded, but that attachment is no longer on the message".to_string())?;
+    *slot = a.clone();
+    let updated = serde_json::to_string(&list).map_err(|e| saving(e.to_string()))?;
+    crate::db::set_message_attachments(db.inner(), &mid, &updated).map_err(saving)?;
 
     Ok(a)
 }
@@ -849,7 +917,8 @@ mod tests {
 
         let mut a = read_attachment(&p).unwrap();
         assert!(needs_offload(&a));
-        offload_file(&p, &mut a).await;
+        // The size gate runs before the credentials are touched.
+        offload_file(&p, &mut a, Ok(None)).await;
 
         assert!(a.remote_path.is_none());
         let err = a.upload_error.as_deref().expect("a reason must be recorded");
@@ -863,7 +932,7 @@ mod tests {
         // A retry re-checks the file and reports the same reason without
         // touching the network (the cap is still exceeded).
         let mut retried = a.clone();
-        offload_file(&p, &mut retried).await;
+        offload_file(&p, &mut retried, Ok(None)).await;
         assert!(retried.remote_path.is_none());
         assert!(retried
             .upload_error

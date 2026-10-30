@@ -478,33 +478,56 @@ pub fn read_messages(db: &Db, conversation_id: &str) -> Result<Vec<MessageRow>, 
     Ok(out)
 }
 
-/// The serialized attachment JSON of one message row (`None` when the row or
-/// its attachment list is absent). Used by the retried-upload path.
+/// The serialized attachment JSON of one message row (`None` when the row is
+/// absent or its attachment column is NULL). Used by the retried-upload path.
 pub fn message_attachments(db: &Db, message_id: &str) -> Result<Option<String>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     conn.query_row(
         "SELECT attachments FROM messages WHERE id = ?1",
         [message_id],
-        |r| r.get(0),
+        |r| r.get::<_, Option<String>>(0),
     )
     .optional()
     .map_err(|e| e.to_string())
+    .map(Option::flatten)
 }
 
-/// Replace a message's attachment JSON after a retried upload. Bumps the row's
-/// sync revision/dirty flag so the new `remotePath` reaches other devices.
+/// Replace a message's attachment JSON after a retried upload.
+///
+/// Bumps the row's sync revision/dirty flag so the new `remotePath` reaches
+/// other devices — **except** in a `scheduled` thread, which never syncs: a
+/// dirty row there would show up as permanently pending in Settings, because
+/// the push filters those rows out (`sync::push`).
 pub fn set_message_attachments(
     db: &Db,
     message_id: &str,
     attachments: &str,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let rev = bump_revision_c(&conn)?;
-    conn.execute(
-        "UPDATE messages SET attachments = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
-        params![message_id, attachments, rev],
-    )
-    .map_err(|e| e.to_string())?;
+    let synced = conn
+        .query_row(
+            "SELECT c.kind = 'chat' FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id WHERE m.id = ?1",
+            [message_id],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    if synced {
+        let rev = bump_revision_c(&conn)?;
+        conn.execute(
+            "UPDATE messages SET attachments = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
+            params![message_id, attachments, rev],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        conn.execute(
+            "UPDATE messages SET attachments = ?2 WHERE id = ?1",
+            params![message_id, attachments],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -2725,6 +2748,68 @@ mod tests {
         // look pending again and redo the whole archive.
         assert_eq!(discard_staged_extractions(&db).unwrap(), 0);
         assert_eq!(folded_through(&db).unwrap(), Some(3_000));
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Retried uploads rewrite a message's attachment JSON. A normal chat row
+    /// must be marked dirty so the new `remotePath` reaches other devices; a
+    /// `scheduled` thread never syncs, so marking it dirty would leave a count
+    /// in Settings that no push can ever drain.
+    #[test]
+    fn set_message_attachments_marks_only_chat_rows_dirty() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-att-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+
+        {
+            let conn = db.0.lock().unwrap();
+            for (cid, kind) in [("chat1", "chat"), ("cron1", "scheduled")] {
+                conn.execute(
+                    "INSERT INTO conversations (id, title, kind, created_at, updated_at)
+                     VALUES (?1, ?1, ?2, 1, 1)",
+                    params![cid, kind],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO messages (id, conversation_id, role, \"index\", content, created_at)
+                     VALUES (?1, ?2, 'user', 0, 'x', 1)",
+                    params![format!("{cid}-m"), cid],
+                )
+                .unwrap();
+            }
+        }
+
+        // A row with no attachments column value reads as "absent", not an error.
+        assert_eq!(message_attachments(&db, "chat1-m").unwrap(), None);
+        assert_eq!(message_attachments(&db, "nope").unwrap(), None);
+
+        set_message_attachments(&db, "chat1-m", r#"[{"id":"a"}]"#).unwrap();
+        assert_eq!(
+            message_attachments(&db, "chat1-m").unwrap().as_deref(),
+            Some(r#"[{"id":"a"}]"#)
+        );
+        set_message_attachments(&db, "cron1-m", r#"[{"id":"b"}]"#).unwrap();
+        assert_eq!(
+            message_attachments(&db, "cron1-m").unwrap().as_deref(),
+            Some(r#"[{"id":"b"}]"#)
+        );
+
+        let conn = db.0.lock().unwrap();
+        let row = |id: &str| -> (i64, i64) {
+            conn.query_row(
+                "SELECT revision, dirty FROM messages WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (chat_rev, chat_dirty) = row("chat1-m");
+        assert!(chat_rev > 0, "a chat row must get a sync revision");
+        assert_eq!(chat_dirty, 1, "a chat row must be pushed");
+        assert_eq!(row("cron1-m"), (0, 0), "a scheduled thread must not sync");
+        drop(conn);
 
         let _ = std::fs::remove_file(&p);
     }
