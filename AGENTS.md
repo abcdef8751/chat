@@ -68,7 +68,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **399 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **401 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
@@ -243,14 +243,23 @@ change. Instead the prompt is **snapshotted and diffed**:
   output byte-for-byte plus the system-id line (pinned by a test). The clock is
   **not** a part — it is a separate `clock` row.
 - **System identity.** The `system` part renders
-  `Running system: pi-chat/<version>+<8-hex prompt hash>. …`, where the hash is
+  `Running system: pi-chat/<version>+<8-hex prompt hash>. Environment: OS: <os>
+  (<arch>); user: <user>; host: <host>; home: <home>. …`, where the hash is
   FNV-1a 64 over the shipped prompt strings (`DEFAULT_SYSTEM_PROMPT`, the
   host-tools note, the style note). The id therefore identifies the app build
   **and** the system-prompt revision: updating the app (or any shipped prompt
   text) changes it, and because the line is part of `parts`, the model is told
   about the change through the ordinary `prompt_update` diff. Pre-`system`
   snapshots do not parse (`from_json` requires every key) and fall back to the
-  whole-text diff, so an upgrade is never silent. `system_info()` (registered
+  whole-text diff, so an upgrade is never silent. The **environment** half
+  describes the machine host tools run on (OS + architecture, the process
+  `USER`/`USERNAME`/`LOGNAME`, the host name from `/proc/sys/kernel/hostname`
+  then `/etc/hostname`/`HOSTNAME`, and `HOME`/`USERPROFILE`); every value is
+  flattened to one line, trimmed and capped at 120 characters by `prompt_safe`,
+  so a hostile username cannot inject instructions. It is computed per turn from
+  the process environment — it is what the app sees, not necessarily the
+  interactive desktop user (a service/launchd context can differ).
+  `system_info()` (registered
   command) returns `{id, version, promptHash}` and the header shows a small
   `sys <hash>` badge on wide viewports (`src/components/SystemBadge.tsx`; hidden
   until the command answers, so a missing command can never break the header).

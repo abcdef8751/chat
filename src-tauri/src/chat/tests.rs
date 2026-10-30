@@ -3299,11 +3299,7 @@ fn legacy_build_system_prompt(
             model_label.trim()
         ));
     }
-    parts.push(format!(
-        "Running system: {}. This id names the app build and system prompt in use; if the user \
-         asks which system you are running, report it.",
-        system_id()
-    ));
+    parts.push(system_line());
     parts.push(
         "Host tools (bash, read_file, write_file) execute on the user's own device — the machine \
          they are sending from — not on a remote server."
@@ -3740,6 +3736,43 @@ fn two_identical_parts_render_the_same_system_id() {
     assert_eq!(a.system, b.system);
     assert_eq!(a.rendered(), b.rendered());
     assert!(a.system.contains(&system_id()), "{}", a.system);
+}
+
+/// The environment half of the system line: os/arch, user, host and home. The
+/// process env is what we have — assert the stable, always-present parts and the
+/// sanitization, not the machine's actual user.
+#[test]
+fn system_environment_reports_os_arch_user_host_and_home() {
+    let line = system_environment();
+    assert!(line.contains("OS: "), "{line}");
+    assert!(line.contains(std::env::consts::OS), "{line}");
+    assert!(line.contains(std::env::consts::ARCH), "{line}");
+    assert!(line.contains("user: "), "{line}");
+    assert!(line.contains("host: "), "{line}");
+    assert!(line.contains("home: "), "{line}");
+    // Never multi-line: a value with control characters is flattened.
+    assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+
+    // The rendered prompt carries both the id and the environment line.
+    let memory = temp_memory("prompt-environment");
+    let parts = SystemPromptParts::new("BASE", "mock", "", &memory, None);
+    let rendered = parts.rendered();
+    assert!(rendered.contains(&system_id()), "{rendered}");
+    assert!(rendered.contains("Environment: "), "{rendered}");
+}
+
+/// A hostile value cannot inject instructions via a newline and is bounded.
+#[test]
+fn prompt_safe_flattens_control_characters_and_bounds_length() {
+    assert_eq!(prompt_safe("bob"), "bob");
+    assert_eq!(prompt_safe("  bob  "), "bob");
+    assert_eq!(prompt_safe(""), "unknown");
+    assert_eq!(prompt_safe("   "), "unknown");
+    assert_eq!(prompt_safe("a\nb\rc"), "a b c");
+    let long = "x".repeat(500);
+    assert_eq!(prompt_safe(&long).chars().count(), 120);
+    // Successful values still survive.
+    assert_eq!(prompt_safe("Ravi"), "Ravi");
 }
 
 /// A changed id alone must reach the model as a prompt-update diff naming both
