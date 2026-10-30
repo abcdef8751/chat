@@ -967,8 +967,17 @@ pub fn apply_user_message_edit(
             .collect();
         tombstone_messages(&tx, conversation_id, &stale_ids)?;
     }
+    // Truncation deletes later turns, but NOT the instruction-update notes: a
+    // `prompt_update` carries changes the model was already told about, and
+    // `conversations.prompt_state` records them as delivered. Deleting the row
+    // (without rewinding the snapshot) would silently revert the model to the
+    // original prompt, and `history_for_request` cannot re-inject a row that no
+    // longer exists. Keeping them leaves harmless gaps in `"index"` (only
+    // ordering/MAX+1 uses it), so the next turn still sees the current
+    // instructions. Clock rows are re-written for the new turn, so they go.
     tx.execute(
-        "DELETE FROM messages WHERE conversation_id = ?1 AND \"index\" > ?2",
+        "DELETE FROM messages
+         WHERE conversation_id = ?1 AND \"index\" > ?2 AND role <> 'prompt_update'",
         params![conversation_id, target_index],
     )
     .map_err(|e| e.to_string())?;

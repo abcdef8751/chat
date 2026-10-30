@@ -4384,6 +4384,37 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
                 "internal row {id} must not be tombstoned"
             );
         }
+
+        // The instruction-update note must survive the truncation: the snapshot
+        // says the model was already told, so deleting the row would silently
+        // revert it to the original prompt. The clock note is re-written for the
+        // new turn, so it is expected to be gone.
+        let remaining: Vec<(String, String)> = {
+            let conn = db.0.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, role FROM messages WHERE conversation_id = ?1 ORDER BY \"index\"",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([&cid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(
+            remaining
+                .iter()
+                .any(|(id, role)| id == &internal[1] && role == "prompt_update"),
+            "the prompt_update note must survive truncation: {remaining:?}"
+        );
+        assert!(
+            !remaining
+                .iter()
+                .any(|(id, _)| id == &internal[0]),
+            "the clock note is re-written per turn and should be dropped"
+        );
     }
 
     #[test]

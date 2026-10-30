@@ -312,9 +312,11 @@ export function setConversationModel(conversationId: string, model: string): Pro
 }
 
 /**
- * Set (or clear) a conversation's thinking level. `null` (or `""`, which the
- * backend normalizes) clears the override so the chat follows the global
- * configured level; any other string is stored as that chat's own level.
+ * Set (or clear) a conversation's thinking level.
+ *
+ * `null` clears the override so the chat inherits the device default. An empty
+ * string is a REAL override meaning "no reasoning" (stored verbatim), so the
+ * header's "Default" entry maps to `null`, not `""`.
  */
 export function setConversationThinkingLevel(
   conversationId: string,

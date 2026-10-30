@@ -1584,7 +1584,10 @@ export default function App() {
       const conv = activeConversation();
       if (conv) {
         try {
-          await setConversationThinkingLevel(conv.id, "");
+          // `null` clears the per-chat override (inherit). An empty string is a
+          // real override meaning "no reasoning" now, so it must not be used to
+          // mean "clear".
+          await setConversationThinkingLevel(conv.id, null);
           setConversations((prev) =>
             prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: null } : c)),
           );
@@ -1637,15 +1640,21 @@ export default function App() {
     // With a conversation open the pick is that chat's own reasoning effort
     // (synced on its row, used by the backend verbatim). The global default is
     // persisted too, so a new chat starts at the level the user just chose.
+    //
+    // The header's "Default" entry is the empty string: that means "inherit the
+    // device default", i.e. CLEAR the per-chat override (`null`). The backend
+    // reserves `""` for an explicit "no reasoning" override, so passing it here
+    // would pin the chat instead of inheriting.
     const conv = activeConversation();
+    const perChat = level === "" ? null : level;
     if (conv) {
       try {
-        await setConversationThinkingLevel(conv.id, level);
+        await setConversationThinkingLevel(conv.id, perChat);
         setConversations((prev) =>
-          prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: level || null } : c)),
+          prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: perChat } : c)),
         );
         setVisibleConversations((prev) =>
-          prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: level || null } : c)),
+          prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: perChat } : c)),
         );
       } catch (e) {
         setSettingsError(String(e));
@@ -2142,17 +2151,12 @@ export default function App() {
     // Editing an existing user row: rewrite it (truncating later messages) and
     // re-run the reply from it, instead of appending a second user turn.
     const editing = editingId();
-    if (editing) {
-      // An edit targets a row in the chat that was open when the pen was
-      // clicked (switching chats cancels it). If that chat is gone — deleted,
-      // pruned as an orphan, or removed by a sync tombstone — then the message
-      // id is dead too, and `send()` is about to create a fresh chat. Rewriting
-      // a row that belongs to another conversation would truncate the wrong
-      // transcript, so cancel (restoring the pre-edit draft) instead.
-      if (!conversations().some((c) => c.id === id)) {
-        cancelEditMessage();
-        return;
-      }
+    if (editing && !id) {
+      // An edit always targets a row in an existing chat (switching chats
+      // cancels it). With no active conversation there is nothing to rewrite,
+      // so restore the pre-edit draft instead of creating an empty chat.
+      cancelEditMessage();
+      return;
     }
     if (!id) {
       const created = await createConversation();
