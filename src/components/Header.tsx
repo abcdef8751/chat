@@ -3,6 +3,7 @@ import { DropdownMenu } from "@kobalte/core/dropdown-menu";
 import type { ModelInfo, Pricing, ProviderInfo, ThinkingOptions } from "../lib/api";
 import { MenuIcon, MoreIcon } from "../lib/icons";
 import { formatTokens } from "../lib/turns";
+import { SystemBadge } from "./SystemBadge";
 
 // Shared styling for dropdown-menu items (header overflow menu). Kept as a
 // literal here so Tailwind's scanner picks up the `data-[highlighted]` variant.
@@ -118,6 +119,9 @@ export function Header(props: {
         <h1 class="truncate text-sm font-semibold">{props.activeTitle}</h1>
       </div>
       <div class="flex min-w-0 flex-wrap items-center justify-end gap-2 sm:gap-3">
+        {/* Which build + system-prompt revision is running (diagnostic only;
+            self-fetching and invisible when the command is unavailable). */}
+        <SystemBadge />
         <Show when={props.activeId}>
           <div
             class="hidden items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-neutral-500 sm:flex dark:text-neutral-400"

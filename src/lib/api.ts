@@ -787,3 +787,23 @@ export function testNotification(): Promise<void> {
 export function requestNotificationPermission(): Promise<boolean> {
   return invoke<boolean>("request_notification_permission");
 }
+
+// --- Running system identity ---
+
+/** The build running right now. `id` is `"pi-chat/<version>+<promptHash>"`, a
+ * distinctive name for the app build + system-prompt revision; the same id is
+ * rendered into the system prompt, so the model can tell which build it runs
+ * against (and the existing instruction-diff note tells it when it changes). */
+export interface SystemInfo {
+  /** e.g. `"pi-chat/0.1.0+ab12cd34"`. */
+  id: string;
+  /** The app version, e.g. `"0.1.0"`. */
+  version: string;
+  /** The 8-hex system-prompt revision (the suffix of `id`). */
+  promptHash: string;
+}
+
+/** Identify the running build + system-prompt revision (header chip). */
+export function systemInfo(): Promise<SystemInfo> {
+  return invoke<SystemInfo>("system_info");
+}
