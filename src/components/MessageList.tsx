@@ -108,7 +108,10 @@ export function MessageList(props: {
                                       </Show>
                                       <Show when={!a.remotePath && !a.text && !a.dataUrl}>
                                         <Show
-                                          when={a.sourcePath}
+                                          when={
+                                            a.sourcePath &&
+                                            !u().id.startsWith("tmp-")
+                                          }
                                           fallback={
                                             <span
                                               title={a.uploadError ?? "This file could not be uploaded"}

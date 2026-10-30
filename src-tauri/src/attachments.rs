@@ -460,11 +460,13 @@ async fn offload_size_error(path: &Path, known: u64) -> Option<String> {
     crate::storage::check_upload_size(len).err()
 }
 
-/// Already-resolved storage credentials. Resolving them is **not** free — it
-/// builds a `SyncState` (and its `reqwest` client), reads the session from the
-/// keychain, and may refresh the token over the network — so a batch resolves
-/// once and passes the result down. `Err` carries why they are unavailable.
-type CredsResult<'a> = Result<Option<&'a crate::storage::Credentials>, &'a str>;
+/// Lazily resolved storage credentials, shared across a batch.
+///
+/// Resolving them is **not** free — it builds a `SyncState` (and its `reqwest`
+/// client), reads the session from the keychain, and may refresh the token over
+/// the network — so it happens at most once per batch, and only *after* a file
+/// clears the size gate. `Err` carries why they are unavailable.
+type CredsCache = Option<Result<Option<crate::storage::Credentials>, String>>;
 
 /// Try to upload an attachment that has **nothing inline**, recording either the
 /// remote object key or a user-facing reason it could not be uploaded.
@@ -477,7 +479,7 @@ type CredsResult<'a> = Result<Option<&'a crate::storage::Credentials>, &'a str>;
 /// what makes a retry possible, and a successfully uploaded file has nothing
 /// left to retry (so the absolute local path does not ride the synced
 /// attachment JSON forever).
-async fn offload_file(path: &Path, a: &mut Attachment, creds: CredsResult<'_>) {
+async fn offload_file(path: &Path, a: &mut Attachment, cache: &mut CredsCache) {
     a.remote_path = None;
     a.upload_error = None;
     a.source_path = Some(path.to_string_lossy().into_owned());
@@ -492,7 +494,10 @@ async fn offload_file(path: &Path, a: &mut Attachment, creds: CredsResult<'_>) {
         a.upload_error = Some(reason);
         return;
     }
-    let creds = match creds {
+    if cache.is_none() {
+        *cache = Some(crate::storage::credentials().await);
+    }
+    let creds = match cache.as_ref().expect("just resolved") {
         Ok(Some(c)) => c,
         Ok(None) => {
             eprintln!("attachments: offload of {display} skipped: cloud sync is off");
@@ -559,19 +564,11 @@ pub async fn read_attachments(
     }
 
     let mut out = Vec::with_capacity(read.len());
-    // Resolved at most once per batch, and only when a file actually needs it.
-    let mut creds: Option<Result<Option<crate::storage::Credentials>, String>> = None;
+    // Resolved at most once per batch, and only after a file clears the size gate.
+    let mut creds: CredsCache = None;
     for (path, mut a) in read {
         if needs_offload(&a) {
-            if creds.is_none() {
-                creds = Some(crate::storage::credentials().await);
-            }
-            let cached = match creds.as_ref().expect("just resolved") {
-                Ok(Some(c)) => Ok(Some(c)),
-                Ok(None) => Ok(None),
-                Err(e) => Err(e.as_str()),
-            };
-            offload_file(Path::new(&path), &mut a, cached).await;
+            offload_file(Path::new(&path), &mut a, &mut creds).await;
         }
         out.push(a);
     }
@@ -599,6 +596,9 @@ pub async fn retry_attachment_upload(
 ) -> Result<Attachment, String> {
     let mut a = attachment;
     let Some(path) = a.source_path.clone() else {
+        // Nothing to retry from: drop any stale object key too, so the record
+        // does not claim a remote copy this row cannot actually reach.
+        a.remote_path = None;
         a.upload_error = Some("the original file path is no longer known".into());
         return Ok(a);
     };
@@ -621,26 +621,14 @@ pub async fn retry_attachment_upload(
     // Refresh the size: the file may have been replaced or grown since it was
     // attached, and the cap check must see the current length.
     a.size = meta.len();
-    // Size gate *before* the credentials: retrying an over-cap file must not
-    // build a `SyncState`, read the keychain or refresh a token just to report
-    // the same cap back (the batch path holds the same invariant).
-    if let Some(reason) = offload_size_error(Path::new(&path), a.size).await {
-        eprintln!("attachments: retry for {path} skipped: {reason}");
-        a.remote_path = None;
-        a.upload_error = Some(reason);
-        return Ok(a);
-    }
+    // `offload_file` gates on that size *before* it resolves credentials, so an
+    // over-cap retry never builds a `SyncState` or touches the keychain.
+    let mut creds: CredsCache = None;
+    offload_file(Path::new(&path), &mut a, &mut creds).await;
 
-    let resolved = crate::storage::credentials().await;
-    let creds = match &resolved {
-        Ok(Some(c)) => Ok(Some(c)),
-        Ok(None) => Ok(None),
-        Err(e) => Err(e.as_str()),
-    };
-    offload_file(Path::new(&path), &mut a, creds).await;
-
-    // Nothing was uploaded: keep the stored state (the row already carries an
-    // accurate warning), so this is not a write.
+    // Nothing was uploaded: leave the row alone — the previously recorded reason
+    // is still the best information it has, and writing here would clobber the
+    // `sourcePath` that only the device holding the file can use.
     if a.remote_path.is_none() {
         return Ok(a);
     }
@@ -919,7 +907,7 @@ mod tests {
         let mut a = read_attachment(&p).unwrap();
         assert!(needs_offload(&a));
         // The size gate runs before the credentials are touched.
-        offload_file(&p, &mut a, Ok(None)).await;
+        offload_file(&p, &mut a, &mut None).await;
 
         assert!(a.remote_path.is_none());
         let err = a.upload_error.as_deref().expect("a reason must be recorded");
@@ -933,7 +921,7 @@ mod tests {
         // A retry re-checks the file and reports the same reason without
         // touching the network (the cap is still exceeded).
         let mut retried = a.clone();
-        offload_file(&p, &mut retried, Ok(None)).await;
+        offload_file(&p, &mut retried, &mut None).await;
         assert!(retried.remote_path.is_none());
         assert!(retried
             .upload_error

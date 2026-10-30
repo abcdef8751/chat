@@ -73,15 +73,14 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **403 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **404 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
 `CC_aarch64_linux_android` etc.). The GUI e2e needs a display and is run
-separately; it was not runnable in the last session (WebDriver's screenshot call
-hung), so this batch is verified by the Rust suite + tsc + production builds
-only.
+separately; it **passed** for this batch (`npm run e2e` → `ALL ASSERTIONS
+PASSED`), alongside the Rust suite, `tsc` and the production build.
 
 `cargo clippy --all-targets -- -D warnings` currently reports **12 pre-existing
 lints** under clippy 1.97 — `manual_inspect` (`sync.rs`), `field_reassign_with_default`
@@ -1194,12 +1193,16 @@ and the app is byte-identical to before. Never blocks the UI.
   retry carries a local path. The UI shows an amber **⚠ retry** warning next to
   that file's name (composer and transcript); clicking it calls
   `retry_attachment_upload`, which re-checks the file and either records
-  `remotePath` or refreshes `uploadError`. A file that is gone reports why and
-  the *returned* attachment stops offering the click, but nothing is written —
-  the persisted row keeps its path, because only the device that has the file can
-  use it and a write from another device would clobber it there. A failed retry
-  never writes at all (the row already carries an accurate warning). A
-  *successful* retry merges the attachment into the row's JSON under one lock
+  `remotePath` or refreshes `uploadError`. A file that is gone reports why; the
+  composer chip degrades to a plain warning, but nothing is written — the
+  persisted row keeps its path (only the device that has the file can use it, and
+  a write from another device would clobber it there), so a transcript chip stays
+  clickable. A failed retry never writes at all (the row keeps the previously
+  recorded reason, which is the best information it has). Sending is refused
+  while a staged attachment is still retrying (the send snapshots the attachment
+  list, so persisting mid-retry would freeze the stale `uploadError` on the row
+  while the object uploads). A *successful* retry merges the attachment into the
+  row's JSON under one lock
   (`db::merge_message_attachment`, so two retries on one message cannot lose each
   other's update) and reloads through `reloadTranscript`, never a bare
   `setMessages` — the chip is visible while the reply still streams, and the
@@ -1478,10 +1481,13 @@ Residuals from this batch:
 - **Row-level LWW can clear a thinking level.** A conversation row written by an
   older client (no `thinking_level`) wins on the mirror and nulls the level. Same
   clock-skew/LWW caveat as other columns.
-- **`sourcePath` rides the synced attachment JSON** for offloaded files (it is
-  what makes a post-send retry possible). It is a local absolute path; the mirror
-  is private/RLS-scoped and the field is encrypted when sync encryption is on,
-  but it is metadata worth knowing about.
+- **`sourcePath` rides the synced attachment JSON** for failed/skipped uploads
+  (it is what makes a post-send retry possible; it is dropped once the upload
+  lands). It is a local absolute path, so on another device the retry resolves
+  nothing — the click reports "the original file is not available" and the row
+  keeps the path, because only the originating device can use it. The mirror is
+  private/RLS-scoped and the field is encrypted when sync encryption is on, but
+  it is metadata worth knowing about.
 - **`prompt_state` is device-local while `prompt_update` rows are too**, so two
   devices with different Settings legitimately send different instruction
   updates for the same chat. The frozen prefix is per device; that is intentional
@@ -1492,9 +1498,10 @@ Residuals from this batch:
 - **`supabase/storage.sql` / `supabase/schema.sql` are applied via the CLI** now
   (`supabase db query --linked --file …`); both are idempotent, so re-running
   after a pull is safe. The bucket and policies exist on the personal project.
-- **GUI e2e could not run in the last session** (the other worktree's dev server
-  held port 1420, and the harness fails fast by design); `tsc` + production build
-  + 403 Rust tests are green. The retry/edit flows are compiler-verified only.
+- **GUI e2e passed for this batch** (`ALL ASSERTIONS PASSED`, keychain snapshot
+  unchanged): streaming, reasoning popup, tool approval + inline timeline,
+  activity container, memory consolidation. The *retry* flow itself remains
+  compiler- and unit-tested only — the mock provider never fails an upload.
 
 **Recent backlog (landed):** a 13-item pass — drawer-open keyboard, memory page
 list→detail on mobile, Enter=newline on Android, live↔persisted timeline

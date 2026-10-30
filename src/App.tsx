@@ -2079,6 +2079,20 @@ export default function App() {
   /** Whether a staged attachment is waiting on an upload retry (blocks `send`). */
   const attachmentsAreRetrying = (list: Attachment[]) =>
     list.some((a) => retryingAttachments.has(`pending:${a.id}`));
+  /**
+   * Refuse a send while a staged attachment is retrying.
+   *
+   * The send snapshots the attachment list, so persisting mid-retry would freeze
+   * the stale `uploadError` on the row while the upload lands (an orphan object
+   * and a model that is told the file is unreadable). Returns `true` when the
+   * send must not proceed — and says so, because a dead Send button with no
+   * explanation reads as a bug.
+   */
+  const sendBlockedByRetry = (list: Attachment[], id: string | null) => {
+    if (!attachmentsAreRetrying(list)) return false;
+    setStreamErrorFor(id, "Waiting for the attachment upload to finish — try again in a moment.");
+    return true;
+  };
   // The banner text a retry set, per attachment. The stream-error banner is the
   // only carrier of a turn's actionable error text, so a successful retry may
   // clear it only when it is the very message that retry wrote.
@@ -2090,9 +2104,12 @@ export default function App() {
   const clearOwnRetryBanner = (key: string, id: string | null) => {
     const mine = retryBanner.get(key);
     retryBanner.delete(key);
-    if (mine !== undefined && (streamErrors()[id ?? ""] ?? null) === mine) {
-      clearStreamError(id);
-    }
+    if (mine === undefined) return;
+    // Identical reasons are common (two same-size files over the cap, or both
+    // "cloud sync is off"), so a text match alone could clear a banner that still
+    // describes another attachment's live failure.
+    for (const other of retryBanner.values()) if (other === mine) return;
+    if ((streamErrors()[id ?? ""] ?? null) === mine) clearStreamError(id);
   };
 
   // Retry a failed remote offload from the composer's attachment chip.
@@ -2125,8 +2142,14 @@ export default function App() {
   // rendered the moment the user row exists, i.e. while the reply still streams).
   async function retryMessageAttachment(messageId: string, a: Attachment) {
     const id = activeId();
-    // Keyed by message + attachment: one in-flight retry per attachment (two on
-    // the same message must not race the row's JSON), and never two for one.
+    // A staged `tmp-user-*` row has no DB row to write back to yet: the upload
+    // would land, the merge would fail, and a second click would mint a second
+    // object. The chip is hidden for those rows too, so this is belt-and-braces.
+    if (messageId.startsWith("tmp-")) return;
+    // Keyed by message + attachment so a repeated click on the same chip is
+    // ignored. Two *different* attachments of one message may retry at once —
+    // `db::merge_message_attachment` takes the connection lock once for the whole
+    // read-modify-write, so neither can lose the other's update.
     const key = retryKey(a, messageId);
     if (retryingAttachments.has(key)) return;
     retryingAttachments.add(key);
@@ -2358,10 +2381,7 @@ export default function App() {
     const staged = pendingAttachments();
     let id = activeId();
     if (isBusy(id) || (!draft().trim() && staged.length === 0)) return;
-    // A retry in flight would race this send: the send snapshots the attachment
-    // list before the retry rewrites it, so the message would persist a stale
-    // `uploadError` while the object uploads and ends up orphaned.
-    if (attachmentsAreRetrying(staged)) return;
+    if (sendBlockedByRetry(staged, id)) return;
 
     // Editing an existing user row: rewrite it (truncating later messages) and
     // re-run the reply from it, instead of appending a second user turn.
@@ -2381,6 +2401,10 @@ export default function App() {
       id = created.id;
     }
     const text = draft().trim();
+
+    // Re-check after the awaits above (`createConversation` can take a moment,
+    // and the retry chip stays clickable throughout).
+    if (sendBlockedByRetry(staged, id)) return;
 
     if (editing) {
       try {
