@@ -369,7 +369,11 @@ pub(crate) fn build_reflection_messages(
     // The boundary and the summary come from the same conversation snapshot as
     // `history`, so an interleaved compaction write cannot desync them.
     let (summary, keep_start) = chat::compacted_history(conversation, history);
-    let mut messages = chat::build_context(system_prompt, summary.as_deref(), &history[keep_start..])?;
+    // Reflection shares the live turn's request layout, including the
+    // instruction-update notes compaction may have folded away: dropping them
+    // would let the pass curate memory under stale preferences/instructions.
+    let kept = chat::history_for_request(history, &history[keep_start..]);
+    let mut messages = chat::build_context(system_prompt, summary.as_deref(), &kept)?;
     messages.push(
         ChatCompletionRequestSystemMessageArgs::default()
             .content(reflection_tail(recent))

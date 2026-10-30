@@ -2316,7 +2316,7 @@ fn apply_history_mode(history: &mut Vec<db::MessageRow>, mode: HistoryMode) {
 ///
 /// Cheap in the ordinary case: it only collects rows whose role matches, and a
 /// conversation with no instruction change has none.
-fn history_for_request(
+pub(crate) fn history_for_request(
     full: &[db::MessageRow],
     kept: &[db::MessageRow],
 ) -> Vec<db::MessageRow> {
