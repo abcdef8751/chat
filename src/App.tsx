@@ -361,14 +361,37 @@ export default function App() {
     // snapshot belongs to a conversation that is no longer on screen.
     if (activeId() !== id) return;
     const current = messages();
+    // Only the LAST persisted user row can be the staged turn's own copy: the
+    // backend appends the user row for the current turn, so matching any earlier
+    // user row would make a repeated send of the same text (a cron thread
+    // replaying its prompt, or the user typing the same line twice) look already
+    // persisted and drop the staged bubble from the second turn.
+    const lastPersistedUser = rows.filter((r) => r.role === "user").slice(-1)[0];
     const staged = current.filter(
       (m) =>
         m.conversation_id === id &&
         m.id.startsWith("tmp-user-") &&
-        !rows.some((r) => sameStagedUserRow(r, m)),
+        (!lastPersistedUser || !sameStagedUserRow(lastPersistedUser, m)),
     );
     const live = liveTurns()[id];
     if (live) {
+      // The backend writes the final assistant row immediately before emitting
+      // `done`. If a reload resolves in that window, appending the synthetic live
+      // row would leave two assistant rows for one turn. Detect it by content
+      // (the persisted row is the live content) and apply the rows as-is; the
+      // terminal reload still reconciles. A blank/mismatched tail keeps the live
+      // row even if it is the previous turn's answer.
+      const tail = rows.slice(-1)[0];
+      if (
+        tail &&
+        tail.role === "assistant" &&
+        tail.stop_reason != null &&
+        tail.content === live.content &&
+        (tail.thinking ?? "") === live.thinking
+      ) {
+        setMessages([...rows, ...staged]);
+        return;
+      }
       // Re-attach the in-flight assistant row so a reload that raced the start
       // of a turn cannot hide it. Deltas keep appending to this key.
       setMessages([
@@ -1206,6 +1229,10 @@ export default function App() {
     // follows whichever chat is open — it is NOT keyed per conversation, and a
     // half-typed draft is not restored when the user comes back to this chat.
     if (untrack(editingId) !== null) cancelEditMessage();
+    // The "no conversation open" error bucket is a one-screen message (e.g. a
+    // failed attachment pick); drop it as soon as a chat is opened so it cannot
+    // resurface on the next empty screen.
+    clearStreamError("");
     // Opening a conversation counts as reading its background output.
     if (id) clearUnseen(id);
     if (!id) {
@@ -2022,6 +2049,10 @@ export default function App() {
 
   async function addAttachmentPaths(paths: string[]) {
     if (paths.length === 0) return;
+    // Resolve the chat the pick was made in BEFORE any await: switching chats
+    // while the native dialog / URI read is in flight must not file the failure
+    // under the conversation the user moved to.
+    const id = activeId();
     try {
       const atts = await readPickedAttachments(paths);
       if (atts.length === 0) {
@@ -2029,26 +2060,28 @@ export default function App() {
         // instead of silently doing nothing. Scoped to the chat the pick was made
         // in, so it doesn't follow the user into another conversation.
         setStreamErrorFor(
-          activeId(),
+          id,
           paths.length === 1 ? "Could not read the selected file." : "Could not read the selected files.",
         );
         return;
       }
       setPendingAttachments((prev) => [...prev, ...atts]);
     } catch (e) {
-      setStreamErrorFor(activeId(), String(e));
+      setStreamErrorFor(id, String(e));
     }
   }
 
   // File explorer button: native picker. Android goes through our own plugin
   // (see `pickAttachmentPaths`); desktop through the dialog plugin.
   async function pickAttachments() {
+    // Same reason as `addAttachmentPaths`: capture the chat before the dialog.
+    const id = activeId();
     try {
       const paths = await pickAttachmentPaths();
       if (!paths) return;
       await addAttachmentPaths(paths);
     } catch (e) {
-      setStreamErrorFor(activeId(), String(e));
+      setStreamErrorFor(id, String(e));
     }
   }
 
@@ -2102,22 +2135,28 @@ export default function App() {
     channel.onmessage = (ev) => {
       // Ignore events from a superseded turn (Stop, then a new send).
       if (turnTokens[id] !== token) return;
-      // Terminal events must ALWAYS be handled, even if the user switched to a
-      // different conversation mid-turn. Dropping them left `streaming` set
-      // forever, which disabled the composer in every chat. Only the visible
-      // transcript needs refreshing.
-      if (ev.type === "done" || ev.type === "error") {
+      // `done` is the ONLY terminal event. `error` is a mid-turn report: the
+      // backend emits it and then finishes the turn normally (persists the
+      // partial assistant row and emits `done`), so treating it as terminal
+      // dropped the live record and reloaded a transcript that had no answer yet.
+      // It must also NOT clear the banner — the following terminal `done` used to
+      // do exactly that, which made every failure message flash and vanish.
+      if (ev.type === "error") {
         // Keyed to THIS turn's conversation (not the visible one): the failure
-        // belongs to the chat it happened in, and the persisted assistant row
-        // carries the same annotation once it is reloaded below.
-        if (ev.type === "error") setStreamErrorFor(id, ev.message);
-        // A successful turn makes any earlier banner for this chat stale.
-        else clearStreamError(id);
+        // belongs to the chat it happened in.
+        setStreamErrorFor(id, ev.message);
+        return;
+      }
+      if (ev.type === "done") {
+        // A turn that ended in `error` keeps its banner (the actionable text is
+        // not in the persisted row — that only carries the `(error)` annotation);
+        // any other terminal makes an earlier banner for this chat stale.
+        if (ev.stopReason !== "error") clearStreamError(id);
         // Settled off-screen: mark the row (and the hamburger) so the user knows
         // there is output to read. OS notifications are the backend's job. A
         // turn that errored before producing anything has nothing to read, so it
         // must not light a "New activity" dot (a partial answer still counts).
-        if (activeId() !== id && (ev.type === "done" || received.current)) markUnseen(id);
+        if (activeId() !== id && received.current) markUnseen(id);
         removeStreaming(id);
         dropLiveTurn(id, token);
         // Streaming is already cleared, so this applies the persisted rows (the

@@ -253,15 +253,23 @@ pub fn sniff_image_mime(head: &[u8]) -> Option<&'static str> {
     if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
         return Some("image/webp");
     }
-    if head.starts_with(b"BM") {
-        return Some("image/bmp");
+    // BMP's `BM` is only two bytes — plain text starting with e.g. "BM 25" or
+    // "BMJ …" would otherwise be misrouted to the image path (and on a vision
+    // model, sent as a bogus BMP part that fails the whole turn). Require a
+    // plausible `BITMAPFILEHEADER` + DIB header size: `BM`, at least 18 bytes,
+    // and a known DIB header size (12/16/40/52/56/64/108/124) at offset 14.
+    if head.len() >= 18 && head.starts_with(b"BM") {
+        let dib = u32::from_le_bytes([head[14], head[15], head[16], head[17]]);
+        if matches!(dib, 12 | 16 | 40 | 52 | 56 | 64 | 108 | 124) {
+            return Some("image/bmp");
+        }
     }
     None
 }
 
 /// How many leading bytes [`is_image_file`] reads to sniff a format. Enough for
-/// the longest signature (WebP's `RIFF....WEBP`).
-const SNIFF_BYTES: usize = 16;
+/// the longest signature checked (BMP's DIB header size at offset 14..18).
+const SNIFF_BYTES: usize = 32;
 
 /// Whether `path` is a raster image: a raster **extension**, or a regular file
 /// whose first [`SNIFF_BYTES`] bytes sniff as one of the supported formats.
@@ -800,10 +808,14 @@ mod tests {
             sniff_image_mime(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
             Some("image/webp")
         );
-        assert_eq!(sniff_image_mime(b"BM\x36\x00\x00\x00"), Some("image/bmp"));
+        assert_eq!(
+            sniff_image_mime(b"BM\x36\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00"),
+            Some("image/bmp")
+        );
 
         // Not images: text, SVG/XML, ICO, a RIFF *non*-WebP container, an empty
-        // file, and a truncated PNG signature.
+        // file, a truncated PNG signature, and — importantly — plain text that
+        // merely begins with BMP's two-byte `BM` marker.
         for other in [
             b"hello world".as_slice(),
             b"<svg><rect/></svg>",
@@ -811,6 +823,8 @@ mod tests {
             b"RIFF\x24\x00\x00\x00WAVEfmt ",
             b"",
             b"\x89PNG",
+            b"BMJ 2024 annual review",
+            b"BM 25,12.5,hello",
         ] {
             assert_eq!(sniff_image_mime(other), None, "{other:?}");
         }

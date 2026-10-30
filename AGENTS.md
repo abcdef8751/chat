@@ -126,18 +126,22 @@ following rounds (DeepSeek thinking mode requires it, else HTTP 400); traces are
 **never** replayed across user turns. Toggle: `AppConfig.echo_reasoning_content`.
 
 **Truncated output.** `RoundAccum.truncated` is set when the provider reports
-`finish_reason` `length`/`max_tokens`. A truncated round that carries tool calls
-is unusable — the streamed argument JSON may be cut mid-fragment — so the loop
-persists **nothing** for it, dispatches nothing, and ends the turn with
-`stop_reason = "error"` plus an actionable message (retry / smaller output /
-higher provider cap). A truncated **answer** (no tool calls) keeps
-`stop_reason = "length"`, which the timeline annotates "(output limit reached)".
-The tool-round cap reports `"tool_limit"` (annotated "(tool-round limit
-reached)") so it is no longer confused with an output limit. Streamed arguments
-that fail to parse are recorded as `Value::Null` (never silently `{}`) and their
-ids tracked: such a call is **not** dispatched; it still gets a tool-error result
-row ("arguments were not valid JSON … call again with complete arguments") so
-the transcript stays replay-valid. An empty argument string is still a real
+`finish_reason` `length` (and `max_tokens` is normalised to `length`, so the
+persisted stop reason and the UI annotation agree). A truncated round that
+carries tool calls is unusable — the streamed argument JSON may be cut
+mid-fragment — so the loop persists **no tool-call or result row** for it and
+dispatches nothing (the partial assistant *text* still rides the final
+assistant row), ending the turn with `stop_reason = "error"` plus an actionable
+message (retry / smaller output / higher provider cap). A truncated **answer**
+(no tool calls) keeps `stop_reason = "length"`, which the timeline annotates
+"(output limit reached)". The tool-round cap reports `"tool_limit"` (annotated
+"(tool-round limit reached)") so it is no longer confused with an output limit.
+Streamed arguments that fail to parse are marked `Value::Null` **in memory**
+(never silently coerced to `{}` there) and their ids tracked: such a call is
+**not** dispatched; it still gets a tool-error result row ("arguments were not
+valid JSON … call again with complete arguments") so the transcript stays
+replay-valid. On the wire and in the persisted row those arguments render as
+`{}` (both must be valid JSON). An empty argument string is still a real
 no-argument call.
 
 **Edit → re-run.** `db::edit_user_message` rewrites a `user` row and deletes
@@ -165,10 +169,11 @@ recognizes the five formats from a 16-byte probe, so an extensionless screenshot
 or `fetch_file` download is still read as an image (and PNG bytes in a `.txt`
 are too). Failure paths are plain tool results, never a broken turn: too large →
 "too large to view", unreadable/unsupported → an actionable error, and a
-non-image binary is reported as such — desktop `read_file` refuses files over
-`MAX_READ_FILE_BYTES` (10 MB) with a `bash`/`head`/`tail` hint and reports
-invalid UTF-8 as "binary file (n bytes), not text" instead of a decoding error.
-(The Android branch still `cat`s the file through Termux.)
+non-image binary is reported as such — desktop `read_file` reads a bounded 1 MB
+prefix (the usual 20k-character truncation still applies, so big text files read
+as before) and reports invalid UTF-8 as "binary file (n bytes), not text"
+instead of a decoding error. (The Android branch still `cat`s the file through
+Termux.)
 
 **Failure-handling contract**
 
@@ -247,8 +252,11 @@ change. Instead the prompt is **snapshotted and diffed**:
   snapshots do not parse (`from_json` requires every key) and fall back to the
   whole-text diff, so an upgrade is never silent. `system_info()` (registered
   command) returns `{id, version, promptHash}` and the header shows a small
-  `sys <hash>` badge (`src/components/SystemBadge.tsx`; hidden until the command
-  answers, so a missing command can never break the header).
+  `sys <hash>` badge on wide viewports (`src/components/SystemBadge.tsx`; hidden
+  until the command answers, so a missing command can never break the header).
+  The prompt line tells the model the id names the build and prompt in use and to
+  report it if asked; it makes no claim about version bumps (the hash changes
+  when the hashed prompt strings change, and `CARGO_PKG_VERSION` when released).
 - **Snapshot.** `conversations.prompt_state` (local-only, never synced) stores
   `{"system": "<the literal top-level system message sent>", "parts": {…}}`.
   `system` is frozen for the conversation's life; `parts` is the newest
@@ -817,8 +825,9 @@ bash(command)                     // runs a fresh `bash -c` per call (one-shot);
 read_file(path)                   // text, or an image part when the model is
                                   //   vision-capable (see "read_file images").
                                   //   Images are detected by extension OR the
-                                  //   first bytes; desktop refuses >10 MB and
-                                  //   reports binary non-images as such.
+                                  //   first bytes; desktop reads up to 1 MB (then
+                                  //   the usual truncation) and reports binary
+                                  //   non-images as such.
                                   //   A leading `~`/`~/` expands to $HOME (desktop);
                                   //   `~user` is left untouched, and on Android the
                                   //   path is passed through unchanged (Termux owns

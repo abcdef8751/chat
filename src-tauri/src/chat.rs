@@ -426,11 +426,16 @@ fn apply_chunk(
             return true;
         }
         if !reason.is_empty() {
+            // Normalise the provider spellings of "hit the output limit" to one
+            // value: `stop_reason` is persisted verbatim and the UI keys its
+            // annotation off `length`, so a provider that says `max_tokens` must
+            // not leave a cut-off answer looking like a clean stop.
+            let reason = if reason == "max_tokens" { "length" } else { reason };
             out.finish = Some(reason.to_string());
             // The provider cut the round off at its output limit. A tool call in
             // this round may have partial arguments; the loop must not treat it
             // as a final answer (see `run_tool_loop`).
-            if reason == "length" || reason == "max_tokens" {
+            if reason == "length" {
                 out.truncated = true;
             }
         }
@@ -1508,11 +1513,14 @@ pub(crate) fn system_id() -> String {
     format!("pi-chat/{}+{}", env!("CARGO_PKG_VERSION"), prompt_hash())
 }
 
-/// The one rendered line carrying [`system_id`] in the system prompt.
+/// The one rendered line carrying [`system_id`] in the system prompt. Kept
+/// factual: the id is what this build and its hashed prompt strings produce, so
+/// it changes when those change (a release bump included). No claim about the
+/// user having updated anything.
 fn system_line() -> String {
     format!(
-        "Running system: {}. This id identifies the app build and system-prompt revision and \
-         changes when either is updated.",
+        "Running system: {}. This id names the app build and system prompt in use; if the user \
+         asks which system you are running, report it.",
         system_id()
     )
 }

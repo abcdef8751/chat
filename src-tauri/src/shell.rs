@@ -20,12 +20,12 @@ use crate::tools::truncate;
 /// Default per-call timeout (matches the old persistent session's).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Largest file `read_file` will read into memory on desktop. Larger files are
-/// refused with a pointer at `bash` + `head`/`tail`: the whole file would be
-/// re-sent on every remaining round of the turn, and reading a huge file is how
-/// a single tool call can exhaust a provider's request limit.
+/// How much of a file desktop `read_file` reads before handing it to
+/// `truncate`. Far above the 20k-character output cap, so a long text file is
+/// still readable (truncated) as before, while a huge file cannot be pulled into
+/// memory in full.
 #[cfg(not(target_os = "android"))]
-pub const MAX_READ_FILE_BYTES: u64 = 10_000_000;
+pub const READ_PREFIX_BYTES: u64 = 1_000_000;
 
 /// The user's home directory, honouring the platform's own variable: `HOME`
 /// everywhere, with `USERPROFILE` as the Windows fallback. An empty value is
@@ -183,16 +183,20 @@ impl ShellExecutor {
     /// (including the Android `shq`-quoted branch, where single quotes would
     /// otherwise suppress the shell's own expansion) agrees on the real path.
     ///
-    /// The desktop branch checks the metadata first, refuses non-files and
-    /// oversized files, and only then reads: a blind `read_to_string` on a
-    /// binary (or an extensionless image) surfaced as an opaque UTF-8 error, and
-    /// on a huge file could pull the whole thing into memory just to hand the
-    /// model a truncated copy anyway.
+    /// The desktop branch checks the metadata first, refuses non-files, and reads
+    /// only a bounded prefix: a blind `read_to_string` on a binary (or an
+    /// extensionless image) surfaced as an opaque UTF-8 error, and a huge file
+    /// would be pulled into memory just to hand the model a truncated copy
+    /// anyway. The prefix is ~50× the 20k-character output cap `truncate`
+    /// enforces, so a large log still reads (truncated) exactly as it always
+    /// has; only a genuinely binary file is refused.
     pub async fn read_file(&self, path: &str) -> ToolOutput {
         let path = expand_tilde(path);
         let path = path.as_str();
         #[cfg(not(target_os = "android"))]
         {
+            use tokio::io::AsyncReadExt;
+
             let meta = match tokio::fs::metadata(path).await {
                 Ok(m) => m,
                 Err(e) => return ToolOutput::err(format!("read_file: {e}")),
@@ -200,17 +204,18 @@ impl ShellExecutor {
             if !meta.is_file() {
                 return ToolOutput::err(format!("read_file: {path} is not a file"));
             }
-            if meta.len() > MAX_READ_FILE_BYTES {
-                return ToolOutput::err(format!(
-                    "read_file: {path} is {} bytes, over the {MAX_READ_FILE_BYTES}-byte limit; \
-                     use bash with head/tail (or a char window) to read part of it",
-                    meta.len()
-                ));
-            }
-            let bytes = match tokio::fs::read(path).await {
-                Ok(b) => b,
+            let mut file = match tokio::fs::File::open(path).await {
+                Ok(f) => f,
                 Err(e) => return ToolOutput::err(format!("read_file: {e}")),
             };
+            let mut bytes = Vec::new();
+            if let Err(e) = file
+                .take(READ_PREFIX_BYTES)
+                .read_to_end(&mut bytes)
+                .await
+            {
+                return ToolOutput::err(format!("read_file: {e}"));
+            }
             match String::from_utf8(bytes) {
                 Ok(text) => ToolOutput::ok(truncate(text)),
                 Err(_) => ToolOutput::err(format!(
@@ -446,6 +451,7 @@ mod tests {
         assert_eq!(out.content, "tilde works");
     }
 
+    #[cfg(not(target_os = "android"))]
     #[tokio::test]
     async fn read_file_reports_binary_and_non_files_clearly() {
         let dir = std::env::temp_dir().join(format!("pi-shell-read-{}", std::process::id()));
@@ -470,15 +476,15 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("is not a file"), "{}", out.content);
 
-        // Over the cap: refused from metadata, with a pointer at head/tail.
+        // A long text file still reads: only a bounded prefix is loaded, then the
+        // ordinary 20k-character truncation applies. (A whole-file size cap used
+        // to refuse this, which was a regression for big logs.)
         let huge = dir.join("huge.log");
-        let f = std::fs::File::create(&huge).unwrap();
-        f.set_len(MAX_READ_FILE_BYTES + 1).unwrap();
-        drop(f);
+        std::fs::write(&huge, "x".repeat(3_000_000)).unwrap();
         let out = ex.read_file(huge.to_str().unwrap()).await;
-        assert!(out.is_error);
-        assert!(out.content.contains("over the"), "{}", out.content);
-        assert!(out.content.contains("head"), "{}", out.content);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.ends_with("…[truncated]"), "len {}", out.content.len());
+        assert!(out.content.chars().count() < 30_000);
 
         // Text still reads (and is truncated as before).
         let text = dir.join("notes.txt");

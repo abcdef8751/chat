@@ -540,6 +540,14 @@
         let body = format!("data: {}\n\n", finish_chunk("stop"));
         let (acc, _) = complete_raw(&body).await;
         assert!(!acc.truncated);
+
+        // Anthropic-style `max_tokens` is the same output-limit signal and is
+        // normalised to `length`, because `stop_reason` is persisted verbatim
+        // and the UI annotates on `length`.
+        let body = format!("data: {}\n\n", finish_chunk("max_tokens"));
+        let (acc, _) = complete_raw(&body).await;
+        assert!(acc.truncated, "finish_reason=max_tokens must set truncated");
+        assert_eq!(acc.finish.as_deref(), Some("length"));
     }
 
     /// Unparseable streamed arguments must be marked, not silently replaced with
@@ -3292,8 +3300,8 @@ fn legacy_build_system_prompt(
         ));
     }
     parts.push(format!(
-        "Running system: {}. This id identifies the app build and system-prompt revision and \
-         changes when either is updated.",
+        "Running system: {}. This id names the app build and system prompt in use; if the user \
+         asks which system you are running, report it.",
         system_id()
     ));
     parts.push(

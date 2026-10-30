@@ -128,14 +128,21 @@ function activityState(key: string, initial: boolean): ActivityState {
   return state;
 }
 
-/// Drop remembered state for turns that are neither live nor rendered. Called
-/// from `MessageList` after each transcript rebuild so the map stays bounded by
-/// the visible transcript instead of growing with every turn ever opened.
+/// Drop remembered state for turns that are no longer rendered. Called from
+/// `MessageList` after each transcript rebuild so the map stays bounded by the
+/// visible transcript instead of growing with every turn (or chat) ever opened.
+///
+/// A live turn is in `renderedKeys` while it is on screen; a chat switched away
+/// from mid-turn disappears from the list entirely, which is exactly when its
+/// key should be reclaimed (returning to it re-creates the state as an open live
+/// panel). The earlier "keep keys whose last observed value was live" guard
+/// leaked one entry per mid-turn chat switch forever, because nothing observes
+/// the stale key again to clear its flag.
 export function pruneActivityState(renderedKeys: readonly string[]): void {
   if (activityOpen.size === 0) return;
   const keep = new Set(renderedKeys);
   for (const key of activityOpen.keys()) {
-    if (!keep.has(key) && activityLive.get(key) !== true) {
+    if (!keep.has(key)) {
       activityOpen.delete(key);
       activityLive.delete(key);
     }

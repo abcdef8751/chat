@@ -138,7 +138,7 @@ export function MessageList(props: {
                 )}
               </Show>
 
-              <Show when={t().entries.length > 0 || !!t().answer || t().live}>
+              <Show when={t().entries.length > 0 || !!t().answer}>
                 <Timeline
                   turnKey={t().key}
                   entries={t().entries}
