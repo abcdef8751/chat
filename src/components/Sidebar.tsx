@@ -246,26 +246,24 @@ export function Sidebar(props: {
           read as a jolt. `pointer-events-none` when closed keeps it inert, and
           nothing about it is a layout property, so there is no reflow. */}
       <div
-        class={`fixed inset-0 z-30 bg-black/40 transition-opacity duration-200 ease-out motion-reduce:transition-none lg:hidden ${
+        class={`fixed inset-0 z-30 bg-black/40 transition-opacity duration-150 ease-out motion-reduce:transition-none lg:hidden ${
           props.sidebarOpen ? "opacity-100" : "pointer-events-none opacity-0"
         }`}
         onClick={() => props.setSidebarOpen(false)}
         aria-hidden="true"
       />
       {/* Sidebar — a slide-in drawer below `lg`, always in flow at `lg` and up.
-          Only the drawer *transform* is animated: no width/grid/layout property
-          may transition, or the chat column reflows mid-slide. At `lg` the panel
-          is static, so the transition is switched off with `!` (a plain
-          `lg:transition-none` lost to the unprefixed declaration and let a
-          breakpoint change animate a one-off slide). `will-change` is likewise
-          dropped at `lg`: only the drawer animates, and keeping the whole
-          subtree on a promoted compositing layer wastes GPU memory.
-          (Tailwind v4 spells the important marker as a `!` suffix.) */}
+          The panel itself does NOT animate: a transform transition on a fixed,
+          bordered panel makes WebKitGTK shimmer the text for its duration (the
+          "jitter" users see on desktop windows narrower than `lg`, where this
+          drawer is used). It appears/disappears instantly; only the scrim fades,
+          which has no text and cannot shimmer. Nothing here transitions a layout
+          property, so the chat column never reflows. */}
       <aside
         id="app-sidebar"
         inert={drawerHidden()}
         aria-hidden={drawerHidden() ? "true" : undefined}
-        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform duration-200 ease-out will-change-transform motion-reduce:transition-none lg:static lg:z-auto lg:translate-x-0 lg:transition-none! lg:will-change-auto dark:border-neutral-800 dark:bg-neutral-900 ${
+        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 lg:static lg:z-auto lg:translate-x-0 dark:border-neutral-800 dark:bg-neutral-900 ${
           props.sidebarOpen ? "translate-x-0" : "-translate-x-full"
         }`}
         style={{
@@ -335,7 +333,7 @@ export function Sidebar(props: {
           />
         </div>
 
-        <nav class="flex-1 overflow-y-auto px-2 pb-2 pt-2">
+        <nav class="flex-1 overflow-y-auto px-2 pb-2 pt-2 [scrollbar-gutter:stable]">
           <ul class="space-y-1">
             <For each={chats()}>{(c) => row(c)}</For>
             <Show when={props.visibleConversations.length === 0}>
