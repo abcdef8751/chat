@@ -176,6 +176,9 @@ export function buildEntries(rows: Message[]): ProcessEntry[] {
   const entries: ProcessEntry[] = [];
   const calls = new Map<string, CallEntry>();
   for (const m of rows) {
+    // Clock / prompt-update notes are hidden bookkeeping rows: they belong in the
+    // model's context (and in the shared prompt prefix), never in the timeline.
+    if (m.role === "clock" || m.role === "prompt_update") continue;
     if (m.thinking?.trim()) entries.push({ kind: "thought", id: m.id, text: m.thinking });
     const toolCalls = parseToolCallList(m);
     if (toolCalls) {
@@ -224,9 +227,9 @@ export function groupTurns(messages: Message[], liveTools: LiveTool[], streaming
       rowsByTurn.set(current, []);
       continue;
     }
-    // Clock notes are hidden bookkeeping rows: they belong in the model's context
-    // (and in the shared prompt prefix), never in the timeline.
-    if (m.role === "clock") continue;
+    // Clock / prompt-update notes are hidden bookkeeping rows: they belong in the
+    // model's context (and in the shared prompt prefix), never in the timeline.
+    if (m.role === "clock" || m.role === "prompt_update") continue;
     if (m.role === "memory") {
       if (!current) {
         current = { key: m.id, user: null, entries: [], answer: null, live: false, note: m };

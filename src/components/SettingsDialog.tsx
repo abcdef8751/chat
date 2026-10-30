@@ -1,6 +1,7 @@
-import { For, Show, type JSX } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import type {
+  AndroidStorageStatus,
   ModelInfo,
   ModelOverride,
   ModelsDevProvider,
@@ -8,8 +9,10 @@ import type {
   ProviderInfo,
   SyncStatus,
 } from "../lib/api";
+import { androidRequestStorageAccess, androidStorageStatus } from "../lib/api";
 import { BackArrowIcon } from "../lib/icons";
 import { parseModalities, resolveInputModalities } from "../lib/capabilities";
+import { isAndroidDevice } from "../lib/platform";
 import { formatTokens } from "../lib/turns";
 
 /// Friendly badge text for a models.dev modality token.
@@ -164,6 +167,60 @@ export function SettingsDialog(props: {
   /// `null` when no provider/model is selected (or known).
   const selectedModel = () =>
     props.modelOptions().find((m) => m.id === props.overrideModel) ?? null;
+
+  // --- Android "all files access" (shared storage) ---
+  // The file tools work under shared storage on Android, which needs
+  // MANAGE_EXTERNAL_STORAGE. It is not a runtime prompt: the OS grants it from a
+  // system Settings screen, so the status is re-checked whenever the dialog
+  // opens (and the user can re-check via the button after returning).
+  const [storage, setStorage] = createSignal<AndroidStorageStatus | null>(null);
+  const [storageBusy, setStorageBusy] = createSignal(false);
+  const [storageError, setStorageError] = createSignal<string | null>(null);
+
+  const refreshStorage = async () => {
+    // Desktop (and any build without the command) must simply not show the row.
+    if (!isAndroidDevice()) {
+      setStorage(null);
+      return;
+    }
+    try {
+      setStorage(await androidStorageStatus());
+      setStorageError(null);
+    } catch {
+      // Command unavailable / platform said no: hide the row rather than show a
+      // broken state inside Settings.
+      setStorage(null);
+    }
+  };
+
+  createEffect(() => {
+    if (!props.settingsOpen) return;
+    setStorageError(null);
+    void refreshStorage();
+  });
+
+  const requestStorage = async () => {
+    setStorageBusy(true);
+    setStorageError(null);
+    try {
+      await androidRequestStorageAccess();
+      // The grant happens in the system UI; this only confirms the screen
+      // opened. Re-check on return via the button / window focus below.
+    } catch (e) {
+      setStorageError(String(e));
+    } finally {
+      setStorageBusy(false);
+    }
+  };
+
+  // Coming back from the system screen re-focuses the webview on Android.
+  if (typeof window !== "undefined") {
+    const onFocus = () => {
+      if (props.settingsOpen && storage()) void refreshStorage();
+    };
+    window.addEventListener("focus", onFocus);
+    onCleanup(() => window.removeEventListener("focus", onFocus));
+  }
 
   return (
     <Dialog
@@ -839,6 +896,59 @@ export function SettingsDialog(props: {
                 runs in a fresh shell (no persistent <code>cd</code> / <code>export</code>).
               </span>
             </label>
+
+            {/* Android only: shared-storage ("all files") access for the file
+                tools. Hidden entirely when the command is unavailable (desktop,
+                older builds) so Settings stays clean. */}
+            <Show when={storage()}>
+              {(st) => (
+                <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                      Storage access
+                    </span>
+                    <span
+                      class={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                        st().granted
+                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400"
+                          : "bg-amber-100 text-amber-700 dark:bg-amber-950/50 dark:text-amber-400"
+                      }`}
+                    >
+                      {st().granted ? "Granted" : st().canRequest ? "Not granted" : "Unavailable"}
+                    </span>
+                  </div>
+                  <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                    {st().granted
+                      ? "The file tools can read and write shared storage (Termux runs under the same grant)."
+                      : st().canRequest
+                        ? "Without it the file tools can only reach the app's own directories. Android grants this from a system settings screen, not a popup."
+                        : "This Android version has no all-files access setting; the file tools stay inside the app's own directories."}
+                  </span>
+                  <div class="mt-2 flex items-center gap-2">
+                    <Show when={!st().granted && st().canRequest}>
+                      <button
+                        onClick={() => void requestStorage()}
+                        disabled={storageBusy()}
+                        class="rounded-md bg-neutral-900 px-3 py-1 text-[11px] font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                      >
+                        {storageBusy() ? "Opening…" : "Open settings"}
+                      </button>
+                    </Show>
+                    <button
+                      onClick={() => void refreshStorage()}
+                      class="rounded-md border border-neutral-300 px-3 py-1 text-[11px] font-medium text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                    >
+                      Re-check
+                    </button>
+                  </div>
+                  <Show when={storageError()}>
+                    <p class="mt-1.5 text-[11px] text-red-600 dark:text-red-400">
+                      {storageError()}
+                    </p>
+                  </Show>
+                </div>
+              )}
+            </Show>
 
             <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
               <label class="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">

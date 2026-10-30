@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, onCleanup, onMount, Show, untrack } from "solid-js";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -45,6 +45,7 @@ import {
   setConfig,
   setConversationModel,
   setConversationProvider,
+  setConversationThinkingLevel,
   setModelOverrides as saveModelOverrides,
   stopChat,
   streamChat,
@@ -136,6 +137,46 @@ async function pickAttachmentPaths(): Promise<string[] | null> {
   return Array.isArray(picked) ? picked : [picked];
 }
 
+/**
+ * Merge a freshly fetched conversation list into the previous one, keeping the
+ * SAME object reference for every row whose fields did not change.
+ *
+ * `<For>` diffs by identity, so replacing every object on each background
+ * refresh (a turn finishing, cron tick, sync pull, reflection note) re-created
+ * every sidebar row — flicker, lost hover, lost focus. Returning the previous
+ * array unchanged when nothing moved also skips the whole diff.
+ */
+function mergeConversations(prev: Conversation[], next: Conversation[]): Conversation[] {
+  const prevById = new Map(prev.map((c) => [c.id, c]));
+  let changed = prev.length !== next.length;
+  const merged = next.map((row, i) => {
+    const old = prevById.get(row.id);
+    if (old && sameConversation(old, row)) {
+      if (prev[i] !== old) changed = true; // same rows, different order
+      return old;
+    }
+    changed = true;
+    return row;
+  });
+  return changed ? merged : prev;
+}
+
+function sameConversation(a: Conversation, b: Conversation): boolean {
+  return (
+    a.id === b.id &&
+    a.title === b.title &&
+    a.kind === b.kind &&
+    a.model === b.model &&
+    a.provider_id === b.provider_id &&
+    (a.thinking_level ?? null) === (b.thinking_level ?? null) &&
+    a.system_prompt === b.system_prompt &&
+    a.compaction_summary === b.compaction_summary &&
+    a.compaction_through === b.compaction_through &&
+    a.created_at === b.created_at &&
+    a.updated_at === b.updated_at
+  );
+}
+
 export default function App() {
   const [conversations, setConversations] = createSignal<Conversation[]>([]);
   const [activeId, setActiveId] = createSignal<string | null>(null);
@@ -145,11 +186,30 @@ export default function App() {
   const [nearBottom, setNearBottom] = createSignal(true);
   let messagesScrollEl: HTMLElement | undefined;
 
-  // Inline edit of a user message (Item 13). The edited row lives in the DB;
-  // saving rewrites it, drops later messages, and re-streams a fresh reply.
+  // Editing a user message happens in the CENTRAL composer: the message's text
+  // and attachments are loaded into the ordinary `draft`/`pendingAttachments`
+  // state and `editingId` records which row a send should rewrite. There is no
+  // separate inline editor, so there is one place where a turn's content lives
+  // (and one Send/Cancel pair).
   const [editingId, setEditingId] = createSignal<string | null>(null);
-  const [editDraft, setEditDraft] = createSignal("");
-  const [editAttachments, setEditAttachments] = createSignal<Attachment[]>([]);
+  // Bumped to ask the composer to focus its textarea (after the edit pen loads
+  // a message); the number itself carries no meaning.
+  const [composerFocusNonce, setComposerFocusNonce] = createSignal(0);
+
+  // Conversations whose turn (live or scheduled) settled while the user was
+  // looking at another chat. Drives the per-row sidebar dot and the hamburger
+  // dot; cleared when that conversation becomes active. Indicators only — OS
+  // notifications are the backend's job.
+  const [completedUnseen, setCompletedUnseen] = createSignal<ReadonlySet<string>>(new Set());
+  const markUnseen = (id: string) =>
+    setCompletedUnseen((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
+  const clearUnseen = (id: string) =>
+    setCompletedUnseen((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
 
   // --- Per-conversation streaming state ---
   // In-flight turn bookkeeping per conversation. `messages()` only holds the
@@ -248,9 +308,21 @@ export default function App() {
 
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [baseUrl, setBaseUrl] = createSignal("");
+  // `model` is what the header shows: the model in effect for the OPEN
+  // conversation (its own override, or the device default when it has none).
   const [model, setModel] = createSignal("");
+  // The device-wide default model from config. A conversation without its own
+  // `model` column inherits this (exactly what the backend does in
+  // `run_turn_core`), and a scheduled job's thread is one such conversation —
+  // so switching to it must show THIS, not whatever chat was open before.
+  const [globalModel, setGlobalModel] = createSignal("");
   const [preferences, setPreferences] = createSignal("");
   const [thinkingLevel, setThinkingLevel] = createSignal("");
+  // The GLOBAL configured level (the default for new chats). Kept apart from
+  // `thinkingLevel`, which is the level in effect for the open conversation: a
+  // chat may override it, and switching to a chat with no override must fall
+  // back to this value rather than to the previous chat's level.
+  const [globalThinkingLevel, setGlobalThinkingLevel] = createSignal("");
   const [echoReasoning, setEchoReasoning] = createSignal(true);
   // "YOLO mode": auto-approve gated tool calls (Settings toggle; backend gate).
   const [autoApproveTools, setAutoApproveTools] = createSignal(false);
@@ -662,6 +734,10 @@ export default function App() {
       void refreshCronTriggers();
       if (status === "finished" || status === "error") {
         if (!cronOpen()) setCronUnseen(true);
+        // The thread produced output while the user was elsewhere: flag it in the
+        // sidebar (cleared when they open it) — the transcript refresh below only
+        // covers the chat that is on screen.
+        if (conversationId && conversationId !== activeId()) markUnseen(conversationId);
         // A run appends messages and bumps `updated_at`, so the sidebar order
         // must refresh even when the chat is not the open one.
         void refreshConversations();
@@ -684,9 +760,14 @@ export default function App() {
 
     const cfg = await getConfig();
     setBaseUrl(cfg.baseUrl);
-    setModel(cfg.model);
+    // Preserve the opened chat's own model: the conversation row is the source
+    // of truth for a chat, `cfg.model` only for one that has none.
+    const openedModel = firstChat?.model?.trim();
+    setModel(openedModel ? openedModel : cfg.model);
+    setGlobalModel(cfg.model);
     setPreferences(cfg.preferences ?? "");
     setThinkingLevel(cfg.thinkingLevel ?? "");
+    setGlobalThinkingLevel(cfg.thinkingLevel ?? "");
     setEchoReasoning(cfg.echoReasoningContent ?? true);
     setAutoApproveTools(cfg.autoApproveTools ?? false);
     setCronEnabled(cfg.cronEnabled ?? true);
@@ -802,8 +883,11 @@ export default function App() {
   async function refreshConversations() {
     const q = searchQuery().trim();
     const rows = q ? await searchConversations(q) : await listConversations();
-    setConversations(rows);
-    setVisibleConversations(rows);
+    // Preserve object identity for unchanged rows: `<For>` diffs by identity,
+    // so replacing every conversation on a background refresh re-created every
+    // sidebar row (flicker, lost hover/focus).
+    setConversations((prev) => mergeConversations(prev, rows));
+    setVisibleConversations((prev) => mergeConversations(prev, rows));
   }
 
   // --- Scheduled jobs (cron) handlers ---
@@ -980,10 +1064,16 @@ export default function App() {
     // Scheduled-run pills are per chat: reload the trigger map for the new one.
     void refreshCronTriggers();
     // Editing a message is scoped to the conversation it lives in; a switch
-    // would otherwise let Save target the wrong conversation.
-    setEditingId(null);
-    setEditDraft("");
-    setEditAttachments([]);
+    // would otherwise let Send target the wrong conversation. Only clear the
+    // composer when an edit loaded it — an ordinary half-typed draft survives a
+    // chat switch (and is restored when the user comes back to it).
+    if (untrack(editingId) !== null) {
+      setEditingId(null);
+      setDraft("");
+      setPendingAttachments([]);
+    }
+    // Opening a conversation counts as reading its background output.
+    if (id) clearUnseen(id);
     if (!id) {
       setMessages([]);
       return;
@@ -1073,6 +1163,9 @@ export default function App() {
   async function removeConversation(id: string) {
     setConfirmDeleteId(null);
     await deleteConversation(id);
+    // A deleted chat can't have unread output any more (it would keep the
+    // hamburger dot lit forever).
+    clearUnseen(id);
     await refreshConversations();
     // Its cron jobs cascade away with the conversation row: refresh so a ghost
     // job disappears from the (possibly open) Cron dialog and sidebar glyphs.
@@ -1101,10 +1194,19 @@ export default function App() {
 
     try {
       const cfg = await getConfig();
+      // Opening Settings must not clobber the open conversation's effective
+      // model/level: the dialog edits the DEVICE defaults, while the header
+      // keeps showing what this chat actually runs with.
+      const conv = activeConversation();
       setBaseUrl(cfg.baseUrl);
-      setModel(cfg.model);
+      setGlobalModel(cfg.model);
+      const convModel = conv?.model?.trim();
+      setModel(convModel ? convModel : cfg.model);
       setPreferences(cfg.preferences ?? "");
-      setThinkingLevel(cfg.thinkingLevel ?? "");
+      setGlobalThinkingLevel(cfg.thinkingLevel ?? "");
+      const convLevel = conv?.thinking_level;
+      if (convLevel != null) setThinkingLevel(convLevel);
+      else setThinkingLevel(cfg.thinkingLevel ?? "");
       setEchoReasoning(cfg.echoReasoningContent ?? true);
       setAutoApproveTools(cfg.autoApproveTools ?? false);
       setCronEnabled(cfg.cronEnabled ?? true);
@@ -1138,7 +1240,7 @@ export default function App() {
       baseUrl: baseUrl(),
       model: current.model,
       preferences: preferences(),
-      thinkingLevel: current.thinkingLevel,
+      thinkingLevel: globalThinkingLevel(),
       echoReasoningContent: echoReasoning(),
       autoApproveTools: autoApproveTools(),
       cronEnabled: cronEnabled(),
@@ -1430,20 +1532,41 @@ export default function App() {
   async function changeModel(id: string) {
     if (!id) return;
     setModel(id);
+    // The picker also persists this as the device default, so a chat that
+    // inherits it (e.g. a scheduled thread) resolves to the same model.
+    setGlobalModel(id);
     // Adopt the new model's thinking levels; drop a level it doesn't accept.
     const opts = await thinkingOptions(id, headerProviderId()).catch(() => null);
     setThinkingOpts(opts);
-    let level = thinkingLevel();
+    const level = thinkingLevel();
     if (opts && level && !opts.options.includes(level)) {
-      level = "";
+      // The level is not merely wrong for this chat: this model cannot run it at
+      // all, so reset the device default as well (otherwise clearing only the
+      // per-chat override would just fall back to the same unsupported level)
+      // and clear the chat's override so it inherits the new "no reasoning".
+      setGlobalThinkingLevel("");
       setThinkingLevel("");
+      const conv = activeConversation();
+      if (conv) {
+        try {
+          await setConversationThinkingLevel(conv.id, "");
+          setConversations((prev) =>
+            prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: null } : c)),
+          );
+          setVisibleConversations((prev) =>
+            prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: null } : c)),
+          );
+        } catch {
+          // best-effort: the next switch re-reads the row
+        }
+      }
     }
     try {
       await setConfig({
         baseUrl: baseUrl(),
         model: id,
         preferences: preferences(),
-        thinkingLevel: level,
+        thinkingLevel: globalThinkingLevel(),
         echoReasoningContent: echoReasoning(),
         autoApproveTools: autoApproveTools(),
         cronEnabled: cronEnabled(),
@@ -1474,13 +1597,34 @@ export default function App() {
   }
 
   async function changeThinking(level: string) {
+    setGlobalThinkingLevel(level);
     setThinkingLevel(level);
+    // With a conversation open the pick is that chat's own reasoning effort
+    // (synced on its row, used by the backend verbatim). The global default is
+    // persisted too, so a new chat starts at the level the user just chose.
+    const conv = activeConversation();
+    if (conv) {
+      try {
+        await setConversationThinkingLevel(conv.id, level);
+        setConversations((prev) =>
+          prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: level || null } : c)),
+        );
+        setVisibleConversations((prev) =>
+          prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: level || null } : c)),
+        );
+      } catch (e) {
+        setSettingsError(String(e));
+      }
+    }
     try {
       await setConfig({
         baseUrl: baseUrl(),
-        model: model(),
+        // Persist the DEVICE default, not the open chat's override: a reasoning
+        // change must not rewrite `cfg.model` to this chat's model (that would
+        // silently change what a new chat / scheduled thread inherits).
+        model: globalModel() || model(),
         preferences: preferences(),
-        thinkingLevel: level,
+        thinkingLevel: globalThinkingLevel(),
         echoReasoningContent: echoReasoning(),
         autoApproveTools: autoApproveTools(),
         cronEnabled: cronEnabled(),
@@ -1836,6 +1980,9 @@ export default function App() {
       // transcript needs refreshing.
       if (ev.type === "done" || ev.type === "error") {
         if (ev.type === "error" && activeId() === id) setStreamError(ev.message);
+        // Settled off-screen: mark the row (and the hamburger) so the user knows
+        // there is output to read. OS notifications are the backend's job.
+        if (activeId() !== id) markUnseen(id);
         removeStreaming(id);
         dropLiveTurn(id, token);
         if (activeId() === id) listMessages(id).then(setMessages);
@@ -1963,6 +2110,36 @@ export default function App() {
     }
     const text = draft().trim();
 
+    // Editing an existing user row: rewrite it (truncating later messages) and
+    // re-run the reply from it, instead of appending a second user turn.
+    const editing = editingId();
+    if (editing) {
+      try {
+        await editUserMessage(id, editing, text, staged.length > 0 ? staged : null);
+      } catch (e) {
+        // Keep the composer in edit mode with the text intact so the user can
+        // retry (or Cancel) instead of losing what they typed.
+        setStreamError(String(e));
+        return;
+      }
+      setEditingId(null);
+      setDraft("");
+      setPendingAttachments([]);
+      // The edit rewrote the row and deleted everything after it; reload so the
+      // transcript matches, then stream a fresh assistant reply for the edit.
+      try {
+        const rows = await listMessages(id);
+        if (activeId() === id) setMessages(rows);
+      } catch {
+        // The stream's `done` reload below still reconciles state.
+      }
+      if (activeId() !== id) return;
+      // The edited user row already exists — the backend must not insert a
+      // second one, so mark this re-run as a regeneration.
+      await runAssistantTurn(id, text, staged, null, true);
+      return;
+    }
+
     const userMsg: Message = {
       id: `tmp-user-${tempId++}`,
       conversation_id: id,
@@ -2010,74 +2187,24 @@ export default function App() {
     // idle state; the message can be edited to re-run the turn.
   }
 
-  // --- Inline editing of user messages (Item 13) --------------------------
+  // --- Editing a user message in the central composer ---------------------
 
+  /** Load a persisted user message into the composer for editing. The row is
+   *  rewritten (and later turns truncated) only when the user sends. */
   function startEditMessage(m: Message) {
     if (isBusy(activeId())) return;
     // Only persisted rows are editable; a `tmp-` row hasn't been written yet.
     if (m.id.startsWith("tmp-")) return;
     setEditingId(m.id);
-    setEditDraft(m.content);
-    setEditAttachments(parseAttachments(m));
+    setDraft(m.content);
+    setPendingAttachments(parseAttachments(m));
+    setComposerFocusNonce((n) => n + 1);
   }
 
   function cancelEditMessage() {
     setEditingId(null);
-    setEditDraft("");
-    setEditAttachments([]);
-  }
-
-  async function addEditAttachmentPaths(paths: string[]) {
-    if (paths.length === 0) return;
-    try {
-      const atts = await readPickedAttachments(paths);
-      if (atts.length === 0) return;
-      setEditAttachments((prev) => [...prev, ...atts]);
-    } catch (e) {
-      setStreamError(String(e));
-    }
-  }
-
-  async function pickEditAttachments() {
-    try {
-      const paths = await pickAttachmentPaths();
-      if (!paths) return;
-      await addEditAttachmentPaths(paths);
-    } catch (e) {
-      setStreamError(String(e));
-    }
-  }
-
-  function removeEditAttachment(id: string) {
-    setEditAttachments((prev) => prev.filter((a) => a.id !== id));
-  }
-
-  async function saveEditMessage() {
-    const id = activeId();
-    const messageId = editingId();
-    if (!id || !messageId || isBusy(id)) return;
-    const text = editDraft().trim();
-    const atts = editAttachments();
-    if (!text && atts.length === 0) return;
-    try {
-      await editUserMessage(id, messageId, text, atts.length > 0 ? atts : null);
-    } catch (e) {
-      setStreamError(String(e));
-      return;
-    }
-    cancelEditMessage();
-    // The edit rewrote the row and deleted everything after it; reload so the
-    // transcript matches, then stream a fresh assistant reply for the edit.
-    try {
-      const rows = await listMessages(id);
-      if (activeId() === id) setMessages(rows);
-    } catch {
-      // The stream's `done` reload below still reconciles state.
-    }
-    if (activeId() !== id) return;
-    // The edited user row already exists — the backend must not insert a second
-    // one, so mark this re-run as a regeneration.
-    await runAssistantTurn(id, text, atts, null, true);
+    setDraft("");
+    setPendingAttachments([]);
   }
 
   function approveLiveTool(callId: string) {
@@ -2310,12 +2437,28 @@ export default function App() {
     const convId = activeId();
     const ap = activeProviderId();
     const conv = convId ? activeConversation() : null;
-    const prov = conv?.provider_id ?? ap;
+    // A scheduled job's thread carries no provider of its own (NULL), and an
+    // empty string must not shadow the active provider either — `??` alone
+    // treated `""` as a real override and left the header pointing at nothing.
+    const convProv = conv?.provider_id;
+    const prov = convProv && convProv !== "" ? convProv : ap;
     if (convId === lastSyncId && ap === lastSyncAp) return;
     lastSyncId = convId;
     lastSyncAp = ap;
     setHeaderProviderId(prov);
-    if (conv?.model) setModel(conv.model);
+    // The conversation's own model wins; one without it inherits the device
+    // default (`cfg.model`), which is what the backend resolves for a cron
+    // thread — so the header must show that, not the previously open chat's
+    // model. Read untracked: a global-model change is not a conversation switch.
+    const ownModel = conv?.model?.trim();
+    const nextModel = ownModel ? ownModel : untrack(globalModel);
+    if (nextModel) setModel(nextModel);
+    // Same rule for reasoning effort: a non-null level is this chat's own
+    // (`""` included — it means "no reasoning"), otherwise fall back to the
+    // device default rather than leaving the previous chat's level showing.
+    const convLevel = conv?.thinking_level;
+    if (convLevel != null) setThinkingLevel(convLevel);
+    else setThinkingLevel(untrack(globalThinkingLevel));
     if (prov !== lastModelsProv) {
       lastModelsProv = prov;
       void loadModels(false, prov || null);
@@ -2533,6 +2676,7 @@ export default function App() {
         setConfirmDeleteId={setConfirmDeleteId}
         removeConversation={removeConversation}
         cronConversationIds={cronConversationIds()}
+        unseenConversationIds={completedUnseen()}
       />
 
       {/* Main */}
@@ -2568,6 +2712,7 @@ export default function App() {
           openCron={openCron}
           cronUnseen={cronUnseen()}
           cronHasJobs={cronJobs().length > 0}
+          hasUnseen={completedUnseen().size > 0}
         />
 
         <Show when={settingsError() && !settingsOpen()}>
@@ -2608,15 +2753,7 @@ export default function App() {
               onToggleThought={toggleThought}
               onApprove={approveLiveTool}
               onDeny={denyLiveTool}
-              editingId={editingId()}
-              editDraft={editDraft()}
-              setEditDraft={setEditDraft}
-              editAttachments={editAttachments()}
               onStartEdit={startEditMessage}
-              onCancelEdit={cancelEditMessage}
-              onSaveEdit={() => void saveEditMessage()}
-              onRemoveEditAttachment={removeEditAttachment}
-              onPickEditAttachments={() => void pickEditAttachments()}
               cronTriggers={cronTriggers()}
             />
           </Show>
@@ -2640,6 +2777,9 @@ export default function App() {
           setDraft={setDraft}
           onSend={send}
           onStop={stop}
+          editing={editingId() !== null}
+          onCancelEdit={cancelEditMessage}
+          focusNonce={composerFocusNonce()}
         />
       </main>
 

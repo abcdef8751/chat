@@ -45,6 +45,9 @@ export function Header(props: {
   openCron: () => void;
   cronUnseen: boolean;
   cronHasJobs: boolean;
+  /// At least one conversation produced output while the user was elsewhere.
+  /// Marks the hamburger (the per-row dot lives in the sidebar itself).
+  hasUnseen: boolean;
 }) {
   // Re-apply the selection after the option list is rebuilt. WebKit clears a
   // <select> when its selected <option> is removed during a refresh, and the
@@ -102,9 +105,15 @@ export function Header(props: {
           aria-label="Show chats"
           aria-controls="app-sidebar"
           aria-expanded={props.sidebarOpen}
-          class="shrink-0 rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
+          class="relative shrink-0 rounded-md p-1.5 text-neutral-500 transition hover:bg-neutral-100 lg:hidden dark:text-neutral-400 dark:hover:bg-neutral-800"
         >
           <MenuIcon />
+          {/* Background-completion dot: a turn or scheduled run settled in a
+              chat that was not on screen. The hamburger is the only sidebar
+              affordance on narrow viewports; the per-row dot is the detail. */}
+          <Show when={props.hasUnseen}>
+            <span class="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-amber-500" />
+          </Show>
         </button>
         <h1 class="truncate text-sm font-semibold">{props.activeTitle}</h1>
       </div>
@@ -177,9 +186,14 @@ export function Header(props: {
         <div>
           <select
             class="max-w-[9rem] pr-7 truncate rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-500 disabled:opacity-60 sm:max-w-56 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200 dark:focus:border-neutral-500"
-            title="Model"
+            title={props.modelsLoading ? "Loading models…" : "Model"}
             aria-busy={props.modelsLoading}
-            disabled={props.modelsLoading || props.providers.length === 0}
+            // Only "no provider at all" makes the picker unusable. A refresh in
+            // flight must NOT disable it: a fetch for the newly opened chat's
+            // provider left the control unopenable exactly when the user wanted
+            // to pick a model, and a failing/stalled fetch could keep it that
+            // way. The spinner + `aria-busy` already say "loading".
+            disabled={props.providers.length === 0}
             ref={(el) => (modelSelectEl = el)}
             value={props.providers.length === 0 ? "" : props.model}
             onChange={(e) => {

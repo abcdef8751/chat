@@ -7,6 +7,11 @@ export interface Conversation {
   kind: "chat" | "scheduled";
   model: string | null;
   provider_id: string | null;
+  /**
+   * Per-chat reasoning effort (the backend serializes it snake_case). `null`
+   * means "follow the global config"; any string is that chat's own level.
+   */
+  thinking_level?: string | null;
   system_prompt: string | null;
   compaction_summary: string | null;
   /** Id of the newest message folded into `compaction_summary` (local-only). */
@@ -39,6 +44,12 @@ export interface Attachment {
   kind: "image" | "file";
   dataUrl: string | null;
   text: string | null;
+  /**
+   * Remote object key when the file was too large to inline and got stored
+   * remotely (sync on). The model fetches it through a tool, so the UI shows a
+   * "stored remotely" badge instead of the contents.
+   */
+  remotePath?: string | null;
 }
 
 export interface ModelOverride {
@@ -298,6 +309,41 @@ export function setConversationProvider(
 
 export function setConversationModel(conversationId: string, model: string): Promise<void> {
   return invoke<void>("set_conversation_model", { conversationId, model });
+}
+
+/**
+ * Set (or clear) a conversation's thinking level. `null` (or `""`, which the
+ * backend normalizes) clears the override so the chat follows the global
+ * configured level; any other string is stored as that chat's own level.
+ */
+export function setConversationThinkingLevel(
+  conversationId: string,
+  thinkingLevel: string | null,
+): Promise<void> {
+  return invoke<void>("set_conversation_thinking_level", {
+    conversationId,
+    thinkingLevel: thinkingLevel ?? null,
+  });
+}
+
+// --- Android all-files access (Settings) ---
+
+/** Whether this app may read/write shared storage (Android only). */
+export interface AndroidStorageStatus {
+  /** Access is currently granted. */
+  granted: boolean;
+  /** The OS can still be asked (the all-files-access screen exists). */
+  canRequest: boolean;
+}
+
+/** Query the Android all-files-access grant. Rejects on desktop/older builds. */
+export function androidStorageStatus(): Promise<AndroidStorageStatus> {
+  return invoke<AndroidStorageStatus>("android_storage_status");
+}
+
+/** Open the system "all files access" screen (Android only). */
+export function androidRequestStorageAccess(): Promise<void> {
+  return invoke<void>("android_request_storage_access");
 }
 
 // --- Multi-provider management ---

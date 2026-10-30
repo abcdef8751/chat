@@ -100,6 +100,25 @@ export function BackArrowIcon() {
   );
 }
 
+/** A pen — "edit this message" (loads it into the composer). */
+export function EditIcon(props: { class?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      class={props.class ?? "h-4 w-4"}
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.7"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
 /** A small clock — the "has a scheduled job" glyph and the cron transcript pill. */
 export function ClockIcon(props: { class?: string }) {
   return (

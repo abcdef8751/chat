@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import type { Conversation } from "../lib/api";
 import { CloseIcon, ClockIcon, MarkAvatar } from "../lib/icons";
@@ -32,6 +32,9 @@ export function Sidebar(props: {
   /// Conversations owning at least one enabled job — the tiny clock glyph next
   /// to their title (informational only, never interactive).
   cronConversationIds: ReadonlySet<string>;
+  /// Conversations that produced output while the user was looking elsewhere.
+  /// Each gets a small amber dot next to its title.
+  unseenConversationIds: ReadonlySet<string>;
 }) {
   const drawerHidden = () => !props.wideViewport && !props.sidebarOpen;
 
@@ -129,9 +132,14 @@ export function Sidebar(props: {
 
   // Scheduled runs are job-owned threads (`kind = 'scheduled'`), rendered in
   // their own collapsible section. Everything else is a normal chat.
-  const chats = () => props.visibleConversations.filter((c) => c.kind !== "scheduled");
-  const scheduled = () =>
-    props.visibleConversations.filter((c) => c.kind === "scheduled");
+  // Memoized: these used to re-filter on every render, which meant a new array
+  // per render for `<For>` to diff.
+  const chats = createMemo(() =>
+    props.visibleConversations.filter((c) => c.kind !== "scheduled"),
+  );
+  const scheduled = createMemo(() =>
+    props.visibleConversations.filter((c) => c.kind === "scheduled"),
+  );
   const [scheduledOpen, setScheduledOpen] = createSignal(true);
 
   const row = (c: Conversation) => (
@@ -167,6 +175,13 @@ export function Sidebar(props: {
               from the button to the inner title span. */}
           <span class="flex min-w-0 items-center gap-1">
             <span class="truncate">{c.title}</span>
+            <Show when={props.unseenConversationIds.has(c.id)}>
+              <span
+                title="New activity"
+                aria-label="New activity"
+                class="ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500"
+              />
+            </Show>
             <Show when={props.cronConversationIds.has(c.id)}>
               <span
                 title="Has a scheduled job"
@@ -225,20 +240,29 @@ export function Sidebar(props: {
 
   return (
     <>
-      {/* Sidebar backdrop — narrow viewports only, closes the drawer on tap */}
-      <Show when={props.sidebarOpen}>
-        <div
-          class="fixed inset-0 z-30 bg-black/40 lg:hidden"
-          onClick={() => props.setSidebarOpen(false)}
-          aria-hidden="true"
-        />
-      </Show>
-      {/* Sidebar — a slide-in drawer below `lg`, always in flow at `lg` and up */}
+      {/* Sidebar backdrop — narrow viewports only, closes the drawer on tap.
+          Kept mounted and faded with the drawer's own duration: mounting it only
+          while open made it pop in/out instantly while the panel slid, which
+          read as a jolt. `pointer-events-none` when closed keeps it inert, and
+          nothing about it is a layout property, so there is no reflow. */}
+      <div
+        class={`fixed inset-0 z-30 bg-black/40 transition-opacity duration-200 ease-out motion-reduce:transition-none lg:hidden ${
+          props.sidebarOpen ? "opacity-100" : "pointer-events-none opacity-0"
+        }`}
+        onClick={() => props.setSidebarOpen(false)}
+        aria-hidden="true"
+      />
+      {/* Sidebar — a slide-in drawer below `lg`, always in flow at `lg` and up.
+          Only the drawer *transform* is animated: no width/grid/layout property
+          may transition, or the chat column reflows mid-slide. At `lg` the panel
+          is static, so the transition is switched off with `!` (a plain
+          `lg:transition-none` lost to the unprefixed declaration and let a
+          breakpoint change animate a one-off slide). */}
       <aside
         id="app-sidebar"
         inert={drawerHidden()}
         aria-hidden={drawerHidden() ? "true" : undefined}
-        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform lg:static lg:z-auto lg:translate-x-0 lg:transition-none dark:border-neutral-800 dark:bg-neutral-900 ${
+        class={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform duration-200 ease-out will-change-transform motion-reduce:transition-none lg:static lg:z-auto lg:translate-x-0 lg:!transition-none dark:border-neutral-800 dark:bg-neutral-900 ${
           props.sidebarOpen ? "translate-x-0" : "-translate-x-full"
         }`}
         style={{
@@ -336,6 +360,15 @@ export function Sidebar(props: {
                 </span>
                 <ClockIcon class="h-3 w-3" />
                 Scheduled
+                {/* Collapsed rows hide their own dots, so surface unseen
+                    scheduled output on the section header too. */}
+                <Show when={scheduled().some((c) => props.unseenConversationIds.has(c.id))}>
+                  <span
+                    title="New activity in a scheduled thread"
+                    aria-label="New activity in a scheduled thread"
+                    class="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500"
+                  />
+                </Show>
                 <span class="ml-auto font-normal normal-case tracking-normal">
                   {scheduled().length}
                 </span>

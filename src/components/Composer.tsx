@@ -20,6 +20,13 @@ export function Composer(props: {
   setDraft: (value: string) => void;
   onSend: () => void;
   onStop: () => void;
+  /// The user is editing an existing message: the composer holds its text and
+  /// attachments and sending rewrites that row instead of appending a new turn.
+  editing?: boolean;
+  onCancelEdit?: () => void;
+  /// Bumped by the parent when the composer should take focus (e.g. clicking a
+  /// message's edit pen loads it here); the value itself is meaningless.
+  focusNonce?: number;
 }) {
   let textareaEl: HTMLTextAreaElement | undefined;
   const busy = () => props.busy ?? props.streaming;
@@ -52,6 +59,18 @@ export function Composer(props: {
     queueMicrotask(autoResize);
   });
 
+  // Focus on demand: clicking a message's edit pen loads that text into this
+  // composer, and the user should be able to type/Enter straight away. Android
+  // is skipped on purpose — focusing raises the soft keyboard, and the pen tap
+  // may be followed by the user scrolling the transcript instead.
+  let lastFocusNonce = props.focusNonce ?? 0;
+  createEffect(() => {
+    const nonce = props.focusNonce ?? 0;
+    if (nonce === lastFocusNonce) return;
+    lastFocusNonce = nonce;
+    if (!isAndroid) queueMicrotask(() => textareaEl?.focus());
+  });
+
   const handleSend = () => {
     props.onSend();
     queueMicrotask(autoResize);
@@ -71,6 +90,16 @@ export function Composer(props: {
                       <DocIcon />
                       <span class="max-w-52 truncate">{a.name}</span>
                       <span class="opacity-60">{formatBytes(a.size)}</span>
+                      {/* Nothing inline to send: the file is stored remotely and
+                          the model fetches it through a tool on demand. */}
+                      <Show when={a.remotePath && !a.text && !a.dataUrl}>
+                        <span
+                          title="Stored remotely — the assistant downloads it on demand"
+                          class="shrink-0 rounded-full bg-neutral-200 px-1.5 py-0.5 text-[10px] font-medium text-neutral-600 dark:bg-neutral-700 dark:text-neutral-300"
+                        >
+                          remote
+                        </span>
+                      </Show>
                     </div>
                   }
                 >
@@ -90,6 +119,21 @@ export function Composer(props: {
               </div>
             )}
           </For>
+        </div>
+      </Show>
+      <Show when={props.editing}>
+        <div class="mb-2 flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+          <span class="flex min-w-0 items-center gap-1.5">
+            <span class="font-medium">Editing message</span>
+            <span class="truncate opacity-70">— sending replaces it and re-runs the reply</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => props.onCancelEdit?.()}
+            class="shrink-0 rounded-md border border-amber-400/60 px-2 py-0.5 text-[11px] font-medium transition hover:bg-amber-100 dark:border-amber-700 dark:hover:bg-amber-900/40"
+          >
+            Cancel
+          </button>
         </div>
       </Show>
       <Show when={props.contextNote}>
@@ -113,7 +157,13 @@ export function Composer(props: {
           }}
           class="max-h-[60vh] min-h-[3rem] w-full resize-none bg-transparent px-2 py-1 text-sm leading-6 outline-none placeholder:text-neutral-400 dark:text-neutral-100 dark:placeholder:text-neutral-500"
           rows={1}
-          placeholder={props.streaming ? "Assistant is replying…" : "Message Pi Chat…"}
+          placeholder={
+            props.editing
+              ? "Edit your message…"
+              : props.streaming
+                ? "Assistant is replying…"
+                : "Message Pi Chat…"
+          }
           value={props.draft}
           disabled={busy()}
           onInput={(e) => {
@@ -144,8 +194,8 @@ export function Composer(props: {
                 <button
                   onClick={handleSend}
                   disabled={busy() || (!props.draft.trim() && props.pendingAttachments.length === 0)}
-                  title="Send"
-                  aria-label="Send"
+                  title={props.editing ? "Save & re-run" : "Send"}
+                  aria-label={props.editing ? "Save and re-run" : "Send"}
                   class="flex h-8 w-8 items-center justify-center rounded-full bg-neutral-900 text-white transition hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
                 >
                   <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5" /><path d="M5 12l7-7 7 7" /></svg>
