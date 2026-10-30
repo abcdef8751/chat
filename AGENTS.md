@@ -28,11 +28,14 @@ A general-purpose AI chat app (not a coding agent) with:
 - Per-turn **activity container**: one collapsible per turn, labelled
   `Thought · N tools`, holding the reasoning button(s) (which open the trace
   popup — the raw trace never renders inline), the tool cards, and the interim
-  text. It opens itself while the turn streams and collapses when it finishes;
-  the final answer renders below it. Interim text lives *inside* it rather than
-  between the answer's segments because some models reuse their pre-tool
-  narration as a draft and restate it in the answer (the system prompt also asks
-  them not to, but that is only a nudge)
+  text. It opens itself while the turn streams and collapses once when it
+  finishes; the final answer renders below it. Its open state is keyed by the
+  turn, not the component instance, so streamed re-derives, a mid-turn
+  re-mount, or a background transcript refresh can neither close it nor lose a
+  manual toggle; only the live→finished edge auto-collapses. Interim text lives
+  *inside* it rather than between the answer's segments because some models
+  reuse their pre-tool narration as a draft and restate it in the answer (the
+  system prompt also asks them not to, but that is only a nudge)
 - LaTeX math (`$…$` / `$$…$$`) rendered with KaTeX
 - Click any transcript image to expand it centred on screen
 - Plain-Markdown long-term **memory** curated by an idle reflection pass
@@ -65,13 +68,22 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **382 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **399 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
-desktop-notification smoke test). Clippy,
-`tsc --noEmit`, and `npm run build` are clean. The Android target also
+desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
+The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
 `CC_aarch64_linux_android` etc.). The GUI e2e needs a display and is run
-separately — it passes end to end (`ALL ASSERTIONS PASSED`).
+separately; it was not runnable in the last session (WebDriver's screenshot call
+hung), so this batch is verified by the Rust suite + tsc + production builds
+only.
+
+`cargo clippy --all-targets -- -D warnings` currently reports **12 pre-existing
+lints** under clippy 1.97 — `manual_inspect` (`sync.rs`), `field_reassign_with_default`
+(`config.rs`, `providers.rs`, `reflection.rs`), `assertions_on_constants`
+(`storage.rs`, and the old `MAX_PROMPT_DIFF_LINES <= 200` assertion in
+`chat/tests.rs`). None is on code from this batch (the touched clippy output is
+empty); fixing them is a separate cleanup.
 
 | Area              | State | Notes                                                                                                     |
 | ----------------- | ----- | --------------------------------------------------------------------------------------------------------- |
@@ -113,6 +125,21 @@ tool-call round's reasoning is echoed on its assistant tool-call message for the
 following rounds (DeepSeek thinking mode requires it, else HTTP 400); traces are
 **never** replayed across user turns. Toggle: `AppConfig.echo_reasoning_content`.
 
+**Truncated output.** `RoundAccum.truncated` is set when the provider reports
+`finish_reason` `length`/`max_tokens`. A truncated round that carries tool calls
+is unusable — the streamed argument JSON may be cut mid-fragment — so the loop
+persists **nothing** for it, dispatches nothing, and ends the turn with
+`stop_reason = "error"` plus an actionable message (retry / smaller output /
+higher provider cap). A truncated **answer** (no tool calls) keeps
+`stop_reason = "length"`, which the timeline annotates "(output limit reached)".
+The tool-round cap reports `"tool_limit"` (annotated "(tool-round limit
+reached)") so it is no longer confused with an output limit. Streamed arguments
+that fail to parse are recorded as `Value::Null` (never silently `{}`) and their
+ids tracked: such a call is **not** dispatched; it still gets a tool-error result
+row ("arguments were not valid JSON … call again with complete arguments") so
+the transcript stays replay-valid. An empty argument string is still a real
+no-argument call.
+
 **Edit → re-run.** `db::edit_user_message` rewrites a `user` row and deletes
 every later row in the conversation (recording per-message tombstones so the
 truncation propagates), then the frontend re-streams. That re-stream passes
@@ -133,16 +160,29 @@ default). Because async-openai's tool messages are text-only, the image rides a
 synthetic **user** message appended *after* the round's tool results (so parallel
 tool calls stay adjacent to their results); it is request-scoped and never
 persisted. A non-vision model gets a plain text result saying it cannot view
-images.
+images. Detection is **extension or content**: `attachments::sniff_image_mime`
+recognizes the five formats from a 16-byte probe, so an extensionless screenshot
+or `fetch_file` download is still read as an image (and PNG bytes in a `.txt`
+are too). Failure paths are plain tool results, never a broken turn: too large →
+"too large to view", unreadable/unsupported → an actionable error, and a
+non-image binary is reported as such — desktop `read_file` refuses files over
+`MAX_READ_FILE_BYTES` (10 MB) with a `bash`/`head`/`tail` hint and reports
+invalid UTF-8 as "binary file (n bytes), not text" instead of a decoding error.
+(The Android branch still `cat`s the file through Termux.)
 
 **Failure-handling contract**
 
 - Stream error mid-turn → keep partial text, `stop_reason = "error"`, offer retry.
+- Output-limit truncation → `error` (tool-call round, nothing persisted) or
+  `length`/`tool_limit` annotations (answer/cap); never execute a cut-off call.
 - Tool error → convert to a tool-error result so the model can self-correct; never throw.
 - Abort → cancels the in-flight request/tool dispatch immediately via a
   race-free `CancelToken` (`StreamRegistry`), then closes the stream and persists
   the partial; idempotent.
 - Runaway guard → hard cap on consecutive tool rounds.
+- Stream errors are **per conversation** in the UI (keyed by id, cleared when the
+  next turn starts or the same chat's turn finishes successfully), so an error
+  from one chat never shows up in another.
 
 ---
 
@@ -192,11 +232,23 @@ Recomputing the whole system prompt every turn and re-injecting it at the top
 would invalidate the provider's prefix cache on every preference/memory/model
 change. Instead the prompt is **snapshotted and diffed**:
 
-- **Parts.** `chat::SystemPromptParts` holds the seven components
-  (`preferences`, `base`, `model`, `tools`, `style`, `started`, `memory`) and
-  `rendered()` reproduces the historical `build_system_prompt` output
-  byte-for-byte (pinned by a test). The clock is **not** a part — it is a
-  separate `clock` row.
+- **Parts.** `chat::SystemPromptParts` holds the eight components
+  (`preferences`, `base`, `model`, `system`, `tools`, `style`, `started`,
+  `memory`) and `rendered()` reproduces the historical `build_system_prompt`
+  output byte-for-byte plus the system-id line (pinned by a test). The clock is
+  **not** a part — it is a separate `clock` row.
+- **System identity.** The `system` part renders
+  `Running system: pi-chat/<version>+<8-hex prompt hash>. …`, where the hash is
+  FNV-1a 64 over the shipped prompt strings (`DEFAULT_SYSTEM_PROMPT`, the
+  host-tools note, the style note). The id therefore identifies the app build
+  **and** the system-prompt revision: updating the app (or any shipped prompt
+  text) changes it, and because the line is part of `parts`, the model is told
+  about the change through the ordinary `prompt_update` diff. Pre-`system`
+  snapshots do not parse (`from_json` requires every key) and fall back to the
+  whole-text diff, so an upgrade is never silent. `system_info()` (registered
+  command) returns `{id, version, promptHash}` and the header shows a small
+  `sys <hash>` badge (`src/components/SystemBadge.tsx`; hidden until the command
+  answers, so a missing command can never break the header).
 - **Snapshot.** `conversations.prompt_state` (local-only, never synced) stores
   `{"system": "<the literal top-level system message sent>", "parts": {…}}`.
   `system` is frozen for the conversation's life; `parts` is the newest
@@ -764,6 +816,9 @@ bash(command)                     // runs a fresh `bash -c` per call (one-shot);
                                   //   `~` inside the command string is expanded by bash itself.
 read_file(path)                   // text, or an image part when the model is
                                   //   vision-capable (see "read_file images").
+                                  //   Images are detected by extension OR the
+                                  //   first bytes; desktop refuses >10 MB and
+                                  //   reports binary non-images as such.
                                   //   A leading `~`/`~/` expands to $HOME (desktop);
                                   //   `~user` is left untouched, and on Android the
                                   //   path is passed through unchanged (Termux owns
@@ -1130,7 +1185,7 @@ and the app is byte-identical to before. Never blocks the UI.
 │  ├─ App.tsx          # thin shell: shared chat/settings state + mounts the surfaces
 │  ├─ components/      # surfaces split out of App.tsx (Sidebar, Header, MessageList,
 │  │                   #   Timeline, ImageLightbox, Composer, MemoryPage, CronPage,
-│  │                   #   SettingsDialog)
+│  │                   #   SettingsDialog, SystemBadge)
 │  └─ lib/
 │     ├─ api.ts        # typed invoke wrappers over Tauri commands
 │     ├─ platform.ts   # Android bridge: isAndroid / onBack / exitApp / readAttachmentFromUri
@@ -1316,7 +1371,20 @@ and the app is byte-identical to before. Never blocks the UI.
 
 ## Next / open items
 
-**Batch landed (nine changes):** Android all-files + notification permissions
+**Batch landed (five changes):** output-limit truncation that can no longer
+silently drop or execute a cut-off tool call (`length` / `tool_limit` /
+invalid-JSON handling); a distinctive running-system id in the prompt
+(`pi-chat/<version>+<prompt hash>`) with the existing diff note informing the
+model on upgrade, plus a header `sys <hash>` badge (`system_info`); `read_file`
+images detected by content and sane binary/oversized failures; per-conversation
+stream error banners; stable activity-container state (no more panel vanishing
+mid-turn) and a `reloadTranscript` guard so a background sync/reflection/cron
+reload can never replace a live turn. Residuals: clippy drift (above), GUI e2e
+not runnable in this environment, Android `read_file` still `cat`s through
+Termux (no size/binary guard), and the truncation fix reports a clear error but
+cannot raise a provider's output cap.
+
+**Prior batch (nine changes):** Android all-files + notification permissions
 with a Settings storage row; sidebar jitter fix; synced per-chat model +
 thinking level and verified capability overrides; tilde expansion for
 `read_file`/`write_file`; header model picker fixed inside cron threads; large
