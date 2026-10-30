@@ -1078,14 +1078,17 @@ and the app is byte-identical to before. Never blocks the UI.
   It also runs one round **immediately on startup** (rather than after the first
   60s wait), so changes made on another device reconcile as the window opens;
   the call is a no-op when sync is disabled or signed out.
-- **Schema:** `supabase/schema.sql` (run in the Supabase SQL editor) creates
-  `conversations`, `messages`, `memory_files` with revision/deleted_at, enables
-  RLS, and stores the client revision via a trigger. Columns introduced after a
-  table already existed are **also repeated in the idempotent migration block at
-  the end** (`alter table … add column if not exists`) — `create table if not
-  exists` is a no-op on a deployed project, and a push naming a missing column
-  fails with `PGRST204`, stalling sync one-way until someone re-runs the file.
-  `conversations.thinking_level` is the current example.
+- **Schema:** `supabase/schema.sql` creates `conversations`, `messages`,
+  `memory_files` with revision/deleted_at, enables RLS, and stores the client
+  revision via a trigger. Columns introduced after a table already existed are
+  **also repeated in the idempotent migration block at the end** (`alter table …
+  add column if not exists`) — `create table if not exists` is a no-op on a
+  deployed project, and a push naming a missing column fails with `PGRST204`,
+  stalling sync one-way until someone re-runs the file. `conversations.thinking_level`
+  is the current example. Apply schema changes with the logged-in CLI:
+  `supabase db query --linked --file supabase/schema.sql` (or a single
+  `--linked "alter table …"`); the personal project is already linked and both
+  `schema.sql` and `storage.sql` have been applied.
 - **Large attachments** (`supabase/storage.sql`, run once) add the private
   `attachments` bucket with owner-scoped RLS (`auth.uid()` must equal the first
   key segment). Oversized or binary attachments are uploaded as
@@ -1346,9 +1349,9 @@ Residuals from this batch:
 - **The composer draft is single, not per chat.** A half-typed message follows
   the next chat you open (edit state is stashed/restored, but drafts are not
   keyed by conversation).
-- **`supabase/storage.sql` must be run once** in the SQL editor, and
-  `supabase/schema.sql` re-run after this release (idempotent `add column if not
-  exists`), or conversation push fails with `PGRST204`.
+- **`supabase/storage.sql` / `supabase/schema.sql` are applied via the CLI** now
+  (`supabase db query --linked --file …`); both are idempotent, so re-running
+  after a pull is safe. The bucket and policies exist on the personal project.
 - **GUI e2e was not re-run** for this batch (needs a display); `tsc` + production
   build + 382 Rust tests are green. The inline-editor → composer flow is
   compiler-verified only.

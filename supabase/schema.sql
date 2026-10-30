@@ -1,7 +1,11 @@
 -- Pi Chat — Supabase schema (backup + sync)
 --
--- Run this in the Supabase SQL editor (or via the local admin script) AFTER
--- creating the project. Everything is namespaced by the signed-in Supabase user
+-- Apply with the logged-in CLI after creating/choosing the project:
+--   supabase db query --linked --file supabase/schema.sql
+-- (Idempotent: tables/indexes use IF NOT EXISTS and the trailing migration block
+-- re-adds post-hoc columns. Prefer the CLI over the dashboard so this file stays
+-- the single source of truth.)
+-- Everything is namespaced by the signed-in Supabase user
 -- via RLS. Conversation ids are client-generated UUIDs matching local SQLite;
 -- message ids are text (`<conversation_id>:<index>` or a fresh uuid) — see the
 -- `messages` table comments — so rows map 1:1.

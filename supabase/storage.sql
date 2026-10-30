@@ -1,7 +1,9 @@
 -- Supabase Storage setup for large / binary chat attachments.
 --
--- Run this in the Supabase SQL editor (Dashboard → SQL Editor → New query),
--- once per project, *after* supabase/schema.sql.
+-- Apply with the logged-in CLI, once per project, *after* supabase/schema.sql:
+--   supabase db query --linked --file supabase/storage.sql
+-- (Idempotent: the bucket is inserted `on conflict do nothing` and every policy
+-- is dropped before recreation.)
 --
 -- Why: an attachment with nothing inline to send (text past 1 MB, an image past
 -- 10 MB, a PDF/zip/other binary) is uploaded to this private bucket instead of
