@@ -756,7 +756,7 @@ pub async fn do_sync(app: &AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE messages SET dirty = 1
-             WHERE revision = 0 AND role != 'memory'
+             WHERE revision = 0 AND role NOT IN ('memory', 'clock', 'prompt_update')
                AND conversation_id IN (SELECT id FROM conversations WHERE kind = 'chat')",
             [],
         )

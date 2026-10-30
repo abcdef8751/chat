@@ -2861,10 +2861,11 @@ pub(crate) async fn run_turn_core(
     let mut user_message_id: Option<String> = None;
     if regenerate {
         // `apply_user_message_edit` truncated everything after the edited row, so
-        // it is the last persisted message. Match it by content at the last
-        // `user` position rather than blindly popping the tail: if anything were
-        // appended in the interim (e.g. a `memory` note), popping the tail would
-        // miss and the turn would be sent upstream twice.
+        // it is the last persisted `user` row (instruction notes may follow it).
+        // Match by content at the last `user` position rather than blindly popping
+        // the tail: if anything were appended in the interim (e.g. a `prompt_update`
+        // note), popping the tail would miss and the turn would be sent upstream
+        // twice.
         if let Some(pos) = history
             .iter()
             .rposition(|m| m.role == "user" && m.content == content)

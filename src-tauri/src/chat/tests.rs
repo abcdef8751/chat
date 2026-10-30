@@ -4473,6 +4473,22 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             None,
         )
         .unwrap();
+        // An instruction note delivered after that turn must survive the edit and
+        // still be sent upstream: deleting it would silently revert the model to
+        // the original prompt (the snapshot already recorded it as delivered).
+        crate::db::insert_message(
+            &db,
+            cid.clone(),
+            "prompt_update".into(),
+            "INSTRUCTION-DIFF-MARKER".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         crate::db::apply_user_message_edit(&db, &cid, &row.id, "edited text", None).unwrap();
 
         let cfg = AppConfig {
@@ -4510,11 +4526,19 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert_eq!(user_rows.len(), 1, "regenerate must not insert a second user row");
         assert_eq!(user_rows[0].id, row.id);
         assert_eq!(user_rows[0].content, "edited text");
-        assert_eq!(rows.len(), 2, "the edited user turn + the assistant reply");
-        assert_eq!(rows[1].role, "assistant");
-        assert_eq!(rows[1].content, "Edited reply");
+        assert_eq!(rows.len(), 3, "edited user turn + retained note + assistant reply");
+        let note = rows
+            .iter()
+            .find(|m| m.role == "prompt_update")
+            .expect("the instruction note must survive the edit");
+        assert_eq!(note.content, "INSTRUCTION-DIFF-MARKER");
+        let assistant = rows
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("the reply is persisted");
+        assert_eq!(assistant.content, "Edited reply");
 
-        // And the upstream request carries the turn exactly once.
+        // And the upstream request carries the turn exactly once, plus the note.
         let caps = bodies.lock().unwrap().clone();
         let req = request_body(&caps[0]);
         let sent: Vec<_> = req["messages"]
@@ -4525,6 +4549,15 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             .collect();
         assert_eq!(sent.len(), 1, "the user turn must appear once upstream");
         assert_eq!(sent[0]["content"], "edited text");
+        assert!(
+            req["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "system"
+                    && m["content"].as_str().unwrap_or("").contains("INSTRUCTION-DIFF-MARKER")),
+            "the retained instruction note must be replayed to the model: {req}"
+        );
     }
 
     /// The `regenerate` dedup must not rely on the edited row being the literal

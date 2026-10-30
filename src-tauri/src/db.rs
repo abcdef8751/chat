@@ -906,7 +906,9 @@ pub fn apply_user_message_edit(
             [conversation_id],
             |r| r.get(0),
         )
-        .map_err(|e| e.to_string())?;
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
 
     // The edit target must be a user turn in this conversation.
     let target = tx
@@ -937,10 +939,11 @@ pub fn apply_user_message_edit(
     )
     .map_err(|e| e.to_string())?;
 
-    // Truncate: drop every later message so nothing survives the fork. Record a
-    // per-message tombstone for each one first — the conversation row survives
-    // the edit, so without a message tombstone a second device keeps the stale
-    // tail (torn history).
+    // Truncate: drop every later *turn* so nothing survives the fork (instruction
+    // notes are retained — see the DELETE below). Record a per-message tombstone
+    // for each dropped turn first — the conversation row survives the edit, so
+    // without a message tombstone a second device keeps the stale tail (torn
+    // history).
     //
     // Internal bookkeeping rows (`clock`, `memory`, `prompt_update`) are excluded:
     // they are local-only (never pushed, `revision = 0`), so a tombstone for one
@@ -1456,7 +1459,10 @@ pub fn mark_all_dirty_for_resync(db: &Db) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     conn.execute("UPDATE conversations SET dirty = 1", [])
         .map_err(|e| e.to_string())?;
-    conn.execute("UPDATE messages SET dirty = 1 WHERE role != 'memory'", [])
+    conn.execute(
+        "UPDATE messages SET dirty = 1 WHERE role NOT IN ('memory', 'clock', 'prompt_update')",
+        [],
+    )
         .map_err(|e| e.to_string())?;
     conn.execute("UPDATE memory_sync SET dirty = 1", [])
         .map_err(|e| e.to_string())?;

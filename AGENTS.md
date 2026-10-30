@@ -216,7 +216,15 @@ change. Instead the prompt is **snapshotted and diffed**:
   no longer carries — for compaction **and** for cron's bounded
   `fresh`/`recent` modes. Without this the model silently reverts to the
   original prompt after compaction. Reflection uses the same helper so memory
-  curation sees the current instructions.
+  curation sees the current instructions. Edit-time truncation also **keeps**
+  `prompt_update` rows (`apply_user_message_edit` deletes later turns only), since
+  the snapshot says they were delivered and a deleted row could never be
+  re-injected.
+- **The header's "Default" entry clears the override.** It maps to `null`
+  (inherit the device default) at the command boundary, not `""`: the backend
+  reserves `""` for an explicit "no reasoning" override. Choosing a reasoning
+  level from the picker persists it as *both* the device default and that chat's
+  override; the provider's `none` level is the per-chat way to pin "no reasoning".
 - **Local-only.** `prompt_update` rows are bookkeeping (revision 0 / dirty 0, no
   `updated_at` bump); `groupTurns` and `buildEntries` skip them, `search` and
   `summarize_history` exclude them, and edit-time truncation does not tombstone

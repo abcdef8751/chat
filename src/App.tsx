@@ -1586,8 +1586,11 @@ export default function App() {
         try {
           // `null` clears the per-chat override (inherit). An empty string is a
           // real override meaning "no reasoning" now, so it must not be used to
-          // mean "clear".
-          await setConversationThinkingLevel(conv.id, null);
+          // mean "clear". Only write when there is an override to clear: a no-op
+          // update would still bump `updated_at` and reorder the sidebar.
+          if (conv.thinking_level != null) {
+            await setConversationThinkingLevel(conv.id, null);
+          }
           setConversations((prev) =>
             prev.map((c) => (c.id === conv.id ? { ...c, thinking_level: null } : c)),
           );
