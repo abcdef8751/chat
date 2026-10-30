@@ -259,11 +259,48 @@ struct RoundAccum {
     thinking: String,
     usage: Option<Value>,
     finish: Option<String>,
+    /// The provider stopped because it hit its output-token limit
+    /// (`finish_reason` = `length`/`max_tokens`). Any tool call in the round is
+    /// therefore suspect: its streamed argument JSON may be cut off mid-fragment.
+    /// `finish` keeps the raw reason for the transcript; this is the semantic
+    /// flag the loop acts on.
+    truncated: bool,
     failed: bool,
     /// The provider's failure text, kept so a bulk caller can tell a transient
     /// rate limit from a permanent rejection.
     error: Option<String>,
     tool_calls: Vec<ToolCall>,
+    /// Ids of accumulated tool calls whose streamed `arguments` string was not
+    /// valid JSON (typically cut off mid-call). Their `arguments` is
+    /// [`Value::Null`] — never `{}`, so nothing can mistake them for a real
+    /// no-argument call.
+    invalid_call_ids: Vec<String>,
+}
+
+/// The message shown (and recorded as the turn's error) when a round hits the
+/// provider's output limit while forming a tool call. Actionable on purpose: the
+/// call was not run, and the fix is a retry, a smaller output, or a higher
+/// provider-side cap.
+const TRUNCATED_TOOL_CALL_ERROR: &str = "The model hit its output limit while forming a \
+     tool call, so the call was incomplete and was not run. Retry the request; if it repeats, \
+     ask for a smaller output or raise the provider's max output tokens.";
+
+/// The JSON **value** stored/sent for a tool call. An unparseable (truncated)
+/// argument blob is recorded as `{}`: both the persisted row and the upstream
+/// request must stay valid JSON, and the round's tool result explains that
+/// nothing ran.
+fn call_arguments_value(call: &ToolCall) -> Value {
+    if call.arguments.is_null() {
+        json!({})
+    } else {
+        call.arguments.clone()
+    }
+}
+
+/// [`call_arguments_value`] serialized as the wire form (`function.arguments` is
+/// a JSON *string* in the OpenAI request shape).
+fn call_arguments_text(call: &ToolCall) -> String {
+    call_arguments_value(call).to_string()
 }
 
 /// Join the `data:` payload lines of one raw SSE event, if it has any.
@@ -390,6 +427,12 @@ fn apply_chunk(
         }
         if !reason.is_empty() {
             out.finish = Some(reason.to_string());
+            // The provider cut the round off at its output limit. A tool call in
+            // this round may have partial arguments; the loop must not treat it
+            // as a final answer (see `run_tool_loop`).
+            if reason == "length" || reason == "max_tokens" {
+                out.truncated = true;
+            }
         }
     }
     let delta = &choice["delta"];
@@ -624,10 +667,26 @@ async fn run_completion(
     indices.sort();
     for idx in indices {
         let (id, name, args) = &calls[&idx];
+        let id = id.clone().unwrap_or_else(|| format!("call_{idx}"));
+        // An empty argument string is a real no-argument call (many providers
+        // omit `arguments` for zero-arg tools); only *unparseable* text is an
+        // incomplete fragment. Mark it instead of silently substituting `{}`,
+        // which made a cut-off call look like a valid empty one.
+        let arguments = if args.trim().is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str::<Value>(args) {
+                Ok(v) => v,
+                Err(_) => {
+                    out.invalid_call_ids.push(id.clone());
+                    Value::Null
+                }
+            }
+        };
         out.tool_calls.push(ToolCall {
-            id: id.clone().unwrap_or_else(|| format!("call_{idx}")),
+            id,
             name: name.clone().unwrap_or_default(),
-            arguments: serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({})),
+            arguments,
         });
     }
     out
@@ -693,7 +752,7 @@ fn track_context(total: &mut Value, round: &Option<Value>) {
 fn encode_tool_calls(calls: &[ToolCall]) -> String {
     let arr: Vec<Value> = calls
         .iter()
-        .map(|c| json!({"id": c.id, "name": c.name, "arguments": c.arguments}))
+        .map(|c| json!({"id": c.id, "name": c.name, "arguments": call_arguments_value(c)}))
         .collect();
     json!({"tool_calls": arr}).to_string()
 }
@@ -2430,8 +2489,25 @@ pub(crate) async fn run_tool_loop(
                 stop_reason = "error".into();
                 final_error = acc.error.clone();
             } else {
-                stop_reason = "length".into(); // tool-round cap reached
+                stop_reason = "tool_limit".into(); // tool-round cap reached
             }
+            final_text = acc.text;
+            final_thinking = (!acc.thinking.is_empty()).then_some(acc.thinking);
+            break;
+        }
+
+        // A round the provider cut off at its output limit *while forming a tool
+        // call* is unusable: the call's arguments are incomplete, so dispatching
+        // would run something the model never finished asking for. Treat it as a
+        // failure and persist nothing — no assistant tool-call row, no tool
+        // result — so the stored transcript stays replay-valid. A truncated
+        // round with no tool calls is an ordinary cut-off answer and keeps the
+        // `length` stop reason below.
+        if acc.truncated && !acc.tool_calls.is_empty() {
+            stop_reason = "error".into();
+            let message = TRUNCATED_TOOL_CALL_ERROR.to_string();
+            final_error = Some(message.clone());
+            sink.emit(StreamEvent::Error { message });
             final_text = acc.text;
             final_thinking = (!acc.thinking.is_empty()).then_some(acc.thinking);
             break;
@@ -2487,7 +2563,7 @@ pub(crate) async fn run_tool_loop(
                                         id: c.id.clone(),
                                         function: async_openai::types::chat::FunctionCall {
                                             name: c.name.clone(),
-                                            arguments: c.arguments.to_string(),
+                                            arguments: call_arguments_text(c),
                                         },
                                     },
                                 )
@@ -2509,14 +2585,21 @@ pub(crate) async fn run_tool_loop(
             let mut aborted_mid_tools = false;
             let mut outcomes: Vec<DispatchedTool> = Vec::with_capacity(acc.tool_calls.len());
             for call in &acc.tool_calls {
+                // A call whose streamed arguments were not valid JSON never runs:
+                // the model's output was cut mid-call, so any object we invented
+                // would be meaningless. It still owes the transcript a result row
+                // (below) so the round stays replay-valid, and the error names the
+                // tool so the model can re-emit a complete call.
+                let invalid_arguments = acc.invalid_call_ids.contains(&call.id);
                 // YOLO mode treats a gated call as ungated: it runs immediately
                 // and is announced with `gated: false` so the UI never renders
                 // (or waits on) the approve/deny prompt. A cron call that would
                 // *grant* auto-approval is gated even though the tool name is
                 // app-local: that click is the boundary against a prompt-injected
                 // page scheduling an unattended shell (see `grants_autoapprove`).
-                let host_gated = tools::is_gated(&call.name)
-                    || grants_autoapprove(&call.name, &call.arguments, persist);
+                let host_gated = !invalid_arguments
+                    && (tools::is_gated(&call.name)
+                        || grants_autoapprove(&call.name, &call.arguments, persist));
                 if host_gated {
                     gated_ids.push(call.id.clone());
                 }
@@ -2530,7 +2613,7 @@ pub(crate) async fn run_tool_loop(
                 sink.emit(StreamEvent::ToolCall {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
-                    arguments: call.arguments.to_string(),
+                    arguments: call_arguments_text(call),
                     gated: host_gated && !yolo,
                 });
 
@@ -2561,29 +2644,42 @@ pub(crate) async fn run_tool_loop(
                 // may use every memory tool plus host/web tools, reflection
                 // turns may not touch host/web tools, and extraction turns may
                 // run no tools at all.
-                let refused = match mode {
-                    ToolMode::Reflection if !is_memory_tool => Some(format!(
-                        "{} is not available during memory consolidation; use save_memory, \
-                         read_memory, write_memory, or memory_str_replace.",
+                //
+                // An invalid-arguments call is refused first (it was never
+                // gated): the transcript still gets its result row below, but
+                // nothing is executed.
+                let refused = if invalid_arguments {
+                    Some(format!(
+                        "{} was not run: its arguments were not valid JSON (the model's \
+                         output was likely truncated mid-call). Call it again with complete, \
+                         valid JSON arguments.",
                         call.name
-                    )),
-                    // Extraction advertises no tools, so a hallucinated call is
-                    // refused here rather than reaching `dispatch_tool`.
-                    ToolMode::Extract => Some(format!(
-                        "{} is not available during memory extraction; reply with the summary \
-                         text instead of calling tools.",
-                        call.name
-                    )),
-                    // A scheduled run blocks host-tool side effects unless the
-                    // job opted into auto-approval. Memory and web tools stay
-                    // available (read-only / app-local).
-                    ToolMode::Cron(CronToolPolicy::ReadOnly) if host_gated => Some(format!(
-                        "{} is not available in this scheduled run: the job's tool policy is \
-                         'readonly'. Enable auto-approve on the job (or ask the user to run it \
-                         manually).",
-                        call.name
-                    )),
-                    _ => None,
+                    ))
+                } else {
+                    match mode {
+                        ToolMode::Reflection if !is_memory_tool => Some(format!(
+                            "{} is not available during memory consolidation; use save_memory, \
+                             read_memory, write_memory, or memory_str_replace.",
+                            call.name
+                        )),
+                        // Extraction advertises no tools, so a hallucinated call is
+                        // refused here rather than reaching `dispatch_tool`.
+                        ToolMode::Extract => Some(format!(
+                            "{} is not available during memory extraction; reply with the summary \
+                             text instead of calling tools.",
+                            call.name
+                        )),
+                        // A scheduled run blocks host-tool side effects unless the
+                        // job opted into auto-approval. Memory and web tools stay
+                        // available (read-only / app-local).
+                        ToolMode::Cron(CronToolPolicy::ReadOnly) if host_gated => Some(format!(
+                            "{} is not available in this scheduled run: the job's tool policy is \
+                             'readonly'. Enable auto-approve on the job (or ask the user to run it \
+                             manually).",
+                            call.name
+                        )),
+                        _ => None,
+                    }
                 };
                 let outcome = if let Some(message) = refused {
                     DispatchedTool::plain(ToolOutput::err(message))

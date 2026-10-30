@@ -522,6 +522,56 @@
             .any(|e| matches!(e, StreamEvent::Error { message } if message == "plain boom")));
     }
 
+    /// `finish_reason: length` is the provider's output-limit signal: the round
+    /// must be flagged as truncated so the loop never mistakes a cut-off tool
+    /// call for a final answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_flags_output_limit_truncation() {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            delta_chunk("cut"),
+            finish_chunk("length")
+        );
+        let (acc, _) = complete_raw(&body).await;
+        assert!(acc.truncated, "finish_reason=length must set truncated");
+        assert_eq!(acc.finish.as_deref(), Some("length"));
+
+        // A normal finish is not truncation.
+        let body = format!("data: {}\n\n", finish_chunk("stop"));
+        let (acc, _) = complete_raw(&body).await;
+        assert!(!acc.truncated);
+    }
+
+    /// Unparseable streamed arguments must be marked, not silently replaced with
+    /// `{}` — otherwise a call cut off mid-JSON looked like a real empty call.
+    /// An *empty* argument string stays a legitimate no-argument call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_marks_unparseable_tool_arguments() {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            tool_frag(0, "call_1", "bash", r#"{\"command\":\"echo"#),
+            finish_chunk("tool_calls")
+        );
+        let (acc, _) = complete_raw(&body).await;
+        assert_eq!(acc.invalid_call_ids, vec!["call_1".to_string()]);
+        assert_eq!(acc.tool_calls.len(), 1);
+        assert!(
+            acc.tool_calls[0].arguments.is_null(),
+            "invalid args must be Null, never {{}}"
+        );
+        assert!(!acc.truncated, "a tool_calls finish is not truncation");
+
+        // A zero-argument call (empty `arguments`) is valid, not invalid.
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            tool_frag(0, "call_2", "list_crons", ""),
+            finish_chunk("tool_calls")
+        );
+        let (acc, _) = complete_raw(&body).await;
+        assert!(acc.invalid_call_ids.is_empty());
+        assert_eq!(acc.tool_calls[0].arguments, json!({}));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_completion_honors_abort_between_fast_events() {
         // Deltas arrive back-to-back (no gap), so a per-iteration timer would
@@ -2081,6 +2131,300 @@ async fn abort_mid_multi_call_round_leaves_one_result_per_call() {
         assert_eq!(m["role"], "tool", "call {id} has no following tool result");
         assert_eq!(m["tool_call_id"], id.as_str());
     }
+}
+
+/// A round cut off by the provider's output limit *while forming a tool call* is
+/// not a final answer: the arguments are incomplete, so nothing may run. The old
+/// behaviour fell through to the final-answer branch, silently dropped the call
+/// and showed the user a random cut-off. Now it fails the turn, persists nothing
+/// partial, and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_tool_round_fails_without_dispatching_or_persisting_calls() {
+    let marker = std::env::temp_dir().join(format!(
+        "pi-chat-truncated-tool-{}-marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let command = format!("touch {}", marker.display());
+    let (port, handle) = start_mock(
+        vec![vec![
+            delta_chunk("Let me run that."),
+            // Cut off mid-argument: the provider hit its output limit.
+            tool_frag(0, "call_1", "bash", &format!(r#"{{\"command\":\"{command}"#)),
+            finish_chunk("length"),
+        ]],
+        0,
+    );
+    let db = Arc::new(open_db("truncated-tool-round"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        // So a would-be dispatch would certainly run: absence of the marker
+        // proves the call never reached the executor.
+        auto_approve_tools: true,
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    run_chat_turn(
+        &db,
+        &cfg,
+        "test-key",
+        &brave,
+        &shell,
+        &temp_memory("truncated-tool-round"),
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.clone(),
+        "go".into(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    // No tool call was run...
+    assert!(!marker.exists(), "a truncated tool call must never execute");
+
+    // ...and no partial round was written: the transcript is just the user turn
+    // plus the failed assistant row.
+    let rows = msgs(&db, &cid);
+    assert!(
+        rows.iter().all(|m| m.role != "tool"),
+        "a truncated round must not persist a tool result"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.contains("tool_calls")),
+        "a truncated round must not persist an assistant tool-calls row"
+    );
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.stop_reason.as_deref(), Some("error"));
+    assert_eq!(last.content, "Let me run that.");
+
+    let guard = events.lock().unwrap();
+    assert!(
+        guard.iter().any(|e| matches!(
+            e,
+            StreamEvent::Error { message } if message.contains("output limit")
+        )),
+        "the turn must explain the output limit"
+    );
+    assert!(guard
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Done { stop_reason } if stop_reason == "error")));
+}
+
+/// A truncated round with **no** tool calls is an ordinary cut-off answer: keep
+/// the text, report `length`, and do not raise an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_final_answer_keeps_text_and_reports_length() {
+    let (port, handle) = start_mock(
+        vec![vec![delta_chunk("Half an ans"), finish_chunk("length")]],
+        0,
+    );
+    let db = Arc::new(open_db("truncated-answer"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    run_chat_turn(
+        &db,
+        &cfg,
+        "test-key",
+        &brave,
+        &shell,
+        &temp_memory("truncated-answer"),
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.clone(),
+        "go".into(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    let rows = msgs(&db, &cid);
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.content, "Half an ans");
+    assert_eq!(last.stop_reason.as_deref(), Some("length"));
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error { .. })),
+        "a truncated final answer is not an error"
+    );
+}
+
+/// Arguments that are not valid JSON (with a `tool_calls` finish, i.e. not the
+/// provider's truncation flag) must not execute. The call still gets a result
+/// row — the transcript must stay replay-valid — and the model is told the JSON
+/// was invalid so it can retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_tool_arguments_are_refused_without_running_the_tool() {
+    let marker = std::env::temp_dir().join(format!(
+        "pi-chat-invalid-args-{}-marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    // Complete-looking arguments with trailing garbage: unparseable as a whole,
+    // but a greedy/incorrect implementation could still extract and run them.
+    let args = format!(
+        r#"{{\"path\":\"{}\",\"content\":\"x\"}}garbage"#,
+        marker.display()
+    );
+    let (port, handle) = start_mock(
+        vec![
+            vec![
+                tool_frag(0, "call_1", "write_file", &args),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("retrying"), finish_chunk("stop")],
+        ],
+        0,
+    );
+    let db = Arc::new(open_db("invalid-args"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        auto_approve_tools: true,
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    run_chat_turn(
+        &db,
+        &cfg,
+        "test-key",
+        &brave,
+        &shell,
+        &temp_memory("invalid-args"),
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.clone(),
+        "write it".into(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    assert!(!marker.exists(), "invalid arguments must never run the tool");
+
+    let rows = msgs(&db, &cid);
+    // The round is persisted normally: assistant call row + one result.
+    let call_row = rows
+        .iter()
+        .find(|m| m.role == "assistant" && m.content.contains("\"tool_calls\""))
+        .expect("assistant tool-calls row");
+    let call_value: Value = serde_json::from_str(&call_row.content).unwrap();
+    assert_eq!(
+        call_value["tool_calls"][0]["arguments"],
+        json!({}),
+        "the persisted row must hold valid JSON, never null/partial text"
+    );
+    let tool_row = rows
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("one result row per call");
+    let tr: Value = serde_json::from_str(&tool_row.content).unwrap();
+    assert_eq!(tr["tool_call_id"], "call_1");
+    assert_eq!(tr["error"], true);
+    assert!(
+        tr["output"].as_str().unwrap().contains("not valid JSON"),
+        "{}",
+        tr["output"]
+    );
+    // The loop carried on, so the model could recover.
+    assert_eq!(rows.last().unwrap().content, "retrying");
+    assert_eq!(rows.last().unwrap().stop_reason.as_deref(), Some("stop"));
+}
+
+/// The tool-round cap is not a provider output limit: it must report its own
+/// stop reason, not `length`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_round_cap_reports_tool_limit() {
+    let turns: Vec<Vec<String>> = (0..=tools::MAX_TOOL_ROUNDS)
+        .map(|i| {
+            vec![
+                tool_frag(0, &format!("call_{i}"), "list_crons", ""),
+                finish_chunk("tool_calls"),
+            ]
+        })
+        .collect();
+    let (port, handle) = start_mock(turns, 0);
+    let db = Arc::new(open_db("tool-round-cap"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    run_chat_turn(
+        &db,
+        &cfg,
+        "test-key",
+        &brave,
+        &shell,
+        &temp_memory("tool-round-cap"),
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.clone(),
+        "loop".into(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    let rows = msgs(&db, &cid);
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.stop_reason.as_deref(), Some("tool_limit"));
+    assert!(
+        rows.iter().all(|m| m.stop_reason.as_deref() != Some("length")),
+        "the round cap must not masquerade as an output limit"
+    );
+    // Exactly MAX_TOOL_ROUNDS rounds were dispatched; the cap discards the rest.
+    let call_rows = rows
+        .iter()
+        .filter(|m| m.role == "assistant" && m.content.contains("\"tool_calls\""))
+        .count();
+    assert_eq!(call_rows, tools::MAX_TOOL_ROUNDS as usize);
 }
 
 /// A multi-call round emits each call's `ToolResult` as soon as that call
