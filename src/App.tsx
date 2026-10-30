@@ -322,6 +322,83 @@ export default function App() {
     });
   }
 
+  // A staged (`tmp-user-*`) row is the local preview of a turn the backend
+  // persists just before streaming starts. Two rows are the same turn when the
+  // text matches and they carry the same attachment ids (unique per picked
+  // file), which is what "the fetched rows already contain this bubble" means.
+  function sameStagedUserRow(persisted: Message, staged: Message): boolean {
+    if (persisted.role !== "user" || persisted.content !== staged.content) return false;
+    const ids = (m: Message) => parseAttachments(m).map((a) => a.id).sort().join(",");
+    return ids(persisted) === ids(staged);
+  }
+
+  /** Single implementation of "refresh the open conversation's transcript".
+   *
+   *  Every reload used to be `listMessages(id).then(setMessages)` guarded by
+   *  `!isStreaming(id)` **before** the await — so a 60s sync pull, a reflection
+   *  finish, a cron event or the chat-switch loader could resolve MID-TURN and
+   *  replace `messages` with the persisted rows, which lack the in-flight
+   *  assistant row (and any staged `tmp-user-*` row). That closed the activity
+   *  panel and froze the answer while the model was still talking. The decision
+   *  is therefore deferred to RESOLUTION time:
+   *
+   *  - the chat is no longer open → discard the snapshot;
+   *  - a live turn exists → re-attach its assistant row (like the switch loader)
+   *    so deltas keep appending to a rendered row;
+   *  - a turn is registered but has no live record (transient) → leave the
+   *    transcript alone; the turn's own terminal reload reconciles it;
+   *  - otherwise → apply the persisted rows, keeping any staged user row the
+   *    snapshot does not contain yet.
+   */
+  async function reloadTranscript(id: string) {
+    let rows: Message[];
+    try {
+      rows = await listMessages(id);
+    } catch {
+      return; // best-effort refresh; the turn's terminal reload reconciles
+    }
+    // The user switched (or closed the chat) while the fetch was in flight: this
+    // snapshot belongs to a conversation that is no longer on screen.
+    if (activeId() !== id) return;
+    const current = messages();
+    const staged = current.filter(
+      (m) =>
+        m.conversation_id === id &&
+        m.id.startsWith("tmp-user-") &&
+        !rows.some((r) => sameStagedUserRow(r, m)),
+    );
+    const live = liveTurns()[id];
+    if (live) {
+      // Re-attach the in-flight assistant row so a reload that raced the start
+      // of a turn cannot hide it. Deltas keep appending to this key.
+      setMessages([
+        ...rows,
+        ...staged,
+        {
+          id: live.assistantKey,
+          conversation_id: id,
+          role: "assistant",
+          index: rows.length + staged.length,
+          content: live.content,
+          model: null,
+          provider: null,
+          thinking_level: null,
+          thinking: live.thinking,
+          usage: null,
+          stop_reason: null,
+          attachments: null,
+          created_at: Date.now(),
+        },
+      ]);
+      return;
+    }
+    // A turn that is registered without a live record yet (or any more) is a
+    // transient state between the streaming flags and the record itself; leave
+    // the visible transcript alone rather than risk dropping its live row.
+    if (isStreaming(id)) return;
+    setMessages([...rows, ...staged]);
+  }
+
   // Files staged for the next message (picked or dropped).
   const [pendingAttachments, setPendingAttachments] = createSignal<Attachment[]>([]);
   const [dragOver, setDragOver] = createSignal(false);
@@ -719,8 +796,10 @@ export default function App() {
       (event) => {
         void refreshReflectionStats();
         const id = activeId();
-        if (id && event.payload.conversationId === id && !isStreaming(id)) {
-          listMessages(id).then(setMessages);
+        if (id && event.payload.conversationId === id) {
+          // The note lands in this chat's transcript; the reload must not clobber
+          // a turn that started (or is still running) while the event arrived.
+          void reloadTranscript(id);
         }
         refreshConversations().catch(() => {});
       },
@@ -753,7 +832,7 @@ export default function App() {
       if (!event.payload?.changed) return;
       refreshConversations().catch(() => {});
       const id = activeId();
-      if (id && !isStreaming(id)) listMessages(id).then(setMessages);
+      if (id) void reloadTranscript(id);
     });
     onCleanup(() => unlistenSync);
 
@@ -781,9 +860,7 @@ export default function App() {
         void refreshConversations();
       }
       const id = activeId();
-      if (id && conversationId === id && !isStreaming(id)) {
-        listMessages(id).then(setMessages);
-      }
+      if (id && conversationId === id) void reloadTranscript(id);
       // Keep the selected job's run history live while the dialog is open.
       if (cronSelectedId() && cronSelectedId() === jobId) void loadCronRuns(jobId);
     });
@@ -1135,34 +1212,9 @@ export default function App() {
       setMessages([]);
       return;
     }
-    listMessages(id).then((rows) => {
-      if (activeId() !== id) return; // user switched again while loading
-      const live = liveTurns()[id];
-      if (live) {
-        // Re-attach the in-flight assistant row so a chat switched back to
-        // mid-turn keeps rendering streamed output. Deltas keep appending to it.
-        setMessages([
-          ...rows,
-          {
-            id: live.assistantKey,
-            conversation_id: id,
-            role: "assistant",
-            index: rows.length,
-            content: live.content,
-            model: null,
-            provider: null,
-            thinking_level: null,
-            thinking: live.thinking,
-            usage: null,
-            stop_reason: null,
-            attachments: null,
-            created_at: Date.now(),
-          },
-        ]);
-      } else {
-        setMessages(rows);
-      }
-    });
+    // One implementation of "load this chat's rows and never clobber a live
+    // turn" (re-attaches the in-flight assistant row when there is one).
+    void reloadTranscript(id);
   });
 
   // Keep the newest message in view unless the user has scrolled up or is
@@ -1872,7 +1924,7 @@ export default function App() {
     try {
       await reflectNow(id);
       await reloadMemory(memorySelected() ?? undefined);
-      if (activeId() === id) listMessages(id).then(setMessages);
+      if (activeId() === id) void reloadTranscript(id);
     } catch (e) {
       setMemoryError(String(e));
     } finally {
@@ -2068,7 +2120,9 @@ export default function App() {
         if (activeId() !== id && (ev.type === "done" || received.current)) markUnseen(id);
         removeStreaming(id);
         dropLiveTurn(id, token);
-        if (activeId() === id) listMessages(id).then(setMessages);
+        // Streaming is already cleared, so this applies the persisted rows (the
+        // assistant row carries the error annotation, if any).
+        if (activeId() === id) void reloadTranscript(id);
         refreshConversations().catch(() => {});
         // A live turn may have created / changed / deleted cron jobs through the
         // agent tools (which have no event emitter of their own).
@@ -2222,12 +2276,9 @@ export default function App() {
       setPendingAttachments([]);
       // The edit rewrote the row and deleted everything after it; reload so the
       // transcript matches, then stream a fresh assistant reply for the edit.
-      try {
-        const rows = await listMessages(id);
-        if (activeId() === id) setMessages(rows);
-      } catch {
-        // The stream's `done` reload below still reconciles state.
-      }
+      // `reloadTranscript` swallows a failed fetch — the stream's `done` reload
+      // below still reconciles state.
+      await reloadTranscript(id);
       if (activeId() !== id) return;
       // The edited user row already exists — the backend must not insert a
       // second one, so mark this re-run as a regeneration.
