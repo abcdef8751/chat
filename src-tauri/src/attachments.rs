@@ -229,10 +229,70 @@ pub fn is_image_path(path: &str) -> bool {
     is_raster_image_ext(&ext)
 }
 
+/// Identify a raster image from its leading bytes, returning the canonical MIME
+/// string [`mime_for`] uses for that format.
+///
+/// This is what lets an **extensionless** image (a screenshot, a `fetch_file`
+/// download) be read as an image rather than fed to the UTF-8 text path, where
+/// it failed with an opaque decoding error. Only the five formats the vision
+/// path supports are recognised: SVG/ICO deliberately return `None` and stay on
+/// the text/metadata path.
+///
+/// `head` only needs the first few bytes; a shorter slice simply cannot match a
+/// longer signature.
+pub fn sniff_image_mime(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if head.starts_with(b"\xFF\xD8\xFF") {
+        return Some("image/jpeg");
+    }
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if head.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    None
+}
+
+/// How many leading bytes [`is_image_file`] reads to sniff a format. Enough for
+/// the longest signature (WebP's `RIFF....WEBP`).
+const SNIFF_BYTES: usize = 16;
+
+/// Whether `path` is a raster image: a raster **extension**, or a regular file
+/// whose first [`SNIFF_BYTES`] bytes sniff as one of the supported formats.
+///
+/// Cheap on purpose: only a 16-byte probe is read, never the whole file, and a
+/// missing/unreadable path is simply "not an image" so the caller falls back to
+/// the ordinary `read_file` path (which reports the real error).
+pub fn is_image_file(path: &str) -> bool {
+    if is_image_path(path) {
+        return true;
+    }
+    let expanded = crate::shell::expand_tilde(path);
+    let Ok(meta) = std::fs::metadata(&expanded) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(&expanded) else {
+        return false;
+    };
+    let mut head = [0u8; SNIFF_BYTES];
+    let n = std::io::Read::read(&mut file, &mut head).unwrap_or(0);
+    sniff_image_mime(&head[..n]).is_some()
+}
+
 /// Read an image file into `(mime, data_url)`, where `data_url` is a
-/// `data:<mime>;base64,…` URL ready to hand to a multimodal model. Errors when
-/// the path is unreadable, is not a file, is not a raster image by extension,
-/// or exceeds [`MAX_IMAGE_BYTES`].
+/// `data:<mime>;base64,…` URL ready to hand to a multimodal model. The MIME
+/// comes from a raster extension when there is one, otherwise from sniffing the
+/// leading bytes. Errors when the path is unreadable, is not a file, is not one
+/// of the five supported raster formats, or exceeds [`MAX_IMAGE_BYTES`].
 pub fn read_image(path: &str) -> Result<(String, String), String> {
     let p = Path::new(path);
     let meta = std::fs::metadata(p).map_err(|e| format!("{path}: {e}"))?;
@@ -243,19 +303,30 @@ pub fn read_image(path: &str) -> Result<(String, String), String> {
         .extension()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if !is_raster_image_ext(&ext) {
-        return Err(format!("{path} is not a supported image"));
-    }
+    // Extension first (no read needed), then a 16-byte content sniff so a file
+    // whose name says nothing about its contents is still recognised.
+    let mime = if is_raster_image_ext(&ext) {
+        mime_for(&ext)
+    } else {
+        let mut file = std::fs::File::open(p).map_err(|e| format!("{path}: {e}"))?;
+        let mut head = [0u8; SNIFF_BYTES];
+        let n = std::io::Read::read(&mut file, &mut head).map_err(|e| format!("{path}: {e}"))?;
+        sniff_image_mime(&head[..n]).ok_or_else(|| {
+            format!(
+                "{path} is not a supported image (read_file only returns png/jpeg/gif/webp/bmp \
+                 images)"
+            )
+        })?
+    };
     if meta.len() > MAX_IMAGE_BYTES {
         return Err(format!(
             "{path}: image is too large to view ({} bytes > {MAX_IMAGE_BYTES} byte limit)",
             meta.len()
         ));
     }
-    let mime = mime_for(&ext).to_string();
     let bytes = std::fs::read(p).map_err(|e| format!("{path}: {e}"))?;
     let data_url = format!("data:{};base64,{}", mime, base64_encode(&bytes));
-    Ok((mime, data_url))
+    Ok((mime.to_string(), data_url))
 }
 
 /// Build an image [`Attachment`] from bytes we already hold (a fetched URL, not a
@@ -706,7 +777,88 @@ mod tests {
         let mut t = std::env::temp_dir();
         t.push(format!("pi-chat-read-image-{}.txt", std::process::id()));
         std::fs::write(&t, "hi").unwrap();
-        assert!(read_image(t.to_str().unwrap()).is_err());
+        let err = read_image(t.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("not a supported image"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_file(&t);
+    }
+
+    // -- content sniffing (extensionless images) ------------------------------
+
+    #[test]
+    fn sniff_image_mime_recognizes_exactly_the_five_raster_formats() {
+        assert_eq!(
+            sniff_image_mime(b"\x89PNG\r\n\x1a\n\x00\x00"),
+            Some("image/png")
+        );
+        assert_eq!(sniff_image_mime(b"\xFF\xD8\xFF\xE0\x00"), Some("image/jpeg"));
+        assert_eq!(sniff_image_mime(b"GIF87aREST"), Some("image/gif"));
+        assert_eq!(sniff_image_mime(b"GIF89aREST"), Some("image/gif"));
+        assert_eq!(
+            sniff_image_mime(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(sniff_image_mime(b"BM\x36\x00\x00\x00"), Some("image/bmp"));
+
+        // Not images: text, SVG/XML, ICO, a RIFF *non*-WebP container, an empty
+        // file, and a truncated PNG signature.
+        for other in [
+            b"hello world".as_slice(),
+            b"<svg><rect/></svg>",
+            b"\x00\x00\x01\x00",
+            b"RIFF\x24\x00\x00\x00WAVEfmt ",
+            b"",
+            b"\x89PNG",
+        ] {
+            assert_eq!(sniff_image_mime(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn read_image_uses_content_when_the_extension_says_nothing() {
+        // The bytes of a real PNG header (a full image is not needed).
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+
+        // Extensionless (e.g. a `fetch_file` download or a saved screenshot).
+        let mut noext = std::env::temp_dir();
+        noext.push(format!("pi-chat-sniff-{}-shot", std::process::id()));
+        std::fs::write(&noext, png).unwrap();
+        let (mime, url) = read_image(noext.to_str().unwrap()).unwrap();
+        assert_eq!(mime, "image/png");
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        assert!(is_image_file(noext.to_str().unwrap()));
+        let _ = std::fs::remove_file(&noext);
+
+        // A misleading name: PNG bytes in a `.txt` still read as an image.
+        let mut mislabelled = std::env::temp_dir();
+        mislabelled.push(format!("pi-chat-sniff-{}.txt", std::process::id()));
+        std::fs::write(&mislabelled, png).unwrap();
+        let (mime, _) = read_image(mislabelled.to_str().unwrap()).unwrap();
+        assert_eq!(mime, "image/png");
+        assert!(is_image_file(mislabelled.to_str().unwrap()));
+        let _ = std::fs::remove_file(&mislabelled);
+    }
+
+    #[test]
+    fn is_image_file_is_false_for_text_and_svg() {
+        let mut text = std::env::temp_dir();
+        text.push(format!("pi-chat-is-image-{}.txt", std::process::id()));
+        std::fs::write(&text, "just some words").unwrap();
+        assert!(!is_image_file(text.to_str().unwrap()));
+        let _ = std::fs::remove_file(&text);
+
+        let mut svg = std::env::temp_dir();
+        svg.push(format!("pi-chat-is-image-{}.svg", std::process::id()));
+        std::fs::write(&svg, "<svg><rect/></svg>").unwrap();
+        assert!(!is_image_file(svg.to_str().unwrap()));
+        let _ = std::fs::remove_file(&svg);
+
+        // A raster *extension* is still enough even when the file is unreadable.
+        assert!(is_image_file("/definitely/missing/photo.png"));
+        // A missing extensionless path is not an image (the text path reports the
+        // real error instead).
+        assert!(!is_image_file("/definitely/missing/noext"));
     }
 }

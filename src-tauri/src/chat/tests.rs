@@ -522,6 +522,56 @@
             .any(|e| matches!(e, StreamEvent::Error { message } if message == "plain boom")));
     }
 
+    /// `finish_reason: length` is the provider's output-limit signal: the round
+    /// must be flagged as truncated so the loop never mistakes a cut-off tool
+    /// call for a final answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_flags_output_limit_truncation() {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            delta_chunk("cut"),
+            finish_chunk("length")
+        );
+        let (acc, _) = complete_raw(&body).await;
+        assert!(acc.truncated, "finish_reason=length must set truncated");
+        assert_eq!(acc.finish.as_deref(), Some("length"));
+
+        // A normal finish is not truncation.
+        let body = format!("data: {}\n\n", finish_chunk("stop"));
+        let (acc, _) = complete_raw(&body).await;
+        assert!(!acc.truncated);
+    }
+
+    /// Unparseable streamed arguments must be marked, not silently replaced with
+    /// `{}` — otherwise a call cut off mid-JSON looked like a real empty call.
+    /// An *empty* argument string stays a legitimate no-argument call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completion_marks_unparseable_tool_arguments() {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            tool_frag(0, "call_1", "bash", r#"{\"command\":\"echo"#),
+            finish_chunk("tool_calls")
+        );
+        let (acc, _) = complete_raw(&body).await;
+        assert_eq!(acc.invalid_call_ids, vec!["call_1".to_string()]);
+        assert_eq!(acc.tool_calls.len(), 1);
+        assert!(
+            acc.tool_calls[0].arguments.is_null(),
+            "invalid args must be Null, never {{}}"
+        );
+        assert!(!acc.truncated, "a tool_calls finish is not truncation");
+
+        // A zero-argument call (empty `arguments`) is valid, not invalid.
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            tool_frag(0, "call_2", "list_crons", ""),
+            finish_chunk("tool_calls")
+        );
+        let (acc, _) = complete_raw(&body).await;
+        assert!(acc.invalid_call_ids.is_empty());
+        assert_eq!(acc.tool_calls[0].arguments, json!({}));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_completion_honors_abort_between_fast_events() {
         // Deltas arrive back-to-back (no gap), so a per-iteration timer would
@@ -2083,6 +2133,300 @@ async fn abort_mid_multi_call_round_leaves_one_result_per_call() {
     }
 }
 
+/// A round cut off by the provider's output limit *while forming a tool call* is
+/// not a final answer: the arguments are incomplete, so nothing may run. The old
+/// behaviour fell through to the final-answer branch, silently dropped the call
+/// and showed the user a random cut-off. Now it fails the turn, persists nothing
+/// partial, and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_tool_round_fails_without_dispatching_or_persisting_calls() {
+    let marker = std::env::temp_dir().join(format!(
+        "pi-chat-truncated-tool-{}-marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let command = format!("touch {}", marker.display());
+    let (port, handle) = start_mock(
+        vec![vec![
+            delta_chunk("Let me run that."),
+            // Cut off mid-argument: the provider hit its output limit.
+            tool_frag(0, "call_1", "bash", &format!(r#"{{\"command\":\"{command}"#)),
+            finish_chunk("length"),
+        ]],
+        0,
+    );
+    let db = Arc::new(open_db("truncated-tool-round"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        // So a would-be dispatch would certainly run: absence of the marker
+        // proves the call never reached the executor.
+        auto_approve_tools: true,
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    run_chat_turn(
+        &db,
+        &cfg,
+        "test-key",
+        &brave,
+        &shell,
+        &temp_memory("truncated-tool-round"),
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.clone(),
+        "go".into(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    // No tool call was run...
+    assert!(!marker.exists(), "a truncated tool call must never execute");
+
+    // ...and no partial round was written: the transcript is just the user turn
+    // plus the failed assistant row.
+    let rows = msgs(&db, &cid);
+    assert!(
+        rows.iter().all(|m| m.role != "tool"),
+        "a truncated round must not persist a tool result"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.contains("tool_calls")),
+        "a truncated round must not persist an assistant tool-calls row"
+    );
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.stop_reason.as_deref(), Some("error"));
+    assert_eq!(last.content, "Let me run that.");
+
+    let guard = events.lock().unwrap();
+    assert!(
+        guard.iter().any(|e| matches!(
+            e,
+            StreamEvent::Error { message } if message.contains("output limit")
+        )),
+        "the turn must explain the output limit"
+    );
+    assert!(guard
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Done { stop_reason } if stop_reason == "error")));
+}
+
+/// A truncated round with **no** tool calls is an ordinary cut-off answer: keep
+/// the text, report `length`, and do not raise an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_final_answer_keeps_text_and_reports_length() {
+    let (port, handle) = start_mock(
+        vec![vec![delta_chunk("Half an ans"), finish_chunk("length")]],
+        0,
+    );
+    let db = Arc::new(open_db("truncated-answer"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    run_chat_turn(
+        &db,
+        &cfg,
+        "test-key",
+        &brave,
+        &shell,
+        &temp_memory("truncated-answer"),
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.clone(),
+        "go".into(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    let rows = msgs(&db, &cid);
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.content, "Half an ans");
+    assert_eq!(last.stop_reason.as_deref(), Some("length"));
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error { .. })),
+        "a truncated final answer is not an error"
+    );
+}
+
+/// Arguments that are not valid JSON (with a `tool_calls` finish, i.e. not the
+/// provider's truncation flag) must not execute. The call still gets a result
+/// row — the transcript must stay replay-valid — and the model is told the JSON
+/// was invalid so it can retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_tool_arguments_are_refused_without_running_the_tool() {
+    let marker = std::env::temp_dir().join(format!(
+        "pi-chat-invalid-args-{}-marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    // Complete-looking arguments with trailing garbage: unparseable as a whole,
+    // but a greedy/incorrect implementation could still extract and run them.
+    let args = format!(
+        r#"{{\"path\":\"{}\",\"content\":\"x\"}}garbage"#,
+        marker.display()
+    );
+    let (port, handle) = start_mock(
+        vec![
+            vec![
+                tool_frag(0, "call_1", "write_file", &args),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("retrying"), finish_chunk("stop")],
+        ],
+        0,
+    );
+    let db = Arc::new(open_db("invalid-args"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        auto_approve_tools: true,
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    run_chat_turn(
+        &db,
+        &cfg,
+        "test-key",
+        &brave,
+        &shell,
+        &temp_memory("invalid-args"),
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.clone(),
+        "write it".into(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    assert!(!marker.exists(), "invalid arguments must never run the tool");
+
+    let rows = msgs(&db, &cid);
+    // The round is persisted normally: assistant call row + one result.
+    let call_row = rows
+        .iter()
+        .find(|m| m.role == "assistant" && m.content.contains("\"tool_calls\""))
+        .expect("assistant tool-calls row");
+    let call_value: Value = serde_json::from_str(&call_row.content).unwrap();
+    assert_eq!(
+        call_value["tool_calls"][0]["arguments"],
+        json!({}),
+        "the persisted row must hold valid JSON, never null/partial text"
+    );
+    let tool_row = rows
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("one result row per call");
+    let tr: Value = serde_json::from_str(&tool_row.content).unwrap();
+    assert_eq!(tr["tool_call_id"], "call_1");
+    assert_eq!(tr["error"], true);
+    assert!(
+        tr["output"].as_str().unwrap().contains("not valid JSON"),
+        "{}",
+        tr["output"]
+    );
+    // The loop carried on, so the model could recover.
+    assert_eq!(rows.last().unwrap().content, "retrying");
+    assert_eq!(rows.last().unwrap().stop_reason.as_deref(), Some("stop"));
+}
+
+/// The tool-round cap is not a provider output limit: it must report its own
+/// stop reason, not `length`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_round_cap_reports_tool_limit() {
+    let turns: Vec<Vec<String>> = (0..=tools::MAX_TOOL_ROUNDS)
+        .map(|i| {
+            vec![
+                tool_frag(0, &format!("call_{i}"), "list_crons", ""),
+                finish_chunk("tool_calls"),
+            ]
+        })
+        .collect();
+    let (port, handle) = start_mock(turns, 0);
+    let db = Arc::new(open_db("tool-round-cap"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    run_chat_turn(
+        &db,
+        &cfg,
+        "test-key",
+        &brave,
+        &shell,
+        &temp_memory("tool-round-cap"),
+        &approvals,
+        CancelToken::new(),
+        &sink,
+        cid.clone(),
+        "loop".into(),
+        Vec::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = handle.join();
+
+    let rows = msgs(&db, &cid);
+    let last = rows.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.stop_reason.as_deref(), Some("tool_limit"));
+    assert!(
+        rows.iter().all(|m| m.stop_reason.as_deref() != Some("length")),
+        "the round cap must not masquerade as an output limit"
+    );
+    // Exactly MAX_TOOL_ROUNDS rounds were dispatched; the cap discards the rest.
+    let call_rows = rows
+        .iter()
+        .filter(|m| m.role == "assistant" && m.content.contains("\"tool_calls\""))
+        .count();
+    assert_eq!(call_rows, tools::MAX_TOOL_ROUNDS as usize);
+}
+
 /// A multi-call round emits each call's `ToolResult` as soon as that call
 /// finishes — not after every call in the round has been awaited.
 ///
@@ -2947,6 +3291,11 @@ fn legacy_build_system_prompt(
             model_label.trim()
         ));
     }
+    parts.push(format!(
+        "Running system: {}. This id identifies the app build and system-prompt revision and \
+         changes when either is updated.",
+        system_id()
+    ));
     parts.push(
         "Host tools (bash, read_file, write_file) execute on the user's own device — the machine \
          they are sending from — not on a remote server."
@@ -3178,12 +3527,13 @@ async fn first_turn_snapshots_the_system_prompt_without_an_update_note() {
             Some(0)
         )
     );
-    // Snapshot shape: system + the seven parts.
+    // Snapshot shape: system + the eight parts.
     let parts = v["parts"].as_object().expect("snapshot.parts");
     for key in [
         "preferences",
         "base",
         "model",
+        "system",
         "tools",
         "style",
         "started",
@@ -3341,6 +3691,105 @@ async fn changed_model_label_shows_up_in_the_diff() {
         "{}",
         updates[0].content
     );
+}
+
+#[test]
+fn system_id_is_stable_and_shaped_like_a_build_id() {
+    let id = system_id();
+    assert_eq!(id, system_id(), "the id must be deterministic across calls");
+    let (head, hash) = id.rsplit_once('+').expect("pi-chat/<version>+<hex>");
+    assert_eq!(head, format!("pi-chat/{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(hash.len(), 8, "{id}");
+    assert!(
+        hash.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "the hash must be lowercase hex: {id}"
+    );
+    assert_eq!(prompt_hash(), hash);
+}
+
+#[test]
+fn system_info_serializes_the_frozen_contract() {
+    let info = system_info();
+    assert_eq!(info.id, system_id());
+    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(info.prompt_hash, prompt_hash());
+    let v = serde_json::to_value(&info).unwrap();
+    assert_eq!(v["id"], info.id);
+    assert_eq!(v["version"], info.version);
+    assert_eq!(v["promptHash"], info.prompt_hash);
+    assert!(
+        v.get("prompt_hash").is_none(),
+        "the frontend contract uses camelCase"
+    );
+}
+
+#[test]
+fn two_identical_parts_render_the_same_system_id() {
+    let memory = temp_memory("prompt-id-stable");
+    let a = SystemPromptParts::new("BASE", "mock", "", &memory, None);
+    let b = SystemPromptParts::new("BASE", "mock", "", &memory, None);
+    assert_eq!(a.system, b.system);
+    assert_eq!(a.rendered(), b.rendered());
+    assert!(a.system.contains(&system_id()), "{}", a.system);
+}
+
+/// A changed id alone must reach the model as a prompt-update diff naming both
+/// the old and the new id — that is the only way a shipped prompt revision is
+/// communicated to an existing conversation.
+#[test]
+fn changing_only_the_system_id_yields_a_diff_naming_both_ids() {
+    let memory = temp_memory("prompt-id-diff");
+    let parts = SystemPromptParts::new("BASE", "mock", "", &memory, None);
+    let old_id = system_id();
+    let mut changed = parts.clone();
+    changed.system = "Running system: pi-chat/9.9.9+deadbeef. This id identifies the app build \
+                      and system-prompt revision and changes when either is updated."
+        .to_string();
+    let note = prompt_update_text(&parts.rendered(), &changed.rendered()).expect("a diff");
+    assert!(note.contains(&old_id), "{note}");
+    assert!(note.contains("pi-chat/9.9.9+deadbeef"), "{note}");
+}
+
+/// A snapshot written before the `system` part existed must not parse as
+/// current (that would silently hide the new id line forever). It falls back to
+/// the whole-text diff, which must carry the new id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_system_snapshot_produces_a_diff_with_the_new_id() {
+    let (port, _bodies, handle) = start_mock_capture(vec![ok_turn("one"), ok_turn("two")], 0);
+    let db = Arc::new(open_db("prompt-legacy-snapshot"));
+    let cid = insert_conv(&db);
+    let memory = temp_memory("prompt-legacy-snapshot");
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        ..Default::default()
+    };
+    run_turn_once(&db, &cfg, &cid, "hi", &memory).await;
+
+    // Rewrite the stored snapshot into the pre-`system` shape: the top-level text
+    // without the running-system line, and parts without the `system` key.
+    let raw = crate::db::prompt_state(&db, &cid)
+        .unwrap()
+        .expect("first turn stores a snapshot");
+    let mut v: Value = serde_json::from_str(&raw).unwrap();
+    let system = v["system"].as_str().unwrap();
+    let line = system
+        .lines()
+        .find(|l| l.starts_with("Running system: "))
+        .expect("the new snapshot carries the id line");
+    v["system"] = json!(system.replace(&format!("\n\n{line}"), ""));
+    v["parts"].as_object_mut().unwrap().remove("system");
+    crate::db::set_prompt_state(&db, &cid, &v.to_string()).unwrap();
+
+    run_turn_once(&db, &cfg, &cid, "again", &memory).await;
+    let _ = handle.join();
+
+    let updates = prompt_update_rows(&db, &cid);
+    assert_eq!(updates.len(), 1, "exactly one prompt_update note");
+    let note = &updates[0].content;
+    assert!(note.contains("+Running system: "), "{note}");
+    assert!(note.contains(&system_id()), "{note}");
 }
 
 #[test]
@@ -4804,6 +5253,86 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         // No image part is sent to a text-only model.
         assert!(!bodies.lock().unwrap()[1].contains("image_url"));
         let _ = std::fs::remove_file(&img);
+    }
+
+    /// `read_file` must recognise an image by its **content**, not only its
+    /// extension: a `fetch_file` download or a saved screenshot often has no
+    /// `.png` suffix, and used to be fed to the UTF-8 text path (opaque error).
+    #[test]
+    fn read_file_extensionless_image_dispatches_by_content() {
+        let img = std::env::temp_dir().join(format!(
+            "pi-read-image-sniff-{}-screenshot",
+            std::process::id()
+        ));
+        // A PNG signature is all the sniffer needs; the data URL carries it on.
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+        let path = img.to_str().unwrap().to_string();
+        assert!(
+            crate::attachments::is_image_file(&path),
+            "the extensionless PNG must be routed to the image path"
+        );
+
+        // Vision-capable model: the image is returned for injection.
+        let db = open_db("read-image-sniff");
+        let vision_base = "http://127.0.0.1:1/v1".to_string();
+        mark_model_vision(&db, &vision_base);
+        let vision_cfg = AppConfig {
+            base_url: vision_base,
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let d = read_file_image(&path, &vision_cfg, Some(&db));
+        assert!(d.attachment.is_none());
+        assert!(
+            d.image
+                .as_deref()
+                .is_some_and(|u| u.starts_with("data:image/png;base64,")),
+            "expected a PNG data URL"
+        );
+        assert!(
+            d.output.content.contains("loaded image"),
+            "{}",
+            d.output.content
+        );
+
+        // Text-only model (unknown provider): a plain "cannot view" result.
+        let text_cfg = AppConfig {
+            base_url: "http://127.0.0.1:2/v1".into(),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let d = read_file_image(&path, &text_cfg, Some(&db));
+        assert!(d.image.is_none());
+        assert!(
+            d.output.content.contains("cannot view"),
+            "{}",
+            d.output.content
+        );
+
+        let _ = std::fs::remove_file(&img);
+    }
+
+    /// A binary non-image (or an SVG) makes `read_image` fail; the tool result
+    /// must be a clear error the model can act on, not a UTF-8 decoder message.
+    #[test]
+    fn read_file_binary_non_image_reports_an_actionable_error() {
+        let bin = std::env::temp_dir().join(format!(
+            "pi-read-nonimage-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&bin, [0u8, 159, 146, 150, 255]).unwrap();
+        let cfg = AppConfig {
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let d = read_file_image(bin.to_str().unwrap(), &cfg, None);
+        assert!(d.output.is_error);
+        assert!(
+            d.output.content.contains("not a supported image"),
+            "{}",
+            d.output.content
+        );
+        let _ = std::fs::remove_file(&bin);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

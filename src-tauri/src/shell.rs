@@ -20,6 +20,13 @@ use crate::tools::truncate;
 /// Default per-call timeout (matches the old persistent session's).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Largest file `read_file` will read into memory on desktop. Larger files are
+/// refused with a pointer at `bash` + `head`/`tail`: the whole file would be
+/// re-sent on every remaining round of the turn, and reading a huge file is how
+/// a single tool call can exhaust a provider's request limit.
+#[cfg(not(target_os = "android"))]
+pub const MAX_READ_FILE_BYTES: u64 = 10_000_000;
+
 /// The user's home directory, honouring the platform's own variable: `HOME`
 /// everywhere, with `USERPROFILE` as the Windows fallback. An empty value is
 /// treated as unset (a blank `HOME` must not expand `~/x` to `/x`).
@@ -175,14 +182,42 @@ impl ShellExecutor {
     /// A leading `~` is expanded here as well as in `tools.rs`, so every caller
     /// (including the Android `shq`-quoted branch, where single quotes would
     /// otherwise suppress the shell's own expansion) agrees on the real path.
+    ///
+    /// The desktop branch checks the metadata first, refuses non-files and
+    /// oversized files, and only then reads: a blind `read_to_string` on a
+    /// binary (or an extensionless image) surfaced as an opaque UTF-8 error, and
+    /// on a huge file could pull the whole thing into memory just to hand the
+    /// model a truncated copy anyway.
     pub async fn read_file(&self, path: &str) -> ToolOutput {
         let path = expand_tilde(path);
         let path = path.as_str();
         #[cfg(not(target_os = "android"))]
         {
-            match tokio::fs::read_to_string(path).await {
+            let meta = match tokio::fs::metadata(path).await {
+                Ok(m) => m,
+                Err(e) => return ToolOutput::err(format!("read_file: {e}")),
+            };
+            if !meta.is_file() {
+                return ToolOutput::err(format!("read_file: {path} is not a file"));
+            }
+            if meta.len() > MAX_READ_FILE_BYTES {
+                return ToolOutput::err(format!(
+                    "read_file: {path} is {} bytes, over the {MAX_READ_FILE_BYTES}-byte limit; \
+                     use bash with head/tail (or a char window) to read part of it",
+                    meta.len()
+                ));
+            }
+            let bytes = match tokio::fs::read(path).await {
+                Ok(b) => b,
+                Err(e) => return ToolOutput::err(format!("read_file: {e}")),
+            };
+            match String::from_utf8(bytes) {
                 Ok(text) => ToolOutput::ok(truncate(text)),
-                Err(e) => ToolOutput::err(format!("read_file: {e}")),
+                Err(_) => ToolOutput::err(format!(
+                    "read_file: {path} is a binary file ({} bytes), not text; read_file returns \
+                     text or supported images only",
+                    meta.len()
+                )),
             }
         }
         #[cfg(target_os = "android")]
@@ -409,5 +444,49 @@ mod tests {
         let _ = std::fs::remove_file(&full);
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(out.content, "tilde works");
+    }
+
+    #[tokio::test]
+    async fn read_file_reports_binary_and_non_files_clearly() {
+        let dir = std::env::temp_dir().join(format!("pi-shell-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ex = ShellExecutor::new();
+
+        // Invalid UTF-8: the tool must say "binary", not leak a decoder error that
+        // reads like a missing file.
+        let binary = dir.join("payload.bin");
+        std::fs::write(&binary, [0u8, 159, 146, 150, 255]).unwrap();
+        let out = ex.read_file(binary.to_str().unwrap()).await;
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("binary"),
+            "expected a binary-file error: {}",
+            out.content
+        );
+        assert!(out.content.contains("5 bytes"), "{}", out.content);
+
+        // A directory is not a file.
+        let out = ex.read_file(dir.to_str().unwrap()).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("is not a file"), "{}", out.content);
+
+        // Over the cap: refused from metadata, with a pointer at head/tail.
+        let huge = dir.join("huge.log");
+        let f = std::fs::File::create(&huge).unwrap();
+        f.set_len(MAX_READ_FILE_BYTES + 1).unwrap();
+        drop(f);
+        let out = ex.read_file(huge.to_str().unwrap()).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("over the"), "{}", out.content);
+        assert!(out.content.contains("head"), "{}", out.content);
+
+        // Text still reads (and is truncated as before).
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, "hello").unwrap();
+        let out = ex.read_file(text.to_str().unwrap()).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "hello");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
