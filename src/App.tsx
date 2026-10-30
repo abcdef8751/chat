@@ -192,6 +192,22 @@ export default function App() {
   // separate inline editor, so there is one place where a turn's content lives
   // (and one Send/Cancel pair).
   const [editingId, setEditingId] = createSignal<string | null>(null);
+  // The composer's own contents from before the pen loaded a message for
+  // editing. Loading an edit reuses `draft`/`pendingAttachments`, so without
+  // this stash both Send-edit and Cancel would silently destroy what the user
+  // had typed (or attached). Deliberately NON-reactive: it is written on the
+  // pen click and read only on cancel, so making it a signal would re-render
+  // the whole tree for state nothing renders. `preEditStashed` is the single
+  // source of truth for "an edit is loaded and owns the composer"; a second pen
+  // click while editing replaces the loaded text but never the stash.
+  let preEditDraft = "";
+  let preEditAttachments: Attachment[] = [];
+  let preEditStashed = false;
+  const dropEditStash = () => {
+    preEditDraft = "";
+    preEditAttachments = [];
+    preEditStashed = false;
+  };
   // Bumped to ask the composer to focus its textarea (after the edit pen loads
   // a message); the number itself carries no meaning.
   const [composerFocusNonce, setComposerFocusNonce] = createSignal(0);
@@ -1086,14 +1102,11 @@ export default function App() {
     // Scheduled-run pills are per chat: reload the trigger map for the new one.
     void refreshCronTriggers();
     // Editing a message is scoped to the conversation it lives in; a switch
-    // would otherwise let Send target the wrong conversation. Only clear the
-    // composer when an edit loaded it — an ordinary half-typed draft survives a
-    // chat switch (and is restored when the user comes back to it).
-    if (untrack(editingId) !== null) {
-      setEditingId(null);
-      setDraft("");
-      setPendingAttachments([]);
-    }
+    // would otherwise let Send target the wrong conversation. Cancelling
+    // restores the pre-edit draft, so the single composer draft then simply
+    // follows whichever chat is open — it is NOT keyed per conversation, and a
+    // half-typed draft is not restored when the user comes back to this chat.
+    if (untrack(editingId) !== null) cancelEditMessage();
     // Opening a conversation counts as reading its background output.
     if (id) clearUnseen(id);
     if (!id) {
@@ -2123,6 +2136,22 @@ export default function App() {
     const staged = pendingAttachments();
     let id = activeId();
     if (isBusy(id) || (!draft().trim() && staged.length === 0)) return;
+
+    // Editing an existing user row: rewrite it (truncating later messages) and
+    // re-run the reply from it, instead of appending a second user turn.
+    const editing = editingId();
+    if (editing) {
+      // An edit targets a row in the chat that was open when the pen was
+      // clicked (switching chats cancels it). If that chat is gone — deleted,
+      // pruned as an orphan, or removed by a sync tombstone — then the message
+      // id is dead too, and `send()` is about to create a fresh chat. Rewriting
+      // a row that belongs to another conversation would truncate the wrong
+      // transcript, so cancel (restoring the pre-edit draft) instead.
+      if (!conversations().some((c) => c.id === id)) {
+        cancelEditMessage();
+        return;
+      }
+    }
     if (!id) {
       const created = await createConversation();
       setConversations([created, ...conversations()]);
@@ -2132,18 +2161,19 @@ export default function App() {
     }
     const text = draft().trim();
 
-    // Editing an existing user row: rewrite it (truncating later messages) and
-    // re-run the reply from it, instead of appending a second user turn.
-    const editing = editingId();
     if (editing) {
       try {
         await editUserMessage(id, editing, text, staged.length > 0 ? staged : null);
       } catch (e) {
         // Keep the composer in edit mode with the text intact so the user can
-        // retry (or Cancel) instead of losing what they typed.
+        // retry (or Cancel) instead of losing what they typed. The pre-edit
+        // stash stays armed, so Cancel still restores their original draft.
         setStreamError(String(e));
         return;
       }
+      // The user deliberately replaced the composer contents with this edit:
+      // the pre-edit stash is no longer wanted.
+      dropEditStash();
       setEditingId(null);
       setDraft("");
       setPendingAttachments([]);
@@ -2217,6 +2247,15 @@ export default function App() {
     if (isBusy(activeId())) return;
     // Only persisted rows are editable; a `tmp-` row hasn't been written yet.
     if (m.id.startsWith("tmp-")) return;
+    // Stash the user's own input exactly once, on the first pen click. Clicking
+    // another message's pen while already editing replaces the loaded edit
+    // content but must not overwrite the original stash (else Cancel would
+    // "restore" the previous edit's text instead of the user's draft).
+    if (!preEditStashed) {
+      preEditDraft = draft();
+      preEditAttachments = pendingAttachments();
+      preEditStashed = true;
+    }
     setEditingId(m.id);
     setDraft(m.content);
     setPendingAttachments(parseAttachments(m));
@@ -2225,8 +2264,11 @@ export default function App() {
 
   function cancelEditMessage() {
     setEditingId(null);
-    setDraft("");
-    setPendingAttachments([]);
+    // Hand back what the composer held before the pen loaded the message;
+    // without a stash (defensive) the composer goes empty as it used to.
+    setDraft(preEditStashed ? preEditDraft : "");
+    setPendingAttachments(preEditStashed ? preEditAttachments : []);
+    dropEditStash();
   }
 
   function approveLiveTool(callId: string) {
@@ -2776,6 +2818,7 @@ export default function App() {
               onApprove={approveLiveTool}
               onDeny={denyLiveTool}
               onStartEdit={startEditMessage}
+              editingId={editingId()}
               cronTriggers={cronTriggers()}
             />
           </Show>

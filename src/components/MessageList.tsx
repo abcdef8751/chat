@@ -20,6 +20,10 @@ export function MessageList(props: {
   /// Editing no longer happens inline: the composer owns the text, the
   /// attachments and the send/Cancel affordances.
   onStartEdit: (m: Message) => void;
+  /// The id of the user row currently loaded into the composer, if any. Drives
+  /// the pen's active state so the affordance shows WHICH message is being
+  /// edited (and gives the GUI e2e a stable `aria-pressed` hook).
+  editingId?: string | null;
   /// messageId → cron job title: a scheduled run posted that user message.
   /// Rendered as a small pill beside the bubble; purely informational.
   cronTriggers?: Record<string, string>;
@@ -115,7 +119,12 @@ export function MessageList(props: {
                           disabled={props.streaming}
                           title="Edit"
                           aria-label="Edit message"
-                          class="rounded-md p-1 text-neutral-400 opacity-70 transition hover:bg-neutral-100 hover:text-neutral-700 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
+                          aria-pressed={props.editingId === u().id}
+                          class={`rounded-md p-1 transition hover:bg-neutral-100 hover:text-neutral-700 disabled:cursor-not-allowed disabled:opacity-30 dark:hover:bg-neutral-800 dark:hover:text-neutral-300 ${
+                            props.editingId === u().id
+                              ? "bg-amber-100 text-amber-700 opacity-100 dark:bg-amber-950/60 dark:text-amber-300"
+                              : "text-neutral-400 opacity-70 dark:text-neutral-500"
+                          }`}
                         >
                           <EditIcon class="h-3.5 w-3.5" />
                         </button>

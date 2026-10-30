@@ -171,6 +171,14 @@ export function Composer(props: {
             autoResize();
           }}
           onKeyDown={(e) => {
+            if (e.key === "Escape" && props.editing) {
+              // Escape leaves edit mode from the keyboard. The pen's Cancel
+              // button does the same thing; cancelling restores the draft the
+              // composer held before the edit loaded.
+              e.preventDefault();
+              props.onCancelEdit?.();
+              return;
+            }
             if (e.key === "Enter" && !e.shiftKey && !isAndroid) {
               e.preventDefault();
               handleSend();
