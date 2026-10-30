@@ -65,7 +65,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **329 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **382 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). Clippy,
 `tsc --noEmit`, and `npm run build` are clean. The Android target also
@@ -78,11 +78,11 @@ separately — it passes end to end (`ALL ASSERTIONS PASSED`).
 | Stack / scaffold  | ✅    | SolidJS + Tailwind v4 + Kobalte + Tauri v2; SQLite via rusqlite (bundled)                                  |
 | Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, capped tool loop                        |
 | Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; per-model price **and capability (modality) overrides** |
-| Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline, **editable user messages** (edit → truncate → re-run) |
-| Tools             | ✅    | `bash` (one-shot shell), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` + `fetch_image` (ungated) |
-| UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; memory page list→detail on narrow viewports |
+| Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline, **edit in the central composer** (pen under the bubble → draft → truncate → re-run), per-chat **model + thinking level** |
+| Tools             | ✅    | `bash` (one-shot shell, **`~` paths expanded for read/write, not for command strings**), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` + `fetch_image` + **`fetch_file`** (remote-stored attachment download; ungated) |
+| UI shell          | ✅    | `App.tsx` split into `src/components/*`; mobile drawer + full-screen memory pages; hardware back stack; **unseen-activity dots (hamburger + chat row)**; stable sidebar rows |
 | Memory            | ✅    | Plain Markdown, core files + agent-grown files, idle reflection, separate reflection cost, parallel backfill |
-| Cron jobs         | ✅    | Each job owns a local-only thread (kept out of the chat list); per-job tool policy; catch-up max 1; OS notification (desktop) + badge |
+| Cron jobs         | ✅    | Each job owns a local-only thread (kept out of the chat list); per-job tool policy; **deadline-aware scheduler (~1 s)**; catch-up max 1; OS notification (desktop) + badge |
 | Cloud sync        | ✅    | Opt-in Supabase backup+sync: email/password GoTrue auth, PostgREST push/pull, LWW by revision + tombstones, memory files, optional client-side encryption |
 | Context + price   | ✅    | Context counter, frozen per-turn cost, near-limit note, forced compaction (M7)                            |
 | GUI e2e           | ✅    | `npm run e2e` — mock LLM + WebKitWebDriver (streaming, timeline, tools, reflection)                        |
@@ -186,6 +186,49 @@ carries its weekday too.
 
 ---
 
+## System prompt snapshot + update notes
+
+Recomputing the whole system prompt every turn and re-injecting it at the top
+would invalidate the provider's prefix cache on every preference/memory/model
+change. Instead the prompt is **snapshotted and diffed**:
+
+- **Parts.** `chat::SystemPromptParts` holds the seven components
+  (`preferences`, `base`, `model`, `tools`, `style`, `started`, `memory`) and
+  `rendered()` reproduces the historical `build_system_prompt` output
+  byte-for-byte (pinned by a test). The clock is **not** a part — it is a
+  separate `clock` row.
+- **Snapshot.** `conversations.prompt_state` (local-only, never synced) stores
+  `{"system": "<the literal top-level system message sent>", "parts": {…}}`.
+  `system` is frozen for the conversation's life; `parts` is the newest
+  instruction state the model has been told about.
+- **Prepare.** `prepare_system_prompt` compares the new parts with the stored
+  ones. No snapshot → send the full render and save. Unchanged → send the
+  frozen `system`. Changed → still send the frozen `system` at the top and
+  produce a **bounded line diff** (unified, 3 lines of context, capped at 200
+  lines), persisted as a `prompt_update` row and sent as a system message right
+  before the clock note. `parts` then advances; `system` does not.
+- **Ordering.** The note row is inserted **before** `db::set_prompt_state`, so a
+  failed insert leaves the change owed instead of silently consuming it. The
+  wire layout is `frozen system → summary (if any) → orphaned notes → kept
+  history → new note → clock → user`.
+- **Truncation must not drop notes.** `chat::history_for_request(full, kept)`
+  re-injects every `prompt_update` from the full transcript that the kept slice
+  no longer carries — for compaction **and** for cron's bounded
+  `fresh`/`recent` modes. Without this the model silently reverts to the
+  original prompt after compaction. Reflection uses the same helper so memory
+  curation sees the current instructions.
+- **Local-only.** `prompt_update` rows are bookkeeping (revision 0 / dirty 0, no
+  `updated_at` bump); `groupTurns` and `buildEntries` skip them, `search` and
+  `summarize_history` exclude them, and edit-time truncation does not tombstone
+  them. `set_prompt_state` never bumps `updated_at` or the sync revision.
+- **Per-conversation level.** `conversations.thinking_level` (synced) overrides
+  the global `AppConfig.thinking_level` for live turns; `Some("")` is a real
+  override meaning "no reasoning" and is stored verbatim (only `None` inherits).
+  Reflection and cron resolve it first, then the newest message-recorded level,
+  then the global default.
+
+---
+
 ## Context compaction
 
 Keeps a long conversation inside the model's window without losing the raw
@@ -248,18 +291,21 @@ best-effort `ALTER TABLE ... ADD COLUMN` migrations in `open()`.
 ```sql
 conversations(
   id, title, kind,              -- 'chat' | 'scheduled' (a cron job's own thread)
-  model, system_prompt, compaction_summary,
+  model, provider_id,
+  thinking_level,                -- per-chat reasoning effort (synced); '' = no reasoning, NULL = inherit
+  system_prompt, compaction_summary,
   compaction_through,            -- id of the newest message folded into the summary (local-only)
+  prompt_state,                  -- JSON snapshot of the last-sent system prompt + parts (local-only)
   last_reflected_index,          -- memory-reflection watermark
   imported,                      -- 1 = came from an export; backfill-only
   created_at, updated_at)
 
 messages(
-  id, conversation_id, role,     -- user | assistant | tool | memory | clock
+  id, conversation_id, role,     -- user | assistant | tool | memory | clock | prompt_update
   "index",                        -- per-conversation monotonic order
   content, model, provider, thinking_level, thinking,
   usage,                          -- JSON token/cost (frozen `cost` per turn)
-  stop_reason, attachments,       -- JSON attachment array
+  stop_reason, attachments,       -- JSON attachment array (remotePath when offloaded)
   created_at)
 
 model_prices(                     -- models.dev cache
@@ -298,9 +344,11 @@ cron_runs(                        -- per-fire audit trail
   surfaces them to the model as lightweight `system` messages (so they're part of
   the cacheable prefix in both live and reflection turns), and the UI renders them
   as a centered note, not a turn. `clock` rows are the per-turn time note (see
-  "Clock updates"): same treatment, but the timeline skips them entirely. Both
-  roles are **local-only bookkeeping** — never synced, never bumping the
-  conversation's revision or `updated_at`.
+  "Clock updates"), and `prompt_update` rows are the line-diff instruction notes
+  (see "System prompt snapshot + update notes"): both get the same treatment, and
+  the timeline skips them entirely. All three roles are **local-only
+  bookkeeping** — never synced, never bumping the conversation's revision or
+  `updated_at`, and excluded from edit-time tombstones.
 - **Tool-turn persistence:** assistant tool-request rows are
   `{"tool_calls":[{id,name,arguments}]}`; tool-result rows (`role="tool"`) are
   `{"tool_call_id","name","error","output"}`. Frontend parsers in `App.tsx`
@@ -561,12 +609,17 @@ chats. `db::open` moves each such job to a fresh `scheduled` thread (once; the
 old chat and past runs stay where they are).
 
 - **Scheduler** (`cron.rs`, mirrors `reflection::spawn`): one pass 3 s after
-  startup (a slot missed while the app was closed catches up), then every 20 s so
-  `* * * * *` jobs feel right. Global kill-switch `AppConfig.cron_enabled`
-  (Settings → Scheduled jobs; local, not synced). Due = an enabled job with
-  `next_run_at <= now`, or any job with a queued one-shot `run_requested` (so
-  "Run now" works on a paused job), oldest slot first, capped at 5 launches per
-  tick and 3 concurrent runs.
+  startup (a slot missed while the app was closed catches up), then a
+  **deadline-aware sleep**: it wakes at the earliest `next_run_at` (clamped to
+  1–15 s), so a due job fires within ~1 s of its slot instead of on a fixed 20 s
+  poll. A tick that made no progress (a wedged due job) backs off to the idle
+  cadence rather than spinning at 1 Hz. The loop is a plain
+  `tauri::async_runtime` task with no window handles, so Linux close-to-tray and
+  Android `KeepAliveService` keep it running with the window hidden. Global
+  kill-switch `AppConfig.cron_enabled` (Settings → Scheduled jobs; local, not
+  synced). Due = an enabled job with `next_run_at <= now`, or any job with a
+  queued one-shot `run_requested` (so "Run now" works on a paused job), oldest
+  slot first, capped at 5 launches per tick and 3 concurrent runs.
 - **Interlock:** a conversation is claimed through `StreamRegistry`
   (`try_register`, not `register` — a live turn may start in the window since the
   due check, and replacing its cancel token would make Stop abort the wrong
@@ -669,6 +722,18 @@ old chat and past runs stay where they are).
   already-granted permission leaves the plugin's `requestPermissions` invoke
   unresolved, which hung the Test button. The event/badge path is
   platform-neutral.
+- **Live-turn notifications.** A normal chat turn that finishes while the
+  **window is unfocused** also raises an OS notification (title = conversation
+  title, body = the final answer collapsed and truncated to ~200 chars, or a
+  short failure snippet; reasoning is never included). Suppression is
+  **focus-only** — unlike a cron run, an unfocused window means the user is not
+  watching even if that chat is the one selected. Aborted turns and scheduled
+  threads are skipped (cron has its own notification path). `notifications.rs`
+  reuses the same platform send/permission path as cron, and the hook lives in
+  `chat::stream_chat` so the turn has already persisted its row when it fires.
+  When the window *is* focused but a different chat settled, there is no OS
+  notification — the UI shows an amber dot on the hamburger and beside that
+  chat's row instead.
 - **UI:** `src/components/CronPage.tsx` (Header → Cron) lists jobs (schedule,
   next/last run, count, enabled/notify toggles, policy + context badges, Thread /
   Run now / Edit / Delete), hosts the create/edit form (preset + raw cron, live
@@ -687,10 +752,15 @@ everything else.
 // Approval-gated (local side effects / local data) — ungated when YOLO
 // (`AppConfig.auto_approve_tools`) is on.
 bash(command)                     // runs a fresh `bash -c` per call (one-shot); Android
-                                  //   executes inside the user's Termux (see ANDROID_SHELL.md)
+                                  //   executes inside the user's Termux (see ANDROID_SHELL.md).
+                                  //   `~` inside the command string is expanded by bash itself.
 read_file(path)                   // text, or an image part when the model is
-                                  //   vision-capable (see "read_file images")
-write_file(path, content)
+                                  //   vision-capable (see "read_file images").
+                                  //   A leading `~`/`~/` expands to $HOME (desktop);
+                                  //   `~user` is left untouched, and on Android the
+                                  //   path is passed through unchanged (Termux owns
+                                  //   $HOME; quoted paths block shell expansion).
+write_file(path, content)         // same `~` handling as read_file
 
 // Memory — ungated, app-local. All four are in the shared tool list; access
 // is enforced by mode.
@@ -720,13 +790,23 @@ fetch_image(url)                  // raster only (png/jpg/gif/webp/bmp; capped a
                                   //   and PERSISTED on the assistant row, so the
                                   //   attachment is still there after a reload.
 
+// Web — Supabase Storage download, read-only (ungated; live + cron modes only)
+fetch_file(remote_path)           // downloads an attachment that was too large or
+                                  //   binary to inline (object key on the private
+                                  //   `attachments` bucket), decrypts it when the
+                                  //   sync key is set, writes it to
+                                  //   <app data>/downloads/<name> (de-duplicated,
+                                  //   never overwriting), and returns the absolute
+                                  //   local path. Refuses keys outside the signed-in
+                                  //   user's prefix or containing "..".
+
 // Cron management — app-local, read/write to local DB (ungated; live + cron
 // modes only, refused by reflection/extraction by mode)
 create_cron(prompt, schedule, title?, tool_policy?, context?, notify?)   // own thread
 list_crons()
 update_cron(id, prompt?, schedule?, title?, tool_policy?, context?, notify?, enabled?)
 delete_cron(id)
-run_cron_now(id)                  // queues an immediate fire (~20 s tick)
+run_cron_now(id)                  // queues an immediate fire (~1 s scheduler wake)
 ```
 
 The tool list is byte-identical for live and reflection turns so the prompt-cache
@@ -992,7 +1072,20 @@ and the app is byte-identical to before. Never blocks the UI.
   the call is a no-op when sync is disabled or signed out.
 - **Schema:** `supabase/schema.sql` (run in the Supabase SQL editor) creates
   `conversations`, `messages`, `memory_files` with revision/deleted_at, enables
-  RLS, and stores the client revision via a trigger.
+  RLS, and stores the client revision via a trigger. Columns introduced after a
+  table already existed are **also repeated in the idempotent migration block at
+  the end** (`alter table … add column if not exists`) — `create table if not
+  exists` is a no-op on a deployed project, and a push naming a missing column
+  fails with `PGRST204`, stalling sync one-way until someone re-runs the file.
+  `conversations.thinking_level` is the current example.
+- **Large attachments** (`supabase/storage.sql`, run once) add the private
+  `attachments` bucket with owner-scoped RLS (`auth.uid()` must equal the first
+  key segment). Oversized or binary attachments are uploaded as
+  `{user_id}/{uuid}-{name}`, AES-256-GCM encrypted when the sync key exists
+  (marked with a `PIENC1\0` magic prefix), capped at 100 MB, and listed on the
+  message's `attachments` JSON as `remotePath`; `fetch_file` downloads them to
+  `<app data>/downloads/`. Upload failures (signed out, no bucket, over cap) keep
+  the attachment and tell the model it cannot read the file — never a silent drop.
 
 > **Production blocker — email confirmation is currently OFF.** For a personal
 > local-first tool we run Supabase Auth with the **"Confirm email"** toggle off
@@ -1118,6 +1211,21 @@ and the app is byte-identical to before. Never blocks the UI.
 - **GUI needs a display:** use `npm run tauri dev` from the desktop session; scripted checks use `npm run e2e` (same requirement).
 - **One-shot shell:** `bash` runs a fresh `bash -c` per call — no persistent session, so `cd`/`export` do not survive (the agent already assumes non-persistence; see `ANDROID_SHELL.md`). 60s per-call timeout kills the child. On Android, execution happens inside the user's Termux (`crate::android` + `RunCommandPlugin`).
 - **Android:** `npm run tauri android init` created `src-tauri/gen/android`. The Rust bridge compiles for the aarch64 Android target via `cargo check --target aarch64-linux-android` (set `CC_aarch64_linux_android`/`AR_aarch64_linux_android`/linker to the NDK clang). The actual Termux `RUN_COMMAND` round-trip requires a device.
+- **Android storage access:** the manifest declares `MANAGE_EXTERNAL_STORAGE`
+  (all-files), legacy `READ_EXTERNAL_STORAGE` (≤32) / `WRITE_EXTERNAL_STORAGE`
+  (≤28), and `requestLegacyExternalStorage="true"` on `<application>`. All-files
+  access cannot be granted by a runtime dialog: `StorageAccessPlugin.kt` checks
+  `Environment.isExternalStorageManager()` and opens the system
+  `ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION` screen. Settings → Storage
+  access exposes the status and an "Open settings" button (re-polled on window
+  focus after returning); the Tauri commands are async
+  (`android_storage_status` / `android_request_storage_access`) for the same
+  main-thread reason the notification permission commands are, with non-Android
+  stubs registered in `lib.rs`. Device verification still needed.
+- **Android `~` paths:** `expand_tilde` is a no-op on Android. File ops execute in
+  the user's Termux via a single-quoted path, so the app's `$HOME` is both
+  unrelated and unreadable there; leaving `~` untouched avoids pointing at the
+  wrong directory.
 - **Android TLS (rustls-platform-verifier):** reqwest 0.13 routes *every* HTTPS
   request (models.dev catalog, streams, Brave, sync) through
   `rustls-platform-verifier`. On Android that verifier can't reach the OS trust
@@ -1196,6 +1304,46 @@ and the app is byte-identical to before. Never blocks the UI.
 ---
 
 ## Next / open items
+
+**Batch landed (nine changes):** Android all-files + notification permissions
+with a Settings storage row; sidebar jitter fix; synced per-chat model +
+thinking level and verified capability overrides; tilde expansion for
+`read_file`/`write_file`; header model picker fixed inside cron threads; large
+attachments offloaded to Supabase Storage with `fetch_file`; deadline-accurate
+cron firing; system-prompt snapshot + line-diff updates; background-completion
+notifications and unseen-activity dots. Plus review remediation (see the list
+below).
+
+Residuals from this batch:
+
+- **Device verification still needed:** Android all-files grant + Settings row,
+  Termux shared-storage access, and the notification grant on a device with no
+  notifying cron job. Kotlin is not compiled off-device.
+- **Android live-turn notifications may not fire while backgrounded.** The
+  suppression predicate is "main window focused", but Android reports the single
+  window as focused even when the Activity is paused; a lifecycle signal is
+  needed for correct background detection. Cron notifications use the explicit
+  active-conversation registry and are unaffected.
+- **`fetch_file` only covers path-based attachments.** A `content://` attachment
+  picked on Android still degrades to metadata-only (the offload path is the
+  path-based `read_attachments`). Route the URI reader through the same
+  offload/`remotePath` logic.
+- **Row-level LWW can clear a thinking level.** A conversation row written by an
+  older client (no `thinking_level`) wins on the mirror and nulls the level. Same
+  clock-skew/LWW caveat as other columns.
+- **`prompt_state` is device-local while `prompt_update` rows are too**, so two
+  devices with different Settings legitimately send different instruction
+  updates for the same chat. The frozen prefix is per device; that is intentional
+  but worth knowing.
+- **The composer draft is single, not per chat.** A half-typed message follows
+  the next chat you open (edit state is stashed/restored, but drafts are not
+  keyed by conversation).
+- **`supabase/storage.sql` must be run once** in the SQL editor, and
+  `supabase/schema.sql` re-run after this release (idempotent `add column if not
+  exists`), or conversation push fails with `PGRST204`.
+- **GUI e2e was not re-run** for this batch (needs a display); `tsc` + production
+  build + 382 Rust tests are green. The inline-editor → composer flow is
+  compiler-verified only.
 
 **Recent backlog (landed):** a 13-item pass — drawer-open keyboard, memory page
 list→detail on mobile, Enter=newline on Android, live↔persisted timeline
