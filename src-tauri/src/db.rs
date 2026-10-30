@@ -825,8 +825,33 @@ pub fn set_conversation_model(
     Ok(())
 }
 
-/// Set (or clear) a conversation's thinking level. `None`/empty clears it back
-/// to the global config's level. Synced like the model column.
+/// Set (or clear) a conversation's thinking level. `None` clears it back to the
+/// global config's level; **`Some("")` is stored verbatim** and means "no
+/// reasoning" for this chat.
+///
+/// The empty string is a real value, not "unset": every reader
+/// (`chat::run_turn_core`, `reflection::conversation_thinking_level`) treats a
+/// present-but-empty level as an authoritative override that beats the device
+/// default. Filtering it to `NULL` here silently reverted the chat to the global
+/// level on the next launch, so the override could not be expressed at all.
+///
+/// Kept off the command so it can be unit-tested without a `tauri::State`.
+fn set_thinking_level_on(
+    conn: &Connection,
+    conversation_id: &str,
+    thinking_level: Option<&str>,
+) -> Result<(), String> {
+    let rev = bump_revision_c(conn)?;
+    conn.execute(
+        "UPDATE conversations SET thinking_level = ?2, updated_at = ?3, revision = ?4, dirty = 1 WHERE id = ?1",
+        params![conversation_id, thinking_level, now(), rev],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Set (or clear) a conversation's thinking level (see [`set_thinking_level_on`]).
+/// Synced like the model column.
 #[tauri::command]
 pub fn set_conversation_thinking_level(
     db: tauri::State<'_, Db>,
@@ -834,14 +859,7 @@ pub fn set_conversation_thinking_level(
     thinking_level: Option<String>,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let rev = bump_revision_c(&conn)?;
-    let level = thinking_level.filter(|l| !l.is_empty());
-    conn.execute(
-        "UPDATE conversations SET thinking_level = ?2, updated_at = ?3, revision = ?4, dirty = 1 WHERE id = ?1",
-        params![conversation_id, level, now(), rev],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    set_thinking_level_on(&conn, &conversation_id, thinking_level.as_deref())
 }
 
 #[tauri::command]
@@ -923,16 +941,30 @@ pub fn apply_user_message_edit(
     // per-message tombstone for each one first — the conversation row survives
     // the edit, so without a message tombstone a second device keeps the stale
     // tail (torn history).
-    let stale_ids: Vec<String> = {
+    //
+    // Internal bookkeeping rows (`clock`, `memory`, `prompt_update`) are excluded:
+    // they are local-only (never pushed, `revision = 0`), so a tombstone for one
+    // would emit a phantom `messages` delete for a row no other device ever saw.
+    let stale: Vec<(String, String)> = {
         let mut stmt = tx
-            .prepare("SELECT id FROM messages WHERE conversation_id = ?1 AND \"index\" > ?2")
+            .prepare(
+                "SELECT id, role FROM messages WHERE conversation_id = ?1 AND \"index\" > ?2",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![conversation_id, target_index], |r| r.get::<_, String>(0))
+            .query_map(params![conversation_id, target_index], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<String>, _>>().map_err(|e| e.to_string())?
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
     };
     if synced {
+        let stale_ids: Vec<String> = stale
+            .iter()
+            .filter(|(_, role)| !is_internal_role(role))
+            .map(|(id, _)| id.clone())
+            .collect();
         tombstone_messages(&tx, conversation_id, &stale_ids)?;
     }
     tx.execute(
@@ -1076,7 +1108,7 @@ pub fn search_conversations(
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              WHERE lower(c.title) LIKE ?1
-                OR (m.role <> 'clock' AND lower(m.content) LIKE ?1)
+                OR (m.role NOT IN ('clock', 'prompt_update') AND lower(m.content) LIKE ?1)
              ORDER BY c.updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -2991,6 +3023,57 @@ mod tests {
         assert_eq!(conv.compaction_through.as_deref(), Some("msg-7"));
         assert_eq!(conv.updated_at, 5, "compaction must not touch updated_at");
         assert_eq!(last_reflected_index(&db, "c").unwrap(), Some(3));
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `Some("")` is an authoritative "no reasoning" override, not "unset": every
+    /// reader (`chat::run_turn_core`, `reflection::conversation_thinking_level`)
+    /// treats a present-but-empty level as beating the device default. It used to
+    /// be filtered to `NULL` here, so the override silently reverted to the global
+    /// level on the next turn/launch. `None` alone clears back to inherit.
+    #[test]
+    fn thinking_level_empty_string_is_stored_verbatim() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-thinking-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('c', 't', 5, 5)",
+                [],
+            )
+            .unwrap();
+            // The same code path the command uses.
+            set_thinking_level_on(&conn, "c", Some("")).unwrap();
+        }
+        let conv = get_conversation(&db, "c").unwrap().unwrap();
+        assert_eq!(
+            conv.thinking_level.as_deref(),
+            Some(""),
+            "the empty level must survive the round-trip"
+        );
+
+        // A real level round-trips, and `None` is the only thing that clears it.
+        {
+            let conn = db.0.lock().unwrap();
+            set_thinking_level_on(&conn, "c", Some("high")).unwrap();
+        }
+        assert_eq!(
+            get_conversation(&db, "c").unwrap().unwrap().thinking_level.as_deref(),
+            Some("high")
+        );
+        {
+            let conn = db.0.lock().unwrap();
+            set_thinking_level_on(&conn, "c", None).unwrap();
+        }
+        assert_eq!(
+            get_conversation(&db, "c").unwrap().unwrap().thinking_level,
+            None
+        );
 
         let _ = std::fs::remove_file(&p);
     }

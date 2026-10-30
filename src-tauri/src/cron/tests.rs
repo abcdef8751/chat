@@ -669,6 +669,25 @@ fn sleep_for_overdue_job_is_the_minimum() {
     assert_eq!(sleep_deadline(60_000, &[wake(60_000, true)]), MIN_SLEEP);
 }
 
+/// A due job that *cannot* launch or advance its slot (a provider/keychain or DB
+/// error) keeps `next_run_at` in the past, so the deadline alone would clamp to
+/// `MIN_SLEEP` and spin the scheduler at 1 Hz forever. A tick that made no
+/// progress must back off to the idle cadence instead.
+#[test]
+fn a_tick_without_progress_backs_off_to_the_idle_cadence() {
+    let overdue = sleep_deadline(60_000, &[wake(1_000, true)]);
+    assert_eq!(overdue, MIN_SLEEP, "precondition: the deadline alone spins");
+    assert_eq!(
+        wake_after(false, overdue),
+        MAX_SLEEP,
+        "no progress, no 1 Hz spin"
+    );
+    // A tick that did launch/advance keeps the deadline-based (prompt) wake.
+    assert_eq!(wake_after(true, overdue), MIN_SLEEP);
+    // The backoff never *shortens* an already-longer sleep.
+    assert_eq!(wake_after(false, Duration::from_secs(30)), Duration::from_secs(30));
+}
+
 /// A slot a few seconds out is slept to exactly; a distant one is clamped to
 /// the idle cadence so clock skew / a far-future slot cannot park the loop.
 #[test]

@@ -23,6 +23,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// The user's home directory, honouring the platform's own variable: `HOME`
 /// everywhere, with `USERPROFILE` as the Windows fallback. An empty value is
 /// treated as unset (a blank `HOME` must not expand `~/x` to `/x`).
+///
+/// Unused on Android: the app process's `HOME` is not Termux's, so nothing there
+/// expands a `~` (see [`expand_tilde`]).
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn home_dir() -> Option<String> {
     std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
@@ -42,12 +46,32 @@ fn home_dir() -> Option<String> {
 /// This is for **path arguments** only. Command strings handed to `bash` are
 /// never expanded here: bash expands a `~` itself, and doing it twice (or in
 /// the middle of a quoted command) would corrupt the command.
+///
+/// **Android: never expand.** Every file operation there runs inside the user's
+/// Termux through the `run_command` bridge, and the path is handed over
+/// single-quoted (`shq`) — quoting blocks the shell's own `~` expansion, so the
+/// string Termux sees must be the literal one the user wrote. The app process
+/// has its own `HOME` (the sandboxed data dir), which is not Termux's and is
+/// generally unreadable from there; expanding to it would silently point at the
+/// wrong place (or overwrite a literal path). Leave the path alone: Termux owns
+/// `$HOME`, and its own tools can expand what they are asked to.
+#[cfg(target_os = "android")]
+pub fn expand_tilde(path: &str) -> String {
+    path.to_string()
+}
+
+/// Desktop/mobile Rust file operations read the process `HOME` directly, so a
+/// leading `~` is expanded here. See the Android note on the alternative
+/// definition above.
+#[cfg(not(target_os = "android"))]
 pub fn expand_tilde(path: &str) -> String {
     expand_tilde_with(path, home_dir().as_deref())
 }
 
 /// [`expand_tilde`] with an explicit home, so the behaviour is testable without
-/// mutating the process environment (which would race other tests).
+/// mutating the process environment (which would race other tests). Unused on
+/// Android, where the public helper deliberately never expands.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn expand_tilde_with(path: &str, home: Option<&str>) -> String {
     // Only a *leading* `~` is a home reference, and only when it is the whole
     // path or is immediately followed by a separator.

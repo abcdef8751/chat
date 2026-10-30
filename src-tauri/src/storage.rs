@@ -37,6 +37,7 @@ use std::sync::OnceLock;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
+use tokio_stream::StreamExt;
 
 /// Private bucket that holds offloaded attachments.
 pub const BUCKET: &str = "attachments";
@@ -44,7 +45,33 @@ pub const BUCKET: &str = "attachments";
 /// Hard cap on an in-memory upload. Attachment reads already cap images at
 /// 10 MB, so this is the "somebody dragged a 4 GB ISO in" guard: it keeps the
 /// encrypt/upload path from buffering something that would exhaust memory.
+///
+/// The gate lives in [`check_upload_size`] so it can be applied from the length
+/// *before* anything is read (see `attachments::read_attachments`) rather than
+/// only after the bytes are already in memory.
 pub const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Ciphertext overhead tolerated above [`MAX_UPLOAD_BYTES`] on the way back down:
+/// a file uploaded at exactly the cap is a little larger on the wire once
+/// AES-GCM adds its magic header, nonce and tag.
+const ENCRYPT_OVERHEAD_BYTES: u64 = 4096;
+
+/// Largest object body the download path will accept (plaintext cap plus the
+/// encryption envelope), enforced on `Content-Length` *and* while streaming.
+pub const MAX_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES + ENCRYPT_OVERHEAD_BYTES;
+
+/// Whether a file of `len` bytes is small enough for the upload/offload path.
+///
+/// Pure and side-effect free so both sides of the boundary are testable, and so
+/// the check can run on the file's metadata length before it is read into memory.
+pub fn check_upload_size(len: u64) -> Result<(), String> {
+    if len > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "file is too large to upload ({len} bytes; the limit is {MAX_UPLOAD_BYTES} bytes)"
+        ));
+    }
+    Ok(())
+}
 
 /// Magic prefix on an encrypted object body: `PIENC1\0`.
 const ENC_MAGIC: &[u8] = b"PIENC1\0";
@@ -273,12 +300,7 @@ pub struct Downloaded {
 
 /// Upload `bytes` under `key`. Encrypts first when a data key is configured.
 pub async fn upload(key: &str, bytes: &[u8], content_type: &str) -> Result<(), String> {
-    if bytes.len() as u64 > MAX_UPLOAD_BYTES {
-        return Err(format!(
-            "file is too large to upload ({} bytes; the limit is {MAX_UPLOAD_BYTES} bytes)",
-            bytes.len()
-        ));
-    }
+    check_upload_size(bytes.len() as u64)?;
     let Some((base, anon, token, user_id)) = credentials().await? else {
         return Err("cloud sync is not signed in".into());
     };
@@ -342,11 +364,29 @@ pub async fn download(key: &str, user_id: &str) -> Result<Downloaded, String> {
             snippet(&detail)
         ));
     }
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("fetch_file: {e}"))?
-        .to_vec();
+    // Refuse an over-cap object before buffering a byte. `Content-Length` can lie
+    // (or be absent), so the streaming accumulator below re-checks every chunk.
+    if let Some(declared) = resp.content_length() {
+        if declared > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "fetch_file: the remote file is too large to download ({} bytes; the limit is \
+                 {MAX_DOWNLOAD_BYTES} bytes)",
+                declared
+            ));
+        }
+    }
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("fetch_file: {e}"))?;
+        if body.len() as u64 + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "fetch_file: the remote file is too large to download (over the \
+                 {MAX_DOWNLOAD_BYTES}-byte limit); aborted"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
     let bytes = if is_encrypted_body(&body) {
         let Some(k) = enc_key() else {
             return Err(
@@ -529,15 +569,31 @@ mod tests {
     }
 
     #[test]
-    fn uploads_over_the_cap_are_refused() {
-        // The size check runs before any credential lookup, so this is offline.
+    fn upload_size_cap_is_checked_on_both_sides_of_the_boundary() {
+        // The gate is pure, so the boundary can be asserted exactly — the old
+        // version of this test only proved a three-byte slice passes, which could
+        // never fail.
+        assert_eq!(MAX_UPLOAD_BYTES, 100 * 1024 * 1024);
+        assert!(check_upload_size(0).is_ok());
+        assert!(check_upload_size(MAX_UPLOAD_BYTES - 1).is_ok());
+        assert!(check_upload_size(MAX_UPLOAD_BYTES).is_ok(), "the cap is inclusive");
+        let err = check_upload_size(MAX_UPLOAD_BYTES + 1).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        assert!(check_upload_size(4 * 1024 * 1024 * 1024).is_err(), "a 4 GB ISO");
+        // The download side allows only the encryption envelope above the cap.
+        assert!(MAX_DOWNLOAD_BYTES > MAX_UPLOAD_BYTES);
+        assert!(MAX_DOWNLOAD_BYTES - MAX_UPLOAD_BYTES < 64 * 1024);
+    }
+
+    #[test]
+    fn upload_under_the_cap_proceeds_past_the_size_gate() {
+        // The gate itself is covered above; this pins that an in-cap body is not
+        // rejected by it — it goes on to the credential lookup (which needs a
+        // keychain/session and therefore fails offline).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // Don't allocate 100 MB: fake the length via a tiny slice and the check
-        // on `bytes.len()`, which is the only thing that can trip it here.
-        assert!(MAX_UPLOAD_BYTES == 100 * 1024 * 1024);
         rt.block_on(async {
             // Not over the cap: proceeds to the credential lookup, which fails
             // with a "not signed in"/"not configured" error in tests.

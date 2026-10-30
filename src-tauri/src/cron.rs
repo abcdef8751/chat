@@ -153,12 +153,31 @@ pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(STARTUP_DELAY).await;
         loop {
-            if let Err(e) = tick(&app).await {
-                eprintln!("cron: tick failed: {e}");
-            }
-            tokio::time::sleep(next_wake(&app)).await;
+            let progressed = match tick(&app).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("cron: tick failed: {e}");
+                    false
+                }
+            };
+            tokio::time::sleep(wake_after(progressed, next_wake(&app))).await;
         }
     });
+}
+
+/// The post-tick sleep. A due job that could not launch *and* could not advance
+/// its own slot (a provider/keychain or DB error) leaves `next_run_at` in the
+/// past, so `sleep_deadline` would clamp to [`MIN_SLEEP`] and spin the scheduler
+/// at 1 Hz for as long as the fault lasts. When a tick made no progress at all,
+/// back off to the idle cadence instead; the job is retried on that tick.
+///
+/// Pure so the no-progress branch is unit-testable without a Tauri app.
+fn wake_after(progressed: bool, deadline: Duration) -> Duration {
+    if progressed {
+        deadline
+    } else {
+        deadline.max(MAX_SLEEP)
+    }
 }
 
 /// One job's scheduling inputs for [`sleep_deadline`].
@@ -232,10 +251,15 @@ fn next_wake(app: &AppHandle) -> Duration {
     sleep_deadline(db::now_ms(), &wakes)
 }
 
-async fn tick(app: &AppHandle) -> Result<(), String> {
+/// One scheduler pass. Returns whether it made progress (launched, or let a run
+/// advance/skip its own slot) — the caller uses that to decide the next sleep,
+/// so a wedged overdue job cannot spin the loop (see [`wake_after`]).
+async fn tick(app: &AppHandle) -> Result<bool, String> {
     let cfg = app.state::<ConfigState>().get();
     if !cfg.cron_enabled {
-        return Ok(());
+        // A paused scheduler polls at the idle cadence either way; report
+        // progress so the ordinary clamp applies.
+        return Ok(true);
     }
     let now = db::now_ms();
     let due = {
@@ -243,6 +267,7 @@ async fn tick(app: &AppHandle) -> Result<(), String> {
         db::due_cron_jobs(&db, now)?
     };
     let mut fired = 0;
+    let mut launched_anything = false;
     for job in due {
         if fired >= MAX_FIRES_PER_TICK {
             break;
@@ -256,13 +281,16 @@ async fn tick(app: &AppHandle) -> Result<(), String> {
             continue;
         }
         match launch(app, &job, job.run_requested) {
-            Ok(true) => fired += 1,
+            Ok(true) => {
+                fired += 1;
+                launched_anything = true;
+            }
             // Occupation raced us or the cap is full: try again next tick.
             Ok(false) => {}
             Err(e) => eprintln!("cron: could not launch {}: {e}", job.id),
         }
     }
-    Ok(())
+    Ok(launched_anything)
 }
 
 /// Releases a run's two claims (the conversation's stream registration and its

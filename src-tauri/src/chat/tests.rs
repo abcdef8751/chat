@@ -3674,6 +3674,66 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert!(orphans.is_empty());
     }
 
+    /// Instruction-update notes must survive every truncation of the sent
+    /// history, because the frozen system prompt never changes and
+    /// `prompt_state.parts` already claims the change was told — dropping the note
+    /// silently reverts the model to the ORIGINAL instructions.
+    #[test]
+    fn truncated_histories_still_carry_orphaned_prompt_updates() {
+        let full = vec![
+            row("u1", "user", "first"),
+            row("pu", "prompt_update", "UPDATE-ONE"),
+            row("a1", "assistant", "first reply"),
+            row("u2", "user", "second"),
+            row("a2", "assistant", "second reply"),
+            row("u3", "user", "third"),
+            row("a3", "assistant", "third reply"),
+        ];
+
+        // `Recent` (the cron default) keeps only the last two user turns — the note
+        // sits before both of them, so it is re-injected ahead of the window.
+        let mut recent = full.clone();
+        apply_history_mode(&mut recent, HistoryMode::Recent);
+        assert!(
+            !recent.iter().any(|m| m.id == "pu"),
+            "precondition: the bounded window drops the note"
+        );
+        let sent = history_for_request(&full, &recent);
+        assert_eq!(sent[0].id, "pu", "the note leads the kept history");
+        assert_eq!(sent[1].id, "u2");
+
+        // `Fresh` sends no prior turns at all, yet the instruction change is still
+        // owed to the model.
+        let mut fresh = full.clone();
+        apply_history_mode(&mut fresh, HistoryMode::Fresh);
+        assert!(fresh.is_empty());
+        let sent = history_for_request(&full, &fresh);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, "pu");
+        assert_eq!(sent[0].role, "prompt_update");
+
+        // A note inside the kept slice must not be repeated (`Full` keeps it).
+        let mut kept = full.clone();
+        apply_history_mode(&mut kept, HistoryMode::Full);
+        let sent = history_for_request(&full, &kept);
+        assert_eq!(sent.len(), full.len(), "nothing added, nothing dropped");
+        assert_eq!(sent.iter().filter(|m| m.id == "pu").count(), 1);
+
+        // Notes come out in conversation order.
+        let mut two = full.clone();
+        two.insert(4, row("pu2", "prompt_update", "UPDATE-TWO"));
+        let mut recent = two.clone();
+        apply_history_mode(&mut recent, HistoryMode::Recent);
+        let sent = history_for_request(&two, &recent);
+        assert_eq!(
+            sent.iter()
+                .filter(|m| m.role == "prompt_update")
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pu", "pu2"]
+        );
+    }
+
     fn conversation_with(
         summary: Option<&str>,
         through: Option<&str>,
@@ -3908,6 +3968,145 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert!(conv.compaction_through.is_some());
     }
 
+    /// An instruction-update note deep in the folded history must still reach the
+    /// model after compaction. The summarizer deliberately drops `prompt_update`
+    /// rows, and the top-level system message is frozen, so without re-injection
+    /// the model silently reverts to the original instructions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_reinjects_an_orphaned_prompt_update() {
+        let (port, bodies, handle) = start_mock_capture(
+            vec![
+                vec![
+                    delta_chunk("SUMMARY-OF-OLDER"),
+                    finish_chunk("stop"),
+                    usage_chunk(),
+                ],
+                vec![delta_chunk("answer"), finish_chunk("stop"), usage_chunk()],
+            ],
+            0,
+        );
+        let db = Arc::new(open_db("compact-update"));
+        let cid = insert_conv(&db);
+        let memory = temp_memory("compact-update");
+        const MARKER: &str = "INSTRUCTION-UPDATE-MARKER: reply in French from now on.";
+        const FILLER_FIRST: &str = "KEPT-TAIL-MARKER";
+
+        // One ordinary turn, then an instruction change delivered as a note, then
+        // enough plain history that the note is folded by compaction.
+        crate::db::insert_message(
+            &db,
+            cid.clone(),
+            "user".into(),
+            "first".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        crate::db::insert_message(
+            &db,
+            cid.clone(),
+            "prompt_update".into(),
+            MARKER.into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let filler = "x".repeat(2000); // ~500 tokens per message
+        let mut made_kept_tail = false;
+        for i in 0..60 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            // Mark the first message that will *survive* compaction, so the test
+            // can assert the note lands ahead of the verbatim tail.
+            let content = if i == 40 {
+                made_kept_tail = true;
+                format!("{FILLER_FIRST} {filler}")
+            } else {
+                format!("OLD-{i} {filler}")
+            };
+            crate::db::insert_message(
+                &db,
+                cid.clone(),
+                role.into(),
+                content,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(made_kept_tail);
+
+        let mut cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        cfg.model_overrides.insert(
+            "mock".into(),
+            crate::config::ModelOverride {
+                context_window: Some(30_000),
+                ..Default::default()
+            },
+        );
+        run_turn_once(&db, &cfg, &cid, "next", &memory).await;
+        let _ = handle.join();
+
+        let caps = bodies.lock().unwrap().clone();
+        assert_eq!(caps.len(), 2, "expected summarize + one live turn");
+        assert!(
+            !caps[0].contains("INSTRUCTION-UPDATE-MARKER"),
+            "the summarizer must not fold instruction notes into the summary"
+        );
+
+        let msgs = request_body(&caps[1])["messages"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let note_at = msgs
+            .iter()
+            .position(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("INSTRUCTION-UPDATE-MARKER"))
+            })
+            .expect("the folded instruction note must be re-injected");
+        assert_eq!(msgs[note_at]["role"], "system");
+        let summary_at = msgs
+            .iter()
+            .position(|m| m["content"].as_str().is_some_and(|c| c == "SUMMARY-OF-OLDER"))
+            .expect("the compaction summary is sent");
+        let kept_at = msgs
+            .iter()
+            .position(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("KEPT-TAIL-MARKER"))
+            })
+            .expect("the verbatim tail is sent");
+        assert_eq!(
+            summary_at,
+            1,
+            "the summary follows the frozen system prompt"
+        );
+        assert_eq!(
+            note_at,
+            summary_at + 1,
+            "the orphaned note sits right after the summary"
+        );
+        assert!(note_at < kept_at, "and ahead of the kept verbatim history");
+    }
+
     // --- YOLO auto-approve --------------------------------------------------
 
     /// With `auto_approve_tools` on, a gated call runs immediately, is announced
@@ -3977,6 +4176,63 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert!(
             !guard.iter().any(|e| matches!(e, StreamEvent::ToolCall { gated: true, .. })),
             "no gated tool call may be emitted under YOLO"
+        );
+    }
+
+    /// The snapshot must never advance for a note the model did not receive: if
+    /// the `prompt_update` insert fails, the change stays owed and the next turn
+    /// recomputes the same diff. (The old order wrote the snapshot first, losing
+    /// the change forever.)
+    #[test]
+    fn prompt_snapshot_advances_only_after_the_note_is_stored() {
+        let db = open_db("prompt-order");
+        let cid = insert_conv(&db);
+        assert!(crate::db::prompt_state(&db, &cid).unwrap().is_none());
+
+        let prepared = PreparedPrompt {
+            system: "S".into(),
+            update: Some("NOTE".into()),
+            snapshot: Some("{\"system\":\"S\"}".into()),
+        };
+
+        // A read-only connection makes every write fail, exactly as a locked or
+        // full database would.
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        }
+        assert!(persist_prompt_update(&db, &cid, &prepared).is_err());
+        assert!(
+            crate::db::prompt_state(&db, &cid).unwrap().is_none(),
+            "a note that could not be stored must leave the snapshot un-advanced"
+        );
+        assert!(prompt_update_rows(&db, &cid).is_empty());
+
+        // With writes working again: note first, then the snapshot.
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute_batch("PRAGMA query_only = OFF;").unwrap();
+        }
+        persist_prompt_update(&db, &cid, &prepared).unwrap();
+        let notes = prompt_update_rows(&db, &cid);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].content, "NOTE");
+        assert_eq!(
+            crate::db::prompt_state(&db, &cid).unwrap().as_deref(),
+            Some("{\"system\":\"S\"}")
+        );
+
+        // A turn with nothing to say (unchanged prompt) writes neither.
+        let quiet = PreparedPrompt {
+            system: "S".into(),
+            update: None,
+            snapshot: None,
+        };
+        persist_prompt_update(&db, &cid, &quiet).unwrap();
+        assert_eq!(prompt_update_rows(&db, &cid).len(), 1);
+        assert_eq!(
+            crate::db::prompt_state(&db, &cid).unwrap().as_deref(),
+            Some("{\"system\":\"S\"}")
         );
     }
 
@@ -4072,6 +4328,62 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert_eq!(conv.compaction_summary.as_deref(), Some("SUM"));
         assert_eq!(conv.compaction_through.as_deref(), Some(ids[1].as_str()));
         assert_eq!(crate::db::last_reflected_index(&db, &cid).unwrap(), Some(1));
+    }
+
+    /// Edit-time truncation tombstones only **synced** rows. `clock`, `memory` and
+/// `prompt_update` rows are local-only bookkeeping (revision 0, never pushed), so
+/// a tombstone for one would make the push emit a phantom `messages` delete for a
+/// row no other device ever saw.
+    #[test]
+    fn edit_truncation_does_not_tombstone_internal_rows() {
+        let db = open_db("edit-internal-tombstones");
+        let cid = insert_conv(&db);
+        let ids = seed_turns(&db, &cid); // user, assistant, user, assistant
+        let internal = ["clock", "prompt_update"]
+            .iter()
+            .map(|role| {
+                crate::db::insert_message(
+                    &db,
+                    cid.clone(),
+                    (*role).into(),
+                    format!("{role} note"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .id
+            })
+            .collect::<Vec<_>>();
+
+        crate::db::apply_user_message_edit(&db, &cid, &ids[0], "edited", None).unwrap();
+
+        let tombstoned: Vec<String> = {
+            let conn = db.0.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id FROM sync_tombstones WHERE entity = 'messages'")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        // The deleted conversation turns are carried to other devices...
+        for id in &ids[1..] {
+            assert!(tombstoned.contains(id), "turn {id} must be tombstoned");
+        }
+        // ...but the local-only notes are not.
+        for id in &internal {
+            assert!(
+                !tombstoned.contains(id),
+                "internal row {id} must not be tombstoned"
+            );
+        }
     }
 
     #[test]
@@ -4661,6 +4973,22 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         assert!(text.contains("big.txt (2000000 bytes, text/plain)"), "{text}");
         assert!(text.contains("could not be uploaded"), "{text}");
         assert!(text.contains("Tell the user"), "{text}");
+        // A file past the offload cap is never read or uploaded, and the note says
+        // *why* it is unreadable instead of blaming cloud sync.
+        let over_cap = Attachment {
+            id: "d".into(),
+            name: "disk.iso".into(),
+            mime: "application/octet-stream".into(),
+            size: crate::storage::MAX_UPLOAD_BYTES + 1,
+            kind: "file".into(),
+            ..Default::default()
+        };
+        let msg = user_request_message("here", &[over_cap]).unwrap();
+        let text = serde_json::to_string(&msg).unwrap();
+        assert!(text.contains("disk.iso"), "{text}");
+        assert!(text.contains("too large to upload for remote access"), "{text}");
+        assert!(!text.contains("cloud sync is off"), "{text}");
+        assert!(text.contains("too large for you to read"), "{text}");
         // An attachment with contents inline gets no offload note.
         let inline = Attachment {
             id: "c".into(),

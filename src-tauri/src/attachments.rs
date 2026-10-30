@@ -347,6 +347,20 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
     })
 }
 
+/// Why the offload of `path` must be skipped, or `None` when it fits.
+///
+/// Consults the file's **metadata length**, never its contents: the whole point
+/// is to refuse an over-cap file without buffering it. `known` is the size
+/// `read_attachment` already reported, used only when the path has since become
+/// unreadable (the read below fails anyway).
+async fn offload_size_error(path: &Path, known: u64) -> Option<String> {
+    let len = tokio::fs::metadata(path)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(known);
+    crate::storage::check_upload_size(len).err()
+}
+
 /// Read a batch of absolute paths (from the file picker or a drop) into
 /// attachments. Paths that fail to read are skipped rather than failing the
 /// whole batch. Runs on the blocking pool so large reads don't stall the UI.
@@ -359,7 +373,8 @@ pub fn read_attachment(path: &Path) -> Result<Attachment, String> {
 /// `remote_path` as `None` and the attachment in the batch, because the prompt
 /// then tells the model the file exists but could not be uploaded (see
 /// `chat::user_request_message`) — silently dropping it is the bug this exists
-/// to fix.
+/// to fix. An over-cap file is rejected from its metadata length, before
+/// anything is read into memory.
 #[tauri::command]
 pub async fn read_attachments(
     app: tauri::AppHandle,
@@ -386,6 +401,17 @@ pub async fn read_attachments(
     let mut out = Vec::with_capacity(read.len());
     for (path, mut a) in read {
         if needs_offload(&a) {
+            // Size gate BEFORE the read. `storage::upload` checks the cap too, but
+            // by then the whole file is already buffered (and `encrypt_bytes` then
+            // copies it again), so a dragged 4 GB ISO could OOM the app just to be
+            // rejected. The metadata length is already known, so an over-cap file
+            // is never read: it stays metadata-only, and the prompt says it is too
+            // large to offload (see `chat::user_request_message`).
+            if let Some(too_big) = offload_size_error(Path::new(&path), a.size).await {
+                eprintln!("attachments: offload of {path} skipped: {too_big}");
+                out.push(a);
+                continue;
+            }
             if creds.is_none() {
                 creds = Some(crate::storage::credentials().await.unwrap_or(None));
             }
@@ -616,6 +642,46 @@ mod tests {
         let err = read_image(p.to_str().unwrap()).unwrap_err();
         assert!(err.contains("too large"), "unexpected error: {err}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// The offload gate refuses an over-cap file from its **metadata** length, so
+    /// a huge attachment is never read into memory (the old order read it first
+    /// and only then let `storage::upload` reject it — and `encrypt_bytes` copied
+    /// it again).
+    #[tokio::test]
+    async fn offload_gate_rejects_an_over_cap_file_without_reading_it() {
+        use crate::storage::MAX_UPLOAD_BYTES;
+
+        // Sparse: the length is reported without writing 100 MB to disk.
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-offload-cap-{}.bin", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_UPLOAD_BYTES + 1).unwrap();
+        drop(f);
+
+        // The metadata-only read (no bytes touched).
+        let a = read_attachment(&p).unwrap();
+        assert!(needs_offload(&a), "a binary is the offload path");
+        assert_eq!(a.size, MAX_UPLOAD_BYTES + 1);
+
+        let err = offload_size_error(&p, a.size)
+            .await
+            .expect("an over-cap file must be refused");
+        assert!(err.contains("too large"), "{err}");
+
+        // Exactly at the cap is allowed (the check is inclusive).
+        let mut ok = std::env::temp_dir();
+        ok.push(format!("pi-chat-offload-cap-ok-{}.bin", std::process::id()));
+        let f = std::fs::File::create(&ok).unwrap();
+        f.set_len(MAX_UPLOAD_BYTES).unwrap();
+        drop(f);
+        assert!(
+            offload_size_error(&ok, MAX_UPLOAD_BYTES).await.is_none(),
+            "a file exactly at the cap is uploadable"
+        );
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&ok);
     }
 
     #[test]

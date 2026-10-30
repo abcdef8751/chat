@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -751,6 +751,18 @@ pub(crate) fn user_request_message(
                     "This file is too large or not text, so it was not included inline. \
                      Its remote path is: {key}\nUse fetch_file with that remote path to \
                      download it, then read_file to inspect the local copy."
+                )),
+                // Over the offload cap (`attachments::read_attachments` refuses to
+                // read such a file into memory at all), so say *why* it is
+                // unreadable rather than blaming cloud sync. The file is still
+                // named and sized above, so it is never silently dropped.
+                None if a.size > crate::storage::MAX_UPLOAD_BYTES => combined.push_str(&format!(
+                    "This file is too large to upload for remote access ({} bytes; the limit \
+                     is {} bytes), so its contents are not available to you. Tell the user \
+                     the file was attached but is too large for you to read in this \
+                     conversation.",
+                    a.size,
+                    crate::storage::MAX_UPLOAD_BYTES
                 )),
                 None => combined.push_str(
                     "This file could not be uploaded (cloud sync is off or not signed in), \
@@ -1573,10 +1585,19 @@ impl PromptSnapshot {
 }
 
 /// The result of preparing a turn's system prompt: the (stable) top-level system
-/// message and, when the instructions changed, the diff note to append.
+/// message, the diff note to append when the instructions changed, and the
+/// snapshot JSON the caller must persist.
 pub(crate) struct PreparedPrompt {
     pub system: String,
     pub update: Option<String>,
+    /// Serialized snapshot to write to `conversations.prompt_state`, or `None`
+    /// when the stored state already matches (nothing to advance).
+    ///
+    /// Deliberately returned rather than written here: the snapshot must only
+    /// advance **after** the `prompt_update` row has been stored (see
+    /// [`run_turn_core`]), so a failed note insert leaves the change owed instead
+    /// of losing it forever.
+    pub snapshot: Option<String>,
 }
 
 /// Maximum number of changed/context lines a prompt-update diff may carry. The
@@ -1731,8 +1752,9 @@ fn prompt_update_text(old: &str, new: &str) -> Option<String> {
     Some(format!("{PROMPT_UPDATE_PREAMBLE}\n{diff}"))
 }
 
-/// Prepare this turn's system prompt and advance the conversation's prompt
-/// snapshot.
+/// Prepare this turn's system prompt: the frozen top-level prefix, the diff note
+/// to deliver when the instructions changed, and (optionally) the snapshot the
+/// caller must persist.
 ///
 /// The conversation's top-level system message is **frozen** the first time a
 /// turn runs: it is the cacheable prefix, so re-rendering it in place would
@@ -1743,13 +1765,14 @@ fn prompt_update_text(old: &str, new: &str) -> Option<String> {
 /// - snapshot matches the current components → send the stored prefix, no note;
 /// - snapshot differs → send the stored prefix plus a line-diff note.
 ///
-/// The snapshot (and its parts) is written *before* the request, which is a
-/// deliberate best-effort trade: if the request then fails at the transport
-/// level (never reaching the model), that update is not re-sent on the next
-/// turn. A provider error that did reach the model, or an abort, still had the
-/// note in its context, so the parts are correct in the common cases. Re-sending
-/// would need an ack channel the loop does not have; a duplicate diff is more
-/// damaging to the transcript than dropping one.
+/// Whose job is the write: the caller's. [`PreparedPrompt::snapshot`] carries the
+/// JSON and [`run_turn_core`] stores the `prompt_update` row *first*, then the
+/// snapshot — so an insert that fails leaves the diff owed (the next turn
+/// re-emits it) instead of advancing state for a note the model never received.
+/// The snapshot is still written before the request is sent, so a transport-level
+/// failure (request never reaching the model) drops that update rather than
+/// replaying it: a duplicate diff is more damaging to the transcript than a
+/// dropped one, and the loop has no ack channel.
 pub(crate) fn prepare_system_prompt(
     db: &db::Db,
     cfg: &AppConfig,
@@ -1790,18 +1813,23 @@ pub(crate) fn prepare_system_prompt(
         },
     };
 
-    if save {
-        let snapshot = PromptSnapshot {
-            system: system.clone(),
-            parts: Some(parts_now),
-        };
-        if let Err(e) = db::set_prompt_state(db, &conversation.id, &snapshot.to_json()) {
-            // Best-effort bookkeeping: the turn still runs with the right prompt.
-            eprintln!("prompt snapshot: {e}");
-        }
-    }
+    let snapshot = if save {
+        Some(
+            PromptSnapshot {
+                system: system.clone(),
+                parts: Some(parts_now),
+            }
+            .to_json(),
+        )
+    } else {
+        None
+    };
 
-    PreparedPrompt { system, update }
+    PreparedPrompt {
+        system,
+        update,
+        snapshot,
+    }
 }
 
 /// The current component state for a conversation's system prompt.
@@ -1882,6 +1910,47 @@ pub(crate) fn conversation_system_prompt(
 /// Wrap a prompt-update diff in a system message (same shape as a clock note).
 fn prompt_update_message(text: &str) -> Result<ChatCompletionRequestMessage, String> {
     clock_note_message(text)
+}
+
+/// Store this turn's instruction-update note (when there is one) and only then
+/// advance the conversation's prompt snapshot.
+///
+/// The order is the whole point. `prepare_system_prompt` used to write the
+/// snapshot itself, before the note row existed: a failed insert then advanced the
+/// state anyway, so the model was never told about the change *and* its old
+/// snapshot said it had been — the instruction change was lost permanently. With
+/// the note persisted first, a failure propagates and the next turn recomputes the
+/// same diff.
+///
+/// A snapshot write that fails after a successful note insert is best-effort
+/// (logged): the next turn re-emits the same diff, which is a visible nuisance
+/// rather than a silently missed instruction.
+fn persist_prompt_update(
+    db: &db::Db,
+    conversation_id: &str,
+    prepared: &PreparedPrompt,
+) -> Result<(), String> {
+    if let Some(update) = prepared.update.as_deref() {
+        db::insert_message_full(
+            db,
+            conversation_id.to_string(),
+            "prompt_update".into(),
+            update.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+    }
+    if let Some(snapshot) = prepared.snapshot.as_deref() {
+        if let Err(e) = db::set_prompt_state(db, conversation_id, snapshot) {
+            eprintln!("prompt snapshot: {e}");
+        }
+    }
+    Ok(())
 }
 
 /// The tool list every turn advertises. Live, reflection and extraction share it
@@ -2222,6 +2291,48 @@ fn apply_history_mode(history: &mut Vec<db::MessageRow>, mode: HistoryMode) {
         cut = i;
     }
     history.drain(..cut);
+}
+
+/// Compose the history a request actually sends: the kept slice, preceded by
+/// every `prompt_update` note from the **full** conversation that the slice no
+/// longer carries.
+///
+/// An instruction change is delivered exactly once, as a `prompt_update` row that
+/// replays as a system message while it is inside the sent history. Anything
+/// that removes rows from the request therefore drops the note and silently
+/// reverts the model to the ORIGINAL frozen prompt — while `prompt_state.parts`
+/// still claims the change was told, so it is never re-sent:
+///
+/// - **compaction** folds older rows into the summary, and `summarize_history`
+///   deliberately excludes `prompt_update` rows from that fold (the summary keeps
+///   the instructions' *effect*, not a log of which diff was delivered when);
+/// - **bounded cron modes** (`Fresh`, `Recent`) replay little or nothing of the
+///   thread.
+///
+/// Re-injecting them right after the compaction summary (or the system prompt when
+/// there is none) and before the kept verbatim history restores the wire layout
+/// `… → summary → update notes → history → …`. A note that *is* still inside the
+/// slice is not repeated: it is already in position.
+///
+/// Cheap in the ordinary case: it only collects rows whose role matches, and a
+/// conversation with no instruction change has none.
+fn history_for_request(
+    full: &[db::MessageRow],
+    kept: &[db::MessageRow],
+) -> Vec<db::MessageRow> {
+    let kept_ids: HashSet<&str> = kept.iter().map(|m| m.id.as_str()).collect();
+    // Only notes are candidates, so a conversation that never changed its prompt
+    // pays one scan and allocates nothing.
+    let orphans: Vec<&db::MessageRow> = full
+        .iter()
+        .filter(|m| m.role == "prompt_update" && !kept_ids.contains(m.id.as_str()))
+        .collect();
+    if orphans.is_empty() {
+        return kept.to_vec();
+    }
+    let mut out: Vec<db::MessageRow> = orphans.into_iter().cloned().collect();
+    out.extend_from_slice(kept);
+    out
 }
 
 /// Per-job host-tool access for a cron run. The tool *list* is unchanged (cache
@@ -2666,7 +2777,10 @@ pub(crate) async fn run_turn_core(
 ) -> Result<TurnOutcome, String> {
     let conversation = db::get_conversation(db, &conversation_id)?
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
-    let mut history = db::read_messages(db, &conversation_id)?;
+    // The full transcript is read once: `history_for_request` needs it to find
+    // instruction-update notes that the request's kept window no longer carries.
+    let full_history = db::read_messages(db, &conversation_id)?;
+    let mut history = full_history.clone();
     // Bound what a scheduled run replays (see [`HistoryMode`]). The current
     // clock note and prompt are appended explicitly below, so a `Fresh` turn
     // still carries the time and the instruction.
@@ -2707,22 +2821,15 @@ pub(crate) async fn run_turn_core(
     );
     // Stored before the clock and user rows so the transcript replays in the same
     // order the request used: prompt-update note, clock note, user turn. Written
-    // even on the `regenerate` path (it goes through here too).
-    if let Some(update) = prepared.update.as_deref() {
-        db::insert_message_full(
-            db,
-            conversation_id.clone(),
-            "prompt_update".into(),
-            update.to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
-    }
+    // even on the `regenerate` path (it goes through here too) — there the user
+    // row already exists, so the note lands just after it, the same one-turn
+    // storage-order caveat the clock note carries.
+    //
+    // Order matters: the note must land BEFORE the snapshot advances. The note is
+    // what the model actually receives; if its insert fails, the change stays
+    // owed (the next turn recomputes the same diff from the old snapshot) instead
+    // of being marked as delivered and lost forever.
+    persist_prompt_update(db, &conversation_id, &prepared)?;
 
     // Clock note (persisted, hidden from the timeline): written *before* the user
     // turn so it replays verbatim on every later turn and each request stays an
@@ -2805,8 +2912,9 @@ pub(crate) async fn run_turn_core(
     };
 
     // Context layout: system prompt → compaction summary (when one exists) →
-    // verbatim history → [time note] → the new turn. If the request would cross
-    // the threshold of the model's window, force a compaction and rebuild from
+    // orphaned instruction-update notes → verbatim history → [new update note] →
+    // [time note] → the new turn. If the request would cross the
+    // threshold of the model's window, force a compaction and rebuild from
     // its result.
     // Compaction only applies to the full thread: a bounded window is already
     // small, and injecting the thread's summary into a `Fresh`/`Recent` run would
@@ -2817,7 +2925,8 @@ pub(crate) async fn run_turn_core(
         (None, 0)
     };
     let mut messages = {
-        let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
+        let kept = history_for_request(&full_history, &history[keep_start..]);
+        let mut msgs = build_context(&system_prompt, summary.as_deref(), &kept)?;
         if let Some(update) = &update_note {
             msgs.push(update.clone());
         }
@@ -2864,7 +2973,8 @@ pub(crate) async fn run_turn_core(
             summary = Some(new_summary);
             keep_start = new_start;
             messages = {
-                let mut msgs = build_context(&system_prompt, summary.as_deref(), &history[keep_start..])?;
+                let kept = history_for_request(&full_history, &history[keep_start..]);
+                let mut msgs = build_context(&system_prompt, summary.as_deref(), &kept)?;
                 if let Some(update) = &update_note {
                     msgs.push(update.clone());
                 }
