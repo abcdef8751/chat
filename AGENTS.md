@@ -165,7 +165,7 @@ synthetic **user** message appended *after* the round's tool results (so paralle
 tool calls stay adjacent to their results); it is request-scoped and never
 persisted. A non-vision model gets a plain text result saying it cannot view
 images. Detection is **extension or content**: `attachments::sniff_image_mime`
-recognizes the five formats from a 16-byte probe, so an extensionless screenshot
+recognizes the five formats from a 32-byte probe, so an extensionless screenshot
 or `fetch_file` download is still read as an image (and PNG bytes in a `.txt`
 are too). Failure paths are plain tool results, never a broken turn: too large →
 "too large to view", unreadable/unsupported → an actionable error, and a

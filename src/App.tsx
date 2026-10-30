@@ -241,6 +241,7 @@ export default function App() {
   interface LiveTurn {
     token: number;            // this turn's per-conversation token (turnTokens[id])
     assistantKey: string;     // "tmp-assistant-N"
+    startedAt: number;        // `Date.now()` when the turn was launched
     content: string;          // accumulated assistant text
     thinking: string;         // accumulated reasoning
     liveTools: LiveTool[];
@@ -325,9 +326,13 @@ export default function App() {
   // A staged (`tmp-user-*`) row is the local preview of a turn the backend
   // persists just before streaming starts. Two rows are the same turn when the
   // text matches and they carry the same attachment ids (unique per picked
-  // file), which is what "the fetched rows already contain this bubble" means.
+  // file), AND the persisted row is not older than the staged one — the backend
+  // inserts it milliseconds after the preview exists. The timestamp is what
+  // keeps a repeated identical send (or a cron thread replaying its prompt) from
+  // matching the PREVIOUS turn's identical user row and dropping the bubble.
   function sameStagedUserRow(persisted: Message, staged: Message): boolean {
     if (persisted.role !== "user" || persisted.content !== staged.content) return false;
+    if (persisted.created_at < staged.created_at) return false;
     const ids = (m: Message) => parseAttachments(m).map((a) => a.id).sort().join(",");
     return ids(persisted) === ids(staged);
   }
@@ -377,18 +382,12 @@ export default function App() {
     if (live) {
       // The backend writes the final assistant row immediately before emitting
       // `done`. If a reload resolves in that window, appending the synthetic live
-      // row would leave two assistant rows for one turn. Detect it by content
-      // (the persisted row is the live content) and apply the rows as-is; the
-      // terminal reload still reconciles. A blank/mismatched tail keeps the live
-      // row even if it is the previous turn's answer.
+      // row would leave two assistant rows for one turn. The persisted final row
+      // is the ONLY row created after this turn started, so its timestamp is an
+      // exact discriminator (content comparison could confuse a repeated
+      // identical reply with the previous turn's answer).
       const tail = rows.slice(-1)[0];
-      if (
-        tail &&
-        tail.role === "assistant" &&
-        tail.stop_reason != null &&
-        tail.content === live.content &&
-        (tail.thinking ?? "") === live.thinking
-      ) {
+      if (tail && tail.role === "assistant" && tail.stop_reason != null && tail.created_at >= live.startedAt) {
         setMessages([...rows, ...staged]);
         return;
       }
@@ -2128,7 +2127,14 @@ export default function App() {
     setOpenTrace(null);
 
     const token = (turnTokens[id] = (turnTokens[id] ?? 0) + 1);
-    setLiveTurn(id, { token, assistantKey, content: "", thinking: "", liveTools: [] });
+    setLiveTurn(id, {
+      token,
+      assistantKey,
+      startedAt: Date.now(),
+      content: "",
+      thinking: "",
+      liveTools: [],
+    });
 
     const received = { current: false };
     const channel = new Channel<StreamEvent>();
@@ -2176,7 +2182,7 @@ export default function App() {
       // transcript mutations (`setMessages`) are gated on the conversation
       // being the one viewed; tool events are recorded the same way, and
       // `turns()` only renders live entries while this chat is visible anyway
-      // (a `done`/`error` reload then replaces them with the persisted rows).
+      // (the terminal `done` reload then replaces them with the persisted rows).
       if (ev.type === "delta") {
         received.current = true;
         patchLiveTurn(id, (live) => {

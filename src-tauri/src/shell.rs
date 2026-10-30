@@ -216,7 +216,23 @@ impl ShellExecutor {
             {
                 return ToolOutput::err(format!("read_file: {e}"));
             }
-            match String::from_utf8(bytes) {
+            // A prefix can end *inside* a multi-byte character, which is not a
+            // binary file. `Utf8Error::error_len() == None` means "unexpected end
+            // of input", i.e. the prefix was cut mid-character: decode the valid
+            // part and truncate as usual. Any other error is real invalid UTF-8.
+            let valid = match std::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(_) => {
+                    return ToolOutput::err(format!(
+                        "read_file: {path} is a binary file ({} bytes), not text; read_file \
+                         returns text or supported images only",
+                        meta.len()
+                    ))
+                }
+            };
+            // `valid` is a char boundary by construction (`valid_up_to`).
+            match String::from_utf8(bytes[..valid].to_vec()) {
                 Ok(text) => ToolOutput::ok(truncate(text)),
                 Err(_) => ToolOutput::err(format!(
                     "read_file: {path} is a binary file ({} bytes), not text; read_file returns \
@@ -485,6 +501,19 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.ends_with("…[truncated]"), "len {}", out.content.len());
         assert!(out.content.chars().count() < 30_000);
+
+        // The prefix cut can land INSIDE a multi-byte character; that is not a
+        // binary file. 400k × 3-byte chars = 1.2 MB, so byte 1,000,000 is one
+        // byte into a character.
+        let wide = dir.join("wide.log");
+        std::fs::write(&wide, "界".repeat(400_000)).unwrap();
+        let out = ex.read_file(wide.to_str().unwrap()).await;
+        assert!(
+            !out.is_error,
+            "a prefix ending mid-character must not be reported as binary: {}",
+            out.content
+        );
+        assert!(out.content.chars().count() > 1_000);
 
         // Text still reads (and is truncated as before).
         let text = dir.join("notes.txt");

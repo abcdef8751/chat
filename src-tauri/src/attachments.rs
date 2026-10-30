@@ -274,7 +274,7 @@ const SNIFF_BYTES: usize = 32;
 /// Whether `path` is a raster image: a raster **extension**, or a regular file
 /// whose first [`SNIFF_BYTES`] bytes sniff as one of the supported formats.
 ///
-/// Cheap on purpose: only a 16-byte probe is read, never the whole file, and a
+/// Cheap on purpose: only a 32-byte probe is read, never the whole file, and a
 /// missing/unreadable path is simply "not an image" so the caller falls back to
 /// the ordinary `read_file` path (which reports the real error).
 pub fn is_image_file(path: &str) -> bool {
@@ -311,7 +311,7 @@ pub fn read_image(path: &str) -> Result<(String, String), String> {
         .extension()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    // Extension first (no read needed), then a 16-byte content sniff so a file
+    // Extension first (no read needed), then a 32-byte content sniff so a file
     // whose name says nothing about its contents is still recognised.
     let mime = if is_raster_image_ext(&ext) {
         mime_for(&ext)
