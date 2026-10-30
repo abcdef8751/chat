@@ -3,15 +3,18 @@
 //!
 //! A turn the user is watching needs no notification: the transcript updates in
 //! place (and the frontend shows its own per-chat indicator when the user is on
-//! another conversation inside a focused window). The OS notification exists
+//! another conversation inside a foreground app). The OS notification exists
 //! only for the case where the user cannot see the app at all — the window is
-//! unfocused, hidden to the tray, or Android is backgrounded.
+//! unfocused/hidden to the tray on desktop, or the Activity is stopped on
+//! Android.
 //!
-//! Suppression is therefore **focus-only**: unlike a cron run (which is
-//! suppressed when the window is focused *and* the run's thread is on screen),
-//! a live turn still notifies while the window is unfocused even if its
-//! conversation happens to be the active one — the user is not watching. The
-//! frontend's in-app dots cover the "focused window, another conversation" case.
+//! Suppression is therefore **foreground-only**: unlike a cron run (which is
+//! suppressed when the app is in the foreground *and* the run's thread is on
+//! screen), a live turn still notifies while the app is in the background even
+//! if its conversation happens to be the active one — the user is not watching.
+//! The frontend's in-app dots cover the "foreground app, another conversation"
+//! case. See [`app_is_foreground`] for why Android uses the Activity lifecycle
+//! rather than window focus.
 //!
 //! The posting path is deliberately the same one `cron::notify` uses
 //! ([`crate::cron::notifications_allowed`] + [`crate::cron::send_notification`]):
@@ -21,6 +24,30 @@
 //! than pretending it was sent.
 
 use tauri::{AppHandle, Manager};
+
+/// Whether the user can currently see the app.
+///
+/// **Desktop:** the main window is focused. A hidden (close-to-tray) or
+/// unfocused window is not being watched, so a completion should notify.
+///
+/// **Android:** the Activity is visible (between `onStart` and `onStop`),
+/// published through `nativeSetForeground`. `WebviewWindow::is_focused()` is
+/// unreliable there — it can report focused while backgrounded (suppressing
+/// every notification) or unfocused while visibly open (notifying in the user's
+/// face) — so the lifecycle flag is the only dependable signal.
+pub(crate) fn app_is_foreground(app: &AppHandle) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        crate::android::is_foreground()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        app.get_webview_window("main")
+            .and_then(|w| w.is_focused().ok())
+            .unwrap_or(false)
+    }
+}
 
 /// What a finished turn produced, as far as a notification is concerned.
 ///
@@ -43,14 +70,10 @@ pub(crate) fn notify_turn_finished(
     title: &str,
     outcome: TurnOutcome<'_>,
 ) {
-    // Focus is the whole predicate: a focused window means the user can see the
-    // in-app indicators. A hidden window (Linux close-to-tray) reports
-    // `is_focused() == false`, which is exactly when an OS notification helps.
-    let focused = app
-        .get_webview_window("main")
-        .and_then(|w| w.is_focused().ok())
-        .unwrap_or(false);
-    if focused {
+    // Foreground is the whole predicate: a foreground app means the user can
+    // see the in-app indicators (a hidden window or paused Android Activity
+    // reports false, which is exactly when an OS notification helps).
+    if app_is_foreground(app) {
         return;
     }
 

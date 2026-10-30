@@ -308,6 +308,34 @@ class MainActivity : TauriActivity() {
   // the `this` receiver (an Activity, i.e. a Context) is passed as the JNI context.
   private external fun initRustls()
 
+  // Backed by `Java_com_rp_chat_MainActivity_nativeSetForeground`. Android's
+  // window focus is unreliable for "is the app visible" (it can be true while
+  // paused and false while resumed), so completion notifications use this
+  // Activity lifecycle flag instead.
+  private external fun nativeSetForeground(foreground: Boolean)
+
+  private fun publishForeground(foreground: Boolean) {
+    try {
+      nativeSetForeground(foreground)
+    } catch (e: Throwable) {
+      // Never let the notification hint break the Activity lifecycle.
+      Log.w("MainActivity", "foreground bridge failed", e)
+    }
+  }
+
+  // Use onStart/onStop (visibility), not onResume/onPause: a dialog or a
+  // transient focus change pauses the Activity while it is still on screen, and
+  // that must not count as "background" (it would notify in the user's face).
+  override fun onStart() {
+    super.onStart()
+    publishForeground(true)
+  }
+
+  override fun onStop() {
+    publishForeground(false)
+    super.onStop()
+  }
+
   companion object {
     // Dispatch a cancelable `pi-back` event and report whether a listener
     // consumed it (`defaultPrevented`). Wrapped in try/catch so a page that

@@ -1080,6 +1080,8 @@
                 data_url: None,
                 text: Some("hello".into()),
                 remote_path: None,
+                source_path: None,
+                upload_error: None,
             },
             Attachment {
                 id: "a2".into(),
@@ -1090,6 +1092,8 @@
                 data_url: Some("data:image/png;base64,AAECAw==".into()),
                 text: None,
                 remote_path: None,
+                source_path: None,
+                upload_error: None,
             },
         ];
 
@@ -4777,6 +4781,8 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             data_url: None,
             text: Some("new context".into()),
             remote_path: None,
+            source_path: None,
+            upload_error: None,
         };
         crate::db::apply_user_message_edit(&db, &cid, &ids[0], "edited", Some(vec![att])).unwrap();
 
@@ -5620,9 +5626,9 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
         let msg = user_request_message("here", &[over_cap]).unwrap();
         let text = serde_json::to_string(&msg).unwrap();
         assert!(text.contains("disk.iso"), "{text}");
-        assert!(text.contains("too large to upload for remote access"), "{text}");
+        assert!(text.contains("too large to upload"), "{text}");
         assert!(!text.contains("cloud sync is off"), "{text}");
-        assert!(text.contains("too large for you to read"), "{text}");
+        assert!(text.contains("retry the upload"), "{text}");
         // An attachment with contents inline gets no offload note.
         let inline = Attachment {
             id: "c".into(),
@@ -5731,6 +5737,8 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
                     data_url: Some(format!("data:image/png;base64,{large_b64}")),
                     text: None,
                     remote_path: None,
+                    source_path: None,
+                    upload_error: None,
                 };
                 let att_json = serde_json::to_string(&vec![att]).unwrap();
                 crate::db::insert_message_full(&db, cid.clone(), role.into(), content, None, None, None, None, None, None, Some(att_json)).unwrap();
