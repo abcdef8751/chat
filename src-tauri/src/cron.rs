@@ -637,11 +637,8 @@ fn notify(app: &AppHandle, job: &db::CronJob, body: &str) {
     if !job.notify {
         return;
     }
-    let focused = app
-        .get_webview_window("main")
-        .and_then(|w| w.is_focused().ok())
-        .unwrap_or(false);
-    if focused && app.state::<CronState>().is_active(&job.conversation_id) {
+    let foreground = crate::notifications::app_is_foreground(app);
+    if foreground && app.state::<CronState>().is_active(&job.conversation_id) {
         return;
     }
     // Android 13+ silently drops a post without POST_NOTIFICATIONS, so check

@@ -14,6 +14,7 @@
 //! `RUN_COMMAND` transport + result `PendingIntent`/`BroadcastReceiver`.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
 use serde::Deserialize;
@@ -26,6 +27,39 @@ use crate::attachments::{
     is_text_like, is_viewable_image, mime_for, Attachment, MAX_IMAGE_BYTES,
     MAX_TEXT_BYTES,
 };
+
+/// Whether a Pi Chat Activity is currently resumed (i.e. the app is visible).
+///
+/// Defaults to `true`: before the first `onResume` there is no finished turn to
+/// notify about, and a `false` default would let a startup-adjacent completion
+/// post a notification while the app is visibly opening. The Kotlin side sets
+/// this from `onResume`/`onPause` (`nativeSetForeground`).
+static APP_FOREGROUND: AtomicBool = AtomicBool::new(true);
+
+/// Whether the app is in the foreground.
+///
+/// Android's **window focus** is not a reliable proxy: the single WebView window
+/// can report `is_focused() == true` while the Activity is paused (so background
+/// completions never notified) and `false` while it is visibly resumed (so
+/// foreground completions *did* notify). The Activity lifecycle is the source of
+/// truth, published through [`Java_com_rp_chat_MainActivity_nativeSetForeground`].
+pub(crate) fn is_foreground() -> bool {
+    APP_FOREGROUND.load(Ordering::Relaxed)
+}
+
+/// JNI export for Kotlin `MainActivity.nativeSetForeground(Boolean)`, invoked
+/// from `onStart` / `onStop` (visibility, not pause — a dialog pauses the
+/// Activity while it is still on screen). Keep the name in sync with the
+/// external declaration in `MainActivity.kt`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_rp_chat_MainActivity_nativeSetForeground(
+    _env: jni::EnvUnowned,
+    _activity: jni::objects::JObject,
+    foreground: jni::sys::jboolean,
+) {
+    APP_FOREGROUND.store(foreground, Ordering::Relaxed);
+}
 
 /// Initialize `rustls-platform-verifier` with Android's system trust store
 /// before the first TLS handshake.
@@ -199,6 +233,8 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
             data_url: Some(format!("data:{};base64,{}", mime, out.data)),
             text: None,
             remote_path: None,
+            source_path: None,
+            upload_error: None,
         });
     }
 
@@ -214,6 +250,8 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
                     data_url: None,
                     text: Some(text),
                     remote_path: None,
+                    source_path: None,
+                    upload_error: None,
                 });
             }
         }
@@ -228,6 +266,8 @@ pub async fn read_attachment_from_uri(app: &AppHandle, uri: String) -> Result<At
         data_url: None,
         text: None,
         remote_path: None,
+        source_path: None,
+        upload_error: None,
     })
 }
 
