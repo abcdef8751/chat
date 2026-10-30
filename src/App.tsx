@@ -2071,31 +2071,49 @@ export default function App() {
     }
   }
 
+  // Attachments with a retry in flight. Each upload mints a fresh object key, so
+  // a double click would upload the file twice and orphan the first object.
+  const retryingAttachments = new Set<string>();
+
   // Retry a failed remote offload from the composer's attachment chip.
   async function retryPendingAttachment(a: Attachment) {
     const id = activeId();
+    const key = `pending:${a.id}`;
+    if (retryingAttachments.has(key)) return;
+    retryingAttachments.add(key);
     try {
       const updated = await retryAttachmentUpload(a);
       setPendingAttachments((prev) =>
         prev.map((x) => (x.id === updated.id ? updated : x)),
       );
+      if (updated.uploadError) setStreamErrorFor(id, updated.uploadError);
+      else clearStreamError(id);
     } catch (e) {
       setStreamErrorFor(id, String(e));
+    } finally {
+      retryingAttachments.delete(key);
     }
   }
 
   // Retry a failed offload from a persisted user message. The backend rewrites
-  // the row's attachment JSON on success; reload so the chip shows "remote".
+  // the row's attachment JSON on success, so reload through `reloadTranscript`:
+  // a plain `listMessages().then(setMessages)` would replace the transcript with
+  // the persisted rows and drop the live assistant row (the retry chip is
+  // rendered the moment the user row exists, i.e. while the reply still streams).
   async function retryMessageAttachment(messageId: string, a: Attachment) {
     const id = activeId();
+    const key = `message:${a.id}`;
+    if (retryingAttachments.has(key)) return;
+    retryingAttachments.add(key);
     try {
-      await retryAttachmentUpload(a, messageId);
-      if (id) {
-        const rows = await listMessages(id);
-        if (activeId() === id) setMessages(rows);
-      }
+      const updated = await retryAttachmentUpload(a, messageId);
+      if (updated.uploadError) setStreamErrorFor(id, updated.uploadError);
+      else clearStreamError(id);
+      if (id) await reloadTranscript(id);
     } catch (e) {
       setStreamErrorFor(id, String(e));
+    } finally {
+      retryingAttachments.delete(key);
     }
   }
 
