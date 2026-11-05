@@ -1517,10 +1517,11 @@ const HOST_TOOLS_NOTE: &str = "Host tools (bash, read_file, write_file) execute 
 /// Discovery is one cheap app-local `list_skills` call when a task looks like it
 /// matches. A named constant because [`system_id`] hashes the shipped prompt
 /// strings — a change here must change the id.
-const SKILLS_NOTE: &str = "Skills are the user's saved, reusable instruction sets (Markdown \
-     files they keep, invoked with /<id>). When a request clearly matches one, call list_skills, \
-     then read_skill with its id, and follow those instructions for this turn; the user can also \
-     invoke one directly with /<id>. Do not read a skill that does not apply.";
+const SKILLS_NOTE: &str = "The user keeps skills: reusable instruction sets identified by an id \
+     (the list below shows the current ones, when any). When a request clearly matches one, call \
+     read_skill with its id and follow those instructions for this turn; the user can also invoke \
+     one directly with /<id>. Call list_skills if you need an up-to-date list (for example before \
+     editing one). Do not read a skill that does not apply.";
 
 /// The work-note/duplicate-text nudge.
 ///
@@ -1692,6 +1693,12 @@ pub(crate) struct SystemPromptParts {
     pub started: String,
     /// The bounded memory block (`MemoryState::context_block`); `""` if empty.
     pub memory: String,
+    /// Compact index of the user's skills (see `skills::prompt_index`); `""` when
+    /// there are none. Unlike the other user-content parts this one changes as
+    /// skills are added/removed, which is exactly what the frozen-prefix plus
+    /// bounded-diff mechanism is for: the top-level system text never changes,
+    /// only a small `prompt_update` note does.
+    pub skills: String,
 }
 
 impl SystemPromptParts {
@@ -1741,6 +1748,9 @@ impl SystemPromptParts {
             style: STYLE_NOTE.to_string(),
             started,
             memory: memory.context_block(),
+            // The caller with a skills directory fills this in; `new` stays
+            // pure so the historical renderer stays byte-identical.
+            skills: String::new(),
         }
     }
 
@@ -1759,9 +1769,17 @@ impl SystemPromptParts {
             segments.push(self.system.clone());
         }
         segments.push(self.tools.clone());
-        // Constant, never snapshotted as its own part: it ships with the build,
-        // so `from_json` needs no new key and an old snapshot still parses.
-        segments.push(SKILLS_NOTE.to_string());
+        // Constant instruction (ships with the build, so no snapshot key), then
+        // the live index when there is one. Putting the index in this segment
+        // means a skill added/removed changes `parts` — delivered as a bounded
+        // line diff by `prepare_system_prompt`, never by re-sending the frozen
+        // system text.
+        let mut skills = SKILLS_NOTE.to_string();
+        if !self.skills.trim().is_empty() {
+            skills.push('\n');
+            skills.push_str(self.skills.trim_end());
+        }
+        segments.push(skills);
         segments.push(self.style.clone());
         if !self.started.trim().is_empty() {
             segments.push(self.started.clone());
@@ -1785,6 +1803,7 @@ impl SystemPromptParts {
             "style": self.style,
             "started": self.started,
             "memory": self.memory,
+            "skills": self.skills,
         })
     }
 
@@ -1793,6 +1812,11 @@ impl SystemPromptParts {
     /// text). Every key is required — notably `system`: a pre-`system` snapshot
     /// must NOT parse as current, or the model would never be told about the new
     /// id line. Returning `None` here routes it through the whole-text diff.
+    ///
+    /// `skills` is the one exception: it is older than this field, and a snapshot
+    /// taken before the index existed was telling the model "no skills listed",
+    /// which defaults correctly to `""`. Requiring it would force a whole-text
+    /// diff on every upgrade for a purely additive part.
     fn from_json(v: &Value) -> Option<Self> {
         let get = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         Some(Self {
@@ -1804,6 +1828,7 @@ impl SystemPromptParts {
             style: get("style")?,
             started: get("started")?,
             memory: get("memory")?,
+            skills: get("skills").unwrap_or_default(),
         })
     }
 
@@ -2104,19 +2129,27 @@ fn conversation_prompt_parts(
     model: &str,
     memory: &crate::memory::MemoryState,
 ) -> SystemPromptParts {
+    // Test builds: the skills directory is process-global and tests repoint it,
+    // so serialize with them while the index is read. Release: nothing.
+    #[cfg(test)]
+    let _skills_guard = crate::skills::test_lock();
     let base_prompt = conversation
         .system_prompt
         .clone()
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
     let model_label = crate::pricing::cached_model_name(db, base_url, model)
         .unwrap_or_else(|| model.to_string());
-    SystemPromptParts::new(
+    let mut parts = SystemPromptParts::new(
         &base_prompt,
         &model_label,
         &cfg.preferences,
         memory,
         Some(conversation.created_at),
-    )
+    );
+    // The live skill index. It is a normal part: when it changes, the model gets
+    // a bounded `prompt_update` diff and the frozen system text is untouched.
+    parts.skills = crate::skills::prompt_index();
+    parts
 }
 
 /// Base system prompt, with explicit user preferences injected at the top and

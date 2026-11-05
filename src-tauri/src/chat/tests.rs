@@ -3563,10 +3563,11 @@ fn legacy_build_system_prompt(
             .to_string(),
     );
     parts.push(
-        "Skills are the user's saved, reusable instruction sets (Markdown files they keep, \
-         invoked with /<id>). When a request clearly matches one, call list_skills, then \
-         read_skill with its id, and follow those instructions for this turn; the user can also \
-         invoke one directly with /<id>. Do not read a skill that does not apply."
+        "The user keeps skills: reusable instruction sets identified by an id \
+         (the list below shows the current ones, when any). When a request clearly matches one, \
+         call read_skill with its id and follow those instructions for this turn; the user can \
+         also invoke one directly with /<id>. Call list_skills if you need an up-to-date list \
+         (for example before editing one). Do not read a skill that does not apply."
             .to_string(),
     );
     parts.push(
@@ -3628,6 +3629,64 @@ fn system_prompt_parts_render_identically_to_the_legacy_renderer() {
         expected
     );
     assert_eq!(build_system_prompt("BASE", "mock", "", &empty_memory, None), expected);
+}
+
+/// The skills index is a normal part, so adding/removing a skill changes how the
+/// parts render — and that is delivered as a bounded line diff. The frozen
+/// top-level system text (the cacheable prefix) is untouched: this is the whole
+/// reason the index is safe to keep in the prompt.
+#[test]
+fn a_skills_index_change_is_a_diff_not_a_new_system_prompt() {
+    let memory = temp_memory("skills-diff");
+    let mut first = SystemPromptParts::new("BASE", "mock", "", &memory, Some(0));
+    first.skills = "- alpha — Alpha".into();
+    let rendered_first = first.rendered();
+    assert!(rendered_first.contains("- alpha — Alpha"));
+    assert!(!rendered_first.contains("- beta"));
+
+    let mut second = first.clone();
+    second.skills = "- alpha — Alpha\n- beta — Beta".into();
+    let rendered_second = second.rendered();
+    assert_ne!(rendered_first, rendered_second);
+
+    let note = prompt_update_text(&rendered_first, &rendered_second).expect("one-line diff");
+    assert!(note.contains("+- beta — Beta"), "{note}");
+    // The note is a line diff, not a re-injection of the prompt.
+    assert!(
+        note.chars().count() < rendered_second.chars().count(),
+        "the update re-sent the whole prompt"
+    );
+
+    // A snapshot written before the skills part existed still parses, with an
+    // empty index — so an upgrade doesn't force a whole-text diff.
+    let mut old = first.to_json();
+    old.as_object_mut().unwrap().remove("skills");
+    let parsed = SystemPromptParts::from_json(&old).expect("old snapshots must parse");
+    assert_eq!(parsed.skills, "");
+    // ...and a current snapshot round-trips the index.
+    let round = SystemPromptParts::from_json(&first.to_json()).unwrap();
+    assert_eq!(round.skills, "- alpha — Alpha");
+}
+
+#[test]
+fn with_no_skills_the_prompt_matches_the_historical_renderer() {
+    // `new()` starts with an empty index, so every pre-existing byte-identity
+    // assertion still holds; the note itself is constant.
+    let memory = temp_memory("skills-empty");
+    let prompt = SystemPromptParts::new("BASE", "mock", "", &memory, None).rendered();
+    assert!(prompt.contains("The user keeps skills:"));
+    assert!(!prompt.contains("Skills you can read with read_skill:"));
+
+    let mut with_index = SystemPromptParts::new("BASE", "mock", "", &memory, None);
+    with_index.skills = "Skills you can read with read_skill:\n- a — A".into();
+    let rendered = with_index.rendered();
+    assert!(rendered.contains("- a — A"));
+    // The index sits immediately after the skills instruction and before the
+    // work-note nudge, so the diff is localised to those lines.
+    let note_pos = rendered.find("The user keeps skills:").unwrap();
+    let index_pos = rendered.find("- a — A").unwrap();
+    let style_pos = rendered.find("Text you emit before a tool call").unwrap();
+    assert!(note_pos < index_pos && index_pos < style_pos);
 }
 
 #[test]
@@ -3795,7 +3854,7 @@ async fn first_turn_snapshots_the_system_prompt_without_an_update_note() {
             Some(0)
         )
     );
-    // Snapshot shape: system + the eight parts.
+    // Snapshot shape: system + the nine parts (the skills index is additive).
     let parts = v["parts"].as_object().expect("snapshot.parts");
     for key in [
         "preferences",
@@ -3806,6 +3865,7 @@ async fn first_turn_snapshots_the_system_prompt_without_an_update_note() {
         "style",
         "started",
         "memory",
+        "skills",
     ] {
         assert!(parts.contains_key(key), "missing part {key}");
     }

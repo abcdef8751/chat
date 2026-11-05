@@ -73,7 +73,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **439 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **442 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
@@ -265,11 +265,14 @@ Recomputing the whole system prompt every turn and re-injecting it at the top
 would invalidate the provider's prefix cache on every preference/memory/model
 change. Instead the prompt is **snapshotted and diffed**:
 
-- **Parts.** `chat::SystemPromptParts` holds the eight components
+- **Parts.** `chat::SystemPromptParts` holds the nine components
   (`preferences`, `base`, `model`, `system`, `tools`, `style`, `started`,
-  `memory`) and `rendered()` reproduces the historical `build_system_prompt`
-  output byte-for-byte plus the system-id line (pinned by a test). The clock is
-  **not** a part — it is a separate `clock` row.
+  `memory`, `skills`) and `rendered()` reproduces the historical
+  `build_system_prompt` output byte-for-byte plus the system-id line (pinned by a
+  test). The clock is **not** a part — it is a separate `clock` row. `skills` is
+  the one additive part: `from_json` defaults it to `""`, so a snapshot written
+  before the index existed still parses and an upgrade does not force a
+  whole-text diff.
 - **System identity.** The `system` part renders
   `Running system: pi-chat/<version>+<8-hex prompt hash>. Environment: OS: <os>
   (<arch>); user: <user>; host: <host>; home: <home>. …`, where the hash is
@@ -967,14 +970,19 @@ Settings → Skills card lists them and shows the folder.
   stays Termux-only (it is a shell, not a file operation). The same rule runs on
   desktop, where the native path is already the norm.
 - **The assistant uses a skill on demand.** The system prompt carries a constant
-  `SKILLS_NOTE` (part of the shipped prompt, so it changes `prompt_hash`): when a
-  request clearly matches one, the model is told to call `list_skills`, then
-  `read_skill` with its id, and follow those instructions for that turn; the user
-  can also type `/<id>`. It deliberately does **not** inline the skill index or
-  bodies into the prompt: an index would churn the cacheable prefix whenever a
-  skill is added/removed, and a skill name/description is user-authored text the
-  model would treat as instruction. The body stays request-scoped, so a later
-  turn must read it again (or the user re-invokes `/id`).
+  `SKILLS_NOTE` telling the model to `read_skill` and follow a skill when a
+  request matches one (the user can also type `/<id>`), plus a live **index** of
+  the user's skills (`- <id> — <name>: <description>`, 40 entries max, one line
+  each, name/description flattened and capped) so it knows what exists without a
+  tool call. The index is a `SystemPromptParts` component: adding or removing a
+  skill changes `parts`, which the snapshot machinery delivers as a **bounded
+  `prompt_update` line diff** — the frozen top-level system text (the cacheable
+  prefix) is never re-sent or invalidated. That is the whole reason the index is
+  safe to keep in the prompt; the earlier "an index would churn the prefix"
+  claim was wrong. Skill **bodies** stay out of the prompt and request-scoped:
+  a later turn must `read_skill` again (or the user re-invokes `/id`).
+  User-authored metadata is still a prompt-injection surface, bounded exactly
+  like the memory block (one line, capped) and accepted for the same reason.
 - **Replay caveat:** the skill body is request-only; later turns replay the user
   text without it (the cap keeps that bounded). Do not rely on a skill body
   being silently re-injected on the next turn.
@@ -1621,9 +1629,11 @@ persisted message, and the pinned-provider test asserts the endpoint/model while
 the global default differs. (3) **Agent-managed skills** — native `list_skills` /
 `read_skill` / `save_skill` / `delete_skill` (writes approval-gated) plus native
 `read_file`/`write_file` for app-private paths, because on Android the skills
-folder is unreachable from both the user and Termux; the `/` menu re-reads
-skills after every turn. (4) **MCP per-server config** — HTTP `headers` and stdio
-`env`, edited as key→value rows in Settings and carried on every JSON-RPC POST.
+folder is unreachable from both the user and Termux; the system prompt carries a
+constant skills instruction plus a bounded live index (a `prompt_update` diff,
+never a re-sent prefix), and the `/` menu re-reads skills after every turn.
+(4) **MCP per-server config** — HTTP `headers` and stdio `env`, edited as
+key→value rows in Settings and carried on every JSON-RPC POST.
 
 Residuals from this batch:
 
@@ -1637,7 +1647,7 @@ Residuals from this batch:
   existing skill); the model should use the id `list_skills` prints.
 - **`headers` values (like `env`) cross IPC** to the Settings renderer, and
   `mcp.json` is writable through `write_file` when approved or under YOLO.
-- **GUI e2e was not run** for this batch; `cargo test --lib` (439), `tsc`,
+- **GUI e2e was not run** for this batch; `cargo test --lib` (442), `tsc`,
   `npm run build`, `npm run test:turns` and clippy (2 pre-existing lints) are
   green.
 

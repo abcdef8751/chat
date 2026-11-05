@@ -29,6 +29,17 @@ pub struct SkillInfo {
 /// Where the skills live (set once from `setup`).
 static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// Serializes tests that repoint [`DIR`]. The prompt builder reads it too, so it
+/// takes the same lock in test builds; a test can never see an index from a
+/// directory another test is about to remove. No effect on release builds.
+#[cfg(test)]
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn init(dir: PathBuf) {
     // A missing directory is not an error: the app creates it so the user has a
     // place to drop files. A failure is logged and listing simply stays empty.
@@ -519,6 +530,73 @@ pub fn delete(id: &str) -> Result<String, String> {
     Ok(format!("Deleted skill '{resolved}'."))
 }
 
+/// A compact, deterministic index of the user's skills for the system prompt.
+///
+/// `""` when there are none, so a user without skills gets no extra prompt text
+/// (and no first-turn diff). Otherwise one `- <id> — <name>: <description>` line
+/// per skill (the description omitted when empty), capped so a large library
+/// cannot bloat the prompt.
+///
+/// This is a **user-content** part: it rides `SystemPromptParts` so a change is
+/// delivered as a bounded `prompt_update` line diff against the frozen top-level
+/// system message (see `chat::prepare_system_prompt`) — adding or removing a
+/// skill never re-sends or invalidates the cached prefix. Values are flattened
+/// to one line and capped, so a skill name cannot inject instructions or a
+/// paragraph.
+pub fn prompt_index() -> String {
+    /// Entries before the index falls back to `list_skills`.
+    const MAX_ENTRIES: usize = 40;
+    /// Per-value caps; the frontmatter description is already capped, a name is
+    /// not.
+    const MAX_NAME_CHARS: usize = 80;
+    const MAX_DESCRIPTION_CHARS: usize = 200;
+    const INDEX_HEADER: &str = "Skills you can read with read_skill:";
+
+    let skills = list();
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(INDEX_HEADER);
+    let shown = skills.len().min(MAX_ENTRIES);
+    for skill in &skills[..shown] {
+        let line = format!(
+            "- {} — {}{}",
+            skill.id,
+            cap_one_line(&skill.name, MAX_NAME_CHARS),
+            if skill.description.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", cap_one_line(&skill.description, MAX_DESCRIPTION_CHARS))
+            }
+        );
+        out.push('\n');
+        out.push_str(&line);
+    }
+    if skills.len() > shown {
+        out.push_str(&format!(
+            "\n…and {} more (call list_skills).",
+            skills.len() - shown
+        ));
+    }
+    out
+}
+
+/// Flatten a value to one line (control characters become spaces), trim it, and
+/// cap it — so a skill's metadata cannot add prompt structure of its own.
+fn cap_one_line(value: &str, max_chars: usize) -> String {
+    let flattened: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = flattened.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut capped: String = trimmed.chars().take(max_chars).collect();
+    capped.push('…');
+    capped
+}
+
 /// Whether `name` is one of the skill tools (used by `chat.rs` to route
 /// dispatch). They share the live/reflection tool list for prompt cache
 /// alignment (extraction advertises no tools at all); access is enforced by
@@ -713,10 +791,10 @@ mod tests {
 
     /// `init` publishes a process-global directory, so every test that calls it
     /// must take this lock (a test could otherwise re-point the global mid-test).
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// Shared with `chat::conversation_prompt_parts`, which reads the index
+    /// while a test may be repointing it.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        test_lock()
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -999,6 +1077,55 @@ mod tests {
         assert!(delete("a").is_ok());
         assert!(dir.join("b.md").exists());
         assert!(!dir.join("a.md").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The system-prompt index is empty without skills, lists id/name/description
+    /// otherwise, flattens and caps metadata, and bounds the entry count.
+    #[test]
+    fn prompt_index_is_compact_and_bounded() {
+        let _guard = lock();
+        let dir = temp_dir("index");
+        init(dir.clone());
+        assert_eq!(prompt_index(), "");
+
+        save("alpha", "body", Some("Alpha"), Some("Does A")).unwrap();
+        save("beta", "body", Some("Beta"), None).unwrap();
+        // No description and no body paragraph → the line ends at the name.
+        save("empty", "", Some("Empty"), None).unwrap();
+        let index = prompt_index();
+        assert!(
+            index.starts_with("Skills you can read with read_skill:"),
+            "{index}"
+        );
+        assert!(index.contains("\n- alpha — Alpha: Does A"), "{index}");
+        assert!(index.contains("\n- beta — Beta: body"), "{index}");
+        assert!(index.ends_with("\n- empty — Empty"), "{index}");
+
+        // A long name is flattened to one line and capped.
+        save("long", "body", Some(&"N".repeat(300)), None).unwrap();
+        let index = prompt_index();
+        let line = index.lines().find(|l| l.starts_with("- long")).unwrap_or("");
+        assert!(line.chars().count() <= 100, "{line}");
+        assert!(!line.contains('\n'));
+
+        // A large library is truncated with a count instead of bloating the
+        // prompt (and `list_skills` remains the full source).
+        std::fs::remove_file(dir.join("long.md")).unwrap();
+        for i in 0..45 {
+            std::fs::write(
+                dir.join(format!("s{i:02}.md")),
+                format!("---\nname: S{i}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let index = prompt_index();
+        // 3 named skills + 45 generated = 48; 40 are listed.
+        assert!(
+            index.contains("…and 8 more (call list_skills)."),
+            "expected a truncation tally, got:\n{index}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
