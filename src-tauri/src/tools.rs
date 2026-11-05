@@ -181,9 +181,11 @@ fn skill_tools() -> Vec<ChatCompletionTools> {
             "Create or overwrite a skill: a Markdown instruction file the user can invoke with \
              /id. Pass the complete content. Optional `name`/`description` are written as YAML \
              frontmatter only when provided; without them the content is stored exactly as \
-             given. If the id resolves to an existing skill (by stem or display name), that file \
-             is overwritten. Read an existing skill with `read_skill` before rewriting it, and \
-             keep it under 100,000 characters.",
+             given. The target is the file whose **id (file stem)** matches; a display name is \
+             NOT resolved for writes — saving by a name creates a skill with that id and the \
+             reply tells you which existing skill already carries the name. Use the id that \
+             `list_skills` prints. Read an existing skill with `read_skill` before rewriting it, \
+             and keep it under 100,000 characters.",
             json!({
                 "type": "object",
                 "properties": {

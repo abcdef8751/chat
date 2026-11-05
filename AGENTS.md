@@ -274,7 +274,7 @@ change. Instead the prompt is **snapshotted and diffed**:
   `Running system: pi-chat/<version>+<8-hex prompt hash>. Environment: OS: <os>
   (<arch>); user: <user>; host: <host>; home: <home>. …`, where the hash is
   FNV-1a 64 over the shipped prompt strings (`DEFAULT_SYSTEM_PROMPT`, the
-  host-tools note, the style note). The id therefore identifies the app build
+  host-tools note, the skills note, the style note). The id therefore identifies the app build
   **and** the system-prompt revision: updating the app (or any shipped prompt
   text) changes it, and because the line is part of `parts`, the model is told
   about the change through the ordinary `prompt_update` diff. Pre-`system`
@@ -966,6 +966,15 @@ Settings → Skills card lists them and shows the folder.
   `/x/skills`; a symlink inside the directory that points out is refused. `bash`
   stays Termux-only (it is a shell, not a file operation). The same rule runs on
   desktop, where the native path is already the norm.
+- **The assistant uses a skill on demand.** The system prompt carries a constant
+  `SKILLS_NOTE` (part of the shipped prompt, so it changes `prompt_hash`): when a
+  request clearly matches one, the model is told to call `list_skills`, then
+  `read_skill` with its id, and follow those instructions for that turn; the user
+  can also type `/<id>`. It deliberately does **not** inline the skill index or
+  bodies into the prompt: an index would churn the cacheable prefix whenever a
+  skill is added/removed, and a skill name/description is user-authored text the
+  model would treat as instruction. The body stays request-scoped, so a later
+  turn must read it again (or the user re-invokes `/id`).
 - **Replay caveat:** the skill body is request-only; later turns replay the user
   text without it (the cap keeps that bounded). Do not rely on a skill body
   being silently re-injected on the next turn.
@@ -1600,11 +1609,12 @@ and the app is byte-identical to before. Never blocks the UI.
 
 **Latest batch (four fixes):** (1) **one keyboard lift** — Android's native IME
 inset (folded into the app root's `padding-bottom` by `MainActivity.kt`) and
-`createKeyboardInset()`'s visual-viewport estimate both fired, so the composer
-was lifted twice by differing amounts; the JS helper now returns 0 whenever
-`window.PiInsets` exists, `<main>` is only padded without the bridge, and the
-transcript follows a single `keyboardLift()` (the composer also re-measures on
-viewport changes). (2) **Model selection verified end to end** — no change was
+`createKeyboardInset()`'s visual-viewport estimate were both applied, so the
+composer was lifted twice by differing amounts. Now `<main>` pads only
+`max(0, estimate − native)` and the transcript follows
+`max(estimate, native)`: on a healthy bridge the native inset wins (extra 0), on
+a bridge that reports nothing the estimate is the only lift, and the two are
+never summed. The composer also re-measures on viewport changes. (2) **Model selection verified end to end** — no change was
 needed: the header picker persists `conversations.model`, `stream_chat` reads
 that row, `run_turn_core` stamps `turn_cfg.model` onto the request body and the
 persisted message, and the pinned-provider test asserts the endpoint/model while

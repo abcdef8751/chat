@@ -1508,6 +1508,20 @@ pub(crate) fn clock_note_message(text: &str) -> Result<ChatCompletionRequestMess
 const HOST_TOOLS_NOTE: &str = "Host tools (bash, read_file, write_file) execute on the user's own \
      device — the machine they are sending from — not on a remote server.";
 
+/// The skills nudge. Skills are user-kept instruction files that the model can
+/// read and follow; without this the model only learns they exist if the user
+/// happens to type `/id` or asks for one by name. Deliberately a *constant* note
+/// rather than an inline index: a per-skill index would churn the cacheable
+/// system prompt every time a skill is added/removed, and would put user-authored
+/// text (a skill name/description) where the model treats it as instruction.
+/// Discovery is one cheap app-local `list_skills` call when a task looks like it
+/// matches. A named constant because [`system_id`] hashes the shipped prompt
+/// strings — a change here must change the id.
+const SKILLS_NOTE: &str = "Skills are the user's saved, reusable instruction sets (Markdown \
+     files they keep, invoked with /<id>). When a request clearly matches one, call list_skills, \
+     then read_skill with its id, and follow those instructions for this turn; the user can also \
+     invoke one directly with /<id>. Do not read a skill that does not apply.";
+
 /// The work-note/duplicate-text nudge.
 ///
 /// The transcript shows the text a model emits *before* a tool call, and models
@@ -1534,10 +1548,12 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 /// The 8 lowercase hex characters identifying the shipped system-prompt
 /// revision: the FNV-1a 64-bit hash (high half) of the default prompt plus the
-/// two constant notes, separated by `0x1f` so adjacent strings cannot collide by
-/// concatenation.
+/// three constant notes, separated by `0x1f` so adjacent strings cannot collide
+/// by concatenation.
 pub(crate) fn prompt_hash() -> String {
-    let joined = format!("{DEFAULT_SYSTEM_PROMPT}\u{1f}{HOST_TOOLS_NOTE}\u{1f}{STYLE_NOTE}");
+    let joined = format!(
+        "{DEFAULT_SYSTEM_PROMPT}\u{1f}{HOST_TOOLS_NOTE}\u{1f}{SKILLS_NOTE}\u{1f}{STYLE_NOTE}"
+    );
     let hex = format!("{:016x}", fnv1a64(joined.as_bytes()));
     hex[..8].to_string()
 }
@@ -1743,6 +1759,9 @@ impl SystemPromptParts {
             segments.push(self.system.clone());
         }
         segments.push(self.tools.clone());
+        // Constant, never snapshotted as its own part: it ships with the build,
+        // so `from_json` needs no new key and an old snapshot still parses.
+        segments.push(SKILLS_NOTE.to_string());
         segments.push(self.style.clone());
         if !self.started.trim().is_empty() {
             segments.push(self.started.clone());

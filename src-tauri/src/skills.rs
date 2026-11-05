@@ -199,12 +199,17 @@ fn check_lookup_id(id: &str) -> Result<&str, String> {
 fn markdown_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot read skills directory: {e}"))?;
-    Ok(entries
+    let mut files: Vec<PathBuf> = entries
         .flatten()
         .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
         .map(|entry| entry.path())
         .filter(|path| is_markdown(path))
-        .collect())
+        .collect();
+    // `read_dir` order is unspecified. Sort so every lookup — including two
+    // skills that share a display name, and case-variant stems — is
+    // deterministic across runs and devices.
+    files.sort();
+    Ok(files)
 }
 
 /// Match a file stem, case-insensitively (`summarize.md` ← `summarize`).
@@ -515,8 +520,9 @@ pub fn delete(id: &str) -> Result<String, String> {
 }
 
 /// Whether `name` is one of the skill tools (used by `chat.rs` to route
-/// dispatch). They share the live/reflection/extraction tool list for prompt
-/// cache alignment; access is enforced by mode at dispatch.
+/// dispatch). They share the live/reflection tool list for prompt cache
+/// alignment (extraction advertises no tools at all); access is enforced by
+/// mode at dispatch.
 pub fn is_skill_tool(name: &str) -> bool {
     matches!(
         name,
@@ -966,26 +972,33 @@ mod tests {
     }
 
     /// An exact stem must beat a display-name coincidence in another file, no
-    /// matter what `read_dir` returns first. Before this was a single pass, a
-    /// delete could hit the wrong skill.
+    /// matter what `read_dir` returns first. Under a single-pass lookup the
+    /// name-matching file wins whenever it is visited first, so one of these
+    /// reads returned the other skill's body.
     #[test]
     fn an_exact_stem_beats_a_display_name_in_another_file() {
         let _guard = lock();
         let dir = temp_dir("stem-collision");
         init(dir.clone());
 
-        // `summarize.md` displays the name "Summarizer"; `summarizer.md` has
-        // that exact stem.
-        save("summarize", "# Summarize\n\nbody\n", Some("Summarizer"), None).unwrap();
-        save("summarizer", "# Other\n\nbody\n", None, None).unwrap();
+        // Each file displays the OTHER one's stem as its name.
+        save("a", "# Alpha\n\nbody A\n", Some("B"), None).unwrap();
+        save("b", "# Beta\n\nbody B\n", Some("A"), None).unwrap();
         assert_eq!(list().len(), 2);
 
-        assert!(read("summarizer").unwrap().contains("# Other"));
+        assert!(
+            read("a").unwrap().contains("body A"),
+            "read(a) resolved by the display name"
+        );
+        assert!(
+            read("b").unwrap().contains("body B"),
+            "read(b) resolved by the display name"
+        );
 
-        // The stem wins for deletion too: `summarize.md` must survive.
-        assert!(delete("summarizer").is_ok());
-        assert!(dir.join("summarize.md").exists());
-        assert!(!dir.join("summarizer.md").exists());
+        // Deletion targets the named stem too: `b.md` (which displays "A") stays.
+        assert!(delete("a").is_ok());
+        assert!(dir.join("b.md").exists());
+        assert!(!dir.join("a.md").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1039,9 +1052,15 @@ mod tests {
         assert!(err.contains("over the 100000-character limit"), "{err}");
         assert!(!dir.join("huge.md").exists());
 
-        // Exactly at the cap is fine.
+        // Exactly at the cap is fine...
         let at_cap = "y".repeat(MAX_SKILL_CHARS);
         assert!(save("atcap", &at_cap, None, None).is_ok());
+
+        // ...but the cap applies to the composed file: the same content with
+        // frontmatter is over the limit and must be refused, not truncated.
+        let err = save("front", &at_cap, Some("Front"), None).unwrap_err();
+        assert!(err.contains("with its frontmatter"), "{err}");
+        assert!(!dir.join("front.md").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

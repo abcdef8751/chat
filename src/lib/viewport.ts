@@ -9,17 +9,16 @@ import { createSignal, onCleanup, type Accessor } from "solid-js";
  * occupies the difference between the layout viewport and the visual viewport
  * (minus any scroll offset of the visual viewport itself).
  *
- * **Android uses the native bridge instead.** `MainActivity.kt` publishes the
- * IME (and system-bar) inset through `window.PiInsets` + the `pi-insets` event,
- * and App.tsx pads the app root by that amount. That native inset is
- * authoritative whenever it reports a non-zero bottom inset: Android WebView
- * consumes the IME insets natively, so the visual viewport shrinks by the
- * keyboard height while `innerHeight` stays at the full layout height.
- * Subtracting them there would report the keyboard height a SECOND time, and
- * App.tsx would pad the app root *and* <main> — the composer gets pushed twice
- * as far up and the transcript shrinks twice. Never re-add the two. The
- * estimate is only returned while the bridge reports **no** bottom inset at all
- * (a WebView that never delivered one), as a last-resort fallback.
+ * **Android also has the native bridge.** `MainActivity.kt` publishes the IME
+ * (and system-bar) inset through `window.PiInsets` + the `pi-insets` event, and
+ * App.tsx pads the app root by that amount. Android WebView consumes the IME
+ * insets natively, so the visual viewport shrinks by the keyboard height while
+ * `innerHeight` stays at the full layout height. The two must never be ADDED:
+ * App.tsx pads `<main>` by `max(0, estimate - nativeBottom)` and follows
+ * `max(estimate, nativeBottom)` for the transcript. On a healthy bridge the
+ * native inset wins (extra = 0); on a bridge that reports nothing (an OEM
+ * WebView, or `< API 30` where the value depends on `adjustResize`) the estimate
+ * is the only lift, so the composer still rises.
  *
  * Call inside a component/root: the listeners are released via `onCleanup`.
  * Returns 0 on platforms without `visualViewport` (desktop), so the caller's
@@ -28,27 +27,6 @@ import { createSignal, onCleanup, type Accessor } from "solid-js";
 export function createKeyboardInset(): Accessor<number> {
   const [inset, setInset] = createSignal(0);
   if (typeof window === "undefined") return inset;
-
-  // The native shell owns the IME on Android (see above). It is authoritative
-  // whenever it reports a non-zero bottom inset (the nav bar when the keyboard
-  // is closed, the IME when it is open). If it reports 0 it has delivered
-  // nothing — some OEM WebViews and the `< API 30` path can behave that way —
-  // and this estimate is the only chance to lift the composer, so it is kept as
-  // a last-resort fallback rather than disabling the helper outright.
-  const native = (
-    window as unknown as {
-      PiInsets?: { getBottom?: () => number };
-    }
-  ).PiInsets;
-  const nativeOwnsBottom = () => {
-    if (!native) return false;
-    try {
-      return (native.getBottom?.() ?? 0) > 0;
-    } catch {
-      // A disposed JavascriptInterface throws; treat it as "no native value".
-      return false;
-    }
-  };
 
   const vv = window.visualViewport;
   if (!vv) return inset;
@@ -63,7 +41,7 @@ export function createKeyboardInset(): Accessor<number> {
     // over- or under-count. `height === 0` means "not measured yet" (hidden
     // page, teardown), not a fully covered viewport — report no lift then.
     const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-    setInset(vv.height > 0 && !nativeOwnsBottom() ? covered : 0);
+    setInset(vv.height > 0 ? covered : 0);
   };
   const update = () => {
     if (frame) return;

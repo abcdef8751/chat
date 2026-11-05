@@ -639,21 +639,20 @@ export default function App() {
       window.removeEventListener("resize", apply);
     });
   });
-  // True when the native shell owns the keyboard/system insets (Android's
-  // `MainActivity.kt` injects `window.PiInsets` before the page loads). There,
-  // `createKeyboardInset()` deliberately stays 0 (see `lib/viewport.ts`), so
-  // anything that needs the keyboard offset must use `keyboardLift()` below.
-  const hasNativeInsets = createMemo(() => {
-    const w = window as unknown as { PiInsets?: unknown };
-    return !!w.PiInsets;
-  });
+  // The single keyboard lift the layout follows, in CSS px. On Android the
+  // native bottom inset (`insets().bottom`, which already folds in the IME when
+  // the keyboard is open) is authoritative; the visual-viewport estimate is a
+  // fallback for a bridge that reports nothing (see `lib/viewport.ts`).
+  // `Math.max` keeps one value instead of summing the two signals.
+  const keyboardLift = () => Math.max(keyboardInset(), insets().bottom);
 
-  // The single keyboard lift the transcript follows, in CSS px. On Android that
-  // is the native bottom inset (which already folds in the IME); elsewhere it
-  // is the visual-viewport estimate. `Math.max` also keeps one value if both
-  // ever report something.
-  const keyboardLift = () =>
-    Math.max(keyboardInset(), hasNativeInsets() ? insets().bottom : 0);
+  // Extra lift `<main>` must apply itself: the part of the visual-viewport
+  // estimate the native padding does not already cover. On a healthy Android
+  // bridge this is 0 (the root pads the IME); on desktop both are 0; on a
+  // bridge that never delivered an inset it is the whole estimate. Never a sum,
+  // so the composer cannot be pushed up twice.
+  const extraKeyboardLift = () =>
+    Math.max(0, keyboardInset() - insets().bottom);
 
   // Full-screen (mobile) dialogs render in their own `fixed inset-0` viewport,
   // outside the padded app root, so they must apply the same system-bar insets
@@ -3317,12 +3316,14 @@ export default function App() {
         class="flex min-w-0 flex-1 flex-col"
         // Mobile only, and ONLY without the native bridge: the soft keyboard's
         // inset raises the composer and shrinks the transcript. Android must not
-        // pad here too — its IME inset already arrives in `insets().bottom` and
-        // pads the app root. Adding both lifts the composer twice as far and
-        // shrinks the transcript twice (the old inconsistent keyboard behaviour).
+        // Mobile only: the part of the keyboard the native inset does not cover.
+        // On Android the IME arrives in `insets().bottom` and pads the app root,
+        // so this subtracts it (never adds) — the composer cannot be lifted
+        // twice. Without a native bridge this is the whole visual-viewport
+        // estimate, exactly as before.
         style={
-          !hasNativeInsets() && keyboardInset() > 0
-            ? { "padding-bottom": `${keyboardInset()}px` }
+          extraKeyboardLift() > 0
+            ? { "padding-bottom": `${extraKeyboardLift()}px` }
             : undefined
         }
       >

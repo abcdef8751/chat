@@ -3563,6 +3563,13 @@ fn legacy_build_system_prompt(
             .to_string(),
     );
     parts.push(
+        "Skills are the user's saved, reusable instruction sets (Markdown files they keep, \
+         invoked with /<id>). When a request clearly matches one, call list_skills, then \
+         read_skill with its id, and follow those instructions for this turn; the user can also \
+         invoke one directly with /<id>. Do not read a skill that does not apply."
+            .to_string(),
+    );
+    parts.push(
         "Text you emit before a tool call is shown to the user as part of the transcript. Treat \
          it as a short work note, not a draft of the answer: do not restate it after the tool \
          result. Write the user-facing answer once, after the last tool call."
