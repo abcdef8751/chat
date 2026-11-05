@@ -183,42 +183,71 @@ fn parse_skill(raw: &str, id: &str) -> ParsedSkill {
     }
 }
 
-/// Find the file for `id` in `dir`, case-insensitively. Refuses path traversal:
-/// an id is a file stem, never a path.
-fn find_skill_path(dir: &Path, id: &str) -> Result<PathBuf, String> {
+/// Reject an id that could escape the directory. Every lookup path funnels
+/// through here, so an id stays a bare file stem.
+fn check_lookup_id(id: &str) -> Result<&str, String> {
     let id = id.trim();
-    if id.is_empty()
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains("..")
-        || id.contains('\0')
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") || id.contains('\0')
     {
         return Err(format!("unknown skill: {id}"));
     }
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read skills directory: {e}"))?;
-    for entry in entries.flatten() {
-        // `file_type` does not follow symlinks, so a link placed in the skills
-        // directory cannot make this read outside it.
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let path = entry.path();
-        if !is_markdown(&path) {
-            continue;
-        }
+    Ok(id)
+}
+
+/// Every regular Markdown file in the skills directory. `file_type` does not
+/// follow symlinks, so a link placed there cannot make a caller read outside it.
+fn markdown_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read skills directory: {e}"))?;
+    Ok(entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .filter(|path| is_markdown(path))
+        .collect())
+}
+
+/// Match a file stem, case-insensitively (`summarize.md` ← `summarize`).
+fn find_by_stem(files: &[PathBuf], id: &str) -> Option<PathBuf> {
+    files
+        .iter()
+        .find(|path| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .eq_ignore_ascii_case(id)
+        })
+        .cloned()
+}
+
+/// Match the display name (frontmatter `name`, else the first heading), so the
+/// name shown in the `/` menu resolves too.
+fn find_by_name(files: &[PathBuf], name: &str) -> Option<PathBuf> {
+    for path in files {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem.eq_ignore_ascii_case(id) {
-            return Ok(path);
-        }
-        // The slash menu shows the display name (`# Summarize`), so accept that
-        // too — while the file stem stays the canonical id.
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if parse_skill(&raw, stem).name.eq_ignore_ascii_case(id) {
-                return Ok(path);
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if parse_skill(&raw, stem).name.eq_ignore_ascii_case(name) {
+                return Some(path.clone());
             }
         }
     }
-    Err(format!("unknown skill: {id}"))
+    None
+}
+
+/// Find the file for `id` in `dir`, case-insensitively. Refuses path traversal:
+/// an id is a file stem, never a path.
+///
+/// The stem pass runs over **all** files before the display-name pass, so an
+/// exact id always wins over a name coincidence in another file — the result
+/// cannot depend on `read_dir` order (callers include `save_skill`/
+/// `delete_skill`, where the wrong pick loses data).
+fn find_skill_path(dir: &Path, id: &str) -> Result<PathBuf, String> {
+    let id = check_lookup_id(id)?;
+    let files = markdown_files(dir)?;
+    if let Some(path) = find_by_stem(&files, id) {
+        return Ok(path);
+    }
+    find_by_name(&files, id).ok_or_else(|| format!("unknown skill: {id}"))
 }
 
 /// A skill body is injected into every request where it is invoked; cap it so a
@@ -355,33 +384,38 @@ fn compose_skill(content: &str, name: Option<&str>, description: Option<&str>) -
 
 /// Create or overwrite a skill, returning the resolved id.
 ///
-/// `id` is normalized (see [`normalize_skill_id`]); if it already resolves to a
-/// file — case-insensitively by stem, or by display name through
-/// [`find_skill_path`] — that exact file is overwritten, so saving through the
-/// name shown in the `/` menu updates the skill instead of creating a duplicate
-/// next to it.
+/// `id` is normalized (see [`normalize_skill_id`]) and the target is **only**
+/// the file whose stem matches it. A display name (`read_skill` resolves those)
+/// never selects a write target: overwriting a file the caller did not name is
+/// data loss, and the approval prompt only shows the arguments, not the victim.
+/// So `save_skill("Summarizer", …)` creates `summarizer.md` even when
+/// `summarize.md` displays the name "Summarizer"; the reply points that out so
+/// the model can use the right id instead of ending up with two skills.
 ///
-/// Content over [`MAX_SKILL_CHARS`] is refused: a truncated skill would be
-/// silently wrong, so the model must shorten it instead.
+/// The composed file (frontmatter included) over [`MAX_SKILL_CHARS`] is
+/// refused: a truncated skill would be silently wrong, so the model must
+/// shorten it instead.
 pub fn save(
     id: &str,
     content: &str,
     name: Option<&str>,
     description: Option<&str>,
 ) -> Result<String, String> {
-    let chars = content.chars().count();
-    if chars > MAX_SKILL_CHARS {
-        return Err(format!(
-            "save_skill: content is {chars} characters, over the {MAX_SKILL_CHARS}-character \
-             limit; shorten it (a truncated skill would be silently wrong)"
-        ));
-    }
     let normalized = normalize_skill_id(id)?;
     let dir = skill_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create skills directory: {e}"))?;
-    // Reuse an existing file when the id names one: by stem (case-insensitive)
-    // or by display name. The file's stem is the canonical id from then on.
-    let existing = find_skill_path(&dir, &normalized).ok();
+    let files = markdown_files(&dir)?;
+    let existing = find_by_stem(&files, &normalized);
+    // Only for the message: another skill that happens to display this name.
+    let name_collision = if existing.is_none() {
+        find_by_name(&files, id.trim()).and_then(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+    } else {
+        None
+    };
     let resolved = existing
         .as_deref()
         .and_then(|p| p.file_stem())
@@ -390,13 +424,40 @@ pub fn save(
         .unwrap_or_else(|| normalized.clone());
     let path = existing.unwrap_or_else(|| dir.join(format!("{resolved}.md")));
     let text = compose_skill(content, name, description);
-    let tmp = dir.join(format!(".{resolved}.md.tmp"));
-    std::fs::write(&tmp, &text).map_err(|e| format!("save_skill: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("save_skill: {e}"))?;
-    Ok(format!(
-        "Saved skill '{resolved}' ({} characters).",
-        text.chars().count()
-    ))
+    let chars = text.chars().count();
+    if chars > MAX_SKILL_CHARS {
+        return Err(format!(
+            "save_skill: the skill is {chars} characters with its frontmatter, over the \
+             {MAX_SKILL_CHARS}-character limit; shorten it (a truncated skill would be \
+             silently wrong)"
+        ));
+    }
+    // A unique temp name: two saves of the same skill cannot race on one path,
+    // and a failed write/rename removes its own temp file so no hidden `.tmp`
+    // can linger in the skills directory.
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".{resolved}.{}.{}.md.tmp",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::write(&tmp, &text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("save_skill: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("save_skill: {e}"));
+    }
+    let mut message = format!("Saved skill '{resolved}' ({chars} characters).");
+    if let Some(other) = name_collision {
+        message.push_str(&format!(
+            " Note: skill '{other}' already displays the name '{}'. This created a separate \
+             skill; use id '{other}' to edit that one.",
+            id.trim()
+        ));
+    }
+    Ok(message)
 }
 
 /// Raw Markdown of one skill **including** its frontmatter, so the model can
@@ -419,9 +480,31 @@ pub fn read_raw(id: &str) -> Result<String, String> {
 
 /// Delete one skill file, returning its resolved id. An unknown id is an error
 /// (nothing is written or removed).
+///
+/// Like [`save`], a display name is **not** resolved silently: if the id only
+/// matches another file's name, the call fails naming that file's real id. A
+/// delete is irreversible, so it must never pick a file the caller did not name.
 pub fn delete(id: &str) -> Result<String, String> {
     let dir = skill_dir()?;
-    let path = find_skill_path(&dir, id)?;
+    let id = check_lookup_id(id)?;
+    let files = markdown_files(&dir)?;
+    let path = match find_by_stem(&files, id) {
+        Some(path) => path,
+        None => match find_by_name(&files, id) {
+            Some(other) => {
+                let stem = other
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                return Err(format!(
+                    "delete_skill: '{id}' is the display name of skill '{stem}', not a skill \
+                     id. Call delete_skill again with id '{stem}' to delete it."
+                ));
+            }
+            None => return Err(format!("unknown skill: {id}")),
+        },
+    };
     let resolved = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -834,24 +917,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A display name is fine for reading (the `/` menu shows it), but a write
+    /// must never silently target a file with a different stem — it creates its
+    /// own id and says so. A delete by a name with no stem match is refused with
+    /// the real id (a delete cannot be undone, so it must be unambiguous).
     #[test]
-    fn save_by_display_name_overwrites_the_same_file() {
+    fn mutations_target_the_exact_stem_not_a_display_name() {
         let _guard = lock();
         let dir = temp_dir("display-name");
         init(dir.clone());
 
         save("summarize", "one\n", Some("Summarizer"), None).unwrap();
-        // The `/` menu shows the display name; saving through it must update
-        // that file, not create `summarizer.md` beside it.
-        let resolved = save("Summarizer", "two\n", None, None).unwrap();
-        assert!(resolved.contains("'summarize'"), "{resolved}");
-        assert_eq!(list().len(), 1);
+        // Reading by the name shown in the menu resolves.
+        assert!(read("Summarizer").unwrap().contains("one"));
+
+        // A save addressed by the display name does NOT overwrite the file that
+        // displays it; it creates `summarizer.md` and warns about the collision.
+        let msg = save("Summarizer", "two\n", None, None).unwrap();
+        assert!(
+            msg.contains("separate skill") && msg.contains("summarize"),
+            "{msg}"
+        );
+        assert!(std::fs::read_to_string(dir.join("summarize.md"))
+            .unwrap()
+            .contains("one"));
+        assert!(dir.join("summarizer.md").exists());
+        assert_eq!(list().len(), 2);
+
+        // The exact id updates the original.
+        assert!(save("summarize", "three\n", None, None)
+            .unwrap()
+            .contains("'summarize'"));
+        assert!(std::fs::read_to_string(dir.join("summarize.md"))
+            .unwrap()
+            .contains("three"));
+
+        assert!(delete("summarizer").is_ok());
+        assert!(dir.join("summarize.md").exists());
+
+        // A name with no stem match cannot delete anything: the error names
+        // the id to use instead.
+        save("weekly", "body\n", Some("Weekly Review"), None).unwrap();
+        let err = delete("Weekly Review").unwrap_err();
+        assert!(err.contains("weekly"), "{err}");
+        assert!(dir.join("weekly.md").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An exact stem must beat a display-name coincidence in another file, no
+    /// matter what `read_dir` returns first. Before this was a single pass, a
+    /// delete could hit the wrong skill.
+    #[test]
+    fn an_exact_stem_beats_a_display_name_in_another_file() {
+        let _guard = lock();
+        let dir = temp_dir("stem-collision");
+        init(dir.clone());
+
+        // `summarize.md` displays the name "Summarizer"; `summarizer.md` has
+        // that exact stem.
+        save("summarize", "# Summarize\n\nbody\n", Some("Summarizer"), None).unwrap();
+        save("summarizer", "# Other\n\nbody\n", None, None).unwrap();
+        assert_eq!(list().len(), 2);
+
+        assert!(read("summarizer").unwrap().contains("# Other"));
+
+        // The stem wins for deletion too: `summarize.md` must survive.
+        assert!(delete("summarizer").is_ok());
         assert!(dir.join("summarize.md").exists());
         assert!(!dir.join("summarizer.md").exists());
-        assert_eq!(
-            std::fs::read_to_string(dir.join("summarize.md")).unwrap(),
-            "two\n"
-        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save leaves no temp file behind, and a stray `.tmp` (a crash at the
+    /// wrong moment) is ignored by listing and lookups instead of showing up as
+    /// a skill.
+    #[test]
+    fn temp_files_are_not_picked_up_as_skills() {
+        let _guard = lock();
+        let dir = temp_dir("temp-files");
+        init(dir.clone());
+
+        save("alpha", "body", None, None).unwrap();
+        std::fs::write(dir.join(".alpha.1234.0.md.tmp"), "junk").unwrap();
+
+        assert_eq!(list().len(), 1);
+        assert!(read("alpha").is_ok());
+        assert_eq!(list()[0].id, "alpha");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

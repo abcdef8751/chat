@@ -946,6 +946,9 @@ export default function App() {
         // A run appends messages and bumps `updated_at`, so the sidebar order
         // must refresh even when the chat is not the open one.
         void refreshConversations();
+        // `Cron(AutoApprove)` runs may call `save_skill`/`delete_skill`; the
+        // slash menu must pick that up without a restart.
+        void loadSkills();
       }
       const id = activeId();
       if (id && conversationId === id) void reloadTranscript(id);

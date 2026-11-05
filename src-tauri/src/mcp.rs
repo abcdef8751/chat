@@ -1265,7 +1265,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configured_headers_ride_initialize_and_tools_list() {
-        let (port, handle, recorded) = start_mcp_http_mock(3);
+        // Two sessions (discovery + one tool call) = six POSTs, so the tool
+        // call path is covered too.
+        let (port, handle, recorded) = start_mcp_http_mock(6);
         let config = McpServerConfig {
             id: "srv-h".into(),
             name: "Headers".into(),
@@ -1284,25 +1286,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["tools"][0]["name"], "echo");
+        let called = http_call(
+            &config,
+            "tools/call",
+            json!({ "name": "echo", "arguments": { "text": "hi" } }),
+            CALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(called["content"][0]["text"], "echo: hi");
         handle.join().unwrap();
 
         let recorded = recorded.lock().unwrap();
-        assert_eq!(recorded.len(), 3);
-        for method in ["initialize", "notifications/initialized", "tools/list"] {
-            let request = recorded
+        assert_eq!(recorded.len(), 6);
+        for method in [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/call",
+        ] {
+            let requests: Vec<_> = recorded
                 .iter()
-                .find(|r| request_method(r) == method)
-                .unwrap_or_else(|| panic!("no {method} request recorded"));
-            assert_eq!(
-                request_header_values(request, "authorization"),
-                vec!["Bearer s3cr3t"],
-                "{method} must carry the configured Authorization header"
-            );
-            assert_eq!(
-                request_header_values(request, "x-vendor-key"),
-                vec!["abc"],
-                "{method} must carry the trimmed key"
-            );
+                .filter(|r| request_method(r) == method)
+                .collect();
+            assert!(!requests.is_empty(), "no {method} request recorded");
+            for request in requests {
+                assert_eq!(
+                    request_header_values(request, "authorization"),
+                    vec!["Bearer s3cr3t"],
+                    "{method} must carry the configured Authorization header"
+                );
+                assert_eq!(
+                    request_header_values(request, "x-vendor-key"),
+                    vec!["abc"],
+                    "{method} must carry the trimmed key"
+                );
+            }
         }
     }
 

@@ -73,7 +73,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **436 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **439 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
@@ -942,15 +942,21 @@ Settings → Skills card lists them and shows the folder.
   `write_file` can create a skill there. These four tools do it from the app
   process itself: `save_skill(id, content, name?, description?)` normalizes the
   id (trim → lowercase, whitespace runs → `-`, must be `[a-z0-9_-]{1,64}`),
-  overwrites the file an id already resolves to (stem or display name), writes
-  frontmatter only for the optional fields given, replaces any frontmatter
-  already inside `content`, and **refuses** content over `MAX_SKILL_CHARS`
-  (100k) rather than truncating it. `read_skill` returns the raw Markdown
-  *including* frontmatter so a rewrite cannot drop the name/description.
+  targets only the file whose **stem** matches that id, writes frontmatter only
+  for the optional fields given, replaces any frontmatter already inside
+  `content`, and **refuses** a composed file over `MAX_SKILL_CHARS` (100k)
+  rather than truncating it. A display name is resolved for **reads** (the `/`
+  menu shows it) but never selects a mutation target: saving by a display name
+  creates/reuses that id and the reply notes which other skill carries the name,
+  and deleting by one with no stem match is refused naming the real id — so a
+  mutation can never silently hit a file the approval prompt did not show.
+  `read_skill` returns the raw Markdown *including* frontmatter so a rewrite
+  cannot drop the name/description. Writes are atomic (unique temp file +
+  rename, temp removed on failure) and `list` ignores `.tmp` files.
   `save_skill`/`delete_skill` are **approval-gated** (YOLO bypasses; a readonly
   cron run refuses them; reflection/extraction refuse all four by mode). The
-  tools are in every mode's tool list (cache alignment) — access is by mode at
-  dispatch.
+  tools ride the live + reflection tool list (cache alignment); extraction
+  advertises none and refuses any call — access is by mode at dispatch.
 - **Android filesystem routing.** `ShellExecutor::{read_file,write_file}` still
   route through Termux, **except** for paths inside the skills directory, which
   use the app's own `std::fs` view (shared with the desktop implementation).
@@ -994,8 +1000,12 @@ write_memory(path, content)       // replace (curation)
 memory_str_replace(path, old_string, new_string)   // replace one unique occurrence
 
 // Skills — app-local Markdown instruction files (`<app data>/skills/<id>.md`).
-// In every mode's list; reflection/extraction refuse them at dispatch. Reads
-// are ungated; writes/deletes are approval-gated (see gated list above).
+// In the live + reflection tool list (extraction advertises no tools at all);
+// reflection/extraction refuse them at dispatch. Reads are ungated;
+// writes/deletes are approval-gated (see gated list above). A display name is
+// resolved for reads, but a mutation only ever targets the exact stem — a
+// name match on another file never selects a write target (a save by a display
+// name creates that id and says so; a delete by one is refused with the real id).
 list_skills()                     // `Skills directory: <path>` + `id — name: description` lines
 read_skill(id)                    // raw Markdown INCLUDING frontmatter
 save_skill(id, content, name?, description?)   // create/overwrite; id normalized to
@@ -1611,11 +1621,12 @@ Residuals from this batch:
   (and the transcript re-pin) can only be confirmed on Android hardware.
 - **Skills stay app-private.** On Android the folder is still not reachable from
   a file manager, so authoring goes through the assistant (or the Settings path
-  is display-only); `save_skill` normalizes an id before resolving an existing
-  file, so an unusual file stem can still be duplicated by a display-name save.
+  is display-only). A save addressed by a *display* name creates its own id
+  rather than overwriting a file with a different stem (the reply points at the
+  existing skill); the model should use the id `list_skills` prints.
 - **`headers` values (like `env`) cross IPC** to the Settings renderer, and
   `mcp.json` is writable through `write_file` when approved or under YOLO.
-- **GUI e2e was not run** for this batch; `cargo test --lib` (436), `tsc`,
+- **GUI e2e was not run** for this batch; `cargo test --lib` (439), `tsc`,
   `npm run build`, `npm run test:turns` and clippy (2 pre-existing lints) are
   green.
 
