@@ -33,6 +33,9 @@ create table if not exists conversations (
   last_reflected_index bigint,
   imported boolean not null default false,
   import_batch bigint not null default 0,
+  -- Pinned chat: shown in the sidebar's Pinned section. Part of the
+  -- conversation row (LWW by revision), so a pin follows the chat across devices.
+  pinned boolean not null default false,
   created_at bigint not null,
   updated_at bigint not null,
   revision bigint not null,
@@ -58,10 +61,6 @@ create table if not exists messages (
   usage jsonb,
   stop_reason text,
   attachments jsonb,
-  -- User-pinned message: kept visible in the transcript's pinned strip. Part of
-  -- the message row (LWW by revision), so a pin set on one device follows the
-  -- message to the others.
-  pinned boolean not null default false,
   created_at bigint not null,
   revision bigint not null,
   deleted_at bigint,
@@ -194,4 +193,4 @@ create index if not exists user_config_user_revision_idx on user_config(user_id,
 -- adds a column.
 -- ---------------------------------------------------------------------------
 alter table conversations add column if not exists thinking_level text;
-alter table messages add column if not exists pinned boolean not null default false;
+alter table conversations add column if not exists pinned boolean not null default false;

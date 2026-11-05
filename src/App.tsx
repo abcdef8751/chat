@@ -33,7 +33,6 @@ import {
   listMessages,
   listModels,
   listModelsDevProviders,
-  listPinnedMessages,
   listProviders,
   listSkills,
   memoryExtractionStats,
@@ -50,10 +49,10 @@ import {
   setBraveKey,
   setConfig,
   setConversationAutoApprove,
+  setConversationPinned,
   setConversationModel,
   setConversationProvider,
   setConversationThinkingLevel,
-  setMessagePinned,
   setModelOverrides as saveModelOverrides,
   stopChat,
   streamChat,
@@ -198,6 +197,7 @@ function sameConversation(a: Conversation, b: Conversation): boolean {
     a.model === b.model &&
     a.provider_id === b.provider_id &&
     (a.thinking_level ?? null) === (b.thinking_level ?? null) &&
+    !!a.pinned === !!b.pinned &&
     a.system_prompt === b.system_prompt &&
     a.compaction_summary === b.compaction_summary &&
     a.compaction_through === b.compaction_through &&
@@ -230,8 +230,6 @@ export default function App() {
   const [skills, setSkills] = createSignal<SkillInfo[]>([]);
   // Transient, non-blocking status line above the composer (`/compact`).
   const [notice, setNotice] = createSignal<string | null>(null);
-  // Pinned messages of the open conversation, oldest first.
-  const [pinnedMessages, setPinnedMessages] = createSignal<Message[]>([]);
   // Soft-keyboard height in px (0 on desktop): lifts the composer and shrinks
   // the transcript while the mobile keyboard is open.
   const keyboardInset = createKeyboardInset();
@@ -448,7 +446,6 @@ export default function App() {
       const tail = rows.slice(-1)[0];
       if (tail && tail.role === "assistant" && tail.stop_reason != null && tail.created_at >= live.startedAt) {
         setMessages([...rows, ...staged]);
-        void refreshPinned(id);
         return;
       }
       // Re-attach the in-flight assistant row so a reload that raced the start
@@ -472,7 +469,6 @@ export default function App() {
           created_at: Date.now(),
         },
       ]);
-      void refreshPinned(id);
       return;
     }
     // A turn that is registered without a live record yet (or any more) is a
@@ -480,7 +476,6 @@ export default function App() {
     // the visible transcript alone rather than risk dropping its live row.
     if (isStreaming(id)) return;
     setMessages([...rows, ...staged]);
-    void refreshPinned(id);
   }
 
   // Files staged for the next message (picked or dropped).
@@ -1235,64 +1230,17 @@ export default function App() {
     }
   }
 
-  // --- Pinned messages -------------------------------------------------------
+  // --- Pinned chats ---------------------------------------------------------
 
-  let pinnedReqSeq = 0;
-  // The conversation the current strip belongs to. Switching chats clears the
-  // strip immediately instead of flashing the previous chat's pins until the
-  // fetch lands (same-chat refreshes keep it in place).
-  let pinnedFor: string | null = null;
-  /// Refresh the pinned strip. Guarded so a response for a previous chat (or a
-  /// superseded refresh) cannot overwrite the current one's list.
-  async function refreshPinned(idOverride?: string | null) {
-    const id = idOverride === undefined ? activeId() : idOverride;
-    // A background turn in ANOTHER chat calls this with its own id. It must not
-    // clear the open chat's strip or consume the open chat's request token.
-    // Another chat's background settlement is irrelevant to the open strip: the
-    // switch effect fetches that chat's pins when it becomes active. Returning
-    // here avoids a pointless `listPinnedMessages` round trip per off-screen turn.
-    if (id !== activeId()) return;
-    const seq = ++pinnedReqSeq;
-    if (!id) {
-      pinnedFor = null;
-      setPinnedMessages([]);
-      return;
-    }
-    if (pinnedFor !== id) {
-      pinnedFor = id;
-      setPinnedMessages([]);
-    }
+  /// Pin/unpin a chat. The backend stamps the synced row; re-reading the list
+  /// moves it into/out of the sidebar's Pinned section.
+  async function toggleChatPinned(c: Conversation) {
     try {
-      const rows = await listPinnedMessages(id);
-      if (seq !== pinnedReqSeq || activeId() !== id) return;
-      setPinnedMessages(rows);
-    } catch {
-      if (seq === pinnedReqSeq && activeId() === id) setPinnedMessages([]);
-    }
-  }
-  const pinnedIds = createMemo(() => new Set(pinnedMessages().map((m) => m.id)));
-
-  /// Pin/unpin one persisted message, then re-read the strip from the backend
-  /// (the single source of truth). Live `tmp-` rows have no id to pin yet.
-  async function togglePinned(m: Message) {
-    const id = activeId();
-    if (!id || !m.id || m.id.startsWith("tmp-")) return;
-    try {
-      await setMessagePinned(m.id, !pinnedIds().has(m.id));
-      await refreshPinned(id);
+      await setConversationPinned(c.id, !c.pinned);
+      await refreshConversations();
     } catch (e) {
-      // Pins are local UI state, not a turn failure: use the transient notice.
       showNotice(String(e));
     }
-  }
-
-  /// Scroll a message into view (pinned-strip click). `CSS.escape` keeps ids
-  /// with quotes/brackets from breaking the selector.
-  function jumpToMessage(id: string) {
-    const safe = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id;
-    document
-      .querySelector<HTMLElement>(`[data-message-id="${safe}"]`)
-      ?.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
   // --- Skills + `/compact` ---------------------------------------------------
@@ -1556,7 +1504,6 @@ export default function App() {
     clearStreamError("");
     // Opening a conversation counts as reading its background output.
     if (id) clearUnseen(id);
-    void refreshPinned(id);
     if (!id) {
       setMessages([]);
       return;
@@ -2621,7 +2568,6 @@ export default function App() {
         // row the backend derived a title from now exists). Pins are disabled
         // mid-stream, but a reload still keeps the strip honest.
         void maybeAutoTitle(id);
-        void refreshPinned(id);
         // A live turn may have created / changed / deleted cron jobs through the
         // agent tools (which have no event emitter of their own).
         void refreshCrons();
@@ -3342,6 +3288,7 @@ export default function App() {
         removeConversation={removeConversation}
         cronConversationIds={cronConversationIds()}
         unseenConversationIds={completedUnseen()}
+        onTogglePin={toggleChatPinned}
       />
 
       {/* Main */}
@@ -3427,10 +3374,6 @@ export default function App() {
               editingId={editingId()}
               onRetryAttachment={(m, a) => retryMessageAttachment(m.id, a)}
               cronTriggers={cronTriggers()}
-              pinned={pinnedMessages()}
-              pinnedIds={pinnedIds()}
-              onTogglePin={togglePinned}
-              onJumpTo={jumpToMessage}
             />
           </Show>
 

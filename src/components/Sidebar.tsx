@@ -32,6 +32,8 @@ export function Sidebar(props: {
   /// Conversations that produced output while the user was looking elsewhere.
   /// Each gets a small amber dot next to its title.
   unseenConversationIds: ReadonlySet<string>;
+  /// Pin/unpin a chat (it moves into/out of the Pinned section).
+  onTogglePin: (c: Conversation) => void;
 }) {
   const drawerHidden = () => !props.wideViewport && !props.sidebarOpen;
 
@@ -131,8 +133,13 @@ export function Sidebar(props: {
   // their own collapsible section. Everything else is a normal chat.
   // Memoized: these used to re-filter on every render, which meant a new array
   // per render for `<For>` to diff.
+  // A pinned chat is rendered once, in its own section at the top, and excluded
+  // from the ordinary list (so it never appears twice).
+  const pinnedChats = createMemo(() =>
+    props.visibleConversations.filter((c) => c.kind !== "scheduled" && c.pinned),
+  );
   const chats = createMemo(() =>
-    props.visibleConversations.filter((c) => c.kind !== "scheduled"),
+    props.visibleConversations.filter((c) => c.kind !== "scheduled" && !c.pinned),
   );
   const scheduled = createMemo(() =>
     props.visibleConversations.filter((c) => c.kind === "scheduled"),
@@ -162,7 +169,7 @@ export function Sidebar(props: {
             props.setConfirmDeleteId(null);
             props.setSidebarOpen(false);
           }}
-          class={`w-full rounded-lg px-3 py-2 pr-14 text-left text-sm transition ${
+          class={`w-full rounded-lg px-3 py-2 pr-20 text-left text-sm transition ${
             props.activeId === c.id
               ? "bg-neutral-200/80 font-medium dark:bg-neutral-800 dark:text-neutral-100"
               : "text-neutral-700 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
@@ -192,6 +199,33 @@ export function Sidebar(props: {
         {/* Row actions: hover-revealed at `lg`; always visible on
             narrow (touch) viewports where there is no hover. */}
         <div class="absolute right-1.5 top-1/2 flex -translate-y-1/2 gap-0.5 lg:hidden lg:group-hover:flex">
+          <Show when={c.kind !== "scheduled"}>
+            <button
+              title={c.pinned ? "Unpin chat" : "Pin chat"}
+              aria-label={c.pinned ? "Unpin chat" : "Pin chat"}
+              aria-pressed={!!c.pinned}
+              class={`rounded px-1.5 py-1 transition hover:bg-neutral-200 dark:hover:bg-neutral-800 ${
+                c.pinned
+                  ? "text-amber-600 dark:text-amber-400"
+                  : "text-neutral-400 hover:text-neutral-700 dark:text-neutral-500 dark:hover:text-neutral-200"
+              }`}
+              onClick={() => props.onTogglePin(c)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                class="h-3.5 w-3.5"
+                fill={c.pinned ? "currentColor" : "none"}
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 17v5" />
+                <path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z" />
+              </svg>
+            </button>
+          </Show>
           <button
             title="Rename"
             class="rounded px-1.5 py-1 text-xs text-neutral-400 transition hover:bg-neutral-200 hover:text-neutral-700 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
@@ -308,6 +342,19 @@ export function Sidebar(props: {
         </div>
 
         <nav class="flex-1 overflow-y-auto px-2 pb-2 pt-2 [scrollbar-gutter:stable]">
+          {/* Pinned chats: always at the top, in their own section, so a long
+              history cannot push them out of reach. */}
+          <Show when={pinnedChats().length > 0}>
+            <div>
+              <p class="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                Pinned
+              </p>
+              <ul class="space-y-1">
+                <For each={pinnedChats()}>{(c) => row(c)}</For>
+              </ul>
+              <div class="my-2 border-t border-neutral-200 dark:border-neutral-800" />
+            </div>
+          </Show>
           <ul class="space-y-1">
             <For each={chats()}>{(c) => row(c)}</For>
             <Show when={props.visibleConversations.length === 0}>

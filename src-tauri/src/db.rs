@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS conversations (
   last_reflected_index INTEGER,
   imported INTEGER NOT NULL DEFAULT 0,
   import_batch INTEGER NOT NULL DEFAULT 0,
+  -- Pinned chat: shown in the sidebar's Pinned section. Synced (conversation
+  -- row, LWW by revision); pinning does not bump `updated_at`.
+  pinned INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   revision BIGINT NOT NULL DEFAULT 0,
@@ -61,10 +64,6 @@ CREATE TABLE IF NOT EXISTS messages (
   usage TEXT,
   stop_reason TEXT,
   attachments TEXT,
-  -- User-pinned message: kept visible in the transcript's pinned strip. Synced
-  -- (part of the message row, LWW by revision) so a pin set on one device shows
-  -- up on the others.
-  pinned INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   revision BIGINT NOT NULL DEFAULT 0,
   dirty INTEGER NOT NULL DEFAULT 0
@@ -226,9 +225,9 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     let _ = conn.execute("ALTER TABLE model_prices ADD COLUMN modalities TEXT", []);
     // Older databases predate message file attachments.
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT", []);
-    // Older databases predate pinned messages (syncable).
+    // Older databases predate pinned chats (syncable).
     let _ = conn.execute(
-        "ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         [],
     );
     // Older databases predate the per-conversation memory reflection watermark.
@@ -378,6 +377,8 @@ pub struct Conversation {
     pub system_prompt: Option<String>,
     pub compaction_summary: Option<String>,
     pub compaction_through: Option<String>,
+    /// Pinned to the top of the sidebar. Synced with the conversation row.
+    pub pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -433,7 +434,7 @@ pub fn get_conversation(
     let mut stmt = conn
         .prepare(
             "SELECT id, title, kind, model, provider_id, system_prompt, compaction_summary,
-                    compaction_through, created_at, updated_at, thinking_level
+                    compaction_through, created_at, updated_at, thinking_level, pinned
              FROM conversations WHERE id = ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -451,6 +452,7 @@ pub fn get_conversation(
                 created_at: r.get(8)?,
                 updated_at: r.get(9)?,
                 thinking_level: r.get(10)?,
+                pinned: r.get::<_, i64>(11)? != 0,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -792,7 +794,7 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
     let mut stmt = conn
         .prepare(
             "SELECT id, title, kind, model, provider_id, system_prompt, compaction_summary,
-                    compaction_through, created_at, updated_at, thinking_level
+                    compaction_through, created_at, updated_at, thinking_level, pinned
              FROM conversations ORDER BY updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -810,6 +812,7 @@ pub fn list_conversations(db: tauri::State<'_, Db>) -> Result<Vec<Conversation>,
                 created_at: r.get(8)?,
                 updated_at: r.get(9)?,
                 thinking_level: r.get(10)?,
+                pinned: r.get::<_, i64>(11)? != 0,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -846,6 +849,7 @@ pub fn create_conversation(
         system_prompt: None,
         compaction_summary: None,
         compaction_through: None,
+        pinned: false,
         created_at: now,
         updated_at: now,
     })
@@ -1222,7 +1226,7 @@ pub fn search_conversations(
         .prepare(
             "SELECT DISTINCT c.id, c.title, c.kind, c.model, c.provider_id, c.system_prompt,
                     c.compaction_summary, c.compaction_through, c.created_at, c.updated_at,
-                    c.thinking_level
+                    c.thinking_level, c.pinned
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
              WHERE lower(c.title) LIKE ?1
@@ -1244,6 +1248,7 @@ pub fn search_conversations(
                 created_at: r.get(8)?,
                 updated_at: r.get(9)?,
                 thinking_level: r.get(10)?,
+                pinned: r.get::<_, i64>(11)? != 0,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -2683,120 +2688,68 @@ pub fn list_cron_triggers(
 }
 
 // ---------------------------------------------------------------------------
-// Pinned messages / per-chat YOLO / auto-title.
+// Pinned chats / per-chat YOLO / auto-title.
 //
-// Pins ride the synced message row (`pinned`, LWW by revision). The per-chat
+// A pinned chat rides the synced conversation row (`conversations.pinned`, LWW
+// by revision); pinning bumps the revision but NOT `updated_at`, so it neither
+// resets the reflection idle timer nor reorders the unpinned list. The per-chat
 // YOLO choice is local-only (behavior, like the global switch). Titles are
 // replaced only while they still look auto-generated.
 // ---------------------------------------------------------------------------
 
-/// Pin or unpin one message. The pin rides the synced message row (`pinned`),
-/// so the row is marked dirty and its revision bumped. Returns an error when the
-/// id does not exist.
+/// Pin or unpin one chat (the sidebar's Pinned section). Returns an error when
+/// the id does not exist.
 #[tauri::command]
-pub fn set_message_pinned(
+pub fn set_conversation_pinned(
     db: tauri::State<'_, Db>,
-    message_id: String,
+    conversation_id: String,
     pinned: bool,
 ) -> Result<(), String> {
-    set_message_pinned_db(&db, &message_id, pinned)
+    set_conversation_pinned_db(&db, &conversation_id, pinned)
 }
 
-/// [`set_message_pinned`] against a plain [`Db`] (unit-testable; a Tauri
-/// `State` cannot be built in a test).
-pub fn set_message_pinned_db(db: &Db, message_id: &str, pinned: bool) -> Result<(), String> {
+/// [`set_conversation_pinned`] against a plain [`Db`] (unit-testable).
+pub fn set_conversation_pinned_db(
+    db: &Db,
+    conversation_id: &str,
+    pinned: bool,
+) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    // Read the current value and the owning conversation's kind in one statement
-    // (a missing id must not consume a revision). `kind` decides whether the row
-    // participates in sync at all: scheduled threads never push, so marking one
-    // dirty would leave a pending count no push can drain.
     let row: Option<(i64, String)> = conn
         .query_row(
-            "SELECT m.pinned, COALESCE(c.kind, 'chat')
-             FROM messages m LEFT JOIN conversations c ON c.id = m.conversation_id
-             WHERE m.id = ?1",
-            [message_id],
+            "SELECT pinned, kind FROM conversations WHERE id = ?1",
+            [conversation_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
     let (current, kind) = match row {
         Some(v) => v,
-        None => return Err(format!("no message with id {message_id}")),
+        None => return Err(format!("no conversation with id {conversation_id}")),
     };
     if (current != 0) == pinned {
         return Ok(()); // idempotent: no revision churn for a re-pin
     }
     if kind != "chat" {
-        // Local-only pin for a scheduled thread: update content, never sync flags.
+        // Scheduled threads never sync, so a pin there stays local and must not
+        // leave a dirty row no push can drain.
         conn.execute(
-            "UPDATE messages SET pinned = ?2 WHERE id = ?1",
-            params![message_id, pinned as i64],
+            "UPDATE conversations SET pinned = ?2 WHERE id = ?1",
+            params![conversation_id, pinned as i64],
         )
         .map_err(|e| e.to_string())?;
         return Ok(());
     }
     let rev = bump_revision_c(&conn)?;
-    // A pin is an edit of the MESSAGE row, so its revision/dirty drive the sync
-    // push. The conversation row is deliberately untouched (`updated_at` too), so
-    // pinning can't reorder the sidebar or reset the reflection idle timer.
-    let updated = conn
-        .execute(
-            "UPDATE messages SET pinned = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
-            params![message_id, pinned as i64, rev],
-        )
-        .map_err(|e| e.to_string())?;
-    if updated == 0 {
-        return Err(format!("no message with id {message_id}"));
-    }
+    // `updated_at` is deliberately untouched: pinning is a list-placement change,
+    // not a content edit. The sidebar sorts pinned chats by their original
+    // activity, and the reflection idle timer must not be reset by a pin.
+    conn.execute(
+        "UPDATE conversations SET pinned = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
+        params![conversation_id, pinned as i64, rev],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-/// The pinned messages of one conversation, oldest first (the transcript's
-/// pinned strip). Reuses [`MessageRow`] so the frontend can render the snippet
-/// and jump to the row without a second shape.
-#[tauri::command]
-pub fn list_pinned_messages(
-    db: tauri::State<'_, Db>,
-    conversation_id: String,
-) -> Result<Vec<MessageRow>, String> {
-    list_pinned_messages_db(&db, &conversation_id)
-}
-
-/// [`list_pinned_messages`] against a plain [`Db`]. The explicit column list
-/// mirrors [`read_messages`] exactly, so the pinned strip deserializes into the
-/// same [`MessageRow`] shape the transcript uses.
-pub fn list_pinned_messages_db(
-    db: &Db,
-    conversation_id: &str,
-) -> Result<Vec<MessageRow>, String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, conversation_id, role, \"index\", content, model, provider, thinking_level, thinking, usage, stop_reason, attachments, created_at
-             FROM messages WHERE conversation_id = ?1 AND pinned = 1 ORDER BY \"index\" ASC",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([conversation_id], |r| {
-            Ok(MessageRow {
-                id: r.get(0)?,
-                conversation_id: r.get(1)?,
-                role: r.get(2)?,
-                index: r.get(3)?,
-                content: r.get(4)?,
-                model: r.get(5)?,
-                provider: r.get(6)?,
-                thinking_level: r.get(7)?,
-                thinking: r.get(8)?,
-                usage: r.get(9)?,
-                stop_reason: r.get(10)?,
-                attachments: r.get(11)?,
-                created_at: r.get(12)?,
-            })
-        })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 /// This chat's explicit YOLO choice, or `None` when it inherits the device
@@ -3616,60 +3569,39 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pinned messages / per-chat YOLO / auto-title (rust-data worker)
+    // pinned chats / per-chat YOLO / auto-title
     // -----------------------------------------------------------------------
 
-    /// A pin is a MESSAGE-row edit: the message's revision/dirty drive the sync
-    /// push, while the conversation row (and its `updated_at`) is untouched so
-    /// pinning cannot reorder the sidebar or reset the reflection idle timer.
-    /// Unknown ids are rejected instead of silently reporting success.
+    /// A chat pin rides the conversation row: revision + dirty drive sync, but
+    /// `updated_at` is untouched (so pinning cannot reorder the unpinned list or
+    /// reset the reflection idle timer). Re-pinning is idempotent; scheduled
+    /// threads stay local.
     #[test]
-    fn pinned_messages_roundtrip_and_validate_the_id() {
+    fn pinned_chats_roundtrip_and_are_idempotent() {
         let mut p = std::env::temp_dir();
-        p.push(format!("pi-chat-pinned-{}.sqlite", std::process::id()));
+        p.push(format!("pi-chat-chat-pin-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
-
         {
             let conn = db.0.lock().unwrap();
             conn.execute(
                 "INSERT INTO conversations (id, title, created_at, updated_at)
-                 VALUES ('c', 't', 5, 5)",
+                 VALUES ('c', 'My chat', 5, 5), ('s', 'Job', 5, 5)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE conversations SET kind = 'scheduled' WHERE id = 's'",
                 [],
             )
             .unwrap();
         }
-        let first = insert_message(
-            &db,
-            "c".into(),
-            "user".into(),
-            "pin me".into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let second = insert_message(
-            &db,
-            "c".into(),
-            "assistant".into(),
-            "not me".into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
 
-        // The conversation state a pin must not disturb (inserting the user row
-        // already touched it, so snapshot after both inserts).
-        let conv_before = get_conversation(&db, "c").unwrap().unwrap();
-        let (conv_rev_before, conv_dirty_before): (i64, i64) = {
+        set_conversation_pinned_db(&db, "c", true).unwrap();
+        let conv = get_conversation(&db, "c").unwrap().unwrap();
+        assert!(conv.pinned);
+        assert_eq!(conv.updated_at, 5, "a pin must not reorder the chat list");
+        let (rev, dirty): (i64, i64) = {
             let conn = db.0.lock().unwrap();
             conn.query_row(
                 "SELECT revision, dirty FROM conversations WHERE id = 'c'",
@@ -3678,134 +3610,49 @@ mod tests {
             )
             .unwrap()
         };
+        assert!(rev > 0, "a pin must make the row syncable");
+        assert_eq!(dirty, 1);
 
-        set_message_pinned_db(&db, &first.id, true).unwrap();
-        let pinned = list_pinned_messages_db(&db, "c").unwrap();
-        assert_eq!(pinned.len(), 1);
-        assert_eq!(pinned[0].id, first.id);
-        assert_eq!(pinned[0].content, "pin me");
-        assert_eq!(pinned[0].index, first.index);
-        assert_eq!(pinned[0].role, "user");
-
-        // The message row moved (revision bumped, marked dirty).
-        let (msg_rev, msg_dirty, msg_pinned): (i64, i64, i64) = {
+        // Re-pin is a no-op (no revision churn) and unpin works.
+        set_conversation_pinned_db(&db, "c", true).unwrap();
+        let rev2: i64 = {
             let conn = db.0.lock().unwrap();
-            conn.query_row(
-                "SELECT revision, dirty, pinned FROM messages WHERE id = ?1",
-                [&first.id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            conn.query_row("SELECT revision FROM conversations WHERE id = 'c'", [], |r| {
+                r.get(0)
+            })
             .unwrap()
         };
-        assert!(msg_rev > 0, "a pin must bump the message revision");
-        assert_eq!(msg_dirty, 1, "a pin must mark the message dirty");
-        assert_eq!(msg_pinned, 1);
+        assert_eq!(rev, rev2);
+        set_conversation_pinned_db(&db, "c", false).unwrap();
+        assert!(!get_conversation(&db, "c").unwrap().unwrap().pinned);
 
-        // …and the conversation did not.
-        let conv_after = get_conversation(&db, "c").unwrap().unwrap();
-        assert_eq!(conv_after.updated_at, conv_before.updated_at);
-        let (conv_rev_after, conv_dirty_after): (i64, i64) = {
+        // A scheduled thread never syncs: pin locally, no dirty/revision.
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations SET revision = 0, dirty = 0 WHERE id = 's'",
+                [],
+            )
+            .unwrap();
+        }
+        set_conversation_pinned_db(&db, "s", true).unwrap();
+        let sched = get_conversation(&db, "s").unwrap().unwrap();
+        assert!(sched.pinned);
+        let (sched_rev, sched_dirty): (i64, i64) = {
             let conn = db.0.lock().unwrap();
             conn.query_row(
-                "SELECT revision, dirty FROM conversations WHERE id = 'c'",
+                "SELECT revision, dirty FROM conversations WHERE id = 's'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap()
         };
-        assert_eq!(conv_rev_after, conv_rev_before);
-        assert_eq!(conv_dirty_after, conv_dirty_before);
+        assert_eq!(sched_rev, 0);
+        assert_eq!(sched_dirty, 0);
 
-        // Two pins list in transcript order; unpinning drops just that one.
-        set_message_pinned_db(&db, &second.id, true).unwrap();
-        let ids: Vec<String> = list_pinned_messages_db(&db, "c")
-            .unwrap()
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
-        assert_eq!(ids, vec![first.id.clone(), second.id.clone()]);
-
-        set_message_pinned_db(&db, &first.id, false).unwrap();
-        let ids: Vec<String> = list_pinned_messages_db(&db, "c")
-            .unwrap()
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
-        assert_eq!(ids, vec![second.id.clone()]);
-
-        // Pins are scoped per conversation.
-        assert!(list_pinned_messages_db(&db, "other").unwrap().is_empty());
-
-        // An unknown id is an error, not a silent no-op.
-        let err = set_message_pinned_db(&db, "does-not-exist", true).unwrap_err();
-        assert!(err.contains("does-not-exist"), "unhelpful error: {err}");
-
-        // Re-pinning the same value is idempotent: no revision churn.
-        let (rev_before, _): (i64, i64) = {
-            let conn = db.0.lock().unwrap();
-            conn.query_row(
-                "SELECT revision, dirty FROM messages WHERE id = ?1",
-                [&second.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap()
-        };
-        set_message_pinned_db(&db, &second.id, true).unwrap();
-        let rev_after: i64 = {
-            let conn = db.0.lock().unwrap();
-            conn.query_row(
-                "SELECT revision FROM messages WHERE id = ?1",
-                [&second.id],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(rev_before, rev_after, "a re-pin must not bump the revision");
-
-        // A scheduled thread never syncs: pinning there is local-only.
-        {
-            let conn = db.0.lock().unwrap();
-            conn.execute(
-                "INSERT INTO conversations (id, title, kind, created_at, updated_at)
-                 VALUES ('sched', 'job', 'scheduled', 5, 5)",
-                [],
-            )
-            .unwrap();
-        }
-        let sched_msg = insert_message(
-            &db,
-            "sched".into(),
-            "user".into(),
-            "scheduled pin".into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        {
-            let conn = db.0.lock().unwrap();
-            conn.execute(
-                "UPDATE messages SET revision = 0, dirty = 0 WHERE id = ?1",
-                [&sched_msg.id],
-            )
-            .unwrap();
-        }
-        set_message_pinned_db(&db, &sched_msg.id, true).unwrap();
-        let (sched_rev, sched_dirty, sched_pinned): (i64, i64, i64) = {
-            let conn = db.0.lock().unwrap();
-            conn.query_row(
-                "SELECT revision, dirty, pinned FROM messages WHERE id = ?1",
-                [&sched_msg.id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap()
-        };
-        assert_eq!(sched_pinned, 1, "the pin is still visible locally");
-        assert_eq!(sched_rev, 0, "a scheduled pin must not touch sync state");
-        assert_eq!(sched_dirty, 0, "a scheduled pin must not mark the row dirty");
+        assert!(set_conversation_pinned_db(&db, "missing", true)
+            .unwrap_err()
+            .contains("missing"));
 
         let _ = std::fs::remove_file(&p);
     }

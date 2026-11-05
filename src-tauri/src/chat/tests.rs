@@ -4375,6 +4375,7 @@ async fn live_reasoning_echo_is_accepted_by_provider() {
             system_prompt: None,
             compaction_summary: summary.map(str::to_string),
             compaction_through: through.map(str::to_string),
+            pinned: false,
             created_at: 0,
             updated_at: 0,
         }

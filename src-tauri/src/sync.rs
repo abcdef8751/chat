@@ -870,7 +870,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
             .prepare(
                 "SELECT id, title, model, provider_id, system_prompt, compaction_summary,
                         last_reflected_index, imported, import_batch, created_at, updated_at,
-                        revision, thinking_level
+                        revision, thinking_level, pinned
                  FROM conversations WHERE dirty = 1 AND kind = 'chat'",
             )
             .map_err(|e| e.to_string())?;
@@ -893,6 +893,9 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                     // Per-conversation reasoning level (structural, never encrypted:
                     // it is a short enum token and other devices need it as-is).
                     "thinking_level": r.get::<_, Option<String>>(12)?,
+                    // Structural, never encrypted: the sidebar needs the pin
+                    // without the data key. LWW rides the conversation revision.
+                    "pinned": r.get::<_, i64>(13)? != 0,
                     "deleted_at": Value::Null,
                 }))
             })
@@ -922,7 +925,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                 "id": id, "title": "", "model": Value::Null, "provider_id": Value::Null,
                 "system_prompt": Value::Null, "compaction_summary": Value::Null,
                 "last_reflected_index": Value::Null, "imported": false, "import_batch": 0,
-                "thinking_level": Value::Null,
+                "thinking_level": Value::Null, "pinned": false,
                 "created_at": now, "updated_at": now, "revision": rev, "deleted_at": now,
             }));
         }
@@ -956,7 +959,7 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
             let mut stmt = conn
                 .prepare(
                     "SELECT id, conversation_id, role, \"index\", content, model, provider,
-                            thinking_level, thinking, usage, stop_reason, attachments, pinned,
+                            thinking_level, thinking, usage, stop_reason, attachments,
                             created_at, revision
                      FROM messages
                      WHERE dirty = 1 AND revision > 0
@@ -980,11 +983,8 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                         "usage": enc_opt(key, r.get::<_, Option<String>>(9)?),
                         "stop_reason": r.get::<_, Option<String>>(10)?,
                         "attachments": enc_opt(key, r.get::<_, Option<String>>(11)?),
-                        // Structural, never encrypted: the pin must be readable so
-                        // the pull can apply it without the data key.
-                        "pinned": r.get::<_, i64>(12)? != 0,
-                        "created_at": r.get::<_, i64>(13)?,
-                        "revision": r.get::<_, i64>(14)?,
+                        "created_at": r.get::<_, i64>(12)?,
+                        "revision": r.get::<_, i64>(13)?,
                         "deleted_at": Value::Null,
                     }))
                 })
@@ -1720,6 +1720,10 @@ struct RemoteConversation {
     /// one (or an older payload without the column) simply has no preference.
     #[serde(default)]
     thinking_level: Option<String>,
+    /// Pinned chat. `None` means an older/mirror row omitted the column: a new
+    /// local row starts unpinned, an existing row keeps its own pin.
+    #[serde(default)]
+    pinned: Option<bool>,
     created_at: Option<i64>,
     updated_at: Option<i64>,
     revision: i64,
@@ -1741,12 +1745,6 @@ struct RemoteMessage {
     usage: Option<String>,
     stop_reason: Option<String>,
     attachments: Option<String>,
-    /// The user's pin. `None` means the remote row omitted the column (a server
-    /// whose schema predates pinned messages): a new local row gets `false`, and
-    /// an existing row keeps its own pin, so a missing column can never wipe a
-    /// pin. Explicit `true`/`false` is applied (LWW by the row revision).
-    #[serde(default)]
-    pinned: Option<bool>,
     created_at: i64,
     revision: i64,
     #[serde(default)]
@@ -2039,12 +2037,12 @@ async fn apply_conversations(db: &Db, rows: &[Value]) -> Result<(), String> {
             tx.execute(
                 "INSERT INTO conversations
                    (id, title, model, provider_id, system_prompt, compaction_summary, last_reflected_index,
-                    imported, import_batch, created_at, updated_at, revision, thinking_level, dirty)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
+                    imported, import_batch, created_at, updated_at, revision, thinking_level, pinned, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
                 rusqlite::params![
                     r.id, title, r.model, r.provider_id, r.system_prompt, r.compaction_summary,
                     r.last_reflected_index, imported, import_batch, created_at, updated_at,
-                    r.revision, r.thinking_level
+                    r.revision, r.thinking_level, r.pinned.unwrap_or(false) as i64
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -2053,12 +2051,13 @@ async fn apply_conversations(db: &Db, rows: &[Value]) -> Result<(), String> {
                 "UPDATE conversations SET title = ?2, model = ?3, provider_id = ?4,
                         system_prompt = ?5, compaction_summary = ?6, last_reflected_index = ?7,
                         imported = ?8, import_batch = ?9, created_at = ?10, updated_at = ?11,
-                        revision = ?12, thinking_level = ?13, dirty = 0
+                        revision = ?12, thinking_level = ?13,
+                        pinned = COALESCE(?14, pinned), dirty = 0
                  WHERE id = ?1",
                 rusqlite::params![
                     r.id, title, r.model, r.provider_id, r.system_prompt, r.compaction_summary,
                     r.last_reflected_index, imported, import_batch, created_at, updated_at,
-                    r.revision, r.thinking_level
+                    r.revision, r.thinking_level, r.pinned.map(|b| b as i64)
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -2117,12 +2116,12 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
             tx.execute(
                 "INSERT INTO messages
                    (id, conversation_id, role, \"index\", content, model, provider,
-                    thinking_level, thinking, usage, stop_reason, attachments, pinned, created_at, revision, dirty)
-                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
+                    thinking_level, thinking, usage, stop_reason, attachments, created_at, revision, dirty)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
                 rusqlite::params![
                     r.id, r.conversation_id, r.role, r.content, r.model, r.provider,
                     r.thinking_level, r.thinking, r.usage, r.stop_reason, r.attachments,
-                    r.pinned.unwrap_or(false) as i64, r.created_at, r.revision
+                    r.created_at, r.revision
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -2130,13 +2129,12 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
             tx.execute(
                 "UPDATE messages SET role = ?2, content = ?3, model = ?4, provider = ?5,
                         thinking_level = ?6, thinking = ?7, usage = ?8, stop_reason = ?9,
-                        attachments = ?10, pinned = COALESCE(?11, pinned), created_at = ?12,
-                        revision = ?13, dirty = 0
+                        attachments = ?10, created_at = ?11, revision = ?12, dirty = 0
                  WHERE id = ?1",
                 rusqlite::params![
                     r.id, r.role, r.content, r.model, r.provider, r.thinking_level,
                     r.thinking, r.usage, r.stop_reason, r.attachments,
-                    r.pinned.map(|b| b as i64), r.created_at, r.revision
+                    r.created_at, r.revision
                 ],
             )
             .map_err(|e| e.to_string())?;

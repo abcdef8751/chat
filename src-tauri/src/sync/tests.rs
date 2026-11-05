@@ -4058,32 +4058,19 @@ async fn capability_model_override_roundtrips_to_a_second_device() {
 }
 
 // ---------------------------------------------------------------------------
-// pinned messages (synced part of the message row)
+// pinned chats (synced part of the conversation row)
 // ---------------------------------------------------------------------------
 
-/// A pin rides the synced message row: it is pushed as a structural boolean and
-/// lands on a second device through an ordinary pull, without the data key.
+/// A chat pin is a structural boolean on the conversation row: it pushes and
+/// lands on a second device without the data key.
 #[tokio::test]
-async fn pinned_message_roundtrips_to_a_second_device() {
+async fn pinned_chat_roundtrips_to_a_second_device() {
     let srv = MockRest::spawn();
-    let db = temp_db("pin-push");
-    let mem = temp_memory("pin-push", &db);
-    let cfg = temp_config("pin-push");
+    let db = temp_db("chat-pin-push");
+    let mem = temp_memory("chat-pin-push", &db);
+    let cfg = temp_config("chat-pin-push");
     let cid = insert_conv(&db);
-    let msg = db::insert_message(
-        &db,
-        cid.clone(),
-        "user".into(),
-        "pin this".into(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    db::set_message_pinned_db(&db, &msg.id, true).unwrap();
+    db::set_conversation_pinned_db(&db, &cid, true).unwrap();
 
     let client = reqwest::Client::new();
     let ctx = SyncCtx {
@@ -4097,21 +4084,16 @@ async fn pinned_message_roundtrips_to_a_second_device() {
     };
     push(&ctx, "tok", &SyncState::new()).await.unwrap();
 
-    // The pushed message row carries the pin (structural, never encrypted).
-    let pushed_msg = srv
-        .posted("messages")
+    let pushed = srv
+        .posted("conversations")
         .into_iter()
-        .find(|v| v["id"] == msg.id)
-        .expect("message pushed");
-    assert_eq!(
-        pushed_msg["pinned"], true,
-        "pin not pushed: {pushed_msg}"
-    );
+        .find(|v| v["id"].as_str() == Some(cid.as_str()))
+        .expect("conversation pushed");
+    assert_eq!(pushed["pinned"], true, "pin not pushed: {pushed}");
 
-    // Second, blank device pulls the conversation + message and sees the pin.
-    let db2 = temp_db("pin-pull");
-    let mem2 = temp_memory("pin-pull", &db2);
-    let cfg2 = temp_config("pin-pull");
+    let db2 = temp_db("chat-pin-pull");
+    let mem2 = temp_memory("chat-pin-pull", &db2);
+    let cfg2 = temp_config("chat-pin-pull");
     let ctx2 = SyncCtx {
         client: &client,
         base_url: &srv.addr,
@@ -4122,84 +4104,82 @@ async fn pinned_message_roundtrips_to_a_second_device() {
         key: None,
     };
     srv.set_get("conversations", srv.posted("conversations"));
-    srv.set_get("messages", vec![pushed_msg.clone()]);
+    srv.set_get("messages", vec![]);
     srv.set_get("memory_files", vec![]);
     pull(&ctx2, "user-123", "tok", None).await.unwrap();
 
-    let pinned = crate::db::list_pinned_messages_db(&db2, &cid).unwrap();
-    assert_eq!(pinned.len(), 1, "the pin did not reach the second device");
-    assert_eq!(pinned[0].id, msg.id);
+    let pulled = crate::db::get_conversation(&db2, &cid).unwrap().unwrap();
+    assert!(pulled.pinned, "the pin did not reach the second device");
 }
 
-/// `pinned` merges LWW by the message row revision: a newer remote pin is
+/// `pinned` merges LWW by the conversation revision: a newer remote pin is
 /// applied, an older one is ignored, and a remote row that omits the column
 /// (an old server) never clears a local pin.
 #[tokio::test]
-async fn remote_pin_is_applied_by_revision_and_never_cleared_by_omission() {
-    let db = temp_db("pin-lww");
+async fn remote_chat_pin_is_applied_by_revision_and_never_cleared_by_omission() {
+    let db = temp_db("chat-pin-lww");
     let cid = insert_conv(&db);
-    let msg = db::insert_message(
-        &db, cid.clone(), "user".into(), "hello".into(), None, None, None, None, None, None,
-    )
-    .unwrap();
     let base = json!({
-        "id": msg.id, "conversation_id": cid, "role": "user", "content": "hello",
-        "seq": 0, "created_at": 1, "deleted_at": Value::Null
+        "id": cid,
+        "title": "Chat",
+        "model": Value::Null,
+        "provider_id": Value::Null,
+        "system_prompt": Value::Null,
+        "compaction_summary": Value::Null,
+        "last_reflected_index": Value::Null,
+        "imported": false,
+        "import_batch": 0,
+        "thinking_level": Value::Null,
+        "pinned": true,
+        "created_at": 1,
+        "updated_at": 1,
+        "revision": 9_000_000_000_000_i64,
+        "deleted_at": Value::Null,
     });
-
     let pinned_now = |db: &Db| -> i64 {
         let conn = db.0.lock().unwrap();
-        conn.query_row("SELECT pinned FROM messages WHERE id = ?1", [&msg.id], |r| r.get(0))
-            .unwrap()
+        conn.query_row(
+            "SELECT pinned FROM conversations WHERE id = ?1",
+            [&cid],
+            |r| r.get(0),
+        )
+        .unwrap()
     };
 
-    // Newer remote row with an explicit true → applied.
-    let mut newer = base.clone();
-    newer["revision"] = json!(9_000_000_000_000_i64);
-    newer["pinned"] = json!(true);
-    apply_messages(&db, &[newer]).await.unwrap();
+    apply_conversations(&db, &[base.clone()]).await.unwrap();
     assert_eq!(pinned_now(&db), 1, "a newer remote pin must be applied");
 
-    // Older remote row with an explicit false → ignored (local wins).
+    // An older remote row cannot unpin.
     let mut older = base.clone();
-    older["revision"] = json!(1_i64);
+    older["revision"] = json!(8_999_999_999_999_i64);
     older["pinned"] = json!(false);
-    apply_messages(&db, &[older]).await.unwrap();
+    apply_conversations(&db, &[older]).await.unwrap();
     assert_eq!(pinned_now(&db), 1, "an older remote row must not unpin");
 
-    // Newer remote row that omits `pinned` (schema predating the column):
-    // applied, but the local pin survives.
+    // A newer remote row that omits the column (schema predating pinned chats)
+    // is applied but keeps the local pin.
     let mut omitted = base.clone();
     omitted["revision"] = json!(9_000_000_000_001_i64);
-    apply_messages(&db, &[omitted]).await.unwrap();
+    omitted.as_object_mut().unwrap().remove("pinned");
+    apply_conversations(&db, &[omitted]).await.unwrap();
     assert_eq!(
         pinned_now(&db),
         1,
         "a missing pinned column must not clobber a local pin"
     );
 
-    // An explicit null is the same as missing.
+    // Explicit null behaves the same.
     let mut nulled = base.clone();
     nulled["revision"] = json!(9_000_000_000_002_i64);
     nulled["pinned"] = Value::Null;
-    apply_messages(&db, &[nulled]).await.unwrap();
+    apply_conversations(&db, &[nulled]).await.unwrap();
     assert_eq!(pinned_now(&db), 1, "null must not clobber a local pin");
 
-    // A newer remote row with an explicit false DOES unpin (a real edit).
+    // A newer explicit false DOES unpin.
     let mut unpin = base.clone();
     unpin["revision"] = json!(9_000_000_000_003_i64);
     unpin["pinned"] = json!(false);
-    apply_messages(&db, &[unpin]).await.unwrap();
-    assert_eq!(pinned_now(&db), 0, "an explicit remote false must unpin");
-
-    // And an INSERTED remote row without the column defaults to false.
-    let mut fresh = base.clone();
-    fresh["id"] = json!("fresh-msg");
-    fresh["revision"] = json!(9_000_000_000_004_i64);
-    apply_messages(&db, &[fresh]).await.unwrap();
-    let conn = db.0.lock().unwrap();
-    let fresh_pin: i64 = conn
-        .query_row("SELECT pinned FROM messages WHERE id = 'fresh-msg'", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(fresh_pin, 0);
+    apply_conversations(&db, &[unpin]).await.unwrap();
+    assert_eq!(pinned_now(&db), 0, "a newer explicit false must unpin");
 }
+

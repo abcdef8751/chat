@@ -402,6 +402,7 @@ conversations(
   prompt_state,                  -- JSON snapshot of the last-sent system prompt + parts (local-only)
   last_reflected_index,          -- memory-reflection watermark
   imported,                      -- 1 = came from an export; backfill-only
+  pinned,                        -- 1 = pinned to the sidebar's Pinned section (synced, LWW)
   created_at, updated_at)
 
 messages(
@@ -410,7 +411,6 @@ messages(
   content, model, provider, thinking_level, thinking,
   usage,                          -- JSON token/cost (frozen `cost` per turn)
   stop_reason, attachments,       -- JSON attachment array (remotePath when offloaded)
-  pinned,                         -- 1 = pinned in the transcript strip (synced, LWW by message revision)
   created_at)
 
 conversation_yolo(                -- per-chat YOLO override (local-only behavior)
@@ -458,12 +458,14 @@ cron_runs(                        -- per-fire audit trail
   the timeline skips them entirely. All three roles are **local-only
   bookkeeping** — never synced, never bumping the conversation's revision or
   `updated_at`, and excluded from edit-time tombstones.
-- **Pinned messages:** `messages.pinned` is part of the message row, so a pin
-  propagates through the ordinary push/pull under row-revision LWW (pull uses
+- **Pinned chats:** `conversations.pinned` is part of the conversation row, so a
+  pin propagates through the ordinary push/pull under row-revision LWW (pull uses
   `COALESCE(remote, local)` so a mirror that omits the column cannot clear a
-  local pin). `list_pinned_messages` returns full `MessageRow`s (no extra field
-  on `MessageRow`); `MessageList` renders a sticky strip and a pin toggle.
-  Pinning a `scheduled` thread stays local and never marks a row dirty.
+  local pin). Pinning bumps the revision/dirty flag but **not** `updated_at`:
+  it reorders the sidebar's Pinned section without resetting the reflection idle
+  timer. The Sidebar partitions pinned chats into their own section; a
+  `scheduled` thread cannot be pinned from the UI and, if pinned directly, stays
+  local with no sync flags.
 - **Tool-turn persistence:** assistant tool-request rows are
   `{"tool_calls":[{id,name,arguments}]}`; tool-result rows (`role="tool"`) are
   `{"tool_call_id","name","error","output"}`. Frontend parsers in `App.tsx`
@@ -1273,8 +1275,8 @@ and the app is byte-identical to before. Never blocks the UI.
   add column if not exists`) — `create table if not exists` is a no-op on a
   deployed project, and a push naming a missing column fails with `PGRST204`,
   stalling sync one-way until someone re-runs the file. `conversations.thinking_level`
-  and `messages.pinned` are the current examples. Apply schema changes with the
-  logged-in CLI:
+  and `conversations.pinned` are the current examples. Apply schema changes with
+  the logged-in CLI:
   `supabase db query --linked --file supabase/schema.sql` (or a single
   `--linked "alter table …"`); the personal project is already linked and both
   `schema.sql` and `storage.sql` have been applied.
@@ -1545,12 +1547,12 @@ the artificial tool-round cap removed (no `tool_limit`); the Linux icon
 regenerated from the Pi Chat mark; the Memory "Imported chats" card compacted
 into a details hint; MCP servers (HTTP + stdio, Settings UI, gated tools) and
 Markdown skills with a composer `/` menu plus `/compact`; and syncable pinned
-messages (transcript strip + pin toggle, Supabase `messages.pinned`). Review
-remediation included: title generation now recognizes the DB-derived first-line
-title, the slash menu inserts the skill file stem, commands require an explicit
-selection, per-chat YOLO load races and inherit-reset, pinned-strip cross-chat
-races, MCP output/body caps + image omission, serialized MCP reloads, schema
-validation, and a `/compact` registry claim.
+**chats** (sidebar Pinned section + pin toggle, Supabase `conversations.pinned`).
+Review remediation included: title generation now recognizes the DB-derived
+first-line title, the slash menu inserts the skill file stem, commands require an
+explicit selection, per-chat YOLO load races and inherit-reset, MCP output/body
+caps + image omission, serialized MCP reloads, schema validation, and a
+`/compact` registry claim.
 
 Residuals from this batch:
 

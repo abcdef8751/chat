@@ -16,6 +16,8 @@ export interface Conversation {
   compaction_summary: string | null;
   /** Id of the newest message folded into `compaction_summary` (local-only). */
   compaction_through: string | null;
+  /** Pinned to the sidebar's Pinned section (synced with the conversation row). */
+  pinned?: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -378,14 +380,12 @@ export function compactConversation(conversationId: string): Promise<CompactionR
   return invoke<CompactionResult>("compact_conversation", { conversationId });
 }
 
-/** Pin/unpin one message (synced with the message row). */
-export function setMessagePinned(messageId: string, pinned: boolean): Promise<void> {
-  return invoke<void>("set_message_pinned", { messageId, pinned });
-}
-
-/** The pinned messages of a conversation, oldest first. */
-export function listPinnedMessages(conversationId: string): Promise<Message[]> {
-  return invoke<Message[]>("list_pinned_messages", { conversationId });
+/** Pin/unpin one chat (synced with the conversation row). */
+export function setConversationPinned(
+  conversationId: string,
+  pinned: boolean,
+): Promise<void> {
+  return invoke<void>("set_conversation_pinned", { conversationId, pinned });
 }
 
 /** This chat's explicit YOLO choice; `null` = inherit the device default. */

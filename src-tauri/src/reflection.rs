@@ -1598,6 +1598,7 @@ mod tests {
             system_prompt: None,
             compaction_summary: None,
             compaction_through: None,
+            pinned: false,
             created_at: 0,
             updated_at: 0,
         }
