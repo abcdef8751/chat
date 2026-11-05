@@ -2379,11 +2379,117 @@ async fn invalid_tool_arguments_are_refused_without_running_the_tool() {
     assert_eq!(rows.last().unwrap().stop_reason.as_deref(), Some("stop"));
 }
 
-/// The tool-round cap is not a provider output limit: it must report its own
-/// stop reason, not `length`.
+/// A model's title reply is decoration-prone; the sanitizer must produce a
+/// clean sidebar label and cap it at 60 characters.
+#[test]
+fn title_sanitizer_strips_decoration_and_caps() {
+    assert_eq!(sanitize_title("\"  My  Great   Title. \""), "My Great Title");
+    assert_eq!(sanitize_title("# `Backtick Title`"), "Backtick Title");
+    assert_eq!(sanitize_title("## Heading\nignored"), "Heading");
+    assert_eq!(sanitize_title("What is Rust?!?"), "What is Rust");
+    assert_eq!(sanitize_title("标题。"), "标题");
+    assert_eq!(sanitize_title("\n\n   \n"), "");
+    // Auto-naming may replace the placeholder or the DB-derived first-line
+    // title, never a user rename. This predicate is the whole integration rule.
+    assert!(title_is_replaceable("New chat", "Hello there"));
+    assert!(title_is_replaceable("", "Hello there"));
+    assert!(title_is_replaceable("Hello there", "Hello there"));
+    // Byte-exact: the SQL write compares exactly, so whitespace must not pass.
+    assert!(!title_is_replaceable(" Hello there ", "Hello there"));
+    assert!(!title_is_replaceable("My own name", "Hello there"));
+    assert!(!title_is_replaceable("Hello there!", "Hello there"));
+    let long = sanitize_title(&"a".repeat(100));
+    assert_eq!(long.chars().count(), 60);
+    assert_eq!(long, "a".repeat(60));
+}
+
+/// A chat's own YOLO toggle must win over the device default: the gated tool
+/// runs without an approval prompt even though `auto_approve_tools` is false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_chat_yolo_runs_gated_tools_without_an_approval() {
+    let marker = std::env::temp_dir().join(format!(
+        "pi-chat-chat-yolo-{}-marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let args = format!(
+        r#"{{\"path\":\"{}\",\"content\":\"yolo\"}}"#,
+        marker.display()
+    );
+    let (port, handle) = start_mock(
+        vec![
+            vec![
+                tool_frag(0, "call_1", "write_file", &args),
+                finish_chunk("tool_calls"),
+            ],
+            vec![delta_chunk("done"), finish_chunk("stop")],
+        ],
+        0,
+    );
+    let db = Arc::new(open_db("chat-yolo"));
+    let approvals = Arc::new(tools::ApprovalRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = TestSink(events.clone());
+    let cid = insert_conv(&db);
+    {
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO conversation_yolo (conversation_id, auto_approve_tools) VALUES (?1, 1)",
+            [&cid],
+        )
+        .unwrap();
+    }
+    let cfg = AppConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "mock".into(),
+        // The device default is off; the per-chat row must override it.
+        auto_approve_tools: false,
+        ..Default::default()
+    };
+    let brave = tools::BraveSearch::default();
+    let shell = crate::shell::ShellExecutor::new();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_chat_turn(
+            &db,
+            &cfg,
+            "test-key",
+            &brave,
+            &shell,
+            &temp_memory("chat-yolo"),
+            &approvals,
+            CancelToken::new(),
+            &sink,
+            cid.clone(),
+            "write it".into(),
+            Vec::new(),
+            false,
+        ),
+    )
+    .await
+    .expect("per-chat YOLO must not park on the approval prompt")
+    .unwrap();
+    let _ = handle.join();
+
+    assert_eq!(outcome.stop_reason, "stop");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "yolo");
+    let gated = events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, StreamEvent::ToolCall { gated: true, .. }));
+    assert!(!gated, "the call must be announced as ungated");
+    let _ = std::fs::remove_file(&marker);
+}
+
+/// The tool loop has **no** round cap: an earlier revision stopped at 8 rounds
+/// and reported `tool_limit`, which silently truncated legitimate long-running
+/// work. It must keep going until the model answers (or the turn aborts/fails).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tool_round_cap_reports_tool_limit() {
-    let turns: Vec<Vec<String>> = (0..=tools::MAX_TOOL_ROUNDS)
+async fn tool_loop_has_no_round_cap() {
+    // Well past the old cap of 8, then a final plain answer.
+    const ROUNDS: usize = 20;
+    let mut turns: Vec<Vec<String>> = (0..ROUNDS)
         .map(|i| {
             vec![
                 tool_frag(0, &format!("call_{i}"), "list_crons", ""),
@@ -2391,6 +2497,7 @@ async fn tool_round_cap_reports_tool_limit() {
             ]
         })
         .collect();
+    turns.push(vec![delta_chunk("finished"), finish_chunk("stop")]);
     let (port, handle) = start_mock(turns, 0);
     let db = Arc::new(open_db("tool-round-cap"));
     let approvals = Arc::new(tools::ApprovalRegistry::default());
@@ -2426,17 +2533,22 @@ async fn tool_round_cap_reports_tool_limit() {
     let rows = msgs(&db, &cid);
     let last = rows.last().unwrap();
     assert_eq!(last.role, "assistant");
-    assert_eq!(last.stop_reason.as_deref(), Some("tool_limit"));
-    assert!(
-        rows.iter().all(|m| m.stop_reason.as_deref() != Some("length")),
-        "the round cap must not masquerade as an output limit"
+    assert_eq!(
+        last.stop_reason.as_deref(),
+        Some("stop"),
+        "the loop must run past the old cap and finish on the model's answer"
     );
-    // Exactly MAX_TOOL_ROUNDS rounds were dispatched; the cap discards the rest.
+    assert_eq!(last.content, "finished");
+    assert!(
+        rows.iter()
+            .all(|m| m.stop_reason.as_deref() != Some("tool_limit")),
+        "the removed cap must never be reported"
+    );
     let call_rows = rows
         .iter()
         .filter(|m| m.role == "assistant" && m.content.contains("\"tool_calls\""))
         .count();
-    assert_eq!(call_rows, tools::MAX_TOOL_ROUNDS as usize);
+    assert_eq!(call_rows, ROUNDS, "every round past the old cap was dispatched");
 }
 
 /// A multi-call round emits each call's `ToolResult` as soon as that call
@@ -2615,6 +2727,27 @@ fn cron_and_live_registrations_exclude_each_other() {
     registry.remove("c1", &old);
     assert!(registry.is_streaming("c1"));
     registry.remove("c1", &new);
+}
+
+/// `/compact`'s exclusive claim must exclude BOTH a live send and a cron run in
+/// the other direction too — otherwise the interlock it exists for is decorative.
+#[test]
+fn exclusive_compaction_claim_excludes_live_and_cron() {
+    let registry = StreamRegistry::default();
+
+    // Exclusive owns the chat: a live send and a cron run are both refused.
+    let exclusive = registry
+        .try_register_exclusive("c1".into())
+        .expect("free chat");
+    assert!(registry.try_register_live("c1".into()).is_none());
+    assert!(registry.try_register("c1".into()).is_none());
+    registry.remove("c1", &exclusive);
+    assert!(!registry.is_streaming("c1"));
+
+    // A live turn owns the chat: an exclusive pass is refused.
+    let live = registry.try_register_live("c1".into()).expect("free chat");
+    assert!(registry.try_register_exclusive("c1".into()).is_none());
+    registry.remove("c1", &live);
 }
 
 /// The extracted loop used by the reflection pass runs without a DB and still

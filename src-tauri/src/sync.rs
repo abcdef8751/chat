@@ -956,7 +956,8 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
             let mut stmt = conn
                 .prepare(
                     "SELECT id, conversation_id, role, \"index\", content, model, provider,
-                            thinking_level, thinking, usage, stop_reason, attachments, created_at, revision
+                            thinking_level, thinking, usage, stop_reason, attachments, pinned,
+                            created_at, revision
                      FROM messages
                      WHERE dirty = 1 AND revision > 0
                        AND conversation_id IN (SELECT id FROM conversations WHERE kind = 'chat')
@@ -979,8 +980,11 @@ async fn push(ctx: &SyncCtx<'_>, token: &str, progress: &SyncState) -> Result<u6
                         "usage": enc_opt(key, r.get::<_, Option<String>>(9)?),
                         "stop_reason": r.get::<_, Option<String>>(10)?,
                         "attachments": enc_opt(key, r.get::<_, Option<String>>(11)?),
-                        "created_at": r.get::<_, i64>(12)?,
-                        "revision": r.get::<_, i64>(13)?,
+                        // Structural, never encrypted: the pin must be readable so
+                        // the pull can apply it without the data key.
+                        "pinned": r.get::<_, i64>(12)? != 0,
+                        "created_at": r.get::<_, i64>(13)?,
+                        "revision": r.get::<_, i64>(14)?,
                         "deleted_at": Value::Null,
                     }))
                 })
@@ -1737,6 +1741,12 @@ struct RemoteMessage {
     usage: Option<String>,
     stop_reason: Option<String>,
     attachments: Option<String>,
+    /// The user's pin. `None` means the remote row omitted the column (a server
+    /// whose schema predates pinned messages): a new local row gets `false`, and
+    /// an existing row keeps its own pin, so a missing column can never wipe a
+    /// pin. Explicit `true`/`false` is applied (LWW by the row revision).
+    #[serde(default)]
+    pinned: Option<bool>,
     created_at: i64,
     revision: i64,
     #[serde(default)]
@@ -2107,12 +2117,12 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
             tx.execute(
                 "INSERT INTO messages
                    (id, conversation_id, role, \"index\", content, model, provider,
-                    thinking_level, thinking, usage, stop_reason, attachments, created_at, revision, dirty)
-                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
+                    thinking_level, thinking, usage, stop_reason, attachments, pinned, created_at, revision, dirty)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
                 rusqlite::params![
                     r.id, r.conversation_id, r.role, r.content, r.model, r.provider,
                     r.thinking_level, r.thinking, r.usage, r.stop_reason, r.attachments,
-                    r.created_at, r.revision
+                    r.pinned.unwrap_or(false) as i64, r.created_at, r.revision
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -2120,11 +2130,13 @@ async fn apply_messages(db: &Db, rows: &[Value]) -> Result<(), String> {
             tx.execute(
                 "UPDATE messages SET role = ?2, content = ?3, model = ?4, provider = ?5,
                         thinking_level = ?6, thinking = ?7, usage = ?8, stop_reason = ?9,
-                        attachments = ?10, created_at = ?11, revision = ?12, dirty = 0
+                        attachments = ?10, pinned = COALESCE(?11, pinned), created_at = ?12,
+                        revision = ?13, dirty = 0
                  WHERE id = ?1",
                 rusqlite::params![
                     r.id, r.role, r.content, r.model, r.provider, r.thinking_level,
-                    r.thinking, r.usage, r.stop_reason, r.attachments, r.created_at, r.revision
+                    r.thinking, r.usage, r.stop_reason, r.attachments,
+                    r.pinned.map(|b| b as i64), r.created_at, r.revision
                 ],
             )
             .map_err(|e| e.to_string())?;

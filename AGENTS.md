@@ -73,7 +73,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **404 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **422 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
@@ -92,7 +92,7 @@ empty); fixing them is a separate cleanup.
 | Area              | State | Notes                                                                                                     |
 | ----------------- | ----- | --------------------------------------------------------------------------------------------------------- |
 | Stack / scaffold  | ✅    | SolidJS + Tailwind v4 + Kobalte + Tauri v2; SQLite via rusqlite (bundled)                                  |
-| Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, capped tool loop                        |
+| Streaming loop    | ✅    | Raw SSE parse (keeps provider `reasoning_content`), deltas, abort, **uncapped tool loop** (intentional; Stop still aborts) |
 | Config & secrets  | ✅    | OS keychain; models.dev catalog with `/models` fallback; thinking levels; per-model price **and capability (modality) overrides** |
 | Conversations     | ✅    | Sidebar, search, rename/delete, auto-title, attachments, per-turn timeline, **edit in the central composer** (pen under the bubble → draft → truncate → re-run), per-chat **model + thinking level** |
 | Tools             | ✅    | `bash` (one-shot shell, **`~` paths expanded for read/write, not for command strings**), `read_file` (text **and image-aware**)/`write_file` (gated; **optional YOLO auto-approve**), memory tools incl. `memory_str_replace`, native Brave search tools + `web_fetch` + `fetch_image` + **`fetch_file`** (remote-stored attachment download; ungated) |
@@ -118,12 +118,14 @@ prompt(userMessage)
 │   ├─ gate each call (approve / deny / abort) — skipped when auto_approve_tools
 │   ├─ execute tool
 │   ├─ on error: return a tool-error result (model self-corrects)
-│   └─ loop back to the LLM (MAX_TOOL_ROUNDS = 8)
+│   └─ loop back to the LLM (no artificial round cap)
 ├─ persist message + usage + stopReason
 └─ emit final message event
 ```
 
-Guards: capped tool rounds; idempotent abort that preserves partial text; stream
+Guards: **no artificial tool-round cap** (removed at the user's request; Stop,
+abort, stream errors and output truncation still end the loop); idempotent abort
+that preserves partial text; stream
 errors keep partial text and mark `stop_reason = "error"`. Within a turn, each
 tool-call round's reasoning is echoed on its assistant tool-call message for the
 following rounds (DeepSeek thinking mode requires it, else HTTP 400); traces are
@@ -138,8 +140,8 @@ dispatches nothing (the partial assistant *text* still rides the final
 assistant row), ending the turn with `stop_reason = "error"` plus an actionable
 message (retry / smaller output / higher provider cap). A truncated **answer**
 (no tool calls) keeps `stop_reason = "length"`, which the timeline annotates
-"(output limit reached)". The tool-round cap reports `"tool_limit"` (annotated
-"(tool-round limit reached)") so it is no longer confused with an output limit.
+"(output limit reached)". There is no `"tool_limit"` stop reason any more — the
+loop keeps going until the model answers, or the turn is aborted/errors.
 Streamed arguments that fail to parse are marked `Value::Null` **in memory**
 (never silently coerced to `{}` there) and their ids tracked: such a call is
 **not** dispatched; it still gets a tool-error result row ("arguments were not
@@ -159,6 +161,26 @@ the in-memory history. `regenerate: false` is the ordinary send path.
 gated tools: the approval wait is skipped and the `ToolCall` event is emitted
 with `gated: false`, so the UI never shows the pending approve/deny row. Local
 data only (not synced).
+
+**Automatic chat names.** `+ New` opens an empty `"New chat"` immediately —
+there is no naming dialog. On the first user turn's terminal `done` event the
+frontend calls `generate_conversation_title`; the backend asks a tool-less 20 s
+completion for a 2–6 word title and sanitizes it (first line, no quotes/emoji or
+trailing punctuation, ≤60 chars), falling back to `db::derive_title`. The model
+is `AppConfig.title_model` when set (resolved against the **active** provider,
+which is the catalog the Settings picker lists) else the conversation's own
+model (its provider). `db::insert_message` still derives a first-line title
+synchronously, so `set_conversation_title_if_auto` treats *that derived string*
+as replaceable too — but a real user rename never matches and is never
+overwritten. A failure/empty reply logs and leaves the derived title; the
+command never fails the UI or blocks sending.
+
+**Per-chat YOLO.** The composer's `+` sheet has an "Auto-approve tools · this
+chat" switch. `conversations_yolo` stores an explicit choice per conversation
+(no row = inherit the Settings default). `db::resolve_auto_approve` resolves it
+once per turn into `turn_cfg.auto_approve_tools`, so every gate (host tools and
+MCP) sees the same value. The sheet's "use default" link clears the override
+back to inheritance. Local-only (like the global switch).
 
 **`read_file` images.** A raster image (png/jpg/gif/webp/bmp; SVG/ICO excluded;
 capped at `MAX_IMAGE_BYTES`) read by `read_file` is delivered to the model as an
@@ -182,13 +204,14 @@ Termux.)
 **Failure-handling contract**
 
 - Stream error mid-turn → keep partial text, `stop_reason = "error"`, offer retry.
-- Output-limit truncation → `error` (tool-call round, nothing persisted) or
-  `length`/`tool_limit` annotations (answer/cap); never execute a cut-off call.
+- Output-limit truncation → `error` (tool-call round, nothing persisted) or a
+  `length` annotation (answer); never execute a cut-off call.
 - Tool error → convert to a tool-error result so the model can self-correct; never throw.
 - Abort → cancels the in-flight request/tool dispatch immediately via a
   race-free `CancelToken` (`StreamRegistry`), then closes the stream and persists
   the partial; idempotent.
-- Runaway guard → hard cap on consecutive tool rounds.
+- Runaway guard → none by design (the cap was removed); Stop/abort, stream
+  errors and context-window failures are the remaining bounds.
 - Stream errors are **per conversation** in the UI (keyed by id, cleared when the
   next turn starts or the same chat's turn finishes successfully), so an error
   from one chat never shows up in another.
@@ -387,7 +410,12 @@ messages(
   content, model, provider, thinking_level, thinking,
   usage,                          -- JSON token/cost (frozen `cost` per turn)
   stop_reason, attachments,       -- JSON attachment array (remotePath when offloaded)
+  pinned,                         -- 1 = pinned in the transcript strip (synced, LWW by message revision)
   created_at)
+
+conversation_yolo(                -- per-chat YOLO override (local-only behavior)
+  conversation_id PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+  auto_approve_tools)            -- absent row = inherit AppConfig.auto_approve_tools
 
 model_prices(                     -- models.dev cache
   provider, model_id, input_per_million, output_per_million,
@@ -430,6 +458,12 @@ cron_runs(                        -- per-fire audit trail
   the timeline skips them entirely. All three roles are **local-only
   bookkeeping** — never synced, never bumping the conversation's revision or
   `updated_at`, and excluded from edit-time tombstones.
+- **Pinned messages:** `messages.pinned` is part of the message row, so a pin
+  propagates through the ordinary push/pull under row-revision LWW (pull uses
+  `COALESCE(remote, local)` so a mirror that omits the column cannot clear a
+  local pin). `list_pinned_messages` returns full `MessageRow`s (no extra field
+  on `MessageRow`); `MessageList` renders a sticky strip and a pin toggle.
+  Pinning a `scheduled` thread stays local and never marks a row dirty.
 - **Tool-turn persistence:** assistant tool-request rows are
   `{"tool_calls":[{id,name,arguments}]}`; tool-result rows (`role="tool"`) are
   `{"tool_call_id","name","error","output"}`. Frontend parsers in `App.tsx`
@@ -837,6 +871,63 @@ old chat and past runs stay where they are).
   clock glyph) instead of the chat list; the transcript shows the "scheduled"
   chip. The form needs no open chat — a job always owns its thread.
 
+## MCP servers + skills
+
+### MCP (`src-tauri/src/mcp.rs`)
+
+Servers are configured in `<app data>/mcp.json` (edited from Settings → MCP
+servers; never in `config.json`). Each entry is
+`{id, name, enabled, transport: "http"|"stdio", url, command, args, env}`.
+`mcp::init` publishes the path and starts one background discovery pass; the
+Settings card also has an explicit **Reload**.
+
+- **Transport:** JSON-RPC 2.0. HTTP is the streamable-HTTP shape (`POST`,
+  `accept: application/json, text/event-stream`, `mcp-session-id` captured and
+  resent, both plain JSON and SSE replies). stdio spawns the command and speaks
+  newline-delimited JSON-RPC; a per-call session is used, with timeouts, and the
+  child is killed at the end.
+- **Discovery:** `initialize` → `notifications/initialized` → `tools/list`.
+  Results are cached in a process-global (`mcp::global()`), so
+  `chat::chat_tools()` stays synchronous. Reloads are serialized so a slow
+  startup pass cannot overwrite a newer Settings save.
+- **Exposure:** a tool is advertised as `mcp__<server-id>__<tool>` (sanitized,
+  ≤64 chars, hash-suffixed before capping so two long names cannot collide).
+  Only an object `inputSchema` is accepted; anything else falls back to an empty
+  object schema so one broken server cannot 400 every request.
+- **Gating:** every MCP tool is approval-gated (`tools::is_gated` recognizes the
+  prefix). This makes `Cron(ReadOnly)` refuse them, reflection/extraction refuse
+  them by mode, and YOLO (global or per-chat) run them without a prompt. The
+  call is raced against `CancelToken`, like every other tool.
+- **Output:** flattened to text and truncated to the ordinary 20k-char ceiling;
+  `image` parts are replaced with `[image content omitted …]` instead of pasting
+  base64 into the prompt. HTTP bodies are capped at 2 MB.
+- **Security note:** `env` values (including tokens a user puts there) cross IPC
+  to the Settings UI, and `mcp.json` is writable by the model through `write_file`
+  (gated, or YOLO) — treat a server config as executable configuration, not a
+  file-editing convenience.
+
+### Skills (`src-tauri/src/skills.rs`)
+
+A skill is a Markdown file in `<app data>/skills/` (stem = id, optional
+frontmatter `name`/`description`, otherwise the first heading + paragraph). The
+Settings → Skills card lists them and shows the folder.
+
+- **Invocation:** a message starting with `/skill-id` (or the display name) is
+  expanded by `skills::expand_slash`. The skill body is added to the *request*
+  as a system message right before the user turn; the stored/displayed user text
+  stays exactly what the user typed (so edit/replay is unchanged). A bare
+  `/skill` sends `"Follow the skill instructions."`. Bodies are capped at
+  100k chars.
+- **Composer `/` menu:** typing `/` opens a filtered list of skills plus the
+  built-in `/compact`; the menu inserts `/<file-stem> ` (not the display name).
+  Commands require an explicit arrow selection or typing the exact command id,
+  so `/` + Enter cannot run `/compact` by accident. `/compact` calls `compact_conversation`, which takes a
+  `StreamRegistry` claim for the duration (refusing if a turn is already in
+  flight) and returns `{compacted, summary, note}`.
+- **Replay caveat:** the skill body is request-only; later turns replay the user
+  text without it (the cap keeps that bounded). Do not rely on a skill body
+  being silently re-injected on the next turn.
+
 ## Tool surface
 
 Introduced through the same loop, so they're visible, gateable, and aborted like
@@ -905,13 +996,19 @@ list_crons()
 update_cron(id, prompt?, schedule?, title?, tool_policy?, context?, notify?, enabled?)
 delete_cron(id)
 run_cron_now(id)                  // queues an immediate fire (~1 s scheduler wake)
+
+// MCP — a configured server's tools, approval-gated, truncated to the ordinary
+// 20k-char ceiling (image parts are summarized, never inlined).
+mcp__<server-id>__<tool>(…)
 ```
 
 The tool list is byte-identical for live and reflection turns so the prompt-cache
 prefix matches; `run_tool_loop` refuses disallowed calls by mode instead of
-splitting the list (reflection: no host/web tools; extract: none).
-Gating (`tools::is_gated` = bash/read_file/write_file) is bypassed entirely when
-YOLO mode is on.
+splitting the list (reflection: no host/web tools; extract: none). MCP tools are
+appended from the process-global discovery cache, so the list can change only
+when servers/config change (a Settings reload or app start).
+Gating (`tools::is_gated` = bash/read_file/write_file plus every `mcp__*` tool)
+is bypassed entirely when YOLO mode is on (global, or the chat's own override).
 
 **Brave integration (native, no node/MCP process):** `tools.rs` `BraveSearch`
 calls `api.search.brave.com` directly over `reqwest` (the same six-tool surface
@@ -1176,7 +1273,8 @@ and the app is byte-identical to before. Never blocks the UI.
   add column if not exists`) — `create table if not exists` is a no-op on a
   deployed project, and a push naming a missing column fails with `PGRST204`,
   stalling sync one-way until someone re-runs the file. `conversations.thinking_level`
-  is the current example. Apply schema changes with the logged-in CLI:
+  and `messages.pinned` are the current examples. Apply schema changes with the
+  logged-in CLI:
   `supabase db query --linked --file supabase/schema.sql` (or a single
   `--linked "alter table …"`); the personal project is already linked and both
   `schema.sql` and `storage.sql` have been applied.
@@ -1247,11 +1345,12 @@ and the app is byte-identical to before. Never blocks the UI.
 │  ├─ index.css        # Tailwind import + typography + class-based dark variant
 │  ├─ App.tsx          # thin shell: shared chat/settings state + mounts the surfaces
 │  ├─ components/      # surfaces split out of App.tsx (Sidebar, Header, MessageList,
-│  │                   #   Timeline, ImageLightbox, Composer, MemoryPage, CronPage,
-│  │                   #   SettingsDialog, SystemBadge)
+│  │                   #   Timeline, ImageLightbox, Composer, AttachmentSheet,
+│  │                   #   SlashMenu, MemoryPage, CronPage, SettingsDialog, SystemBadge)
 │  └─ lib/
 │     ├─ api.ts        # typed invoke wrappers over Tauri commands
 │     ├─ platform.ts   # Android bridge: isAndroid / onBack / exitApp / readAttachmentFromUri
+│     ├─ viewport.ts   # visualViewport keyboard inset (composer lift)
 │     ├─ turns.ts      # pure turn/timeline helpers + types (groupTurns/buildEntries/parsers)
 │     ├─ turns.test.ts # node --test unit tests for groupTurns (excluded from tsc)
 │     ├─ icons.tsx     # inline SVG icons
@@ -1262,8 +1361,8 @@ and the app is byte-identical to before. Never blocks the UI.
    ├─ capabilities/default.json
    ├─ vendor/tauri-runtime-wry/  # vendored+patched crate (see PATCH.md) via [patch.crates-io]
    ├─ gen/android/     # generated Android project (Kotlin: MainActivity.kt window
-   │                   #   insets/back + picker launcher, PickerPlugin.kt system
-   │                   #   file picker, FileBridgePlugin.kt content:// resolver,
+   │                   #   insets/back + picker launcher, PickerPlugin.kt
+   │                   #   document/image/camera picker, FileBridgePlugin.kt content:// resolver,
    │                   #   KeepAliveService.kt foreground service, RunCommandPlugin.kt Termux bridge)
    ├─ build.rs         # embeds SUPABASE_URL/PUBLISHABLE_KEY from ../.env (rerun-if-changed)
    └─ src/
@@ -1277,6 +1376,8 @@ and the app is byte-identical to before. Never blocks the UI.
       │                 #   per-baseUrl cache, ModelInfo (override-aware `vision`)
       ├─ tools.rs      # tool specs, host executor, gating + approval registry
       │                 #   (YOLO bypass), native BraveSearch
+      ├─ mcp.rs        # MCP client (HTTP/stdio JSON-RPC), discovery cache + commands
+      ├─ skills.rs     # Markdown skills: scan, frontmatter, `/skill` expansion
       ├─ shell.rs      # one-shot host shell executor (fresh `bash -c` per call);
       │                 #   Android routes to the Termux bridge (android.rs)
       ├─ android.rs    # Android [mobile]: Termux RUN_COMMAND bridge (`run_command`
@@ -1435,7 +1536,42 @@ and the app is byte-identical to before. Never blocks the UI.
 
 ## Next / open items
 
-**Latest batch (three fixes):** the sidebar drawer no longer animates its
+**Latest batch (eight features):** automatic chat names (empty new chat, title
+generated from the first message on the terminal `done`; `titleModel` setting;
+derived-title-aware replacement); keyboard-aware mobile composer
+(`visualViewport` lift, bottom-follow only when near the bottom); the composer
+`+` sheet (camera / photo / file + per-chat YOLO with a "use default" reset);
+the artificial tool-round cap removed (no `tool_limit`); the Linux icon
+regenerated from the Pi Chat mark; the Memory "Imported chats" card compacted
+into a details hint; MCP servers (HTTP + stdio, Settings UI, gated tools) and
+Markdown skills with a composer `/` menu plus `/compact`; and syncable pinned
+messages (transcript strip + pin toggle, Supabase `messages.pinned`). Review
+remediation included: title generation now recognizes the DB-derived first-line
+title, the slash menu inserts the skill file stem, commands require an explicit
+selection, per-chat YOLO load races and inherit-reset, pinned-strip cross-chat
+races, MCP output/body caps + image omission, serialized MCP reloads, schema
+validation, and a `/compact` registry claim.
+
+Residuals from this batch:
+
+- **Android camera/image picker needs a device.** `PickerPlugin.kt` was extended
+  for `kind = image|camera` (FileProvider capture) but Kotlin is not compiled
+  off-device; verify capture, cancel, gallery fallback, and permission grants.
+- **MCP stdio is per-call.** Discovery and each `tools/call` spawn a fresh child
+  (cold start for `npx` servers). A long-lived session cache is future work.
+- **Skill bodies are request-only.** A later turn replays the user text without
+  the skill body (capped at 100k chars). Persisting a replayable instruction row
+  would fix it, at the cost of transcript noise.
+- **MCP `env` crosses IPC** to the Settings renderer, and `mcp.json` is writable
+  by `write_file` when approved (or YOLO). Treat server config as executable
+  configuration; a startup stdio server spawns without a fresh approval.
+- **No tool-round cap** is intentional; a provider that never stops calling
+  tools can spend tokens until the context window or the user's Stop ends it.
+- **GUI e2e was not run** for this batch (needs a display/WebKitWebDriver);
+  `cargo test --lib` (422), `tsc`, `npm run build`, `npm run test:turns` and
+  clippy (the 12 pre-existing lints, none new) are green.
+
+**Previous batch (three fixes):** the sidebar drawer no longer animates its
 transform (the WebKitGTK text shimmer behind the old "jitter") and reserves a
 stable scrollbar gutter; Android completion notifications now use Activity
 visibility (`onStart`/`onStop` → JNI → `android::is_foreground()`) instead of the
@@ -1447,8 +1583,8 @@ to the file name (composer and transcript), with
 attachment JSON on success.
 
 **Batch landed (five changes):** output-limit truncation that can no longer
-silently drop or execute a cut-off tool call (`length` / `tool_limit` /
-invalid-JSON handling); a distinctive running-system id in the prompt
+silently drop or execute a cut-off tool call (`length` / invalid-JSON
+handling); a distinctive running-system id in the prompt
 (`pi-chat/<version>+<prompt hash>`) with the existing diff note informing the
 model on upgrade, plus a header `sys <hash>` badge (`system_info`); `read_file`
 images detected by content and sane binary/oversized failures; per-conversation

@@ -61,9 +61,21 @@ CREATE TABLE IF NOT EXISTS messages (
   usage TEXT,
   stop_reason TEXT,
   attachments TEXT,
+  -- User-pinned message: kept visible in the transcript's pinned strip. Synced
+  -- (part of the message row, LWW by revision) so a pin set on one device shows
+  -- up on the others.
+  pinned INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   revision BIGINT NOT NULL DEFAULT 0,
   dirty INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-chat YOLO override. No row = inherit the device-wide
+-- `AppConfig.auto_approve_tools`; a row pins this conversation's choice.
+-- Deliberately local-only (behavior, like the global switch).
+CREATE TABLE IF NOT EXISTS conversation_yolo (
+  conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+  auto_approve_tools INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS model_prices (
@@ -214,6 +226,11 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     let _ = conn.execute("ALTER TABLE model_prices ADD COLUMN modalities TEXT", []);
     // Older databases predate message file attachments.
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT", []);
+    // Older databases predate pinned messages (syncable).
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     // Older databases predate the per-conversation memory reflection watermark.
     let _ = conn.execute(
         "ALTER TABLE conversations ADD COLUMN last_reflected_index INTEGER",
@@ -2665,6 +2682,253 @@ pub fn list_cron_triggers(
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Pinned messages / per-chat YOLO / auto-title.
+//
+// Pins ride the synced message row (`pinned`, LWW by revision). The per-chat
+// YOLO choice is local-only (behavior, like the global switch). Titles are
+// replaced only while they still look auto-generated.
+// ---------------------------------------------------------------------------
+
+/// Pin or unpin one message. The pin rides the synced message row (`pinned`),
+/// so the row is marked dirty and its revision bumped. Returns an error when the
+/// id does not exist.
+#[tauri::command]
+pub fn set_message_pinned(
+    db: tauri::State<'_, Db>,
+    message_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    set_message_pinned_db(&db, &message_id, pinned)
+}
+
+/// [`set_message_pinned`] against a plain [`Db`] (unit-testable; a Tauri
+/// `State` cannot be built in a test).
+pub fn set_message_pinned_db(db: &Db, message_id: &str, pinned: bool) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // Read the current value and the owning conversation's kind in one statement
+    // (a missing id must not consume a revision). `kind` decides whether the row
+    // participates in sync at all: scheduled threads never push, so marking one
+    // dirty would leave a pending count no push can drain.
+    let row: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT m.pinned, COALESCE(c.kind, 'chat')
+             FROM messages m LEFT JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.id = ?1",
+            [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (current, kind) = match row {
+        Some(v) => v,
+        None => return Err(format!("no message with id {message_id}")),
+    };
+    if (current != 0) == pinned {
+        return Ok(()); // idempotent: no revision churn for a re-pin
+    }
+    if kind != "chat" {
+        // Local-only pin for a scheduled thread: update content, never sync flags.
+        conn.execute(
+            "UPDATE messages SET pinned = ?2 WHERE id = ?1",
+            params![message_id, pinned as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let rev = bump_revision_c(&conn)?;
+    // A pin is an edit of the MESSAGE row, so its revision/dirty drive the sync
+    // push. The conversation row is deliberately untouched (`updated_at` too), so
+    // pinning can't reorder the sidebar or reset the reflection idle timer.
+    let updated = conn
+        .execute(
+            "UPDATE messages SET pinned = ?2, revision = ?3, dirty = 1 WHERE id = ?1",
+            params![message_id, pinned as i64, rev],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err(format!("no message with id {message_id}"));
+    }
+    Ok(())
+}
+
+/// The pinned messages of one conversation, oldest first (the transcript's
+/// pinned strip). Reuses [`MessageRow`] so the frontend can render the snippet
+/// and jump to the row without a second shape.
+#[tauri::command]
+pub fn list_pinned_messages(
+    db: tauri::State<'_, Db>,
+    conversation_id: String,
+) -> Result<Vec<MessageRow>, String> {
+    list_pinned_messages_db(&db, &conversation_id)
+}
+
+/// [`list_pinned_messages`] against a plain [`Db`]. The explicit column list
+/// mirrors [`read_messages`] exactly, so the pinned strip deserializes into the
+/// same [`MessageRow`] shape the transcript uses.
+pub fn list_pinned_messages_db(
+    db: &Db,
+    conversation_id: &str,
+) -> Result<Vec<MessageRow>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, conversation_id, role, \"index\", content, model, provider, thinking_level, thinking, usage, stop_reason, attachments, created_at
+             FROM messages WHERE conversation_id = ?1 AND pinned = 1 ORDER BY \"index\" ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([conversation_id], |r| {
+            Ok(MessageRow {
+                id: r.get(0)?,
+                conversation_id: r.get(1)?,
+                role: r.get(2)?,
+                index: r.get(3)?,
+                content: r.get(4)?,
+                model: r.get(5)?,
+                provider: r.get(6)?,
+                thinking_level: r.get(7)?,
+                thinking: r.get(8)?,
+                usage: r.get(9)?,
+                stop_reason: r.get(10)?,
+                attachments: r.get(11)?,
+                created_at: r.get(12)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// This chat's explicit YOLO choice, or `None` when it inherits the device
+/// default (`AppConfig.auto_approve_tools`).
+#[tauri::command]
+pub fn get_conversation_auto_approve(
+    db: tauri::State<'_, Db>,
+    conversation_id: String,
+) -> Result<Option<bool>, String> {
+    conversation_auto_approve(&db, &conversation_id)
+}
+
+/// [`get_conversation_auto_approve`] against a plain [`Db`].
+pub fn conversation_auto_approve(
+    db: &Db,
+    conversation_id: &str,
+) -> Result<Option<bool>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT auto_approve_tools FROM conversation_yolo WHERE conversation_id = ?1",
+        [conversation_id],
+        |r| r.get::<_, i64>(0).map(|v| v != 0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// Pin (`Some(true/false)`) or clear (`None` = inherit the device default) this
+/// chat's YOLO choice. Local-only behavior.
+#[tauri::command]
+pub fn set_conversation_auto_approve(
+    db: tauri::State<'_, Db>,
+    conversation_id: String,
+    value: Option<bool>,
+) -> Result<(), String> {
+    set_conversation_auto_approve_db(&db, &conversation_id, value)
+}
+
+/// [`set_conversation_auto_approve`] against a plain [`Db`]. Deliberately
+/// local-only: no revision bump, no dirty flag, nothing in `syncable_payload`.
+pub fn set_conversation_auto_approve_db(
+    db: &Db,
+    conversation_id: &str,
+    value: Option<bool>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    match value {
+        Some(v) => {
+            conn.execute(
+                "INSERT INTO conversation_yolo (conversation_id, auto_approve_tools)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(conversation_id) DO UPDATE SET auto_approve_tools = excluded.auto_approve_tools",
+                params![conversation_id, v as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM conversation_yolo WHERE conversation_id = ?1",
+                [conversation_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Effective YOLO for one turn: the chat's override when set, else the device
+/// default. Used by `chat::run_turn_core`.
+pub fn resolve_auto_approve(
+    db: &Db,
+    conversation_id: &str,
+    global: bool,
+) -> Result<bool, String> {
+    Ok(conversation_auto_approve(db, conversation_id)?.unwrap_or(global))
+}
+
+/// Replace a conversation's title only while it still carries the placeholder
+/// ("New chat" / empty), so an auto-generated name never overwrites a rename the
+/// user made. Returns whether it wrote. Bumps `updated_at` (the title is
+/// user-visible content, and the sidebar sorts by it).
+pub fn set_conversation_title_if_default(
+    db: &Db,
+    conversation_id: &str,
+    title: &str,
+) -> Result<bool, String> {
+    set_conversation_title_if_auto(db, conversation_id, title, "")
+}
+
+/// Replace a conversation's title while it still looks auto-generated.
+///
+/// `replaceable` is the title the DB itself derived from the first user message
+/// (`derive_title`): the insert path writes that synchronously, so the title
+/// generator would otherwise see a "real" title and never run. Matching it is
+/// safe because a user rename is not the derived string. Pass `""` for the
+/// placeholder-only behaviour.
+///
+/// Returns whether it wrote. A no-op write consumes no sync revision.
+pub fn set_conversation_title_if_auto(
+    db: &Db,
+    conversation_id: &str,
+    title: &str,
+    replaceable: &str,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let matches: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM conversations
+             WHERE id = ?1
+               AND (title = 'New chat' OR title = ''
+                    OR (?2 != '' AND title = ?2))",
+            params![conversation_id, replaceable],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if matches.is_none() {
+        return Ok(false);
+    }
+    let rev = bump_revision_c(&conn)?;
+    let n = conn
+        .execute(
+            "UPDATE conversations SET title = ?2, updated_at = ?3, revision = ?4, dirty = 1
+             WHERE id = ?1
+               AND (title = 'New chat' OR title = ''
+                    OR (?5 != '' AND title = ?5))",
+            params![conversation_id, title.trim(), now(), rev, replaceable],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2961,7 +3225,9 @@ mod tests {
     #[test]
     fn a_failed_extraction_stays_pending_after_a_successful_run() {
         let mut p = std::env::temp_dir();
-        p.push(format!("pi-chat-pending-{}.sqlite", std::process::id()));
+        // Distinct from `pending_rows_and_resync_ignore_unsynced_rows`: tests
+        // run in parallel and must not open the same SQLite/WAL files.
+        p.push(format!("pi-chat-extraction-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
         let now = now_ms();
@@ -3345,6 +3611,364 @@ mod tests {
             get_conversation(&db, "c").unwrap().unwrap().thinking_level,
             None
         );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -----------------------------------------------------------------------
+    // pinned messages / per-chat YOLO / auto-title (rust-data worker)
+    // -----------------------------------------------------------------------
+
+    /// A pin is a MESSAGE-row edit: the message's revision/dirty drive the sync
+    /// push, while the conversation row (and its `updated_at`) is untouched so
+    /// pinning cannot reorder the sidebar or reset the reflection idle timer.
+    /// Unknown ids are rejected instead of silently reporting success.
+    #[test]
+    fn pinned_messages_roundtrip_and_validate_the_id() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-pinned-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('c', 't', 5, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let first = insert_message(
+            &db,
+            "c".into(),
+            "user".into(),
+            "pin me".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let second = insert_message(
+            &db,
+            "c".into(),
+            "assistant".into(),
+            "not me".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The conversation state a pin must not disturb (inserting the user row
+        // already touched it, so snapshot after both inserts).
+        let conv_before = get_conversation(&db, "c").unwrap().unwrap();
+        let (conv_rev_before, conv_dirty_before): (i64, i64) = {
+            let conn = db.0.lock().unwrap();
+            conn.query_row(
+                "SELECT revision, dirty FROM conversations WHERE id = 'c'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        set_message_pinned_db(&db, &first.id, true).unwrap();
+        let pinned = list_pinned_messages_db(&db, "c").unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].id, first.id);
+        assert_eq!(pinned[0].content, "pin me");
+        assert_eq!(pinned[0].index, first.index);
+        assert_eq!(pinned[0].role, "user");
+
+        // The message row moved (revision bumped, marked dirty).
+        let (msg_rev, msg_dirty, msg_pinned): (i64, i64, i64) = {
+            let conn = db.0.lock().unwrap();
+            conn.query_row(
+                "SELECT revision, dirty, pinned FROM messages WHERE id = ?1",
+                [&first.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert!(msg_rev > 0, "a pin must bump the message revision");
+        assert_eq!(msg_dirty, 1, "a pin must mark the message dirty");
+        assert_eq!(msg_pinned, 1);
+
+        // …and the conversation did not.
+        let conv_after = get_conversation(&db, "c").unwrap().unwrap();
+        assert_eq!(conv_after.updated_at, conv_before.updated_at);
+        let (conv_rev_after, conv_dirty_after): (i64, i64) = {
+            let conn = db.0.lock().unwrap();
+            conn.query_row(
+                "SELECT revision, dirty FROM conversations WHERE id = 'c'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(conv_rev_after, conv_rev_before);
+        assert_eq!(conv_dirty_after, conv_dirty_before);
+
+        // Two pins list in transcript order; unpinning drops just that one.
+        set_message_pinned_db(&db, &second.id, true).unwrap();
+        let ids: Vec<String> = list_pinned_messages_db(&db, "c")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![first.id.clone(), second.id.clone()]);
+
+        set_message_pinned_db(&db, &first.id, false).unwrap();
+        let ids: Vec<String> = list_pinned_messages_db(&db, "c")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![second.id.clone()]);
+
+        // Pins are scoped per conversation.
+        assert!(list_pinned_messages_db(&db, "other").unwrap().is_empty());
+
+        // An unknown id is an error, not a silent no-op.
+        let err = set_message_pinned_db(&db, "does-not-exist", true).unwrap_err();
+        assert!(err.contains("does-not-exist"), "unhelpful error: {err}");
+
+        // Re-pinning the same value is idempotent: no revision churn.
+        let (rev_before, _): (i64, i64) = {
+            let conn = db.0.lock().unwrap();
+            conn.query_row(
+                "SELECT revision, dirty FROM messages WHERE id = ?1",
+                [&second.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        set_message_pinned_db(&db, &second.id, true).unwrap();
+        let rev_after: i64 = {
+            let conn = db.0.lock().unwrap();
+            conn.query_row(
+                "SELECT revision FROM messages WHERE id = ?1",
+                [&second.id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(rev_before, rev_after, "a re-pin must not bump the revision");
+
+        // A scheduled thread never syncs: pinning there is local-only.
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, kind, created_at, updated_at)
+                 VALUES ('sched', 'job', 'scheduled', 5, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let sched_msg = insert_message(
+            &db,
+            "sched".into(),
+            "user".into(),
+            "scheduled pin".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "UPDATE messages SET revision = 0, dirty = 0 WHERE id = ?1",
+                [&sched_msg.id],
+            )
+            .unwrap();
+        }
+        set_message_pinned_db(&db, &sched_msg.id, true).unwrap();
+        let (sched_rev, sched_dirty, sched_pinned): (i64, i64, i64) = {
+            let conn = db.0.lock().unwrap();
+            conn.query_row(
+                "SELECT revision, dirty, pinned FROM messages WHERE id = ?1",
+                [&sched_msg.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(sched_pinned, 1, "the pin is still visible locally");
+        assert_eq!(sched_rev, 0, "a scheduled pin must not touch sync state");
+        assert_eq!(sched_dirty, 0, "a scheduled pin must not mark the row dirty");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Auto-titling only replaces the placeholder, never a name the user chose,
+    /// and reports whether it actually wrote. A write is user-visible content, so
+    /// it bumps `updated_at` too (the sidebar sorts by it).
+    #[test]
+    fn title_is_replaced_only_while_it_is_the_default() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-title-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('placeholder', 'New chat', 1000, 1000),
+                        ('blank', '', 1000, 1000),
+                        ('named', 'My own name', 1000, 1000)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Placeholder → replaced, dirty, revision and updated_at bumped.
+        assert!(set_conversation_title_if_default(&db, "placeholder", "  A real title  ").unwrap());
+        let conv = get_conversation(&db, "placeholder").unwrap().unwrap();
+        assert_eq!(conv.title, "A real title");
+        assert!(conv.updated_at > 1000, "a title write must bump updated_at");
+        let (rev, dirty): (i64, i64) = {
+            let conn = db.0.lock().unwrap();
+            conn.query_row(
+                "SELECT revision, dirty FROM conversations WHERE id = 'placeholder'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert!(rev > 0);
+        assert_eq!(dirty, 1);
+
+        // A second pass is a no-op (the title is no longer the placeholder).
+        assert!(!set_conversation_title_if_default(&db, "placeholder", "Another").unwrap());
+        assert_eq!(
+            get_conversation(&db, "placeholder").unwrap().unwrap().title,
+            "A real title"
+        );
+
+        // Empty is also a placeholder.
+        assert!(set_conversation_title_if_default(&db, "blank", "Named later").unwrap());
+        assert_eq!(
+            get_conversation(&db, "blank").unwrap().unwrap().title,
+            "Named later"
+        );
+
+        // A user-chosen title is never overwritten, and nothing is written.
+        assert!(!set_conversation_title_if_default(&db, "named", "Clobbered").unwrap());
+        assert_eq!(
+            get_conversation(&db, "named").unwrap().unwrap().title,
+            "My own name"
+        );
+        // Unknown conversation → false, not an error.
+        assert!(!set_conversation_title_if_default(&db, "missing", "x").unwrap());
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The insert path derives a first-line title, so auto-naming would never run
+    /// if only the literal placeholder were replaceable. The derived string is
+    /// replaceable; a real rename is not.
+    #[test]
+    fn derived_title_is_replaceable_but_a_rename_is_not() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-derived-title-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+        let derived = derive_title("Hello there");
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('auto', ?1, 1000, 1000), ('renamed', 'Hello there!', 1000, 1000)",
+                params![derived],
+            )
+            .unwrap();
+        }
+        assert!(set_conversation_title_if_auto(&db, "auto", "A short name", &derived).unwrap());
+        assert_eq!(
+            get_conversation(&db, "auto").unwrap().unwrap().title,
+            "A short name"
+        );
+        // A user rename that merely resembles the message is left alone.
+        assert!(!set_conversation_title_if_auto(&db, "renamed", "Clobbered", &derived).unwrap());
+        assert_eq!(
+            get_conversation(&db, "renamed").unwrap().unwrap().title,
+            "Hello there!"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Per-chat YOLO: no row inherits the device default; an explicit row wins in
+    /// either direction; clearing it removes the override; and deleting the
+    /// conversation cascades the row away. Local-only (no revision/dirty bump).
+    #[test]
+    fn per_chat_yolo_overrides_and_cascades() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pi-chat-yolo-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = Db(Arc::new(Mutex::new(open(&p).unwrap())));
+
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                 VALUES ('c', 't', 5, 5)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // No row → inherit the global value either way.
+        assert_eq!(conversation_auto_approve(&db, "c").unwrap(), None);
+        assert!(resolve_auto_approve(&db, "c", true).unwrap());
+        assert!(!resolve_auto_approve(&db, "c", false).unwrap());
+
+        // Explicit on beats a global off.
+        set_conversation_auto_approve_db(&db, "c", Some(true)).unwrap();
+        assert_eq!(conversation_auto_approve(&db, "c").unwrap(), Some(true));
+        assert!(resolve_auto_approve(&db, "c", false).unwrap());
+
+        // Explicit off beats a global on.
+        set_conversation_auto_approve_db(&db, "c", Some(false)).unwrap();
+        assert_eq!(conversation_auto_approve(&db, "c").unwrap(), Some(false));
+        assert!(!resolve_auto_approve(&db, "c", true).unwrap());
+
+        // Local-only: no conversation revision/dirty is touched by the override.
+        let (rev, dirty): (i64, i64) = {
+            let conn = db.0.lock().unwrap();
+            conn.query_row("SELECT revision, dirty FROM conversations WHERE id = 'c'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!((rev, dirty), (0, 0));
+
+        // Clearing (`None`) removes the row and falls back to the global value.
+        set_conversation_auto_approve_db(&db, "c", None).unwrap();
+        assert_eq!(conversation_auto_approve(&db, "c").unwrap(), None);
+        assert!(resolve_auto_approve(&db, "c", true).unwrap());
+
+        // Deleting the conversation cascades its override.
+        set_conversation_auto_approve_db(&db, "c", Some(true)).unwrap();
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute("DELETE FROM conversations WHERE id = 'c'", [])
+                .unwrap();
+            let left: i64 = conn
+                .query_row("SELECT COUNT(*) FROM conversation_yolo", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "deleting the chat must cascade its YOLO row");
+        }
 
         let _ = std::fs::remove_file(&p);
     }

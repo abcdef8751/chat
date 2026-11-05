@@ -99,14 +99,22 @@ impl CancelToken {
     }
 }
 
-/// One conversation's in-flight registration: its cancel token and whether a
-/// **cron run** (rather than a live turn) owns it. The distinction matters
-/// because a live send may replace another live turn's token (Stop-then-resend,
-/// see [`StreamRegistry::remove`]) but must never silently take over a scheduled
-/// run, and vice versa.
+/// What kind of work owns a conversation's registration. A live send may replace
+/// another live turn (Stop-then-resend, see [`StreamRegistry::remove`]) but must
+/// never silently take over a scheduled run **or an exclusive maintenance pass**
+/// (`/compact`), and vice versa.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StreamKind {
+    Live,
+    Cron,
+    /// A `/compact` pass: nothing else may run in the chat until it finishes.
+    Exclusive,
+}
+
+/// One conversation's in-flight registration: its cancel token and what owns it.
 struct StreamEntry {
     token: CancelToken,
-    cron: bool,
+    kind: StreamKind,
 }
 
 /// Registration of a conversation's in-flight stream, so the UI can abort it and
@@ -132,21 +140,24 @@ impl StreamRegistry {
         self.streams
             .lock()
             .unwrap()
-            .insert(id, StreamEntry { token: token.clone(), cron: false });
+            .insert(id, StreamEntry { token: token.clone(), kind: StreamKind::Live });
         token
     }
 
-    /// A live-chat registration that refuses to take over a **cron** run.
-    /// `None` means a scheduled run owns this conversation right now; the send
-    /// should be refused (wait for the run to finish) rather than corrupt the
-    /// transcript with two interleaved turns.
+    /// A live-chat registration that refuses to take over a **cron** run or an
+    /// exclusive `/compact` pass. `None` means one of those owns the conversation
+    /// right now; the send should be refused (wait for it to finish) rather than
+    /// corrupt the transcript with two interleaved turns / two compaction writers.
     pub fn try_register_live(&self, id: String) -> Option<CancelToken> {
         let mut streams = self.streams.lock().unwrap();
-        if streams.get(&id).is_some_and(|e| e.cron) {
+        if streams
+            .get(&id)
+            .is_some_and(|e| matches!(e.kind, StreamKind::Cron | StreamKind::Exclusive))
+        {
             return None;
         }
         let token = CancelToken::new();
-        streams.insert(id, StreamEntry { token: token.clone(), cron: false });
+        streams.insert(id, StreamEntry { token: token.clone(), kind: StreamKind::Live });
         Some(token)
     }
 
@@ -186,6 +197,21 @@ impl StreamRegistry {
         self.streams.lock().unwrap().contains_key(id)
     }
 
+    /// Claim a conversation for an exclusive maintenance pass (`/compact`).
+    /// Refuses when **anything** is already in flight — live or scheduled — so a
+    /// compaction cannot race a turn's tool rows or another compaction. A live
+    /// send is refused by [`try_register_live`](Self::try_register_live) for the
+    /// duration, so the interlock is symmetric.
+    pub fn try_register_exclusive(&self, id: String) -> Option<CancelToken> {
+        let mut streams = self.streams.lock().unwrap();
+        if streams.contains_key(&id) {
+            return None;
+        }
+        let token = CancelToken::new();
+        streams.insert(id, StreamEntry { token: token.clone(), kind: StreamKind::Exclusive });
+        Some(token)
+    }
+
     /// Register a conversation for a **cron run** only if nothing is in flight.
     /// Used by the cron scheduler, whose interlock must not be racy: a live user
     /// turn may start in the window between the scheduler's `is_streaming` check
@@ -198,7 +224,7 @@ impl StreamRegistry {
             return None;
         }
         let token = CancelToken::new();
-        streams.insert(id, StreamEntry { token: token.clone(), cron: true });
+        streams.insert(id, StreamEntry { token: token.clone(), kind: StreamKind::Cron });
         Some(token)
     }
 }
@@ -865,6 +891,20 @@ pub(crate) fn user_request_message(
         .into())
 }
 
+/// Build the system message that carries an invoked skill's instructions. It
+/// sits between the time note and the user turn, so the model reads the skill
+/// before the (possibly empty) request that invoked it.
+fn skill_message(body: &str) -> Result<ChatCompletionRequestMessage, String> {
+    ChatCompletionRequestSystemMessageArgs::default()
+        .content(format!(
+            "The user invoked a skill. Follow these instructions for this turn:\n\n{}",
+            body.trim()
+        ))
+        .build()
+        .map_err(|e| e.to_string())
+        .map(Into::into)
+}
+
 /// Build the synthetic user message that carries an image loaded by `read_file`
 /// on a multimodal model. Reuses [`user_request_message`]'s image-part
 /// construction (async-openai's tool-message content has no image variant).
@@ -1317,23 +1357,20 @@ async fn compact_now(
     .await
     {
         Ok(x) => x,
-        // Best-effort: a summarizer failure must never break the user's turn; it
-        // just runs uncompacted (and may hit the provider limit, as before).
-        Err(e) => {
-            eprintln!("context compaction: {e}");
-            return Ok(None);
-        }
+        // Return the reason so `/compact` can explain it. A live turn must stay
+        // best-effort — `run_turn_core` logs this and runs uncompacted (and may
+        // hit the provider limit, as before) rather than failing the user's turn.
+        Err(e) => return Err(format!("summarizer failed: {e}")),
     };
     let summary = summary.trim().to_string();
     if summary.is_empty() {
         return Ok(None); // aborted, or nothing produced
     }
 
-    // Best-effort persistence: if the write fails, skip compaction for this turn
-    // and run uncompacted rather than failing the user's turn.
+    // Same split: report the write failure, but the live caller must not fail the
+    // turn over it. `/compact` surfaces it as a note.
     if let Err(e) = db::set_compaction(db, &conversation.id, &summary, &through_id) {
-        eprintln!("context compaction: persisting summary failed: {e}");
-        return Ok(None);
+        return Err(format!("persisting the summary failed: {e}"));
     }
 
     // Record the spend as background maintenance (kept out of chat cost), the
@@ -2161,9 +2198,12 @@ fn persist_prompt_update(
 }
 
 /// The tool list every turn advertises. Live, reflection and extraction share it
-/// byte-for-byte (prompt-cache alignment), so it is built in one place.
+/// byte-for-byte (prompt-cache alignment), so it is built in one place. MCP tools
+/// are process-global and append in a stable order from the cached discovery.
 pub(crate) fn chat_tools() -> Vec<async_openai::types::chat::ChatCompletionTools> {
-    tools::tool_specs(tools::brave_available())
+    let mut tools = tools::tool_specs(tools::brave_available());
+    tools.extend(crate::mcp::global().tool_specs());
+    tools
 }
 
 /// Everything a completed tool loop produced.
@@ -2360,6 +2400,15 @@ async fn dispatch_tool(
     cfg: &AppConfig,
     db: Option<&db::Db>,
 ) -> DispatchedTool {
+    if crate::mcp::is_mcp_tool(&call.name) {
+        // MCP calls are gated like host tools (YOLO bypasses as usual) and are
+        // dispatched through the process-global client cache.
+        return DispatchedTool::plain(
+            crate::mcp::global()
+                .call_tool(&call.name, &call.arguments)
+                .await,
+        );
+    }
     if call.name == "read_file" {
         if let Some(path) = call.arguments.get("path").and_then(Value::as_str) {
             // Extension *or* content: an extensionless screenshot (`fetch_file`
@@ -2555,12 +2604,21 @@ pub(crate) enum CronToolPolicy {
     AutoApprove,
 }
 
-/// The capped tool loop, factored out of [`run_chat_turn`] so the memory
-/// reflection pass can reuse it. Streams deltas/tool events to `sink`, echoes a
-/// turn's reasoning between tool rounds, and returns the accumulated usage and
-/// final text. When `persist` is `Some`, intermediate assistant/tool rows are
-/// written to the DB (live chat); when `None`, the loop is purely in memory.
-/// `mode` gates which tools may run (see [`ToolMode`]).
+/// The tool loop, factored out of [`run_chat_turn`] so the memory reflection
+/// pass can reuse it. Streams deltas/tool events to `sink`, echoes a turn's
+/// reasoning between tool rounds, and returns the accumulated usage and final
+/// text. When `persist` is `Some`, intermediate assistant/tool rows are written
+/// to the DB (live chat); when `None`, the loop is purely in memory. `mode` gates
+/// which tools may run (see [`ToolMode`]).
+///
+/// There is deliberately **no cap** on consecutive tool rounds. An earlier
+/// revision stopped at `MAX_TOOL_ROUNDS` (8) and reported `stop_reason =
+/// "tool_limit"`, but that cut off legitimate long-running work (deep research,
+/// multi-file edits, chained MCP calls). The cap was removed at the user's
+/// request: the loop now runs until the model stops asking for tools, or the
+/// turn is aborted, the provider fails, or a request is truncated. Runaway
+/// protection comes from the user (Stop), the provider's own limits, and the
+/// abort/error paths — not from a silent round budget.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_loop(
     cfg: &AppConfig,
@@ -2578,7 +2636,6 @@ pub(crate) async fn run_tool_loop(
     mode: ToolMode,
 ) -> Result<ToolLoopResult, String> {
     let mut usage_total = json!({});
-    let mut rounds: u32 = 0;
     let stop_reason: String;
     let mut final_text = String::new();
     let mut final_thinking: Option<String> = None;
@@ -2633,14 +2690,12 @@ pub(crate) async fn run_tool_loop(
         track_context(&mut usage_total, &acc.usage);
 
         let aborted = token.is_cancelled();
-        if aborted || acc.failed || rounds >= tools::MAX_TOOL_ROUNDS {
+        if aborted || acc.failed {
             if aborted {
                 stop_reason = "aborted".into();
-            } else if acc.failed {
+            } else {
                 stop_reason = "error".into();
                 final_error = acc.error.clone();
-            } else {
-                stop_reason = "tool_limit".into(); // tool-round cap reached
             }
             final_text = acc.text;
             final_thinking = (!acc.thinking.is_empty()).then_some(acc.thinking);
@@ -2665,7 +2720,6 @@ pub(crate) async fn run_tool_loop(
         }
 
         if acc.finish.as_deref() == Some("tool_calls") && !acc.tool_calls.is_empty() {
-            rounds += 1;
             let thinking = (!acc.thinking.is_empty()).then_some(acc.thinking.clone());
             pending_reasoning = thinking.clone();
             // Attach the round's reasoning to the first assistant row we store:
@@ -2996,7 +3050,7 @@ pub(crate) async fn run_tool_loop(
     })
 }
 
-/// The shared turn core: persist the user message, run the capped tool loop with
+/// The shared turn core: persist the user message, run the tool loop with
 /// DB persistence, freeze the turn's price, and store the final assistant turn.
 /// Used by a live chat turn ([`run_chat_turn`]) and by an unattended cron run
 /// (which passes [`ToolMode::Cron`] and records `cron_runs` from the outcome).
@@ -3024,6 +3078,16 @@ pub(crate) async fn run_turn_core(
 ) -> Result<TurnOutcome, String> {
     let conversation = db::get_conversation(db, &conversation_id)?
         .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
+    // A leading `/skill-id` invokes a user-authored skill: the body is injected
+    // as a system message and the token itself is removed from what the model is
+    // asked. The original `content` is still what is persisted as the user's row
+    // (and what the edit path matches), so the transcript is unchanged.
+    let (model_content, skill_body) = crate::skills::expand_slash(&content);
+    let user_turn_text = if model_content.trim().is_empty() {
+        "Follow the skill instructions."
+    } else {
+        model_content.as_str()
+    };
     // The full transcript is read once: `history_for_request` needs it to find
     // instruction-update notes that the request's kept window no longer carries.
     let full_history = db::read_messages(db, &conversation_id)?;
@@ -3053,6 +3117,12 @@ pub(crate) async fn run_turn_core(
     if let Some(level) = conversation.thinking_level.as_ref() {
         turn_cfg.thinking_level = level.clone();
     }
+    // Per-chat YOLO wins over the device default (the chat's own toggle in the
+    // header). Everything downstream — `run_tool_loop` gating, the approval
+    // prompt, and cron mode — already reads `cfg.auto_approve_tools`, so this is
+    // the only place the resolution needs to happen.
+    turn_cfg.auto_approve_tools =
+        db::resolve_auto_approve(db, &conversation_id, cfg.auto_approve_tools)?;
 
     // The top-level system message is frozen at its first value (the cacheable
     // prefix); a change to any of its components is delivered as a line-diff note
@@ -3179,7 +3249,10 @@ pub(crate) async fn run_turn_core(
             msgs.push(update.clone());
         }
         msgs.push(time_note.clone());
-        msgs.push(user_request_message(&content, &attachments)?);
+        if let Some(body) = &skill_body {
+            msgs.push(skill_message(body)?);
+        }
+        msgs.push(user_request_message(user_turn_text, &attachments)?);
         msgs
     };
     // The bundled context-window table applies only to catalog providers, and it
@@ -3200,14 +3273,22 @@ pub(crate) async fn run_turn_core(
     // API number on an image-heavy conversation (which is what made compaction
     // fire early), while still accounting for a large new turn.
     let current = match reported_context_tokens(&history) {
-        Some(reported) => reported + estimate_turn_tokens(&content, &attachments),
+        Some(reported) => {
+            // The skill body is a request-only system message, so account for it
+            // here too: otherwise compaction undercounts a long skill turn.
+            let skill_tokens = skill_body
+                .as_deref()
+                .map(|b| (b.chars().count() as u64 / 4).max(1))
+                .unwrap_or(0);
+            reported + estimate_turn_tokens(&model_content, &attachments) + skill_tokens
+        }
         None => estimate_context_tokens(&messages),
     };
     if history_mode == HistoryMode::Full
         && window > 0
         && current as f64 >= window as f64 * COMPACTION_THRESHOLD
     {
-        if let Some((new_summary, new_start)) = compact_now(
+        match compact_now(
             db,
             &conversation,
             &history,
@@ -3216,20 +3297,29 @@ pub(crate) async fn run_turn_core(
             api_key,
             &token,
         )
-        .await?
+        .await
         {
-            summary = Some(new_summary);
-            keep_start = new_start;
-            messages = {
-                let kept = history_for_request(&full_history, &history[keep_start..]);
-                let mut msgs = build_context(&system_prompt, summary.as_deref(), &kept)?;
-                if let Some(update) = &update_note {
-                    msgs.push(update.clone());
-                }
-                msgs.push(time_note.clone());
-                msgs.push(user_request_message(&content, &attachments)?);
-                msgs
-            };
+            Ok(Some((new_summary, new_start))) => {
+                summary = Some(new_summary);
+                keep_start = new_start;
+                messages = {
+                    let kept = history_for_request(&full_history, &history[keep_start..]);
+                    let mut msgs = build_context(&system_prompt, summary.as_deref(), &kept)?;
+                    if let Some(update) = &update_note {
+                        msgs.push(update.clone());
+                    }
+                    msgs.push(time_note.clone());
+                    if let Some(body) = &skill_body {
+                        msgs.push(skill_message(body)?);
+                    }
+                    msgs.push(user_request_message(user_turn_text, &attachments)?);
+                    msgs
+                };
+            }
+            Ok(None) => {}
+            // Compaction is best-effort in a live turn: log and run uncompacted
+            // rather than failing the user's request.
+            Err(e) => eprintln!("context compaction: {e}"),
         }
     }
 
@@ -3319,6 +3409,333 @@ pub(crate) struct TurnOutcome {
     pub text: String,
 }
 
+/// Result of an explicit `/compact`.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionResult {
+    pub compacted: bool,
+    /// The new summary when compaction ran.
+    pub summary: Option<String>,
+    /// User-facing explanation when it did not (nothing old enough, no model,
+    /// a summarizer failure).
+    pub note: Option<String>,
+}
+
+/// Auto-name a conversation from its first user message.
+///
+/// Returns the title now in effect (unchanged when the conversation already had
+/// a real title). Uses `AppConfig.title_model` when set, else the
+/// conversation's own model. The request is tool-less and short (20 s timeout),
+/// and every failure path falls back to the existing title or [`db::derive_title`]
+/// so a flaky title model can never break the UI.
+fn is_placeholder_title(title: &str) -> bool {
+    let title = title.trim();
+    title.is_empty() || title == "New chat"
+}
+
+/// Whether a title is still auto-generated and may be replaced: the literal
+/// placeholder, or the first-line title `db::insert_message` derived from the
+/// first user message. Extracted so the integration rule is unit-testable
+/// (the command itself needs an `AppHandle`).
+fn title_is_replaceable(current: &str, derived: &str) -> bool {
+    // Byte-exact for the derived rule: `set_conversation_title_if_auto` compares
+    // `title = ?5` exactly, so trimming here would spend a title request that
+    // the UPDATE then refuses (a synced title could carry stray whitespace).
+    is_placeholder_title(current) || current == derived
+}
+
+/// The title instruction: only a title, no decoration, in the user's language.
+fn title_system_prompt() -> &'static str {
+    "You write short titles for chat conversations. Reply with ONLY the title: 2-6 words, \
+     no surrounding quotes, no backticks, no emoji, and no trailing period. Use the same \
+     language as the user's message, defaulting to English."
+}
+
+/// Reduce a model's title reply to something safe to show in the sidebar:
+/// first non-empty line, surrounding quotes/backticks/`#` stripped, whitespace
+/// collapsed, trailing sentence punctuation removed, capped at 60 characters.
+/// Returns an empty string when nothing usable is left (the caller falls back to
+/// [`db::derive_title`]).
+pub(crate) fn sanitize_title(raw: &str) -> String {
+    let mut line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim();
+    // Strip decoration in any order: `"# Title"`, "# `Title`" and `#Title` all
+    // reduce to `Title`. Every step only removes characters, so the loop ends.
+    loop {
+        let next = line
+            .trim_start_matches('#')
+            .trim()
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '“' | '”' | '‘' | '’'))
+            .trim();
+        if next.len() == line.len() {
+            break;
+        }
+        line = next;
+    }
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed
+        .trim_end_matches(['.', '。', '!', '?'])
+        .trim_end();
+    trimmed.chars().take(60).collect()
+}
+
+#[tauri::command]
+pub async fn generate_conversation_title(
+    app: tauri::AppHandle,
+    conversation_id: String,
+) -> Result<String, String> {
+    let db = app.state::<db::Db>();
+    let config = app.state::<ConfigState>().get();
+    let conversation = db::get_conversation(&db, &conversation_id)?
+        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
+    let current_title = conversation.title.clone();
+    let first_user = match db::read_messages(&db, &conversation_id)?
+        .into_iter()
+        .find(|m| m.role == "user")
+    {
+        Some(m) => m,
+        None => return Ok(current_title),
+    };
+    // `insert_message` derives a first-line title synchronously. Treat that
+    // derived value as still-auto, otherwise this command would always see a
+    // "real" title by the time the frontend's post-turn retry runs and would
+    // never issue a request. A user rename never equals the derived string.
+    let replaceable = db::derive_title(&first_user.content);
+    if !title_is_replaceable(&current_title, &replaceable) {
+        // Never overwrite a title the user chose.
+        return Ok(current_title);
+    }
+
+    // When a dedicated title model is configured, it belongs to the *active*
+    // provider (that is the catalog the Settings picker lists). Otherwise use
+    // the conversation's own provider/model.
+    let provider = if config.title_model.trim().is_empty() {
+        config.provider_for(conversation.provider_id.as_deref().unwrap_or(""))
+    } else {
+        config.active_provider()
+    };
+    let api_key = match crate::providers::resolve(&provider.id) {
+        Ok(Some(key)) if !key.trim().is_empty() => key,
+        Ok(_) => {
+            eprintln!("auto-title: no API key for provider {}", provider.id);
+            return Ok(current_title);
+        }
+        Err(e) => {
+            eprintln!("auto-title: resolving the provider key failed: {e}");
+            return Ok(current_title);
+        }
+    };
+    let model = if config.title_model.trim().is_empty() {
+        conversation
+            .model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| config.model.clone())
+    } else {
+        config.title_model.clone()
+    };
+    if model.trim().is_empty() {
+        eprintln!("auto-title: no model configured");
+        return Ok(current_title);
+    }
+
+    let messages = match (|| -> Result<Vec<ChatCompletionRequestMessage>, String> {
+        let system = ChatCompletionRequestSystemMessageArgs::default()
+            .content(title_system_prompt().to_string())
+            .build()
+            .map_err(|e| e.to_string())?;
+        // A huge pasted message would waste the title call's context (and cost);
+        // the opening of the message is all a title needs.
+        let snippet: String = first_user.content.chars().take(2000).collect();
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content(snippet)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(vec![system.into(), user.into()])
+    })() {
+        Ok(messages) => messages,
+        Err(e) => {
+            eprintln!("auto-title: building the request failed: {e}");
+            return Ok(current_title);
+        }
+    };
+    let body = match completion_body(&model, &messages, &[], "", None) {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!("auto-title: building the request body failed: {e}");
+            return Ok(current_title);
+        }
+    };
+    let generated = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let response =
+            open_completion_stream(&provider.base_url, &api_key, &body).await?;
+        let acc = run_completion(response, &NullSink, &CancelToken::new()).await;
+        if acc.failed {
+            return Err(acc.error.unwrap_or_else(|| "title request failed".into()));
+        }
+        Ok(acc.text)
+    })
+    .await;
+    let raw = match generated {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => {
+            eprintln!("auto-title: {e}");
+            return Ok(current_title);
+        }
+        Err(_) => {
+            eprintln!("auto-title: request timed out after 20s");
+            return Ok(current_title);
+        }
+    };
+    let mut title = sanitize_title(&raw);
+    if title.trim().is_empty() {
+        title = replaceable.clone();
+    }
+    if title.trim() == current_title.trim() {
+        return Ok(current_title);
+    }
+    // First the plain placeholder rule, then the derived-title rule. Two cheap
+    // statements only when the first misses; keeps both helpers exercised.
+    let saved = db::set_conversation_title_if_default(&db, &conversation_id, &title).and_then(
+        |wrote| {
+            if wrote {
+                Ok(true)
+            } else {
+                db::set_conversation_title_if_auto(&db, &conversation_id, &title, &replaceable)
+            }
+        },
+    );
+    match saved {
+        Ok(true) => Ok(title),
+        // The UPDATE skipped both the placeholder and the derived-title rules —
+        // a rename won the race. Return whatever is in effect now.
+        Ok(false) => Ok(db::get_conversation(&db, &conversation_id)?
+            .map(|c| c.title)
+            .unwrap_or(current_title)),
+        Err(e) => {
+            eprintln!("auto-title: saving the title failed: {e}");
+            Ok(current_title)
+        }
+    }
+}
+
+/// Force a context-compaction pass over the open conversation (`/compact`).
+/// Mirrors [`stream_chat`]'s provider/model/thinking resolution and then runs
+/// the same [`compact_now`] pass a live turn would. Never panics: a summarizer
+/// failure comes back as a `note`.
+#[tauri::command]
+pub async fn compact_conversation(
+    app: tauri::AppHandle,
+    conversation_id: String,
+) -> Result<CompactionResult, String> {
+    let config = app.state::<ConfigState>().get();
+    let db = app.state::<db::Db>();
+    let conversation = db::get_conversation(&db, &conversation_id)?
+        .ok_or_else(|| format!("conversation not found: {conversation_id}"))?;
+    let provider = config.provider_for(conversation.provider_id.as_deref().unwrap_or(""));
+    let api_key = match crate::providers::resolve(&provider.id) {
+        Ok(Some(key)) if !key.trim().is_empty() => key,
+        Ok(_) => {
+            return Ok(CompactionResult {
+                compacted: false,
+                summary: None,
+                note: Some("No API key for this chat's provider — set it in Settings.".into()),
+            })
+        }
+        Err(e) => {
+            return Ok(CompactionResult {
+                compacted: false,
+                summary: None,
+                note: Some(format!("Could not resolve the provider key: {e}")),
+            })
+        }
+    };
+    let model = conversation
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| config.model.clone());
+    if model.trim().is_empty() {
+        return Ok(CompactionResult {
+            compacted: false,
+            summary: None,
+            note: Some("No model selected — set a model in Settings.".into()),
+        });
+    }
+    let mut turn_cfg = config.clone();
+    turn_cfg.base_url = provider.base_url.clone();
+    turn_cfg.model = model;
+    if let Some(level) = conversation.thinking_level.as_ref() {
+        turn_cfg.thinking_level = level.clone();
+    }
+    let use_bundled_context = crate::pricing::uses_catalog(&provider);
+    // Claim the chat BEFORE reading its history: a turn that finishes in between
+    // would otherwise leave the pass summarizing a stale snapshot. Released on
+    // every exit below.
+    let registry = app.state::<StreamRegistry>();
+    let token = match registry.try_register_exclusive(conversation_id.clone()) {
+        Some(token) => token,
+        None => {
+            return Ok(CompactionResult {
+                compacted: false,
+                summary: None,
+                note: Some(
+                    "This chat is busy (a turn or another compaction is running) — wait for it \
+                     to finish, then try again."
+                        .into(),
+                ),
+            })
+        }
+    };
+    let history = match db::read_messages(&db, &conversation_id) {
+        Ok(history) => history,
+        Err(e) => {
+            registry.remove(&conversation_id, &token);
+            return Err(e);
+        }
+    };
+    let outcome = compact_now(
+        &db,
+        &conversation,
+        &history,
+        &turn_cfg,
+        use_bundled_context,
+        &api_key,
+        &token,
+    )
+    .await;
+    registry.remove(&conversation_id, &token);
+    match outcome {
+        Ok(Some((summary, _))) => Ok(CompactionResult {
+            compacted: true,
+            summary: Some(summary),
+            note: None,
+        }),
+        Ok(None) if token.is_cancelled() => Ok(CompactionResult {
+            compacted: false,
+            summary: None,
+            note: Some("Compaction was cancelled.".into()),
+        }),
+        Ok(None) => Ok(CompactionResult {
+            compacted: false,
+            summary: None,
+            note: Some(
+                "Nothing to compact yet — the whole history fits in the 15k-token verbatim budget."
+                    .into(),
+            ),
+        }),
+        Err(e) => Ok(CompactionResult {
+            compacted: false,
+            summary: None,
+            note: Some(format!("Compaction failed: {e}")),
+        }),
+    }
+}
+
 /// The live chat turn: [`run_turn_core`] in [`ToolMode::Live`].
 ///
 /// Returns the turn's bookkeeping outcome so [`stream_chat`] can raise a
@@ -3401,7 +3818,9 @@ pub async fn stream_chat(
         .state::<StreamRegistry>()
         .try_register_live(conversation_id.clone())
         .ok_or_else(|| {
-            "A scheduled run is in progress in this chat — wait for it to finish.".to_string()
+            "This chat is busy (a scheduled run or a compaction is in progress) — wait for it \
+             to finish."
+                .to_string()
         })?;
     let sink = ChannelSink(&channel);
 

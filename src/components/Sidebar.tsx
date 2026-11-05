@@ -1,5 +1,4 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
-import { Dialog } from "@kobalte/core/dialog";
 import type { Conversation } from "../lib/api";
 import { CloseIcon, ClockIcon, MarkAvatar } from "../lib/icons";
 
@@ -14,10 +13,8 @@ export function Sidebar(props: {
   visibleConversations: Conversation[];
   activeId: string | null;
   setActiveId: (id: string) => void;
-  draftTitle: string;
-  setDraftTitle: (value: string) => void;
-  newOpen: boolean;
-  setNewOpen: (open: boolean) => void;
+  /// Start an empty chat immediately. Naming is automatic now: the title is
+  /// generated from the first message, so there is no dialog to fill in.
   createNewChat: () => void;
   searchQuery: string;
   setSearchQuery: (value: string) => void;
@@ -278,40 +275,16 @@ export function Sidebar(props: {
             <span class="text-sm font-semibold tracking-tight">Pi Chat</span>
           </span>
 
-          <Dialog open={props.newOpen} onOpenChange={props.setNewOpen}>
-            <Dialog.Trigger class="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300">
-              + New
-            </Dialog.Trigger>
-            <Dialog.Portal>
-              <Dialog.Overlay class="fixed inset-0 z-50 bg-black/40" />
-              <Dialog.Content class="fixed left-1/2 top-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-xl border border-neutral-200 bg-white p-5 shadow-xl focus:outline-none dark:border-neutral-700 dark:bg-neutral-900">
-                <Dialog.Title class="text-base font-semibold">New chat</Dialog.Title>
-                <Dialog.Description class="mt-1 text-sm text-neutral-500 dark:text-neutral-400">
-                  Give the conversation a name (optional).
-                </Dialog.Description>
-                <input
-                  class="mt-4 w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                  placeholder="Untitled chat"
-                  value={props.draftTitle}
-                  onInput={(e) => props.setDraftTitle(e.currentTarget.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") props.createNewChat();
-                  }}
-                />
-                <div class="mt-4 flex justify-end gap-2">
-                  <Dialog.CloseButton class="rounded-md px-3 py-1.5 text-sm text-neutral-600 transition hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800">
-                    Cancel
-                  </Dialog.CloseButton>
-                  <button
-                    onClick={() => props.createNewChat()}
-                    class="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
-                  >
-                    Create
-                  </button>
-                </div>
-              </Dialog.Content>
-            </Dialog.Portal>
-          </Dialog>
+          <button
+            onClick={() => {
+              props.createNewChat();
+              props.setSidebarOpen(false);
+            }}
+            title="New chat"
+            class="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+          >
+            + New
+          </button>
           <button
             onClick={() => {
               props.setSidebarOpen(false);

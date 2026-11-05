@@ -127,6 +127,10 @@ pub struct AppConfig {
     pub auto_approve_tools: bool,
     /// Global kill-switch for the cron scheduler. Local behavior, not synced.
     pub cron_enabled: bool,
+    /// Model used to auto-name a new chat from its first user message. Empty
+    /// (the default) means "use the conversation's own model". Local behavior,
+    /// not part of `syncable_payload`.
+    pub title_model: String,
 }
 
 impl Default for AppConfig {
@@ -147,6 +151,7 @@ impl Default for AppConfig {
             sync_last_sync_at: None,
             auto_approve_tools: false,
             cron_enabled: true,
+            title_model: String::new(),
         }
     }
 }
@@ -514,5 +519,38 @@ mod tests {
     fn normalize_base_url_trims_trailing_slashes() {
         assert_eq!(normalize_base_url(" https://x/v1/ "), "https://x/v1");
         assert_eq!(normalize_base_url("https://x/v1"), "https://x/v1");
+    }
+
+    /// `title_model` is a local behavior setting: it round-trips through
+    /// `config.json` (and an older file without it loads as empty = "use the
+    /// chat's own model"), but it never rides `syncable_payload`, so another
+    /// device keeps its own choice.
+    #[test]
+    fn title_model_roundtrips_but_never_syncs() {
+        let path = temp_path("title-model");
+        std::fs::write(&path, r#"{"model":"m"}"#).unwrap();
+        let state = ConfigState::load(path.clone()).unwrap();
+        assert_eq!(
+            state.get().title_model,
+            "",
+            "a config without the field defaults to the chat's own model"
+        );
+
+        let mut cfg = state.get();
+        cfg.title_model = "cheap-model".into();
+        state.set(cfg).unwrap();
+        let reloaded = ConfigState::load(path.clone()).unwrap();
+        assert_eq!(reloaded.get().title_model, "cheap-model");
+        assert_eq!(reloaded.get().model, "m");
+
+        // Written as camelCase like the rest of the file, and absent from the
+        // synced payload entirely.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("titleModel"), "not persisted: {raw}");
+        let payload = reloaded.get().syncable_payload();
+        assert!(payload.get("titleModel").is_none());
+        assert!(payload.get("title_model").is_none());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

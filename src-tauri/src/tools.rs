@@ -15,11 +15,9 @@ use tokio_stream::StreamExt;
 
 /// Tool names needing per-call user approval (local side effects / local data).
 pub const GATED_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
-/// Hard cap on consecutive tool rounds before handing back to the user.
-pub const MAX_TOOL_ROUNDS: u32 = 8;
 
 pub fn is_gated(name: &str) -> bool {
-    GATED_TOOLS.contains(&name)
+    GATED_TOOLS.contains(&name) || crate::mcp::is_mcp_tool(name)
 }
 
 /// A tool call parsed out of the assistant stream.
@@ -60,7 +58,7 @@ pub(crate) fn truncate(s: String) -> String {
 }
 
 /// Build one OpenAI function-tool spec.
-fn fn_tool(name: &str, desc: &str, params: Value) -> ChatCompletionTools {
+pub(crate) fn fn_tool(name: &str, desc: &str, params: Value) -> ChatCompletionTools {
     ChatCompletionTools::Function(ChatCompletionTool {
         function: FunctionObject {
             name: name.into(),
@@ -1682,6 +1680,9 @@ mod tests {
             assert!(!is_gated(name));
         }
         assert!(is_gated("bash"));
+        // MCP tools are remote code with side effects: always gated (YOLO,
+        // including the per-chat override, is the explicit bypass).
+        assert!(is_gated("mcp__server__some_tool"));
         assert!(!is_gated("brave_web_search"));
         assert!(!is_gated("save_memory"));
         assert!(!is_gated("read_memory"));

@@ -135,6 +135,69 @@ export interface Config {
    * existing `setConfig` call site.
    */
   cronEnabled?: boolean;
+  /**
+   * Model used to auto-name a chat from its first message. Empty = the
+   * conversation's own model. Local-only; optional for older call sites.
+   */
+  titleModel?: string;
+}
+
+/** A user-authored slash-command bundle in `<app data>/skills/`. */
+export interface SkillInfo {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/**
+ * One row in the composer's `/` menu. Skills come from the skills directory;
+ * `command` entries are built into the app (`compact`).
+ */
+export interface SlashItem {
+  id: string;
+  /** What the user types after `/` (no slash). */
+  name: string;
+  description: string;
+  kind: "skill" | "command";
+}
+
+/** One configured MCP server (camelCase over IPC). */
+export interface McpServerConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  transport: "http" | "stdio";
+  url: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+export interface McpServerStatus {
+  id: string;
+  name: string;
+  enabled: boolean;
+  connected: boolean;
+  tools: number;
+  error: string | null;
+}
+
+export interface McpStatus {
+  servers: McpServerStatus[];
+  tools: number;
+}
+
+/** Config + live status in one round trip. */
+export interface McpSnapshot {
+  servers: McpServerConfig[];
+  status: McpStatus;
+}
+
+/** Result of an explicit `/compact`. */
+export interface CompactionResult {
+  compacted: boolean;
+  summary: string | null;
+  note: string | null;
 }
 
 export interface Pricing {
@@ -299,6 +362,77 @@ export function editUserMessage(
 
 export function renameConversation(conversationId: string, title: string): Promise<void> {
   return invoke<void>("rename_conversation", { conversationId, title });
+}
+
+/**
+ * Generate a short title for a chat from its first user message, using the
+ * configured `titleModel` (empty = the chat's own model). The backend never
+ * overwrites a title the user chose; resolves to the title now in effect.
+ */
+export function generateConversationTitle(conversationId: string): Promise<string> {
+  return invoke<string>("generate_conversation_title", { conversationId });
+}
+
+/** Force a context-compaction pass now (`/compact`). */
+export function compactConversation(conversationId: string): Promise<CompactionResult> {
+  return invoke<CompactionResult>("compact_conversation", { conversationId });
+}
+
+/** Pin/unpin one message (synced with the message row). */
+export function setMessagePinned(messageId: string, pinned: boolean): Promise<void> {
+  return invoke<void>("set_message_pinned", { messageId, pinned });
+}
+
+/** The pinned messages of a conversation, oldest first. */
+export function listPinnedMessages(conversationId: string): Promise<Message[]> {
+  return invoke<Message[]>("list_pinned_messages", { conversationId });
+}
+
+/** This chat's explicit YOLO choice; `null` = inherit the device default. */
+export function getConversationAutoApprove(
+  conversationId: string,
+): Promise<boolean | null> {
+  return invoke<boolean | null>("get_conversation_auto_approve", { conversationId });
+}
+
+/** Pin (`true`/`false`) or clear (`null`, inherit) this chat's YOLO choice. */
+export function setConversationAutoApprove(
+  conversationId: string,
+  value: boolean | null,
+): Promise<void> {
+  return invoke<void>("set_conversation_auto_approve", { conversationId, value });
+}
+
+// --- Skills (slash commands) ------------------------------------------------
+
+export function listSkills(): Promise<SkillInfo[]> {
+  return invoke<SkillInfo[]>("list_skills");
+}
+
+export function reloadSkills(): Promise<SkillInfo[]> {
+  return invoke<SkillInfo[]>("reload_skills");
+}
+
+export function skillsDir(): Promise<string> {
+  return invoke<string>("skills_dir");
+}
+
+// --- MCP servers -----------------------------------------------------------
+
+export function mcpListServers(): Promise<McpSnapshot> {
+  return invoke<McpSnapshot>("mcp_list_servers");
+}
+
+export function mcpSaveServer(server: McpServerConfig): Promise<McpSnapshot> {
+  return invoke<McpSnapshot>("mcp_save_server", { server });
+}
+
+export function mcpRemoveServer(id: string): Promise<McpSnapshot> {
+  return invoke<McpSnapshot>("mcp_remove_server", { id });
+}
+
+export function mcpReload(): Promise<McpSnapshot> {
+  return invoke<McpSnapshot>("mcp_reload");
 }
 
 export function setConversationProvider(
@@ -519,8 +653,10 @@ export function retryAttachmentUpload(
  * reader (`readAttachmentFromUri`) already handles. An empty array means the
  * user cancelled.
  */
-export function pickAttachmentUris(): Promise<string[]> {
-  return invoke<string[]>("pick_attachment_uris");
+export function pickAttachmentUris(
+  kind: "any" | "image" | "camera" = "any",
+): Promise<string[]> {
+  return invoke<string[]>("pick_attachment_uris", { kind });
 }
 
 export function stopChat(conversationId: string): Promise<void> {

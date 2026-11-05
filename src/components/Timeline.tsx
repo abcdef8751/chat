@@ -268,8 +268,7 @@ function ActivityGroup(props: {
 }
 
 /// Stop-reason annotations rendered under the answer. `length` is the model's
-/// output limit; `tool_limit` is the harness's tool-round cap (the backend used
-/// to report the latter as `length`).
+/// output limit. (The tool-round cap is gone, so there is no `tool_limit`.)
 function stopNote(reason: string | null): string | null {
   switch (reason) {
     case "aborted":
@@ -278,8 +277,6 @@ function stopNote(reason: string | null): string | null {
       return "(error)";
     case "length":
       return "(output limit reached)";
-    case "tool_limit":
-      return "(tool-round limit reached)";
     default:
       return null;
   }
@@ -299,6 +296,10 @@ export function Timeline(props: {
   onOpenThought: (id: string, text: string) => void;
   onApprove: (callId: string) => void;
   onDeny: (callId: string) => void;
+  /// Pin/unpin the final answer. Omitted by callers that don't show pins.
+  onTogglePin?: (m: Message) => void;
+  /// Ids of the conversation's pinned messages (drives the pin's active state).
+  pinnedIds?: ReadonlySet<string>;
 }) {
   const answer = () => props.answer;
   const answerLive = () => props.live && !!answer()?.id.startsWith("tmp-assistant-");
@@ -354,7 +355,7 @@ export function Timeline(props: {
 
         <Show when={shownAnswer()}>
           {(a) => (
-            <div class="space-y-2">
+            <div class="space-y-2" data-message-id={a().id}>
               <Show when={parseAttachments(a()).length > 0}>
                 <div class="flex flex-wrap items-end gap-2">
                   <For each={parseAttachments(a())}>
@@ -386,6 +387,45 @@ export function Timeline(props: {
               </Show>
               <Show when={answerLive()}>
                 <span class="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-neutral-400 align-text-bottom" />
+              </Show>
+              {/* Pin toggle for the final answer. A live (`tmp-`) row has no
+                  persisted id yet, so it is not pinnable until the turn lands. */}
+              <Show
+                when={
+                  props.onTogglePin &&
+                  !answerLive() &&
+                  !a().id.startsWith("tmp-")
+                }
+              >
+                <div class="flex justify-start">
+                  <button
+                    type="button"
+                    onClick={() => props.onTogglePin?.(a())}
+                    disabled={props.live}
+                    title={props.pinnedIds?.has(a().id) ? "Unpin answer" : "Pin answer"}
+                    aria-label={props.pinnedIds?.has(a().id) ? "Unpin answer" : "Pin answer"}
+                    aria-pressed={!!props.pinnedIds?.has(a().id)}
+                    class={`rounded-md p-1 transition hover:bg-neutral-100 hover:text-neutral-700 disabled:cursor-not-allowed disabled:opacity-30 dark:hover:bg-neutral-800 dark:hover:text-neutral-300 ${
+                      props.pinnedIds?.has(a().id)
+                        ? "bg-amber-100 text-amber-700 opacity-100 dark:bg-amber-950/60 dark:text-amber-300"
+                        : "text-neutral-400 opacity-70 dark:text-neutral-500"
+                    }`}
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      class="h-3.5 w-3.5"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M12 17v5" />
+                      <path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z" />
+                    </svg>
+                  </button>
+                </div>
               </Show>
             </div>
           )}

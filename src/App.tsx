@@ -10,6 +10,7 @@ import {
   backfillStatus,
   cancelBackfill,
   clearExtractions,
+  compactConversation,
   createConversation,
   createCron,
   cronSetActive,
@@ -18,7 +19,9 @@ import {
   deleteMemoryFile,
   denyTool,
   editUserMessage,
+  generateConversationTitle,
   getConfig,
+  getConversationAutoApprove,
   getPricing,
   hasBraveKey,
   importConversations,
@@ -30,7 +33,9 @@ import {
   listMessages,
   listModels,
   listModelsDevProviders,
+  listPinnedMessages,
   listProviders,
+  listSkills,
   memoryExtractionStats,
   memoryReflectionStats,
   pickAttachmentUris,
@@ -44,9 +49,11 @@ import {
   setActiveProvider,
   setBraveKey,
   setConfig,
+  setConversationAutoApprove,
   setConversationModel,
   setConversationProvider,
   setConversationThinkingLevel,
+  setMessagePinned,
   setModelOverrides as saveModelOverrides,
   stopChat,
   streamChat,
@@ -82,6 +89,8 @@ import {
   type Provider,
   type ProviderInfo,
   type ReflectionStats,
+  type SkillInfo,
+  type SlashItem,
   type StreamEvent,
   type SyncStatus,
   type ThinkingOptions,
@@ -89,6 +98,7 @@ import {
 } from "./lib/api";
 import { isAndroidDevice, onBack, readAttachmentFromUri } from "./lib/platform";
 import { acceptsImages, resolveInputModalities } from "./lib/capabilities";
+import { createKeyboardInset } from "./lib/viewport";
 import { Composer } from "./components/Composer";
 import { CronPage } from "./components/CronPage";
 import { Header } from "./components/Header";
@@ -123,20 +133,38 @@ const ATTACHMENT_FILTERS = [
   { name: "All files", extensions: ["*"] },
 ];
 
+// Photo / Camera picks are image-only. (A desktop webcam cannot be opened by
+// the OS file dialog, so Camera falls back to the image filter there.)
+const IMAGE_FILTERS = [
+  { name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"] },
+];
+
 /**
  * Pick attachment paths. Android: native picker bridge (returns `content://`
- * URIs the content-URI reader already handles). Desktop: the dialog plugin.
+ * URIs the content-URI reader already handles); `kind` selects any / image /
+ * camera. Desktop: the dialog plugin, where Camera falls back to images.
  * `null` = cancelled.
  */
-async function pickAttachmentPaths(): Promise<string[] | null> {
+async function pickAttachmentPaths(
+  kind: "any" | "image" | "camera" = "any",
+): Promise<string[] | null> {
   if (isAndroidDevice()) {
-    const uris = await pickAttachmentUris();
+    const uris = await pickAttachmentUris(kind);
     return uris.length > 0 ? uris : null;
   }
-  const picked = await open({ multiple: true, directory: false, filters: ATTACHMENT_FILTERS });
+  const filters = kind === "any" ? ATTACHMENT_FILTERS : IMAGE_FILTERS;
+  const picked = await open({ multiple: true, directory: false, filters });
   if (!picked) return null;
   return Array.isArray(picked) ? picked : [picked];
 }
+
+/**
+ * Conversations whose title was already generated this session. A chat is
+ * named at most once, so a streamed `done` (which also tries, idempotently)
+ * cannot re-issue the request. An empty/failed attempt is removed again so a
+ * later settled turn can retry.
+ */
+const autoTitleRequested = new Set<string>();
 
 /**
  * Merge a freshly fetched conversation list into the previous one, keeping the
@@ -190,6 +218,23 @@ export default function App() {
   const [streamErrors, setStreamErrors] = createSignal<Record<string, string>>({});
   const [nearBottom, setNearBottom] = createSignal(true);
   let messagesScrollEl: HTMLElement | undefined;
+
+  // Auto-naming: the model used to title a chat from its first turn (empty =
+  // the chat's own model).
+  const [titleModel, setTitleModel] = createSignal("");
+  // Per-chat "YOLO" overrides, keyed by conversation id. `null` (or a missing
+  // key) inherits the device default (`autoApproveTools`); `true`/`false` pins
+  // this chat explicitly.
+  const [chatYolo, setChatYolo] = createSignal<Record<string, boolean | null>>({});
+  // User-authored skills, offered as `/` commands in the composer.
+  const [skills, setSkills] = createSignal<SkillInfo[]>([]);
+  // Transient, non-blocking status line above the composer (`/compact`).
+  const [notice, setNotice] = createSignal<string | null>(null);
+  // Pinned messages of the open conversation, oldest first.
+  const [pinnedMessages, setPinnedMessages] = createSignal<Message[]>([]);
+  // Soft-keyboard height in px (0 on desktop): lifts the composer and shrinks
+  // the transcript while the mobile keyboard is open.
+  const keyboardInset = createKeyboardInset();
 
   // Editing a user message happens in the CENTRAL composer: the message's text
   // and attachments are loaded into the ordinary `draft`/`pendingAttachments`
@@ -255,6 +300,10 @@ export default function App() {
   // that, a scheduled run is invisible and un-abortable (and editing mid-run
   // would fork the transcript).
   const [cronRunning, setCronRunning] = createSignal<ReadonlySet<string>>(new Set());
+  // Conversations with an in-flight `/compact` pass. The backend holds an
+  // exclusive StreamRegistry claim, so the composer must show busy/Stop rather
+  // than let a send race the summarizer.
+  const [compactingIds, setCompactingIds] = createSignal<ReadonlySet<string>>(new Set());
   const [liveTurns, setLiveTurns] = createSignal<Record<string, LiveTurn>>({});
   // Per-conversation turn tokens: a resend/Stop→resend only supersedes the same
   // conversation's events, never another conversation's stream.
@@ -279,7 +328,16 @@ export default function App() {
   // UI gates (send / Stop / inline edit) must use this, not `isStreaming`, or a
   // cron run becomes invisible and un-abortable.
   const isBusy = (id: string | null | undefined) =>
-    isStreaming(id) || (!!id && cronRunning().has(id));
+    isStreaming(id) || (!!id && cronRunning().has(id)) ||
+    (!!id && compactingIds().has(id));
+  const setCompacting = (id: string, on: boolean) =>
+    setCompactingIds((prev) => {
+      if (on === prev.has(id)) return prev;
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
   // Set (or clear, with `null`) the error shown for a conversation. A `null` key
   // is the "no conversation open" bucket. Returning `prev` unchanged when nothing
   // changes keeps the banner from re-rendering on every harmless clear.
@@ -390,6 +448,7 @@ export default function App() {
       const tail = rows.slice(-1)[0];
       if (tail && tail.role === "assistant" && tail.stop_reason != null && tail.created_at >= live.startedAt) {
         setMessages([...rows, ...staged]);
+        void refreshPinned(id);
         return;
       }
       // Re-attach the in-flight assistant row so a reload that raced the start
@@ -413,6 +472,7 @@ export default function App() {
           created_at: Date.now(),
         },
       ]);
+      void refreshPinned(id);
       return;
     }
     // A turn that is registered without a live record yet (or any more) is a
@@ -420,6 +480,7 @@ export default function App() {
     // the visible transcript alone rather than risk dropping its live row.
     if (isStreaming(id)) return;
     setMessages([...rows, ...staged]);
+    void refreshPinned(id);
   }
 
   // Files staged for the next message (picked or dropped).
@@ -434,9 +495,6 @@ export default function App() {
     typeof window === "undefined" ? true : window.matchMedia("(min-width: 64rem)").matches,
   );
   let hamburgerEl: HTMLButtonElement | undefined;
-
-  const [draftTitle, setDraftTitle] = createSignal("");
-  const [newOpen, setNewOpen] = createSignal(false);
 
   const [searchQuery, setSearchQuery] = createSignal("");
   const [visibleConversations, setVisibleConversations] = createSignal<Conversation[]>([]);
@@ -754,10 +812,6 @@ export default function App() {
         void closeSettings();
         return true;
       }
-      if (newOpen()) {
-        setNewOpen(false);
-        return true;
-      }
       if (openTrace()) {
         setOpenTrace(null);
         return true;
@@ -908,6 +962,7 @@ export default function App() {
     setGlobalThinkingLevel(cfg.thinkingLevel ?? "");
     setEchoReasoning(cfg.echoReasoningContent ?? true);
     setAutoApproveTools(cfg.autoApproveTools ?? false);
+    setTitleModel(cfg.titleModel ?? "");
     setCronEnabled(cfg.cronEnabled ?? true);
     setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
     setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
@@ -928,6 +983,7 @@ export default function App() {
     // "scheduled · <title>" pills are right on first paint.
     void refreshCrons();
     void refreshCronTriggers();
+    void loadSkills();
   });
 
   // Re-resolve pricing whenever the selected model, its provider, or the catalog
@@ -1047,6 +1103,269 @@ export default function App() {
         }
         return pruned ? next : prev;
       });
+    }
+  }
+
+  // --- Auto chat names -------------------------------------------------------
+
+  /// Ask the backend to name a chat from its first user turn. Fire-and-forget:
+  /// title generation must never block sending/streaming. It runs from the
+  /// stream's terminal `done` (the user row exists by then); the backend owns
+  /// the "is this title still auto-generated?" decision, so a user rename is
+  /// never overwritten. Each chat is requested at most once per session.
+  async function maybeAutoTitle(id: string) {
+    if (autoTitleRequested.has(id)) return;
+    // Mark before the first await so a concurrent `send`/`done` attempt cannot
+    // issue a second (paid) title request for the same chat.
+    autoTitleRequested.add(id);
+    // `messages()` belongs to the chat on screen; an off-screen settlement needs
+    // its own rows to count user turns.
+    let rows: Message[];
+    if (activeId() === id) rows = messages();
+    else rows = await listMessages(id).catch(() => []);
+    const userTurns = rows.filter((m) => m.role === "user").length;
+    // No user turn yet (an early/failed send): allow a later attempt. More than
+    // one: only the first turn names the chat.
+    if (userTurns === 0) {
+      autoTitleRequested.delete(id);
+      return;
+    }
+    if (userTurns > 1) return;
+    try {
+      const generated = (await generateConversationTitle(id)).trim();
+      if (!generated || generated === "New chat") {
+        // Nothing usable (e.g. called before the user row was persisted): allow
+        // a later settled turn to retry.
+        autoTitleRequested.delete(id);
+        return;
+      }
+      // Update in place (keeping the row's identity stable for the sidebar) and
+      // then reconcile against the backend's list.
+      setConversations((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, title: generated } : c)),
+      );
+      setVisibleConversations((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, title: generated } : c)),
+      );
+      await refreshConversations();
+    } catch {
+      // Non-fatal; allow a later turn to retry.
+      autoTitleRequested.delete(id);
+    }
+  }
+
+  // --- Per-chat YOLO ---------------------------------------------------------
+
+  /// The YOLO value in effect for the open chat: its own explicit choice, else
+  /// the device default.
+  const effectiveChatYolo = (): boolean => {
+    const id = activeId();
+    const explicit = id ? chatYolo()[id] : undefined;
+    return explicit ?? autoApproveTools();
+  };
+
+  /// True when the open chat has no explicit choice and inherits the default.
+  const chatYoloInherited = (): boolean => {
+    const id = activeId();
+    return !id || chatYolo()[id] == null;
+  };
+
+  // Load the open chat's override whenever it becomes active. A slow response
+  // for a chat the user already switched away from is dropped by the token.
+  let yoloReqSeq = 0;
+  createEffect(() => {
+    const id = activeId();
+    const seq = ++yoloReqSeq;
+    if (!id) return;
+    getConversationAutoApprove(id)
+      .then((value) => {
+        if (seq !== yoloReqSeq || activeId() !== id) return;
+        setChatYolo((prev) => ({ ...prev, [id]: value }));
+      })
+      .catch(() => {
+        // Non-fatal: the chat just inherits the device default.
+      });
+  });
+
+  /// Pin this chat's YOLO to the opposite of what is in effect (or, if it was
+  /// inheriting, to the explicit opposite). `null` is never written here: the
+  /// picker toggles between explicit on/off.
+  /// Clear this chat's explicit YOLO choice so it inherits the Settings value
+  /// again. Unlike the toggle, this writes `null`.
+  async function clearChatYolo() {
+    const id = activeId();
+    if (!id) return;
+    const prev = chatYolo()[id];
+    // Supersede any in-flight load for this chat before the optimistic write.
+    ++yoloReqSeq;
+    setChatYolo((p) => ({ ...p, [id]: null }));
+    try {
+      await setConversationAutoApprove(id, null);
+    } catch (e) {
+      setChatYolo((p) => {
+        const copy = { ...p };
+        if (prev === undefined) delete copy[id];
+        else copy[id] = prev;
+        return copy;
+      });
+      showNotice(String(e));
+    }
+  }
+
+  async function toggleChatYolo() {
+    const id = activeId();
+    if (!id) return;
+    // A load started when the chat opened must not land after this write and
+    // restore the pre-toggle value.
+    ++yoloReqSeq;
+    const next = !effectiveChatYolo();
+    const prev = chatYolo()[id];
+    setChatYolo((p) => ({ ...p, [id]: next }));
+    try {
+      await setConversationAutoApprove(id, next);
+    } catch (e) {
+      // Put the previous (possibly inherited) value back and say why.
+      setChatYolo((p) => {
+        const copy = { ...p };
+        if (prev === undefined) delete copy[id];
+        else copy[id] = prev;
+        return copy;
+      });
+      showNotice(String(e));
+    }
+  }
+
+  // --- Pinned messages -------------------------------------------------------
+
+  let pinnedReqSeq = 0;
+  // The conversation the current strip belongs to. Switching chats clears the
+  // strip immediately instead of flashing the previous chat's pins until the
+  // fetch lands (same-chat refreshes keep it in place).
+  let pinnedFor: string | null = null;
+  /// Refresh the pinned strip. Guarded so a response for a previous chat (or a
+  /// superseded refresh) cannot overwrite the current one's list.
+  async function refreshPinned(idOverride?: string | null) {
+    const id = idOverride === undefined ? activeId() : idOverride;
+    // A background turn in ANOTHER chat calls this with its own id. It must not
+    // clear the open chat's strip or consume the open chat's request token.
+    // Another chat's background settlement is irrelevant to the open strip: the
+    // switch effect fetches that chat's pins when it becomes active. Returning
+    // here avoids a pointless `listPinnedMessages` round trip per off-screen turn.
+    if (id !== activeId()) return;
+    const seq = ++pinnedReqSeq;
+    if (!id) {
+      pinnedFor = null;
+      setPinnedMessages([]);
+      return;
+    }
+    if (pinnedFor !== id) {
+      pinnedFor = id;
+      setPinnedMessages([]);
+    }
+    try {
+      const rows = await listPinnedMessages(id);
+      if (seq !== pinnedReqSeq || activeId() !== id) return;
+      setPinnedMessages(rows);
+    } catch {
+      if (seq === pinnedReqSeq && activeId() === id) setPinnedMessages([]);
+    }
+  }
+  const pinnedIds = createMemo(() => new Set(pinnedMessages().map((m) => m.id)));
+
+  /// Pin/unpin one persisted message, then re-read the strip from the backend
+  /// (the single source of truth). Live `tmp-` rows have no id to pin yet.
+  async function togglePinned(m: Message) {
+    const id = activeId();
+    if (!id || !m.id || m.id.startsWith("tmp-")) return;
+    try {
+      await setMessagePinned(m.id, !pinnedIds().has(m.id));
+      await refreshPinned(id);
+    } catch (e) {
+      // Pins are local UI state, not a turn failure: use the transient notice.
+      showNotice(String(e));
+    }
+  }
+
+  /// Scroll a message into view (pinned-strip click). `CSS.escape` keeps ids
+  /// with quotes/brackets from breaking the selector.
+  function jumpToMessage(id: string) {
+    const safe = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id;
+    document
+      .querySelector<HTMLElement>(`[data-message-id="${safe}"]`)
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  // --- Skills + `/compact` ---------------------------------------------------
+
+  async function loadSkills() {
+    try {
+      setSkills(await listSkills());
+    } catch {
+      // Non-fatal: the slash menu simply shows the built-in commands.
+    }
+  }
+
+  // Skills first, built-in commands last. The composer also requires an
+  // explicit selection for commands, so a bare `/` + Enter can never run
+  // `/compact` by accident.
+  const slashItems = createMemo<SlashItem[]>(() => [
+    ...skills().map((s) => ({
+      id: s.id,
+      name: s.name,
+      description: s.description,
+      kind: "skill" as const,
+    })),
+    {
+      id: "compact",
+      name: "compact",
+      description: "Summarise older messages into a summary",
+      kind: "command",
+    },
+  ]);
+
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  /// Show (or clear with `null`) the transient line above the composer. A new
+  /// notice replaces the old one and restarts the ~6s auto-clear.
+  function showNotice(text: string | null) {
+    if (noticeTimer !== undefined) {
+      clearTimeout(noticeTimer);
+      noticeTimer = undefined;
+    }
+    setNotice(text);
+    if (text !== null) {
+      noticeTimer = setTimeout(() => {
+        noticeTimer = undefined;
+        setNotice(null);
+      }, 6000);
+    }
+  }
+  onCleanup(() => {
+    if (noticeTimer !== undefined) clearTimeout(noticeTimer);
+  });
+
+  async function runCompact() {
+    const id = activeId();
+    if (!id) return;
+    if (isBusy(id)) {
+      showNotice("Wait for the current turn to finish, then run /compact again.");
+      return;
+    }
+    setCompacting(id, true);
+    showNotice("Compacting older messages…");
+    try {
+      const result = await compactConversation(id);
+      await reloadTranscript(id);
+      await refreshConversations();
+      // The user may have switched chats while the pass ran; don't show its
+      // result over an unrelated transcript.
+      if (activeId() !== id) return;
+      showNotice(
+        result.compacted ? "Context compacted." : (result.note || "Nothing to compact."),
+      );
+    } catch (e) {
+      showNotice(String(e));
+    } finally {
+      setCompacting(id, false);
     }
   }
 
@@ -1220,6 +1539,8 @@ export default function App() {
   createEffect(() => {
     const id = activeId();
     setOpenTrace(null);
+    // The transient notice belongs to the chat it was raised for.
+    showNotice(null);
     setNearBottom(true);
     // Scheduled-run pills are per chat: reload the trigger map for the new one.
     void refreshCronTriggers();
@@ -1235,6 +1556,7 @@ export default function App() {
     clearStreamError("");
     // Opening a conversation counts as reading its background output.
     if (id) clearUnseen(id);
+    void refreshPinned(id);
     if (!id) {
       setMessages([]);
       return;
@@ -1279,13 +1601,30 @@ export default function App() {
     setNearBottom(shrank || prev == null || el.scrollTop >= prev);
   };
 
+  // Mobile keyboard: when the inset grows while the transcript is pinned to the
+  // bottom, keep the newest message above the composer. Deferred one frame
+  // because the padding change must lay out first. Deliberately does nothing
+  // while the user is reading older messages.
+  let lastKeyboardInset = 0;
+  createEffect(() => {
+    const inset = keyboardInset();
+    const grew = inset > lastKeyboardInset;
+    lastKeyboardInset = inset;
+    if (!grew || !nearBottom()) return;
+    requestAnimationFrame(() => {
+      const el = messagesScrollEl;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
+  });
+
+  // A new chat starts empty and unnamed ("New chat"). The title is generated
+  // from the first message the user sends (see `maybeAutoTitle`); there is no
+  // naming dialog any more.
   async function createNewChat() {
-    const created = await createConversation(draftTitle() || undefined);
+    const created = await createConversation();
     setConversations([created, ...conversations()]);
     setVisibleConversations([created, ...visibleConversations()]);
     setActiveId(created.id);
-    setDraftTitle("");
-    setNewOpen(false);
   }
 
   async function commitRename(id: string) {
@@ -1348,6 +1687,7 @@ export default function App() {
       else setThinkingLevel(cfg.thinkingLevel ?? "");
       setEchoReasoning(cfg.echoReasoningContent ?? true);
       setAutoApproveTools(cfg.autoApproveTools ?? false);
+      setTitleModel(cfg.titleModel ?? "");
       setCronEnabled(cfg.cronEnabled ?? true);
       setReflectionEnabled(cfg.memoryReflectionEnabled ?? true);
       setReflectionIdleMinutes(cfg.memoryReflectionIdleMinutes ?? 30);
@@ -1382,6 +1722,7 @@ export default function App() {
       thinkingLevel: globalThinkingLevel(),
       echoReasoningContent: echoReasoning(),
       autoApproveTools: autoApproveTools(),
+      titleModel: titleModel(),
       cronEnabled: cronEnabled(),
       memoryReflectionEnabled: reflectionEnabled(),
       memoryReflectionIdleMinutes: reflectionIdleMinutes(),
@@ -1404,6 +1745,9 @@ export default function App() {
   // Dialog close = save (milestone 3 contract). Errors surface as a banner.
   async function closeSettings() {
     setSettingsOpen(false);
+    // Skills may have been added/edited while Settings was open (the editor
+    // writes the skills directory): re-read them for the slash menu.
+    void loadSkills();
     try {
       const changed = await persistSettings();
       // Only re-pull the catalog when the endpoint or key changed (or on app
@@ -1714,6 +2058,7 @@ export default function App() {
         thinkingLevel: globalThinkingLevel(),
         echoReasoningContent: echoReasoning(),
         autoApproveTools: autoApproveTools(),
+        titleModel: titleModel(),
         cronEnabled: cronEnabled(),
         memoryReflectionEnabled: reflectionEnabled(),
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
@@ -1778,6 +2123,7 @@ export default function App() {
         thinkingLevel: globalThinkingLevel(),
         echoReasoningContent: echoReasoning(),
         autoApproveTools: autoApproveTools(),
+        titleModel: titleModel(),
         cronEnabled: cronEnabled(),
         memoryReflectionEnabled: reflectionEnabled(),
         memoryReflectionIdleMinutes: reflectionIdleMinutes(),
@@ -2168,19 +2514,23 @@ export default function App() {
     }
   }
 
-  // File explorer button: native picker. Android goes through our own plugin
-  // (see `pickAttachmentPaths`); desktop through the dialog plugin.
-  async function pickAttachments() {
+  // Attachment pickers. The composer offers File / Photo / Camera; File is the
+  // original picker (existing `onPickAttachments` prop). Android's native bridge
+  // takes the kind; on desktop Camera degrades to the image filter.
+  async function pickAttachmentsKind(kind: "any" | "image" | "camera") {
     // Same reason as `addAttachmentPaths`: capture the chat before the dialog.
     const id = activeId();
     try {
-      const paths = await pickAttachmentPaths();
+      const paths = await pickAttachmentPaths(kind);
       if (!paths) return;
       await addAttachmentPaths(paths);
     } catch (e) {
       setStreamErrorFor(id, String(e));
     }
   }
+
+  // File explorer button: the ordinary picker (any file type).
+  const pickAttachments = () => pickAttachmentsKind("any");
 
   function removeAttachment(id: string) {
     setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
@@ -2267,6 +2617,11 @@ export default function App() {
         // assistant row carries the error annotation, if any).
         if (activeId() === id) void reloadTranscript(id);
         refreshConversations().catch(() => {});
+        // First turn finished: this is the one place auto-naming runs (the user
+        // row the backend derived a title from now exists). Pins are disabled
+        // mid-stream, but a reload still keeps the strip honest.
+        void maybeAutoTitle(id);
+        void refreshPinned(id);
         // A live turn may have created / changed / deleted cron jobs through the
         // agent tools (which have no event emitter of their own).
         void refreshCrons();
@@ -2380,6 +2735,7 @@ export default function App() {
   async function send() {
     const staged = pendingAttachments();
     let id = activeId();
+
     if (isBusy(id) || (!draft().trim() && staged.length === 0)) return;
     if (sendBlockedByRetry(staged, id)) return;
 
@@ -2399,6 +2755,7 @@ export default function App() {
       setVisibleConversations([created, ...visibleConversations()]);
       setActiveId(created.id);
       id = created.id;
+
     }
     const text = draft().trim();
 
@@ -2454,6 +2811,9 @@ export default function App() {
     setDraft("");
     setPendingAttachments([]);
     await runAssistantTurn(id, text, staged, userMsg.id);
+    // Naming runs from the stream's terminal `done` event, after the backend has
+    // persisted the user row. Calling it here (before the row exists) could only
+    // ever return "New chat" and would consume the once-per-chat guard.
   }
 
   async function stop() {
@@ -2475,6 +2835,9 @@ export default function App() {
     // composer permanently showing Stop. If the run somehow keeps going, the
     // backend refuses the next send with an explicit message.
     setCronRun(id, false);
+    // `stop_chat` cancels the exclusive compaction token too; clear the local
+    // busy marker so the composer is usable immediately.
+    setCompacting(id, false);
     // The user message is persisted by the backend *before* streaming starts, so
     // it is already in the transcript. Handing the draft back here would
     // duplicate it on the next send, so Stop simply returns the composer to its
@@ -2966,10 +3329,6 @@ export default function App() {
         visibleConversations={visibleConversations()}
         activeId={activeId()}
         setActiveId={setActiveId}
-        draftTitle={draftTitle()}
-        setDraftTitle={setDraftTitle}
-        newOpen={newOpen()}
-        setNewOpen={setNewOpen}
         createNewChat={createNewChat}
         searchQuery={searchQuery()}
         setSearchQuery={setSearchQuery}
@@ -2986,7 +3345,12 @@ export default function App() {
       />
 
       {/* Main */}
-      <main class="flex min-w-0 flex-1 flex-col">
+      <main
+        class="flex min-w-0 flex-1 flex-col"
+        // Mobile only: the soft keyboard's inset raises the composer and
+        // shrinks the transcript (the app root already handles system bars).
+        style={keyboardInset() > 0 ? { "padding-bottom": `${keyboardInset()}px` } : undefined}
+      >
         <Header
           sidebarOpen={sidebarOpen()}
           setSidebarOpen={setSidebarOpen}
@@ -3063,6 +3427,10 @@ export default function App() {
               editingId={editingId()}
               onRetryAttachment={(m, a) => retryMessageAttachment(m.id, a)}
               cronTriggers={cronTriggers()}
+              pinned={pinnedMessages()}
+              pinnedIds={pinnedIds()}
+              onTogglePin={togglePinned}
+              onJumpTo={jumpToMessage}
             />
           </Show>
 
@@ -3072,6 +3440,16 @@ export default function App() {
             </p>
           </Show>
         </section>
+
+        {/* Transient status for `/compact` etc. Non-blocking; auto-clears. */}
+        <Show when={notice()}>
+          <p
+            aria-live="polite"
+            class="border-t border-neutral-200 px-6 py-2 text-xs text-neutral-500 dark:border-neutral-800 dark:text-neutral-400"
+          >
+            {notice()}
+          </p>
+        </Show>
 
         <Composer
           pendingAttachments={pendingAttachments()}
@@ -3089,6 +3467,14 @@ export default function App() {
           editing={editingId() !== null}
           onCancelEdit={cancelEditMessage}
           focusNonce={composerFocusNonce()}
+          canCamera={isAndroidDevice()}
+          yolo={effectiveChatYolo()}
+          yoloInherited={chatYoloInherited()}
+          onToggleYolo={toggleChatYolo}
+          onClearYolo={clearChatYolo}
+          onPickKind={pickAttachmentsKind}
+          slashItems={slashItems()}
+          onRunCompact={runCompact}
         />
       </main>
 
@@ -3187,6 +3573,8 @@ export default function App() {
         formatLastSync={formatLastSync}
         settingsError={settingsError()}
         setSettingsError={setSettingsError}
+        titleModel={titleModel()}
+        setTitleModel={setTitleModel}
       />
 
       <MemoryPage

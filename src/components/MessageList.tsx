@@ -29,6 +29,15 @@ export function MessageList(props: {
   /// messageId → cron job title: a scheduled run posted that user message.
   /// Rendered as a small pill beside the bubble; purely informational.
   cronTriggers?: Record<string, string>;
+  /// The conversation's pinned messages, oldest first. Rendered as a compact
+  /// sticky strip above the transcript; clicking one jumps to it.
+  pinned?: Message[];
+  /// Ids of the pinned messages (drives the pin toggles' active state).
+  pinnedIds?: ReadonlySet<string>;
+  /// Pin/unpin one message (the strip's × and the row/answer pin buttons).
+  onTogglePin?: (m: Message) => void;
+  /// Scroll a message into view (sticky strip click).
+  onJumpTo?: (id: string) => void;
 }) {
   // Keep the per-turn activity-container state map bounded by the transcript
   // that is actually rendered (a still-live turn is retained by the pruner).
@@ -50,12 +59,55 @@ export function MessageList(props: {
     openImage(src, img.alt || undefined);
   }
 
+  // One-line snippet for the pinned strip: collapse whitespace and cap the
+  // length (the chip also truncates visually).
+  const snippet = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, 120);
+
   return (
     <div
       onClick={onTranscriptClick}
-      class="flex min-h-full flex-col justify-end space-y-3 [&_img]:cursor-zoom-in"
+      class="flex min-h-full flex-col [&_img]:cursor-zoom-in"
     >
-      <Index each={props.turns}>
+      {/* Pinned messages: a compact strip that stays at the top while the
+          transcript scrolls. Clicking jumps; × unpins. */}
+      <Show when={(props.pinned?.length ?? 0) > 0}>
+        <div class="sticky top-0 z-10 -mx-6 mb-2 border-b border-neutral-200 bg-white/95 px-6 py-1.5 backdrop-blur dark:border-neutral-800 dark:bg-neutral-950/95">
+          <div class="flex items-center gap-1.5 overflow-x-auto">
+            <span class="shrink-0 text-[10px] font-medium uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+              Pinned
+            </span>
+            <For each={props.pinned}>
+              {(m) => (
+                <div class="flex shrink-0 items-center gap-1 rounded-full border border-neutral-200 bg-neutral-50 pl-2 pr-1 text-[11px] dark:border-neutral-700 dark:bg-neutral-900">
+                  <button
+                    type="button"
+                    onClick={() => props.onJumpTo?.(m.id)}
+                    title={snippet(m.content)}
+                    class="flex min-w-0 items-center gap-1 py-0.5 text-neutral-600 transition hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-neutral-100"
+                  >
+                    <span class="shrink-0 text-[9px] font-semibold uppercase opacity-60">
+                      {m.role === "user" ? "you" : "assistant"}
+                    </span>
+                    <span class="max-w-48 truncate">{snippet(m.content) || "(empty)"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => props.onTogglePin?.(m)}
+                    title="Unpin"
+                    aria-label="Unpin message"
+                    class="shrink-0 rounded-full px-1 text-neutral-400 transition hover:bg-neutral-200 hover:text-neutral-700 dark:text-neutral-500 dark:hover:bg-neutral-800"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
+      </Show>
+
+      <div class="flex flex-1 flex-col justify-end space-y-3">
+        <Index each={props.turns}>
         {(turn) => {
           const t = () => turn();
           return (
@@ -63,7 +115,7 @@ export function MessageList(props: {
               <Show when={t().user}>
                 {(u) => (
                   <div class="flex justify-end">
-                    <div class="max-w-[80%]">
+                    <div class="max-w-[80%]" data-message-id={u().id}>
                       <div class="flex items-start justify-end gap-1.5">
                         {/* A scheduled run posted this message: pill with the
                             job's title, truncating long titles. The `title`
@@ -149,7 +201,38 @@ export function MessageList(props: {
                       {/* Edit affordance: a small pen BELOW the bubble rather
                           than a full button beside it. Clicking loads the
                           message into the central composer. */}
-                      <div class="mt-1 flex justify-end">
+                      <div class="mt-1 flex justify-end gap-1">
+                        <Show
+                          when={props.onTogglePin && !u().id.startsWith("tmp-")}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => props.onTogglePin?.(u())}
+                            disabled={props.streaming}
+                            title={props.pinnedIds?.has(u().id) ? "Unpin" : "Pin"}
+                            aria-label={props.pinnedIds?.has(u().id) ? "Unpin message" : "Pin message"}
+                            aria-pressed={!!props.pinnedIds?.has(u().id)}
+                            class={`rounded-md p-1 transition hover:bg-neutral-100 hover:text-neutral-700 disabled:cursor-not-allowed disabled:opacity-30 dark:hover:bg-neutral-800 dark:hover:text-neutral-300 ${
+                              props.pinnedIds?.has(u().id)
+                                ? "bg-amber-100 text-amber-700 opacity-100 dark:bg-amber-950/60 dark:text-amber-300"
+                                : "text-neutral-400 opacity-70 dark:text-neutral-500"
+                            }`}
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              class="h-3.5 w-3.5"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="2"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path d="M12 17v5" />
+                              <path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z" />
+                            </svg>
+                          </button>
+                        </Show>
                         <button
                           type="button"
                           onClick={() => props.onStartEdit(u())}
@@ -181,6 +264,8 @@ export function MessageList(props: {
                   onOpenThought={props.onToggleThought}
                   onApprove={props.onApprove}
                   onDeny={props.onDeny}
+                  onTogglePin={props.onTogglePin}
+                  pinnedIds={props.pinnedIds}
                 />
               </Show>
 
@@ -198,9 +283,10 @@ export function MessageList(props: {
         }}
       </Index>
 
-      <Show when={props.empty}>
-        <p class="text-sm text-neutral-400 dark:text-neutral-500">No messages yet.</p>
-      </Show>
+        <Show when={props.empty}>
+          <p class="text-sm text-neutral-400 dark:text-neutral-500">No messages yet.</p>
+        </Show>
+      </div>
     </div>
   );
 }

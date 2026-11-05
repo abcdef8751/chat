@@ -2,14 +2,28 @@ import { createEffect, createSignal, For, onCleanup, Show, type JSX } from "soli
 import { Dialog } from "@kobalte/core/dialog";
 import type {
   AndroidStorageStatus,
+  McpServerConfig,
+  McpServerStatus,
+  McpSnapshot,
   ModelInfo,
   ModelOverride,
   ModelsDevProvider,
   Pricing,
   ProviderInfo,
+  SkillInfo,
   SyncStatus,
 } from "../lib/api";
-import { androidRequestStorageAccess, androidStorageStatus } from "../lib/api";
+import {
+  androidRequestStorageAccess,
+  androidStorageStatus,
+  listSkills,
+  mcpListServers,
+  mcpReload,
+  mcpRemoveServer,
+  mcpSaveServer,
+  reloadSkills,
+  skillsDir,
+} from "../lib/api";
 import { BackArrowIcon } from "../lib/icons";
 import { parseModalities, resolveInputModalities } from "../lib/capabilities";
 import { isAndroidDevice } from "../lib/platform";
@@ -91,6 +105,13 @@ export function SettingsDialog(props: {
   doRemoveProvider: (id: string) => void;
   doSetActive: (id: string) => void;
   modelOptions: () => ModelInfo[];
+  /**
+   * Model used to auto-name a chat from its first message. Empty = the chat's
+   * own model. Optional (with `setTitleModel`) so the dialog compiles before
+   * the app shell plumbs it.
+   */
+  titleModel?: string;
+  setTitleModel?: (value: string) => void;
   overrideModel: string;
   setOverrideModel: (value: string) => void;
   overrideFor: (id: string) => ModelOverride;
@@ -233,6 +254,198 @@ export function SettingsDialog(props: {
     window.addEventListener("focus", onFocus);
     onCleanup(() => window.removeEventListener("focus", onFocus));
   }
+
+  // --- MCP servers ---------------------------------------------------------
+  // Config + live connection status in one snapshot. Loading never blocks the
+  // dialog: the card renders immediately and fills in asynchronously.
+  function blankMcpServer(): McpServerConfig {
+    return {
+      id: "",
+      name: "",
+      enabled: true,
+      transport: "http",
+      url: "",
+      command: "",
+      args: [],
+      env: {},
+    };
+  }
+
+  const [mcpServers, setMcpServers] = createSignal<McpServerConfig[]>([]);
+  const [mcpStatus, setMcpStatus] = createSignal<McpServerStatus[]>([]);
+  const [mcpTools, setMcpTools] = createSignal(0);
+  const [mcpLoading, setMcpLoading] = createSignal(false);
+  const [mcpLoaded, setMcpLoaded] = createSignal(false);
+  const [mcpBusy, setMcpBusy] = createSignal(false);
+  const [mcpError, setMcpError] = createSignal<string | null>(null);
+  const [mcpFormOpen, setMcpFormOpen] = createSignal(false);
+  const [mcpForm, setMcpForm] = createSignal<McpServerConfig>(blankMcpServer());
+  // Raw text for the space-separated stdio args. Keeping it as text (not a
+  // derived `args.join(" ")`) stops the input from eating a trailing space
+  // while the user is still typing the next argument.
+  const [mcpArgsText, setMcpArgsText] = createSignal("");
+
+  const applyMcpSnapshot = (snap: McpSnapshot) => {
+    setMcpServers(snap.servers ?? []);
+    setMcpStatus(snap.status?.servers ?? []);
+    setMcpTools(snap.status?.tools ?? 0);
+  };
+
+  const mcpStatusFor = (id: string) => mcpStatus().find((s) => s.id === id) ?? null;
+
+  const mcpStatusText = (server: McpServerConfig): string => {
+    const st = mcpStatusFor(server.id);
+    if (st?.connected)
+      return `connected · ${st.tools} ${st.tools === 1 ? "tool" : "tools"}`;
+    if (st?.error) return st.error;
+    return server.enabled ? "not connected" : "disabled";
+  };
+
+  const mcpStatusIsError = (server: McpServerConfig): boolean => {
+    const st = mcpStatusFor(server.id);
+    return !!st && !st.connected && !!st.error;
+  };
+
+  const refreshMcp = async () => {
+    setMcpLoading(true);
+    try {
+      const snap = await mcpListServers();
+      if (!props.settingsOpen) return;
+      applyMcpSnapshot(snap);
+      setMcpError(null);
+    } catch (e) {
+      if (props.settingsOpen) setMcpError(String(e));
+    } finally {
+      setMcpLoading(false);
+      setMcpLoaded(true);
+    }
+  };
+
+  const reloadMcp = async () => {
+    setMcpLoading(true);
+    setMcpError(null);
+    try {
+      const snap = await mcpReload();
+      if (!props.settingsOpen) return;
+      applyMcpSnapshot(snap);
+    } catch (e) {
+      if (props.settingsOpen) setMcpError(String(e));
+    } finally {
+      setMcpLoading(false);
+      setMcpLoaded(true);
+    }
+  };
+
+  const openMcpForm = (server?: McpServerConfig) => {
+    const next = server
+      ? { ...server, args: [...server.args], env: { ...server.env } }
+      : blankMcpServer();
+    setMcpForm(next);
+    setMcpArgsText(next.args.join(" "));
+    setMcpFormOpen(true);
+    setMcpError(null);
+  };
+
+  const patchMcpForm = (patch: Partial<McpServerConfig>) =>
+    setMcpForm((f) => ({ ...f, ...patch }));
+
+  const saveMcp = async () => {
+    const form = mcpForm();
+    const name = form.name.trim();
+    if (!name) {
+      setMcpError("Give the MCP server a name.");
+      return;
+    }
+    setMcpBusy(true);
+    setMcpError(null);
+    try {
+      const snap = await mcpSaveServer({
+        ...form,
+        name,
+        args:
+          form.transport === "stdio"
+            ? mcpArgsText().split(/\s+/).filter(Boolean)
+            : form.args,
+      });
+      applyMcpSnapshot(snap);
+      setMcpFormOpen(false);
+      setMcpForm(blankMcpServer());
+      setMcpArgsText("");
+    } catch (e) {
+      setMcpError(String(e));
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const toggleMcpEnabled = async (server: McpServerConfig, enabled: boolean) => {
+    setMcpBusy(true);
+    setMcpError(null);
+    try {
+      applyMcpSnapshot(await mcpSaveServer({ ...server, enabled }));
+    } catch (e) {
+      setMcpError(String(e));
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const removeMcp = async (id: string) => {
+    setMcpBusy(true);
+    setMcpError(null);
+    try {
+      applyMcpSnapshot(await mcpRemoveServer(id));
+      if (mcpForm().id === id) setMcpFormOpen(false);
+    } catch (e) {
+      setMcpError(String(e));
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  // --- Skills (slash commands) --------------------------------------------
+  const [skills, setSkills] = createSignal<SkillInfo[]>([]);
+  const [skillsPath, setSkillsPath] = createSignal("");
+  const [skillsLoading, setSkillsLoading] = createSignal(false);
+  const [skillsError, setSkillsError] = createSignal<string | null>(null);
+  const [skillsLoaded, setSkillsLoaded] = createSignal(false);
+
+  const refreshSkills = async (bust: boolean) => {
+    setSkillsLoading(true);
+    setSkillsError(null);
+    try {
+      // Two independent calls: a backend without the directory command should
+      // still list whatever skills it knows about.
+      try {
+        setSkills(bust ? await reloadSkills() : await listSkills());
+      } catch (e) {
+        setSkillsError(String(e));
+      }
+      try {
+        const dir = await skillsDir();
+        if (dir) setSkillsPath(dir);
+      } catch {
+        // No directory command (older backend): the folder line is optional.
+      }
+    } finally {
+      setSkillsLoading(false);
+      setSkillsLoaded(true);
+    }
+  };
+
+  // Lazy: load both cards when the dialog opens, drop their transient error
+  // state on close (the lists themselves refresh on the next open).
+  createEffect(() => {
+    if (!props.settingsOpen) {
+      setMcpFormOpen(false);
+      setMcpError(null);
+      setMcpBusy(false);
+      setSkillsError(null);
+      return;
+    }
+    void refreshMcp();
+    void refreshSkills(false);
+  });
 
   return (
     <Dialog
@@ -762,6 +975,27 @@ export function SettingsDialog(props: {
               </Show>
             </div>
 
+            <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+              <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                Chat titles
+                <select
+                  class="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-neutral-500 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200"
+                  value={props.titleModel ?? ""}
+                  disabled={!props.setTitleModel}
+                  onChange={(e) => props.setTitleModel?.(e.currentTarget.value)}
+                >
+                  <option value="">Chat's own model</option>
+                  <For each={props.modelOptions()}>
+                    {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
+                  </For>
+                </select>
+                <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                  Titles are generated from the first message. Empty uses the chat's own
+                  model.
+                </span>
+              </label>
+            </div>
+
             <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
               Brave Search API key
               <input
@@ -797,6 +1031,253 @@ export function SettingsDialog(props: {
                 </button>
               </Show>
             </label>
+
+            <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                  MCP servers
+                </span>
+                <div class="ml-auto flex items-center gap-1.5">
+                  <button
+                    onClick={() => void reloadMcp()}
+                    disabled={mcpLoading()}
+                    class="rounded-md border border-neutral-300 px-2 py-1 text-[11px] font-medium text-neutral-600 transition hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  >
+                    {mcpLoading() ? "Loading…" : "Reload"}
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (mcpFormOpen()) {
+                        setMcpFormOpen(false);
+                        setMcpError(null);
+                      } else {
+                        openMcpForm();
+                      }
+                    }}
+                    class="rounded-md bg-neutral-900 px-2 py-1 text-[11px] font-medium text-white transition hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                  >
+                    {mcpFormOpen() ? "Cancel" : "+ Add"}
+                  </button>
+                </div>
+              </div>
+              <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                Model Context Protocol servers add their tools to chats.{" "}
+                {mcpTools() > 0
+                  ? `${mcpTools()} ${mcpTools() === 1 ? "tool" : "tools"} available.`
+                  : "No tools connected yet."}
+              </span>
+
+              <div class="mt-2 space-y-2">
+                <Show when={mcpServers().length > 0}>
+                  <For each={mcpServers()}>
+                    {(s) => (
+                      <div class="rounded-lg border border-neutral-200 p-2 dark:border-neutral-700">
+                        <div class="flex flex-wrap items-center gap-2">
+                          <input
+                            type="checkbox"
+                            title={s.enabled ? "Disable this server" : "Enable this server"}
+                            class="h-3.5 w-3.5 shrink-0 rounded border-neutral-300 dark:border-neutral-700"
+                            checked={s.enabled}
+                            disabled={mcpBusy()}
+                            onChange={(e) =>
+                              void toggleMcpEnabled(s, e.currentTarget.checked)
+                            }
+                          />
+                          <span class="min-w-0 flex-1 truncate text-xs font-medium text-neutral-700 dark:text-neutral-200">
+                            {s.name}
+                          </span>
+                          <span class="shrink-0 rounded-full bg-neutral-100 px-1.5 py-0.5 text-[10px] font-medium text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
+                            {s.transport}
+                          </span>
+                          <button
+                            onClick={() => openMcpForm(s)}
+                            class="shrink-0 text-[11px] text-neutral-500 transition hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => void removeMcp(s.id)}
+                            disabled={mcpBusy()}
+                            class="shrink-0 text-[11px] text-red-600 transition hover:underline disabled:opacity-50 dark:text-red-400"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                        <p
+                          class={`mt-1 whitespace-pre-wrap break-words text-[10px] leading-snug ${
+                            mcpStatusIsError(s)
+                              ? "text-red-600 dark:text-red-400"
+                              : "text-neutral-400 dark:text-neutral-500"
+                          }`}
+                        >
+                          {mcpStatusText(s)}
+                        </p>
+                      </div>
+                    )}
+                  </For>
+                </Show>
+                <Show when={mcpLoaded() && mcpServers().length === 0}>
+                  <p class="text-[11px] text-neutral-400 dark:text-neutral-500">
+                    No MCP servers configured.
+                  </p>
+                </Show>
+              </div>
+
+              <Show when={mcpFormOpen()}>
+                <div class="mt-2 space-y-2 rounded-lg border border-neutral-200 bg-neutral-50 p-2 dark:border-neutral-700 dark:bg-neutral-800/40">
+                  <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                    Name
+                    <input
+                      class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                      placeholder="My MCP server"
+                      value={mcpForm().name}
+                      onInput={(e) => patchMcpForm({ name: e.currentTarget.value })}
+                    />
+                  </label>
+                  <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                    Transport
+                    <select
+                      class="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200"
+                      value={mcpForm().transport}
+                      onChange={(e) =>
+                        patchMcpForm({
+                          transport: e.currentTarget.value as "http" | "stdio",
+                        })
+                      }
+                    >
+                      <option value="http">http</option>
+                      <option value="stdio">stdio</option>
+                    </select>
+                  </label>
+                  <Show
+                    when={mcpForm().transport === "http"}
+                    fallback={
+                      <>
+                        <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                          Command
+                          <input
+                            class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                            placeholder="npx"
+                            value={mcpForm().command}
+                            onInput={(e) =>
+                              patchMcpForm({ command: e.currentTarget.value })
+                            }
+                          />
+                        </label>
+                        <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                          Arguments (space-separated)
+                          <input
+                            class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                            placeholder="-y @modelcontextprotocol/server-filesystem /path"
+                            value={mcpArgsText()}
+                            onInput={(e) => setMcpArgsText(e.currentTarget.value)}
+                          />
+                        </label>
+                      </>
+                    }
+                  >
+                    <label class="block text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                      URL
+                      <input
+                        class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        placeholder="https://example.com/mcp"
+                        value={mcpForm().url}
+                        onInput={(e) => patchMcpForm({ url: e.currentTarget.value })}
+                      />
+                    </label>
+                  </Show>
+                  <label class="flex items-center gap-2 text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                    <input
+                      type="checkbox"
+                      class="h-3.5 w-3.5 rounded border-neutral-300 dark:border-neutral-700"
+                      checked={mcpForm().enabled}
+                      onChange={(e) =>
+                        patchMcpForm({ enabled: e.currentTarget.checked })
+                      }
+                    />
+                    Enabled
+                  </label>
+                  <div class="flex items-center gap-2">
+                    <button
+                      onClick={() => void saveMcp()}
+                      disabled={mcpBusy() || !mcpForm().name.trim()}
+                      class="rounded-md bg-neutral-900 px-3 py-1 text-[11px] font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-300"
+                    >
+                      {mcpBusy() ? "Saving…" : "Save"}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setMcpFormOpen(false);
+                        setMcpError(null);
+                      }}
+                      class="rounded-md border border-neutral-300 px-3 py-1 text-[11px] font-medium text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </Show>
+              <Show when={mcpError()}>
+                <p class="mt-1.5 whitespace-pre-wrap break-words text-[11px] text-red-600 dark:text-red-400">
+                  {mcpError()}
+                </p>
+              </Show>
+            </div>
+
+            <div class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                  Skills
+                </span>
+                <button
+                  onClick={() => void refreshSkills(true)}
+                  disabled={skillsLoading()}
+                  class="ml-auto rounded-md border border-neutral-300 px-2 py-1 text-[11px] font-medium text-neutral-600 transition hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                >
+                  {skillsLoading() ? "Loading…" : "Reload"}
+                </button>
+              </div>
+              <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
+                Create a Markdown file in the folder below. In the composer, start a
+                message with <code>/</code> to invoke a skill.
+              </span>
+              <Show when={skillsPath()}>
+                <code class="mt-2 block select-all break-all rounded-lg bg-neutral-100 px-2 py-1.5 font-mono text-[10px] text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300">
+                  {skillsPath()}
+                </code>
+              </Show>
+              <ul class="mt-2 space-y-1.5">
+                <For each={skills()}>
+                  {(s) => (
+                    <li class="rounded-md border border-neutral-200 px-2 py-1.5 dark:border-neutral-700">
+                      <div class="flex items-baseline gap-2">
+                        <span class="min-w-0 truncate text-xs font-medium text-neutral-700 dark:text-neutral-200">
+                          {s.name}
+                        </span>
+                        <code class="shrink-0 text-[10px] text-neutral-400 dark:text-neutral-500">
+                          /{s.id}
+                        </code>
+                      </div>
+                      <Show when={s.description}>
+                        <p class="mt-0.5 text-[11px] leading-snug text-neutral-500 dark:text-neutral-400">
+                          {s.description}
+                        </p>
+                      </Show>
+                    </li>
+                  )}
+                </For>
+              </ul>
+              <Show when={skillsLoaded() && !skillsLoading() && skills().length === 0}>
+                <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                  No skills yet.
+                </p>
+              </Show>
+              <Show when={skillsError()}>
+                <p class="mt-1.5 whitespace-pre-wrap break-words text-[11px] text-red-600 dark:text-red-400">
+                  {skillsError()}
+                </p>
+              </Show>
+            </div>
 
             <label class="block text-xs font-medium text-neutral-600 dark:text-neutral-300">
               Explicit user preferences

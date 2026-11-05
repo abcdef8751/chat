@@ -181,12 +181,20 @@ pub fn picker_plugin() -> TauriPlugin<tauri::Wry> {
 /// Open the native document picker and return the selected `content://` URIs,
 /// or an empty vec when the user cancelled. The URIs are then read through the
 /// `FileBridgePlugin` content-URI reader (`read_attachment_from_uri`).
-pub async fn pick_attachment_uris(app: &AppHandle) -> Result<Vec<String>, String> {
+pub async fn pick_attachment_uris(
+    app: &AppHandle,
+    kind: Option<String>,
+) -> Result<Vec<String>, String> {
     let handle = app.state::<PickerHandle>();
-    // Kotlin resolves a JSON array of URI strings, or JSON `null` on cancel.
+    // `kind`: "any" (documents), "image" (images only) or "camera" (capture a
+    // photo). Kotlin resolves a JSON array of URI strings, or JSON `null` on
+    // cancel.
     let uris: Option<Vec<String>> = handle
         .0
-        .run_mobile_plugin_async("pickFiles", json!({}))
+        .run_mobile_plugin_async(
+            "pickFiles",
+            json!({ "kind": kind.unwrap_or_else(|| "any".into()) }),
+        )
         .await
         .map_err(|e| format!("pick_attachment_uris: {e}"))?;
     Ok(uris.unwrap_or_default())

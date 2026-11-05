@@ -7,6 +7,7 @@ mod cron;
 mod crypt;
 mod db;
 mod import;
+mod mcp;
 mod memory;
 mod models;
 mod notifications;
@@ -15,6 +16,7 @@ mod providers;
 mod reflection;
 mod secrets;
 mod shell;
+mod skills;
 mod storage;
 mod sync;
 mod tools;
@@ -61,6 +63,11 @@ pub fn run() {
             // The `fetch_file` tool runs inside the tool loop (no AppHandle), so
             // publish the app data dir once here for its downloads folder.
             crate::storage::init_app_data_dir(dir.clone());
+            // MCP servers are configured in `<app data>/mcp.json`; skills are
+            // Markdown files in `<app data>/skills/`. Both are read by the tool
+            // loop (no AppHandle), so publish their locations once here.
+            crate::mcp::init(dir.clone());
+            crate::skills::init(dir.join("skills"));
             let conn = db::open(&dir.join("chat.sqlite"))
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) })?;
             let conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
@@ -160,6 +167,10 @@ pub fn run() {
             db::set_conversation_provider,
             db::set_conversation_model,
             db::set_conversation_thinking_level,
+            db::set_message_pinned,
+            db::list_pinned_messages,
+            db::get_conversation_auto_approve,
+            db::set_conversation_auto_approve,
             db::delete_conversation,
             db::search_conversations,
             config::get_config,
@@ -179,6 +190,15 @@ pub fn run() {
             chat::stream_chat,
             chat::stop_chat,
             chat::system_info,
+            chat::generate_conversation_title,
+            chat::compact_conversation,
+            mcp::mcp_list_servers,
+            mcp::mcp_save_server,
+            mcp::mcp_remove_server,
+            mcp::mcp_reload,
+            skills::list_skills,
+            skills::reload_skills,
+            skills::skills_dir,
             tools::approve_tool,
             tools::deny_tool,
             memory::list_memory_files,
@@ -307,13 +327,17 @@ async fn read_attachment_from_uri(uri: String) -> Result<attachments::Attachment
 /// the command registered (and the invoke handler stable) on other platforms.
 #[cfg(target_os = "android")]
 #[tauri::command]
-async fn pick_attachment_uris(app: tauri::AppHandle) -> Result<Vec<String>, String> {
-    crate::android::pick_attachment_uris(&app).await
+async fn pick_attachment_uris(
+    app: tauri::AppHandle,
+    kind: Option<String>,
+) -> Result<Vec<String>, String> {
+    crate::android::pick_attachment_uris(&app, kind).await
 }
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
-async fn pick_attachment_uris() -> Result<Vec<String>, String> {
+async fn pick_attachment_uris(kind: Option<String>) -> Result<Vec<String>, String> {
+    let _ = kind;
     Err("pick_attachment_uris is only available on Android".into())
 }
 

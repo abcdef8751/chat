@@ -307,91 +307,16 @@ export function MemoryPage(props: {
 
           {/* Import an archive, then backfill it: map (parallel extraction)
               then reduce (one writer). */}
-          <div class="mt-4 rounded-lg border border-neutral-200 p-3 dark:border-neutral-700">
-            <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-              <div class="min-w-0">
-                <p class="text-xs font-medium">Imported chats</p>
-                <p class="mt-0.5 text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">
-                  Import an Anthropic export — a <code>conversations.json</code> file.
-                  Imported chats keep their original dates and are kept out of the
-                  idle reflection sweep. Backfill then extracts durable facts from
-                  them in parallel and consolidates the summaries into memory in one
-                  pass; extraction never writes to memory, only the final pass does.
-                  Backfill covers only your most recent import — or all of
-                  history when you choose "Backfill all history". The run uses
-                  the active provider's default model unless you pick one
-                  below.
-                </p>
-                <div class="mt-2 flex flex-wrap items-center gap-3">
-                  <label class="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">
-                    Backfill model
-                    <select
-                      ref={(el) => (backfillModelSelectEl = el)}
-                      class="rounded-md border border-neutral-300 bg-white px-2 py-1 text-[11px] text-neutral-700 outline-none focus:border-neutral-500 dark:border-neutral-600 dark:bg-neutral-800 dark:text-neutral-200"
-                      value={props.backfillModel}
-                      disabled={props.backfill?.running}
-                      onChange={(e) => {
-                        props.setBackfillModel(e.currentTarget.value);
-                        // Drop a thinking level the new model doesn't accept.
-                        if (
-                          props.backfillThinking &&
-                          props.backfillThinkingOpts &&
-                          !props.backfillThinkingOpts.options.includes(props.backfillThinking)
-                        ) {
-                          props.setBackfillThinking("");
-                        }
-                      }}
-                    >
-                      <option value="">Active default</option>
-                      <For each={props.backfillModels}>
-                        {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
-                      </For>
-                    </select>
-                  </label>
-                  <Show
-                    when={
-                      props.backfillThinkingOpts?.supportsReasoning &&
-                      props.backfillThinkingOpts.options.length > 0
-                    }
-                  >
-                    <label class="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">
-                      Thinking
-                      <select
-                        class="rounded-md border border-neutral-300 bg-white px-2 py-1 text-[11px] text-neutral-700 outline-none focus:border-neutral-500 dark:border-neutral-600 dark:bg-neutral-800 dark:text-neutral-200"
-                        value={props.backfillThinking}
-                        disabled={props.backfill?.running}
-                        onChange={(e) => props.setBackfillThinking(e.currentTarget.value)}
-                      >
-                        <option value="">Provider default</option>
-                        <For each={props.backfillThinkingOpts!.options}>
-                          {(o) => <option value={o}>Thinking: {o}</option>}
-                        </For>
-                      </select>
-                    </label>
-                  </Show>
-                </div>
-                <Show when={props.importReport}>
-                  <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
-                    Imported {props.importReport!.conversations} chats ·{' '}
-                    {props.importReport!.messages} messages
-                    <Show when={props.importReport!.skipped > 0}>
-                      {' '}
-                      · {props.importReport!.skipped} skipped
-                    </Show>
-                  </p>
-                </Show>
-                <Show when={props.extractionStats}>
-                  <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
-                    {props.extractionStats!.staged} staged · {props.extractionStats!.pending}{' '}
-                    awaiting extraction
-                  </p>
-                </Show>
-              </div>
-              <div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <div class="mt-4 rounded-lg border border-neutral-200 p-2 dark:border-neutral-700">
+            {/* Compact header: title + actions on one wrapping row, so a narrow
+                dialog stacks the buttons instead of pushing them off-screen. */}
+            <div class="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+              <span class="text-xs font-medium">Imported chats</span>
+              <div class="ml-auto flex flex-wrap items-center justify-end gap-1.5">
                 <button
                   onClick={() => void props.importChats()}
                   disabled={props.backfill?.running}
-                  class="rounded-md border border-neutral-300 px-2.5 py-1.5 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  class="rounded-md border border-neutral-300 px-2 py-1 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
                 >
                   Import file…
                 </button>
@@ -399,7 +324,7 @@ export function MemoryPage(props: {
                   <button
                     onClick={() => void props.discardExtractions()}
                     disabled={props.backfill?.running}
-                    class="rounded-md border border-neutral-300 px-2.5 py-1.5 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                    class="rounded-md border border-neutral-300 px-2 py-1 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
                   >
                     Discard staged
                   </button>
@@ -414,7 +339,7 @@ export function MemoryPage(props: {
                           thinkingLevel: props.backfillThinking || null,
                         })
                       }
-                      class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                      class="rounded-md border border-neutral-300 px-2 py-1 text-[11px] text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
                     >
                       Backfill
                     </button>
@@ -422,7 +347,7 @@ export function MemoryPage(props: {
                 >
                   <button
                     onClick={() => void props.stopBackfill()}
-                    class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                    class="rounded-md border border-neutral-300 px-2 py-1 text-[11px] text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
                   >
                     Cancel
                   </button>
@@ -436,7 +361,7 @@ export function MemoryPage(props: {
                     })
                   }
                   disabled={props.backfill?.running}
-                  class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                  class="rounded-md border border-neutral-300 px-2 py-1 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
                 >
                   Backfill all history
                 </button>
@@ -450,12 +375,104 @@ export function MemoryPage(props: {
                   }
                   disabled={props.backfill?.running}
                   title="Re-extract every conversation even if it was already backfilled (ignores the 'already extracted' watermark), then consolidate into memory. A full re-mine — slower than 'Backfill all history'."
-                  class="rounded-md border border-neutral-300 px-3 py-1.5 text-xs text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                  class="rounded-md border border-neutral-300 px-2 py-1 text-[11px] text-neutral-600 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
                 >
                   Force backfill all history
                 </button>
               </div>
             </div>
+
+            {/* One-line summary + the old explanation folded into a native
+                disclosure, collapsed by default so the card stays compact. */}
+            <details class="group mt-1.5">
+              <summary class="cursor-pointer list-none text-[11px] text-neutral-500 marker:content-none transition hover:text-neutral-700 [&::-webkit-details-marker]:hidden dark:text-neutral-400 dark:hover:text-neutral-200">
+                <span class="select-none">
+                  Imported chats keep their dates and use backfill ·{" "}
+                  <span class="underline decoration-dotted underline-offset-2 group-open:hidden">
+                    Details
+                  </span>
+                  <span class="hidden underline decoration-dotted underline-offset-2 group-open:inline">
+                    Hide
+                  </span>
+                </span>
+              </summary>
+              <p class="mt-1 text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">
+                Import an Anthropic export — a <code>conversations.json</code> file.
+                Imported chats keep their original dates and are kept out of the
+                idle reflection sweep. Backfill then extracts durable facts from
+                them in parallel and consolidates the summaries into memory in one
+                pass; extraction never writes to memory, only the final pass does.
+                Backfill covers only your most recent import — or all of
+                history when you choose "Backfill all history". The run uses
+                the active provider's default model unless you pick one
+                below.
+              </p>
+            </details>
+
+            <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+              <label class="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">
+                Backfill model
+                <select
+                  ref={(el) => (backfillModelSelectEl = el)}
+                  class="rounded-md border border-neutral-300 bg-white px-2 py-1 text-[11px] text-neutral-700 outline-none focus:border-neutral-500 dark:border-neutral-600 dark:bg-neutral-800 dark:text-neutral-200"
+                  value={props.backfillModel}
+                  disabled={props.backfill?.running}
+                  onChange={(e) => {
+                    props.setBackfillModel(e.currentTarget.value);
+                    // Drop a thinking level the new model doesn't accept.
+                    if (
+                      props.backfillThinking &&
+                      props.backfillThinkingOpts &&
+                      !props.backfillThinkingOpts.options.includes(props.backfillThinking)
+                    ) {
+                      props.setBackfillThinking("");
+                    }
+                  }}
+                >
+                  <option value="">Active default</option>
+                  <For each={props.backfillModels}>
+                    {(m) => <option value={m.id}>{m.name?.trim() || m.id}</option>}
+                  </For>
+                </select>
+              </label>
+              <Show
+                when={
+                  props.backfillThinkingOpts?.supportsReasoning &&
+                  props.backfillThinkingOpts.options.length > 0
+                }
+              >
+                <label class="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">
+                  Thinking
+                  <select
+                    class="rounded-md border border-neutral-300 bg-white px-2 py-1 text-[11px] text-neutral-700 outline-none focus:border-neutral-500 dark:border-neutral-600 dark:bg-neutral-800 dark:text-neutral-200"
+                    value={props.backfillThinking}
+                    disabled={props.backfill?.running}
+                    onChange={(e) => props.setBackfillThinking(e.currentTarget.value)}
+                  >
+                    <option value="">Provider default</option>
+                    <For each={props.backfillThinkingOpts!.options}>
+                      {(o) => <option value={o}>Thinking: {o}</option>}
+                    </For>
+                  </select>
+                </label>
+              </Show>
+            </div>
+            <Show when={props.importReport}>
+              <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                Imported {props.importReport!.conversations} chats ·{' '}
+                {props.importReport!.messages} messages
+                <Show when={props.importReport!.skipped > 0}>
+                  {' '}
+                  · {props.importReport!.skipped} skipped
+                </Show>
+              </p>
+            </Show>
+            <Show when={props.extractionStats}>
+              <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                {props.extractionStats!.staged} staged · {props.extractionStats!.pending}{' '}
+                awaiting extraction
+              </p>
+            </Show>
 
             <Show when={props.backfill?.running}>
               <div class="mt-2">

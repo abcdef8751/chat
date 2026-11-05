@@ -1,13 +1,20 @@
 package com.rp.chat
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.util.Log
+import androidx.core.content.FileProvider
 import app.tauri.annotation.Command
+import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.Plugin
+import java.io.File
 import java.util.ArrayList
 
 /**
@@ -86,9 +93,39 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
     @Volatile
     private var pendingSince: Long = 0L
 
+    // Destination of a camera capture launched with `EXTRA_OUTPUT`. The camera
+    // app writes the full-size photo there and returns RESULT_OK with a null
+    // data intent, so onActivityResult has to recover the URI from here. Kept
+    // static with pendingInvoke (the Activity may be recreated mid-capture).
+    @Volatile
+    private var pendingCameraUri: String? = null
+
+    @Volatile
+    private var pendingCameraFile: File? = null
+
+    // Application context, captured in pickFiles. Used only to take a
+    // persistable read grant on document-picker results so FileBridgePlugin's
+    // content-URI reader keeps working even if it runs after the transient
+    // grant would expire (the reader normally runs immediately).
+    @Volatile
+    private var appContext: Context? = null
+
     // A pending pick older than this is treated as orphaned. Comfortably longer
     // than any real picker interaction, so it never races a live pick.
     private const val PICK_STALE_MS = 120_000L
+
+    /** Forget the camera destination, optionally deleting an abandoned file. */
+    private fun clearCameraState(deleteFile: Boolean) {
+      if (deleteFile) {
+        try {
+          pendingCameraFile?.delete()
+        } catch (e: Exception) {
+          Log.w(TAG, "clearCameraState: could not delete capture file", e)
+        }
+      }
+      pendingCameraUri = null
+      pendingCameraFile = null
+    }
 
     /**
      * Point the picker at the current activity's launcher. Called from
@@ -130,6 +167,8 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
         pendingInvoke = null
         pendingGeneration = -1
         pendingSince = 0L
+        // A capture destination from the orphaned pick is dead too.
+        clearCameraState(deleteFile = true)
       }
       launcher = l
       Log.d(TAG, "setLauncher: generation=$generation")
@@ -151,30 +190,85 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
      */
     @JvmStatic
     fun onActivityResult(resultCode: Int, data: Intent?) {
-      val invoke = pendingInvoke ?: return
+      val invoke = pendingInvoke
+      if (invoke == null) {
+        // A forwarded result with no parked invoke (e.g. the orphan was already
+        // resolved by setLauncher): drop any camera bookkeeping with it.
+        clearCameraState(deleteFile = true)
+        return
+      }
       pendingInvoke = null
       pendingGeneration = -1
       pendingSince = 0L
 
-      if (resultCode != Activity.RESULT_OK || data == null) {
+      // Take the camera destination out of the static state before deciding
+      // what to return; every exit path below owns it now.
+      val cameraUri = pendingCameraUri
+      val cameraFile = pendingCameraFile
+      pendingCameraUri = null
+      pendingCameraFile = null
+
+      if (resultCode != Activity.RESULT_OK) {
         // Cancelled (back press / dismissed). NOTE: `resolve(null)` would bind
         // to `resolve(data: JSObject?)`, whose `PluginResult(null)` serializes
         // as `{}` — which Rust's `Option<Vec<String>>` cannot deserialize. The
         // no-arg overload sends the literal `null`, which deserializes to
         // `None` → an empty (cancelled) result on the Rust side.
+        try {
+          cameraFile?.delete()
+        } catch (e: Exception) {
+          Log.w(TAG, "onActivityResult: could not delete cancelled capture", e)
+        }
         invoke.resolve()
         return
       }
 
       val uris = ArrayList<String>()
-      val clip = data.clipData
-      if (clip != null) {
-        for (i in 0 until clip.itemCount) {
-          uris.add(clip.getItemAt(i).uri.toString())
+      if (cameraUri != null) {
+        // ACTION_IMAGE_CAPTURE writes the full-size photo to `EXTRA_OUTPUT` and
+        // commonly returns RESULT_OK with a null data intent, so the URI comes
+        // from our own FileProvider state. Skip it when the camera left an
+        // empty file (some OEMs do this on a cancelled capture).
+        if (cameraFile == null || cameraFile.length() > 0) {
+          uris.add(cameraUri)
+        } else {
+          cameraFile.delete()
         }
-      } else {
-        data.data?.let { uris.add(it.toString()) }
       }
+      if (uris.isEmpty()) {
+        val clip = data?.clipData
+        if (clip != null) {
+          for (i in 0 until clip.itemCount) {
+            uris.add(clip.getItemAt(i).uri.toString())
+          }
+        } else {
+          data?.data?.let { uris.add(it.toString()) }
+        }
+      }
+      if (uris.isEmpty()) {
+        invoke.resolve()
+        return
+      }
+
+      // Best-effort persistable grant for document picks. The reader downstream
+      // (`FileBridgePlugin.readUri`) normally runs immediately, while the
+      // transient grant is still valid; ACTION_PICK/camera results simply have
+      // no persistable grant to take (SecurityException) and are ignored.
+      if (data?.data != null || data?.clipData != null) {
+        for (uriString in uris) {
+          try {
+            appContext?.contentResolver?.takePersistableUriPermission(
+              Uri.parse(uriString),
+              Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+          } catch (e: SecurityException) {
+            // Not a persistable document grant — transient is enough.
+          } catch (e: Exception) {
+            Log.w(TAG, "onActivityResult: takePersistableUriPermission failed", e)
+          }
+        }
+      }
+
       // `resolveObject` with a plain `List<String>`: Jackson serializes it as a
       // top-level JSON array, which is what Rust deserializes into
       // `Option<Vec<String>>`. (`JSArray` cannot be used here: it extends
@@ -185,9 +279,15 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  /** Launch the system document picker; resolve with the chosen URIs. */
+  /**
+   * Open a picker and resolve with the chosen URIs. `kind` comes from Rust as
+   * `"any"` (documents, the historical behaviour), `"image"` (photo picker,
+   * multi-select) or `"camera"` (capture one photo).
+   */
   @Command
   fun pickFiles(invoke: Invoke) {
+    appContext = activity.applicationContext
+    val kind = parseKind(invoke)
     val launch = launcher
     if (launch == null) {
       invoke.reject("picker: launcher not ready")
@@ -220,26 +320,128 @@ class PickerPlugin(private val activity: Activity) : Plugin(activity) {
       pendingInvoke = null
       pendingGeneration = -1
       pendingSince = 0L
+      clearCameraState(deleteFile = true)
     }
 
-    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
-    intent.addCategory(Intent.CATEGORY_OPENABLE)
-    intent.type = "*/*"
-    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+    // Candidate intents, tried in order. A camera capture needs an output Uri;
+    // when the capture intent cannot be launched we fall back to the gallery
+    // picker so the action still does something useful.
+    val intents: List<Intent> = when (kind) {
+      "image" -> listOf(documentIntent("image/*"))
+      "camera" -> cameraIntents()
+      else -> listOf(documentIntent("*/*"))
+    }
 
-    pendingInvoke = invoke
-    pendingGeneration = generation
-    pendingSince = SystemClock.elapsedRealtime()
-    try {
-      launch(intent)
-    } catch (e: Exception) {
-      // Launch itself failed (e.g. no documents provider): un-park so the next
-      // pick is not rejected as "already picking".
-      pendingInvoke = null
-      pendingGeneration = -1
-      pendingSince = 0L
-      Log.w(TAG, "pickFiles: launch failed", e)
-      invoke.reject("picker: ${e.message}")
+    var lastError: Exception? = null
+    for (intent in intents) {
+      pendingInvoke = invoke
+      pendingGeneration = generation
+      pendingSince = SystemClock.elapsedRealtime()
+      try {
+        launch(intent)
+        return
+      } catch (e: Exception) {
+        lastError = e
+        // Launch itself failed (e.g. no documents provider / no camera app):
+        // un-park so the next attempt (and the next pick) is not rejected as
+        // "already picking".
+        pendingInvoke = null
+        pendingGeneration = -1
+        pendingSince = 0L
+        // A capture that never launched must not leave its destination pinned
+        // for a result that will not arrive.
+        clearCameraState(deleteFile = true)
+        Log.w(TAG, "pickFiles: launch failed for intent '${intent.action}'", e)
+      }
+    }
+
+    if (kind == "camera") {
+      // No camera app and no gallery: report "nothing picked" (an empty array)
+      // instead of surfacing an error the attachment UI cannot act on.
+      invoke.resolveObject(ArrayList<String>())
+    } else {
+      invoke.reject("picker: ${lastError?.message ?: "could not launch"}")
     }
   }
+
+  /**
+   * Read the optional `kind` argument. A missing/blank arg (older callers) is
+   * the ordinary document picker.
+   */
+  private fun parseKind(invoke: Invoke): String {
+    return try {
+      val args = invoke.parseArgs(PickFilesArgs::class.java)
+      args.kind?.trim()?.lowercase() ?: "any"
+    } catch (e: Exception) {
+      Log.w(TAG, "pickFiles: could not parse kind, defaulting to any", e)
+      "any"
+    }
+  }
+
+  private fun documentIntent(type: String): Intent =
+    Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+      addCategory(Intent.CATEGORY_OPENABLE)
+      this.type = type
+      putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+    }
+
+  /**
+   * Capture intents for `kind = "camera"`, in preference order:
+   *  1. `ACTION_IMAGE_CAPTURE` with a FileProvider destination in the app cache.
+   *     The `<provider>` + `@xml/file_paths` entry already exist in the
+   *     manifest (`cache-path path="."` covers `cacheDir/camera/`). Without
+   *     `EXTRA_OUTPUT` most camera apps return only a thumbnail bitmap rather
+   *     than a `content://` URI, so the output Uri is required.
+   *  2. A gallery `ACTION_PICK` fallback for devices with no camera app (or a
+   *     capture intent the launcher refuses).
+   */
+  private fun cameraIntents(): List<Intent> {
+    val intents = ArrayList<Intent>()
+    val capture = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+    val file = try {
+      val dir = File(activity.cacheDir, "camera")
+      if (!dir.exists()) dir.mkdirs()
+      File.createTempFile("capture-", ".jpg", dir)
+    } catch (e: Exception) {
+      Log.w(TAG, "cameraIntents: could not create capture file", e)
+      null
+    }
+    if (file != null) {
+      try {
+        val uri = FileProvider.getUriForFile(
+          activity,
+          "${activity.packageName}.fileprovider",
+          file,
+        )
+        capture.putExtra(MediaStore.EXTRA_OUTPUT, uri)
+        // The camera app writes the photo through our content URI. The clipData
+        // copy of the grant is the belt-and-braces form some OEM camera apps
+        // need on Android 11+ (the intent flags alone are not always honoured).
+        capture.clipData = ClipData.newRawUri("capture", uri)
+        capture.addFlags(
+          Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION,
+        )
+        pendingCameraUri = uri.toString()
+        pendingCameraFile = file
+        intents.add(capture)
+      } catch (e: Exception) {
+        Log.w(TAG, "cameraIntents: could not build FileProvider output", e)
+        file.delete()
+      }
+    }
+    intents.add(Intent(Intent.ACTION_PICK).apply { type = "image/*" })
+    return intents
+  }
+}
+
+/**
+ * Args for `PickerPlugin.pickFiles`. A plain POJO with a no-arg constructor and
+ * mutable properties, NOT a Kotlin `data class`: Tauri deserializes the JSON
+ * payload with Jackson, which needs the no-arg constructor + setters.
+ * `@InvokeArg` keeps it (and its members) from being stripped/renamed by the
+ * release ProGuard rules. `kind` is `"any"` | `"image"` | `"camera"`.
+ */
+@InvokeArg
+class PickFilesArgs {
+  var kind: String? = null
 }
