@@ -2583,13 +2583,13 @@ export default function App() {
         if (activeId() === id) void reloadTranscript(id);
         refreshConversations().catch(() => {});
         // First turn finished: this is the one place auto-naming runs (the user
-        // row the backend derived a title from now exists). Pins are disabled
-        // mid-stream, but a reload still keeps the strip honest.
+        // row the backend derived a title from now exists).
         void maybeAutoTitle(id);
-        // A live turn may have created / changed / deleted cron jobs through the
-        // agent tools (which have no event emitter of their own).
+        // A live turn may have created / changed / deleted cron jobs or skills
+        // through the agent tools (which have no event emitter of their own).
         void refreshCrons();
         void refreshCronTriggers();
+        void loadSkills();
         return;
       }
       // Everything below updates the per-conversation live record — which must
