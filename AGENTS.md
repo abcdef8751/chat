@@ -73,7 +73,7 @@ in `src-tauri`; the UI is a Solid SPA.
 
 ## Current status
 
-`cargo test --lib`: **422 passed, 4 ignored** (the opt-in live reasoning-echo
+`cargo test --lib`: **436 passed, 4 ignored** (the opt-in live reasoning-echo
 check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
@@ -879,7 +879,7 @@ old chat and past runs stay where they are).
 
 Servers are configured in `<app data>/mcp.json` (edited from Settings → MCP
 servers; never in `config.json`). Each entry is
-`{id, name, enabled, transport: "http"|"stdio", url, command, args, env}`.
+`{id, name, enabled, transport: "http"|"stdio", url, command, args, env, headers}`.
 `mcp::init` publishes the path and starts one background discovery pass; the
 Settings card also has an explicit **Reload**.
 
@@ -888,6 +888,15 @@ Settings card also has an explicit **Reload**.
   resent, both plain JSON and SSE replies). stdio spawns the command and speaks
   newline-delimited JSON-RPC; a per-call session is used, with timeouts, and the
   child is killed at the end.
+- **Per-server config.** HTTP servers may carry extra request `headers` (auth
+  tokens, vendor keys) and stdio servers extra `env` pairs; both are edited as
+  key→value rows in the Settings form and stored in `mcp.json`. Configured
+  headers ride **every** POST (`initialize`, the `initialized` notification,
+  `tools/list`, `tools/call`), but a name matching `content-type`, `accept`,
+  `mcp-protocol-version` or `mcp-session-id` is silently ignored so a config
+  cannot break the handshake. A header name/value `reqwest` cannot represent is
+  skipped rather than failing the server. Older `mcp.json` files (no `headers`)
+  parse unchanged.
 - **Discovery:** `initialize` → `notifications/initialized` → `tools/list`.
   Results are cached in a process-global (`mcp::global()`), so
   `chat::chat_tools()` stays synchronous. Reloads are serialized so a slow
@@ -903,10 +912,10 @@ Settings card also has an explicit **Reload**.
 - **Output:** flattened to text and truncated to the ordinary 20k-char ceiling;
   `image` parts are replaced with `[image content omitted …]` instead of pasting
   base64 into the prompt. HTTP bodies are capped at 2 MB.
-- **Security note:** `env` values (including tokens a user puts there) cross IPC
-  to the Settings UI, and `mcp.json` is writable by the model through `write_file`
-  (gated, or YOLO) — treat a server config as executable configuration, not a
-  file-editing convenience.
+- **Security note:** `env` and `headers` values (including tokens a user puts
+  there) cross IPC to the Settings UI, and `mcp.json` is writable by the model
+  through `write_file` (gated, or YOLO) — treat a server config as executable
+  configuration, not a file-editing convenience.
 
 ### Skills (`src-tauri/src/skills.rs`)
 
@@ -925,7 +934,31 @@ Settings → Skills card lists them and shows the folder.
   Commands require an explicit arrow selection or typing the exact command id,
   so `/` + Enter cannot run `/compact` by accident. `/compact` calls `compact_conversation`, which takes a
   `StreamRegistry` claim for the duration (refusing if a turn is already in
-  flight) and returns `{compacted, summary, note}`.
+  flight) and returns `{compacted, summary, note}`. The list is re-read after
+  every turn (an agent can create a skill mid-chat) and when Settings closes.
+- **Agent authoring (`list_skills` / `read_skill` / `save_skill` /
+  `delete_skill`).** The directory is **app-private**, so on Android neither the
+  user (no file manager access) nor the agent's Termux-routed `read_file`/
+  `write_file` can create a skill there. These four tools do it from the app
+  process itself: `save_skill(id, content, name?, description?)` normalizes the
+  id (trim → lowercase, whitespace runs → `-`, must be `[a-z0-9_-]{1,64}`),
+  overwrites the file an id already resolves to (stem or display name), writes
+  frontmatter only for the optional fields given, replaces any frontmatter
+  already inside `content`, and **refuses** content over `MAX_SKILL_CHARS`
+  (100k) rather than truncating it. `read_skill` returns the raw Markdown
+  *including* frontmatter so a rewrite cannot drop the name/description.
+  `save_skill`/`delete_skill` are **approval-gated** (YOLO bypasses; a readonly
+  cron run refuses them; reflection/extraction refuse all four by mode). The
+  tools are in every mode's tool list (cache alignment) — access is by mode at
+  dispatch.
+- **Android filesystem routing.** `ShellExecutor::{read_file,write_file}` still
+  route through Termux, **except** for paths inside the skills directory, which
+  use the app's own `std::fs` view (shared with the desktop implementation).
+  Containment is resolved by path components with the longest existing ancestor
+  canonicalized, so `/x/skills-evil` and `skills/../..` are not inside
+  `/x/skills`; a symlink inside the directory that points out is refused. `bash`
+  stays Termux-only (it is a shell, not a file operation). The same rule runs on
+  desktop, where the native path is already the norm.
 - **Replay caveat:** the skill body is request-only; later turns replay the user
   text without it (the cap keeps that bounded). Do not rely on a skill body
   being silently re-injected on the next turn.
@@ -959,6 +992,15 @@ save_memory(content, path)        // append; path required
 read_memory(path)
 write_memory(path, content)       // replace (curation)
 memory_str_replace(path, old_string, new_string)   // replace one unique occurrence
+
+// Skills — app-local Markdown instruction files (`<app data>/skills/<id>.md`).
+// In every mode's list; reflection/extraction refuse them at dispatch. Reads
+// are ungated; writes/deletes are approval-gated (see gated list above).
+list_skills()                     // `Skills directory: <path>` + `id — name: description` lines
+read_skill(id)                    // raw Markdown INCLUDING frontmatter
+save_skill(id, content, name?, description?)   // create/overwrite; id normalized to
+                                  //   [a-z0-9_-]{1,64}; >100k chars refused
+delete_skill(id)                  // removes one skill file; unknown id is an error
 
 // Web search — native Brave Search API, read-only (ungated)
 brave_web_search(query, count?)
@@ -1009,7 +1051,8 @@ prefix matches; `run_tool_loop` refuses disallowed calls by mode instead of
 splitting the list (reflection: no host/web tools; extract: none). MCP tools are
 appended from the process-global discovery cache, so the list can change only
 when servers/config change (a Settings reload or app start).
-Gating (`tools::is_gated` = bash/read_file/write_file plus every `mcp__*` tool)
+Gating (`tools::is_gated` = bash/read_file/write_file plus `save_skill`/
+`delete_skill` and every `mcp__*` tool)
 is bypassed entirely when YOLO mode is on (global, or the chat's own override).
 
 **Brave integration (native, no node/MCP process):** `tools.rs` `BraveSearch`
@@ -1459,6 +1502,12 @@ and the app is byte-identical to before. Never blocks the UI.
   the user's Termux via a single-quoted path, so the app's `$HOME` is both
   unrelated and unreadable there; leaving `~` untouched avoids pointing at the
   wrong directory.
+- **Android app-private paths (skills):** the skills directory lives in the app
+  data dir, which Termux cannot read. `read_file`/`write_file` therefore use the
+  app's own filesystem view for paths inside it (component-wise containment,
+  symlinks and `..` resolved) and Termux for everything else; the dedicated
+  `list_skills`/`read_skill`/`save_skill`/`delete_skill` tools are the reliable
+  authoring path. `bash` never leaves Termux.
 - **Android TLS (rustls-platform-verifier):** reqwest 0.13 routes *every* HTTPS
   request (models.dev catalog, streams, Brave, sync) through
   `rustls-platform-verifier`. On Android that verifier can't reach the OS trust
@@ -1538,7 +1587,39 @@ and the app is byte-identical to before. Never blocks the UI.
 
 ## Next / open items
 
-**Latest batch (eight features):** automatic chat names (empty new chat, title
+**Latest batch (four fixes):** (1) **one keyboard lift** — Android's native IME
+inset (folded into the app root's `padding-bottom` by `MainActivity.kt`) and
+`createKeyboardInset()`'s visual-viewport estimate both fired, so the composer
+was lifted twice by differing amounts; the JS helper now returns 0 whenever
+`window.PiInsets` exists, `<main>` is only padded without the bridge, and the
+transcript follows a single `keyboardLift()` (the composer also re-measures on
+viewport changes). (2) **Model selection verified end to end** — no change was
+needed: the header picker persists `conversations.model`, `stream_chat` reads
+that row, `run_turn_core` stamps `turn_cfg.model` onto the request body and the
+persisted message, and the pinned-provider test asserts the endpoint/model while
+the global default differs. (3) **Agent-managed skills** — native `list_skills` /
+`read_skill` / `save_skill` / `delete_skill` (writes approval-gated) plus native
+`read_file`/`write_file` for app-private paths, because on Android the skills
+folder is unreachable from both the user and Termux; the `/` menu re-reads
+skills after every turn. (4) **MCP per-server config** — HTTP `headers` and stdio
+`env`, edited as key→value rows in Settings and carried on every JSON-RPC POST.
+
+Residuals from this batch:
+
+- **The keyboard fix needs a device.** The double-padding is removed by
+  construction and desktop is unchanged, but the actual IME open/close sequence
+  (and the transcript re-pin) can only be confirmed on Android hardware.
+- **Skills stay app-private.** On Android the folder is still not reachable from
+  a file manager, so authoring goes through the assistant (or the Settings path
+  is display-only); `save_skill` normalizes an id before resolving an existing
+  file, so an unusual file stem can still be duplicated by a display-name save.
+- **`headers` values (like `env`) cross IPC** to the Settings renderer, and
+  `mcp.json` is writable through `write_file` when approved or under YOLO.
+- **GUI e2e was not run** for this batch; `cargo test --lib` (436), `tsc`,
+  `npm run build`, `npm run test:turns` and clippy (2 pre-existing lints) are
+  green.
+
+**Previous batch (eight features):** automatic chat names (empty new chat, title
 generated from the first message on the terminal `done`; `titleModel` setting;
 derived-title-aware replacement); keyboard-aware mobile composer
 (`visualViewport` lift, bottom-follow only when near the bottom); the composer

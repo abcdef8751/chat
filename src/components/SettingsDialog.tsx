@@ -1348,8 +1348,10 @@ export function SettingsDialog(props: {
                 </button>
               </div>
               <span class="mt-1 block text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
-                Create a Markdown file in the folder below. In the composer, start a
-                message with <code>/</code> to invoke a skill.
+                Add a Markdown file to the folder below, or just ask the assistant to create,
+                edit or delete one. On Android this folder is app-private, so the assistant is
+                the way to author skills. In the composer, start a message with <code>/</code> to
+                invoke a skill.
               </span>
               <Show when={skillsPath()}>
                 <code class="mt-2 block select-all break-all rounded-lg bg-neutral-100 px-2 py-1.5 font-mono text-[10px] text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300">
