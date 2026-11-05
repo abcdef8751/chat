@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import type { Attachment, SlashItem } from "../lib/api";
 import { DocIcon } from "../lib/icons";
 import { isAndroid } from "../lib/platform";
@@ -175,6 +175,26 @@ export function Composer(props: {
   createEffect(() => {
     void props.draft;
     queueMicrotask(autoResize);
+  });
+
+  // `autoResize` reads `visualViewport.height` once, so without this its 60%
+  // cap stays stale after the keyboard opens/closes or the window resizes —
+  // the textarea would grow behind the keyboard (or stay needlessly short).
+  // Coalesce the two viewport signals into one frame and release on unmount.
+  let resizeFrame = 0;
+  const scheduleAutoResize = () => {
+    if (resizeFrame) return;
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = 0;
+      autoResize();
+    });
+  };
+  window.visualViewport?.addEventListener("resize", scheduleAutoResize);
+  window.addEventListener("resize", scheduleAutoResize);
+  onCleanup(() => {
+    if (resizeFrame) cancelAnimationFrame(resizeFrame);
+    window.visualViewport?.removeEventListener("resize", scheduleAutoResize);
+    window.removeEventListener("resize", scheduleAutoResize);
   });
 
   // Focus on demand: clicking a message's edit pen loads that text into this

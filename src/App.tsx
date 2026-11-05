@@ -639,6 +639,22 @@ export default function App() {
       window.removeEventListener("resize", apply);
     });
   });
+  // True when the native shell owns the keyboard/system insets (Android's
+  // `MainActivity.kt` injects `window.PiInsets` before the page loads). There,
+  // `createKeyboardInset()` deliberately stays 0 (see `lib/viewport.ts`), so
+  // anything that needs the keyboard offset must use `keyboardLift()` below.
+  const hasNativeInsets = createMemo(() => {
+    const w = window as unknown as { PiInsets?: unknown };
+    return !!w.PiInsets;
+  });
+
+  // The single keyboard lift the transcript follows, in CSS px. On Android that
+  // is the native bottom inset (which already folds in the IME); elsewhere it
+  // is the visual-viewport estimate. `Math.max` also keeps one value if both
+  // ever report something.
+  const keyboardLift = () =>
+    Math.max(keyboardInset(), hasNativeInsets() ? insets().bottom : 0);
+
   // Full-screen (mobile) dialogs render in their own `fixed inset-0` viewport,
   // outside the padded app root, so they must apply the same system-bar insets
   // to their padding themselves. On desktop `insets()` are all 0, making this
@@ -1548,15 +1564,17 @@ export default function App() {
     setNearBottom(shrank || prev == null || el.scrollTop >= prev);
   };
 
-  // Mobile keyboard: when the inset grows while the transcript is pinned to the
-  // bottom, keep the newest message above the composer. Deferred one frame
-  // because the padding change must lay out first. Deliberately does nothing
-  // while the user is reading older messages.
-  let lastKeyboardInset = 0;
+  // Mobile keyboard: when the lift grows while the transcript is pinned to the
+  // bottom, keep the newest message above the composer. Use `keyboardLift()`,
+  // not `keyboardInset()`: on Android the latter is 0 by design (native insets
+  // own the IME), so keying on it would never re-pin the newest message there.
+  // Deferred one frame because the padding change must lay out first.
+  // Deliberately does nothing while the user is reading older messages.
+  let lastKeyboardLift = 0;
   createEffect(() => {
-    const inset = keyboardInset();
-    const grew = inset > lastKeyboardInset;
-    lastKeyboardInset = inset;
+    const lift = keyboardLift();
+    const grew = lift > lastKeyboardLift;
+    lastKeyboardLift = lift;
     if (!grew || !nearBottom()) return;
     requestAnimationFrame(() => {
       const el = messagesScrollEl;
@@ -3294,9 +3312,16 @@ export default function App() {
       {/* Main */}
       <main
         class="flex min-w-0 flex-1 flex-col"
-        // Mobile only: the soft keyboard's inset raises the composer and
-        // shrinks the transcript (the app root already handles system bars).
-        style={keyboardInset() > 0 ? { "padding-bottom": `${keyboardInset()}px` } : undefined}
+        // Mobile only, and ONLY without the native bridge: the soft keyboard's
+        // inset raises the composer and shrinks the transcript. Android must not
+        // pad here too — its IME inset already arrives in `insets().bottom` and
+        // pads the app root. Adding both lifts the composer twice as far and
+        // shrinks the transcript twice (the old inconsistent keyboard behaviour).
+        style={
+          !hasNativeInsets() && keyboardInset() > 0
+            ? { "padding-bottom": `${keyboardInset()}px` }
+            : undefined
+        }
       >
         <Header
           sidebarOpen={sidebarOpen()}
