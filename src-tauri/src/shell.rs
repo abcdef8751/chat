@@ -7,24 +7,22 @@
 //! to the user's installed Termux via the `RUN_COMMAND` intent so host tools
 //! share one coherent filesystem namespace (`crate::android`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(not(target_os = "android"))]
 use tokio::process::Command;
 
-use crate::tools::ToolOutput;
-#[cfg(not(target_os = "android"))]
 use crate::tools::truncate;
+use crate::tools::ToolOutput;
 
 /// Default per-call timeout (matches the old persistent session's).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How much of a file desktop `read_file` reads before handing it to
-/// `truncate`. Far above the 20k-character output cap, so a long text file is
-/// still readable (truncated) as before, while a huge file cannot be pulled into
-/// memory in full.
-#[cfg(not(target_os = "android"))]
+/// How much of a file `read_file` reads before handing it to `truncate`. Far
+/// above the 20k-character output cap, so a long text file is still readable
+/// (truncated) as before, while a huge file cannot be pulled into memory in
+/// full.
 pub const READ_PREFIX_BYTES: u64 = 1_000_000;
 
 /// The user's home directory, honouring the platform's own variable: `HOME`
@@ -178,12 +176,14 @@ impl ShellExecutor {
     }
 
     /// Read a file as text. Desktop reads the host filesystem directly;
-    /// Android routes through Termux so the same namespace as `bash` is used.
+    /// Android routes through Termux so the same namespace as `bash` is used —
+    /// **except** inside the app-private skills directory, which Termux cannot
+    /// see (see [`app_private_path`]).
     /// A leading `~` is expanded here as well as in `tools.rs`, so every caller
     /// (including the Android `shq`-quoted branch, where single quotes would
     /// otherwise suppress the shell's own expansion) agrees on the real path.
     ///
-    /// The desktop branch checks the metadata first, refuses non-files, and reads
+    /// The native branch checks the metadata first, refuses non-files, and reads
     /// only a bounded prefix: a blind `read_to_string` on a binary (or an
     /// extensionless image) surfaced as an opaque UTF-8 error, and a huge file
     /// would be pulled into memory just to hand the model a truncated copy
@@ -193,79 +193,34 @@ impl ShellExecutor {
     pub async fn read_file(&self, path: &str) -> ToolOutput {
         let path = expand_tilde(path);
         let path = path.as_str();
-        #[cfg(not(target_os = "android"))]
-        {
-            use tokio::io::AsyncReadExt;
-
-            let meta = match tokio::fs::metadata(path).await {
-                Ok(m) => m,
-                Err(e) => return ToolOutput::err(format!("read_file: {e}")),
-            };
-            if !meta.is_file() {
-                return ToolOutput::err(format!("read_file: {path} is not a file"));
-            }
-            let file = match tokio::fs::File::open(path).await {
-                Ok(f) => f,
-                Err(e) => return ToolOutput::err(format!("read_file: {e}")),
-            };
-            let mut bytes = Vec::new();
-            if let Err(e) = file
-                .take(READ_PREFIX_BYTES)
-                .read_to_end(&mut bytes)
-                .await
-            {
-                return ToolOutput::err(format!("read_file: {e}"));
-            }
-            // A prefix can end *inside* a multi-byte character, which is not a
-            // binary file. `Utf8Error::error_len() == None` means "unexpected end
-            // of input", i.e. the prefix was cut mid-character: decode the valid
-            // part and truncate as usual. Any other error is real invalid UTF-8.
-            let valid = match std::str::from_utf8(&bytes) {
-                Ok(_) => bytes.len(),
-                Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                Err(_) => {
-                    return ToolOutput::err(format!(
-                        "read_file: {path} is a binary file ({} bytes), not text; read_file \
-                         returns text or supported images only",
-                        meta.len()
-                    ))
-                }
-            };
-            // `valid` is a char boundary by construction (`valid_up_to`).
-            match String::from_utf8(bytes[..valid].to_vec()) {
-                Ok(text) => ToolOutput::ok(truncate(text)),
-                Err(_) => ToolOutput::err(format!(
-                    "read_file: {path} is a binary file ({} bytes), not text; read_file returns \
-                     text or supported images only",
-                    meta.len()
-                )),
-            }
-        }
         #[cfg(target_os = "android")]
         {
-            self.run(&format!("cat {}", shq(path))).await
+            // The skills directory is app-private: Termux cannot read it, so
+            // `read_file` there must use the app's own filesystem access.
+            if !app_private_path(path) {
+                return self.run(&format!("cat {}", shq(path))).await;
+            }
         }
+        read_file_native(path).await
     }
 
     /// Write text to a file. Desktop writes the host filesystem directly;
-    /// Android routes through Termux. A leading `~` is expanded first, for the
-    /// same reason as [`ShellExecutor::read_file`].
+    /// Android routes through Termux — again except in the app-private skills
+    /// directory. A leading `~` is expanded first, for the same reason as
+    /// [`ShellExecutor::read_file`].
     pub async fn write_file(&self, path: &str, content: &str) -> ToolOutput {
         let path = expand_tilde(path);
         let path = path.as_str();
-        #[cfg(not(target_os = "android"))]
-        {
-            match tokio::fs::write(path, content).await {
-                Ok(()) => ToolOutput::ok(format!("wrote {} bytes to {path}", content.len())),
-                Err(e) => ToolOutput::err(format!("write_file: {e}")),
-            }
-        }
         #[cfg(target_os = "android")]
         {
-            // Heredoc into the target path so arbitrary content round-trips.
-            let script = format!("cat > {} <<'PI_FILE_EOF'\n{}\nPI_FILE_EOF", shq(path), content);
-            self.run(&script).await
+            if !app_private_path(path) {
+                // Heredoc into the target path so arbitrary content round-trips.
+                let script =
+                    format!("cat > {} <<'PI_FILE_EOF'\n{}\nPI_FILE_EOF", shq(path), content);
+                return self.run(&script).await;
+            }
         }
+        write_file_native(path, content).await
     }
 
     #[cfg(not(target_os = "android"))]
@@ -320,6 +275,135 @@ impl ShellExecutor {
             )),
         }
     }
+}
+
+/// Read a file from the app's own filesystem view. This is the desktop path and
+/// also the Android path for app-private locations (see [`app_private_path`]),
+/// factored out so both branches share one implementation.
+async fn read_file_native(path: &str) -> ToolOutput {
+    use tokio::io::AsyncReadExt;
+
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(e) => return ToolOutput::err(format!("read_file: {e}")),
+    };
+    if !meta.is_file() {
+        return ToolOutput::err(format!("read_file: {path} is not a file"));
+    }
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => return ToolOutput::err(format!("read_file: {e}")),
+    };
+    let mut bytes = Vec::new();
+    if let Err(e) = file
+        .take(READ_PREFIX_BYTES)
+        .read_to_end(&mut bytes)
+        .await
+    {
+        return ToolOutput::err(format!("read_file: {e}"));
+    }
+    // A prefix can end *inside* a multi-byte character, which is not a binary
+    // file. `Utf8Error::error_len() == None` means "unexpected end of input",
+    // i.e. the prefix was cut mid-character: decode the valid part and truncate
+    // as usual. Any other error is real invalid UTF-8.
+    let valid = match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => return binary_file_error(path, meta.len()),
+    };
+    // `valid` is a char boundary by construction (`valid_up_to`).
+    match String::from_utf8(bytes[..valid].to_vec()) {
+        Ok(text) => ToolOutput::ok(truncate(text)),
+        Err(_) => binary_file_error(path, meta.len()),
+    }
+}
+
+fn binary_file_error(path: &str, len: u64) -> ToolOutput {
+    ToolOutput::err(format!(
+        "read_file: {path} is a binary file ({len} bytes), not text; read_file returns text or \
+         supported images only"
+    ))
+}
+
+/// Write text through the app's own filesystem view (desktop always, Android for
+/// app-private locations).
+async fn write_file_native(path: &str, content: &str) -> ToolOutput {
+    match tokio::fs::write(path, content).await {
+        Ok(()) => ToolOutput::ok(format!("wrote {} bytes to {path}", content.len())),
+        Err(e) => ToolOutput::err(format!("write_file: {e}")),
+    }
+}
+
+/// Whether `path` is inside the app-private skills directory.
+///
+/// The skills directory lives in the app data dir. On Android that is sandboxed
+/// storage the user's Termux cannot read (and there is no file manager access
+/// either), so routing these paths through Termux would make `read_file`/
+/// `write_file` — and therefore skill authoring — impossible. Those paths
+/// therefore always use the app's own filesystem access. `bash` stays
+/// Termux-only: it is a shell, not a file operation.
+///
+/// Containment is a real path-component check (symlinks and `..` resolved via
+/// the longest existing ancestor), never a string prefix: `/data/skills-evil`
+/// is not inside `/data/skills`, and `..` cannot climb out.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn app_private_path(path: &str) -> bool {
+    crate::skills::dir_path()
+        .map(|dir| path_is_within(Path::new(path), &dir))
+        .unwrap_or(false)
+}
+
+/// Whether `path` resolves inside `root` (both as the OS sees them).
+///
+/// `root` is canonicalized (it exists — the app creates it). For `path`, the
+/// longest existing ancestor is canonicalized (resolving symlinks) and the
+/// remaining components are applied lexically, so a not-yet-existing file (the
+/// `write_file` case) is still checked correctly: `skills/sub/../..` is not
+/// mistaken for a child of `skills`.
+#[cfg_attr(all(not(target_os = "android"), not(test)), allow(dead_code))]
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let Some(resolved) = resolve_for_containment(path) else {
+        return false;
+    };
+    // `Path::starts_with` compares whole components, so `/a/skills-evil` does
+    // not match `/a/skills`.
+    resolved.starts_with(&root)
+}
+
+/// Resolve `path` to an absolute path with `..`/`.` applied and symlinks in the
+/// existing prefix resolved. Returns `None` when nothing can be resolved.
+#[cfg_attr(all(not(target_os = "android"), not(test)), allow(dead_code))]
+fn resolve_for_containment(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let comps: Vec<Component> = absolute.components().collect();
+    // Split at the longest prefix that exists, so `canonicalize` can resolve
+    // symlinks in it; then apply the rest lexically.
+    for split in (0..=comps.len()).rev() {
+        let prefix: PathBuf = comps[..split].iter().collect();
+        let Ok(mut resolved) = prefix.canonicalize() else {
+            continue;
+        };
+        for comp in &comps[split..] {
+            match comp {
+                Component::Normal(seg) => resolved.push(seg),
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                _ => {}
+            }
+        }
+        return Some(resolved);
+    }
+    None
 }
 
 /// Single-quote a shell argument (paths) so it survives as one token.
@@ -523,5 +607,45 @@ mod tests {
         assert_eq!(out.content, "hello");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- app-private path containment --------------------------------------
+
+    /// The skills directory is app-private, so on Android it must be detected by
+    /// real path components — not a string prefix, and not fooled by `..`.
+    #[test]
+    fn containment_check_is_component_wise() {
+        let base = std::env::temp_dir().join(format!("pi-shell-contain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("skills");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.md"), "x").unwrap();
+
+        // A file directly inside, and one that does not exist yet (write_file).
+        assert!(path_is_within(&root.join("a.md"), &root));
+        assert!(path_is_within(&root.join("new-file.md"), &root));
+        assert!(path_is_within(&root.join("sub/new.md"), &root));
+        assert!(path_is_within(&root, &root));
+
+        // A sibling whose name only shares the prefix is NOT inside.
+        std::fs::create_dir_all(base.join("skills-evil")).unwrap();
+        assert!(!path_is_within(&base.join("skills-evil/a.md"), &root));
+        // Traversal out of the directory is refused, existing or not.
+        assert!(!path_is_within(&root.join("../outside.md"), &root));
+        assert!(!path_is_within(&root.join("sub/../../outside.md"), &root));
+        assert!(!path_is_within(Path::new("/etc/passwd"), &root));
+        // A symlink inside the directory pointing outside is resolved and
+        // refused (on platforms where the link was created).
+        #[cfg(unix)]
+        {
+            let link = root.join("escape");
+            if std::os::unix::fs::symlink(&base, &link).is_ok() {
+                assert!(!path_is_within(&link.join("outside.md"), &root));
+            }
+        }
+        // A missing root contains nothing.
+        assert!(!path_is_within(&root.join("a.md"), &base.join("does-not-exist")));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

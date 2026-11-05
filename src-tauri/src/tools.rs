@@ -14,7 +14,16 @@ use tauri::Manager;
 use tokio_stream::StreamExt;
 
 /// Tool names needing per-call user approval (local side effects / local data).
-pub const GATED_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
+pub const GATED_TOOLS: &[&str] = &[
+    "bash",
+    "read_file",
+    "write_file",
+    // Skill authoring mutates app-private files that the user cannot easily
+    // reach otherwise, so writes/deletes are approved (YOLO bypasses; a
+    // readonly cron run refuses them). Listing/reading stay ungated.
+    "save_skill",
+    "delete_skill",
+];
 
 pub fn is_gated(name: &str) -> bool {
     GATED_TOOLS.contains(&name) || crate::mcp::is_mcp_tool(name)
@@ -139,6 +148,68 @@ fn memory_str_replace_tool() -> ChatCompletionTools {
     )
 }
 
+/// Skill authoring tools. A skill is a Markdown instruction file invoked with
+/// `/id`; these let the assistant list, read, create/overwrite, and delete them
+/// in the app-private skills directory (which `read_file`/`write_file` and
+/// Termux cannot reach on Android). `save_skill`/`delete_skill` are gated.
+fn skill_tools() -> Vec<ChatCompletionTools> {
+    vec![
+        fn_tool(
+            "list_skills",
+            "List the user's saved skills (Markdown instruction files that can be invoked with \
+             /id). Returns one `id — name: description` line per skill, plus the skills \
+             directory path. Use it before editing or deleting a skill.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+        fn_tool(
+            "read_skill",
+            "Read one skill's full raw Markdown, **including** its YAML frontmatter, so you can \
+             edit it without losing its name or description. Use `list_skills` to find the id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Skill id from list_skills (a file stem such as 'code-review')" }
+                },
+                "required": ["id"]
+            }),
+        ),
+        fn_tool(
+            "save_skill",
+            "Create or overwrite a skill: a Markdown instruction file the user can invoke with \
+             /id. Pass the complete content. Optional `name`/`description` are written as YAML \
+             frontmatter only when provided; without them the content is stored exactly as \
+             given. If the id resolves to an existing skill (by stem or display name), that file \
+             is overwritten. Read an existing skill with `read_skill` before rewriting it, and \
+             keep it under 100,000 characters.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Short identifier/file stem, e.g. 'code-review'; spaces become '-' and it is lowercased" },
+                    "content": { "type": "string", "description": "The full Markdown contents of the skill (instructions for the model)" },
+                    "name": { "type": "string", "description": "Optional display name shown in the / menu (written as frontmatter)" },
+                    "description": { "type": "string", "description": "Optional one-line description shown in the / menu (written as frontmatter)" }
+                },
+                "required": ["id", "content"]
+            }),
+        ),
+        fn_tool(
+            "delete_skill",
+            "Delete a skill file permanently. Errors when the id does not match an existing \
+             skill; use `list_skills` to check the id first.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Skill id from list_skills" }
+                },
+                "required": ["id"]
+            }),
+        ),
+    ]
+}
+
 fn web_fetch_tool() -> ChatCompletionTools {
     fn_tool(
         "web_fetch",
@@ -257,10 +328,15 @@ pub fn tool_specs(brave: bool) -> Vec<ChatCompletionTools> {
         memory_read_tool(),
         memory_write_tool(),
         memory_str_replace_tool(),
+    ];
+    // Skills sit right after the memory tools: both are app-local instruction
+    // stores. Writes are gated; reads are not.
+    tools.extend(skill_tools());
+    tools.extend([
         web_fetch_tool(),
         fetch_image_tool(),
         fetch_file_tool(),
-    ];
+    ]);
     tools.extend(cron_tools());
     if brave {
         tools.extend(brave_tools());
@@ -1652,10 +1728,10 @@ mod tests {
     #[test]
     fn tool_specs_shape() {
         let with = tool_specs(true);
-        // 15 host/memory/web/cron tools + 6 native Brave tools.
-        assert_eq!(with.len(), 21);
+        // 19 host/memory/skill/web/cron tools + 6 native Brave tools.
+        assert_eq!(with.len(), 25);
         let without = tool_specs(false);
-        assert_eq!(without.len(), 15);
+        assert_eq!(without.len(), 19);
         // The list is identical for live and reflection (cache alignment);
         // access is enforced by mode at execution time, not by the list.
         for name in [
@@ -1667,6 +1743,19 @@ mod tests {
         ] {
             assert!(without.iter().any(|t| tool_name(t) == name), "missing {name}");
         }
+        // Skill tools: present exactly once, in every mode. Writes are gated
+        // (`save_skill`/`delete_skill`), reads are not.
+        for name in ["list_skills", "read_skill", "save_skill", "delete_skill"] {
+            assert_eq!(
+                without.iter().filter(|t| tool_name(t) == name).count(),
+                1,
+                "{name} must appear exactly once"
+            );
+        }
+        assert!(!is_gated("list_skills"));
+        assert!(!is_gated("read_skill"));
+        assert!(is_gated("save_skill"));
+        assert!(is_gated("delete_skill"));
         // Cron management is app-local and ungated, and present in every mode
         // (the list is shared; dispatch enforces access).
         for name in [

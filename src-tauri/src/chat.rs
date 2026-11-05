@@ -2454,6 +2454,12 @@ async fn dispatch_tool(
         "save_memory" | "read_memory" | "write_memory" | "memory_str_replace"
     ) {
         crate::memory::execute_tool(call, memory).await
+    } else if crate::skills::is_skill_tool(&call.name) {
+        // App-local skill files (the directory is app-private, so this is the
+        // only authoring path on Android). Reads are ungated; writes are gated
+        // by `tools::is_gated` in the caller, so `Cron(ReadOnly)` refuses those
+        // before dispatch.
+        crate::skills::execute_tool(call)
     } else if call.name == "web_fetch" {
         // Read-only and ungated, like the Brave tools, and needs no API key.
         tools::execute_web_tool(call).await
@@ -2481,9 +2487,10 @@ async fn dispatch_tool(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ToolMode {
     /// A live chat turn: all memory tools (`save_memory`, `read_memory`,
-    /// `write_memory`, `memory_str_replace`) plus host and web tools.
+    /// `write_memory`, `memory_str_replace`), the skill tools, plus host and web
+    /// tools.
     Live,
-    /// Memory consolidation: all memory tools, no host/web tools.
+    /// Memory consolidation: all memory tools, no host/web/skill tools.
     Reflection,
     /// Memory extraction (the map half of a backfill): no tools are advertised
     /// at all, because extraction is pure summarization. The gate below is a

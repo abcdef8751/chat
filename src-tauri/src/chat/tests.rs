@@ -3080,6 +3080,67 @@ async fn fetch_image_is_refused_in_reflection_and_extraction_modes() {
     }
 }
 
+/// Skill tools are not memory tools, so consolidation and extraction refuse
+/// them before dispatch (they are in the shared tool list for prompt-cache
+/// alignment, but only live turns may use them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skill_tools_are_refused_in_reflection_and_extraction_modes() {
+    for mode in [ToolMode::Reflection, ToolMode::Extract] {
+        let (port, handle) = start_mock(
+            vec![
+                vec![
+                    tool_frag(0, "c1", "list_skills", ""),
+                    tool_frag(0, "", "", "{}"),
+                    finish_chunk("tool_calls"),
+                ],
+                vec![delta_chunk("done"), finish_chunk("stop")],
+            ],
+            0,
+        );
+        let cfg = AppConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock".into(),
+            ..Default::default()
+        };
+        let mcp = tools::BraveSearch::default();
+        let shell = crate::shell::ShellExecutor::new();
+        let memory = temp_memory("skills-gate");
+        let approvals = tools::ApprovalRegistry::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink(events.clone());
+        let messages = build_messages("p", None, &[], "hi", &[]).unwrap();
+        let tools_list = tools::tool_specs(false);
+        run_tool_loop(
+            &cfg,
+            "test-key",
+            &mcp,
+            &shell,
+            &memory,
+            &approvals,
+            "conv_skill_gate",
+            messages,
+            &tools_list,
+            CancelToken::new(),
+            &sink,
+            None,
+            mode,
+        )
+        .await
+        .unwrap();
+        let _ = handle.join();
+
+        let guard = events.lock().unwrap();
+        assert!(
+            guard.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolResult { ok: false, output, .. }
+                    if output.contains("not available during memory")
+            )),
+            "{mode:?} did not refuse list_skills"
+        );
+    }
+}
+
 /// One-shot loopback HTTP fixture serving an image, for the fetch_image path.
 fn start_image_mock(content_type: &str, body: &str) -> (u16, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
