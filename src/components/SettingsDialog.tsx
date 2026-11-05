@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
+import { createEffect, createSignal, For, Index, onCleanup, Show, type JSX } from "solid-js";
 import { Dialog } from "@kobalte/core/dialog";
 import type {
   AndroidStorageStatus,
@@ -268,8 +268,26 @@ export function SettingsDialog(props: {
       command: "",
       args: [],
       env: {},
+      headers: {},
     };
   }
+
+  /** One editable key→value row (headers or env, depending on the transport). */
+  type McpKeyValueRow = { key: string; value: string };
+
+  const rowsFromMap = (map: Record<string, string> | undefined): McpKeyValueRow[] =>
+    Object.entries(map ?? {}).map(([key, value]) => ({ key, value }));
+
+  /** Collapse rows to a map: blank keys are dropped, later duplicates win. */
+  const rowsToMap = (rows: McpKeyValueRow[]): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const row of rows) {
+      const key = row.key.trim();
+      if (!key) continue;
+      out[key] = row.value;
+    }
+    return out;
+  };
 
   const [mcpServers, setMcpServers] = createSignal<McpServerConfig[]>([]);
   const [mcpStatus, setMcpStatus] = createSignal<McpServerStatus[]>([]);
@@ -284,6 +302,10 @@ export function SettingsDialog(props: {
   // derived `args.join(" ")`) stops the input from eating a trailing space
   // while the user is still typing the next argument.
   const [mcpArgsText, setMcpArgsText] = createSignal("");
+  // Editable key→value rows for the map the current transport uses (headers for
+  // `http`, env for `stdio`). Rows are kept separately from the form signal so
+  // a blank row can exist while the user is typing its key.
+  const [mcpRows, setMcpRows] = createSignal<McpKeyValueRow[]>([]);
 
   const applyMcpSnapshot = (snap: McpSnapshot) => {
     setMcpServers(snap.servers ?? []);
@@ -338,16 +360,45 @@ export function SettingsDialog(props: {
 
   const openMcpForm = (server?: McpServerConfig) => {
     const next = server
-      ? { ...server, args: [...server.args], env: { ...server.env } }
+      ? {
+          ...server,
+          args: [...server.args],
+          env: { ...(server.env ?? {}) },
+          headers: { ...(server.headers ?? {}) },
+        }
       : blankMcpServer();
     setMcpForm(next);
     setMcpArgsText(next.args.join(" "));
+    setMcpRows(rowsFromMap(next.transport === "stdio" ? next.env : next.headers));
     setMcpFormOpen(true);
     setMcpError(null);
   };
 
   const patchMcpForm = (patch: Partial<McpServerConfig>) =>
     setMcpForm((f) => ({ ...f, ...patch }));
+
+  /** Stash the visible rows into the outgoing map before switching transports. */
+  const changeMcpTransport = (transport: "http" | "stdio") => {
+    const current = mcpForm().transport;
+    if (current === transport) return;
+    const saved = rowsToMap(mcpRows());
+    const next =
+      current === "stdio"
+        ? { ...mcpForm(), transport, env: saved }
+        : { ...mcpForm(), transport, headers: saved };
+    setMcpForm(next);
+    setMcpRows(rowsFromMap(transport === "stdio" ? next.env : next.headers));
+  };
+
+  const updateMcpRow = (index: number, patch: Partial<McpKeyValueRow>) =>
+    setMcpRows((rows) =>
+      rows.map((row, i) => (i === index ? { ...row, ...patch } : row)),
+    );
+
+  const addMcpRow = () => setMcpRows((rows) => [...rows, { key: "", value: "" }]);
+
+  const removeMcpRow = (index: number) =>
+    setMcpRows((rows) => rows.filter((_, i) => i !== index));
 
   const saveMcp = async () => {
     const form = mcpForm();
@@ -358,6 +409,7 @@ export function SettingsDialog(props: {
     }
     setMcpBusy(true);
     setMcpError(null);
+    const configured = rowsToMap(mcpRows());
     try {
       const snap = await mcpSaveServer({
         ...form,
@@ -366,11 +418,16 @@ export function SettingsDialog(props: {
           form.transport === "stdio"
             ? mcpArgsText().split(/\s+/).filter(Boolean)
             : form.args,
+        // Only the visible transport's map comes from the rows; the other one is
+        // whatever was stashed when the transport was last switched.
+        headers: form.transport === "http" ? configured : form.headers,
+        env: form.transport === "stdio" ? configured : form.env,
       });
       applyMcpSnapshot(snap);
       setMcpFormOpen(false);
       setMcpForm(blankMcpServer());
       setMcpArgsText("");
+      setMcpRows([]);
     } catch (e) {
       setMcpError(String(e));
     } finally {
@@ -1140,9 +1197,7 @@ export function SettingsDialog(props: {
                       class="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200"
                       value={mcpForm().transport}
                       onChange={(e) =>
-                        patchMcpForm({
-                          transport: e.currentTarget.value as "http" | "stdio",
-                        })
+                        changeMcpTransport(e.currentTarget.value as "http" | "stdio")
                       }
                     >
                       <option value="http">http</option>
@@ -1186,6 +1241,61 @@ export function SettingsDialog(props: {
                       />
                     </label>
                   </Show>
+
+                  <div class="space-y-1">
+                    <div class="flex items-center gap-2">
+                      <span class="text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
+                        {mcpForm().transport === "http"
+                          ? "Headers"
+                          : "Environment variables"}
+                      </span>
+                      <button
+                        onClick={addMcpRow}
+                        class="ml-auto rounded-md border border-neutral-300 px-2 py-1 text-[11px] font-medium text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                      >
+                        + Add row
+                      </button>
+                    </div>
+                    <Show when={mcpRows().length === 0}>
+                      <p class="text-[10px] text-neutral-400 dark:text-neutral-500">
+                        {mcpForm().transport === "http"
+                          ? "Sent with every request, e.g. Authorization → Bearer …"
+                          : "Passed to the process, e.g. API_KEY → …"}
+                      </p>
+                    </Show>
+                    <Index each={mcpRows()}>
+                      {(row, i) => (
+                        <div class="flex items-center gap-1">
+                          <input
+                            class="min-w-0 flex-1 rounded-lg border border-neutral-300 px-2 py-1 text-xs outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                            placeholder={
+                              mcpForm().transport === "http" ? "Header" : "Name"
+                            }
+                            value={row().key}
+                            onInput={(e) =>
+                              updateMcpRow(i, { key: e.currentTarget.value })
+                            }
+                          />
+                          <input
+                            class="min-w-0 flex-1 rounded-lg border border-neutral-300 px-2 py-1 text-xs outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                            placeholder="Value"
+                            value={row().value}
+                            onInput={(e) =>
+                              updateMcpRow(i, { value: e.currentTarget.value })
+                            }
+                          />
+                          <button
+                            onClick={() => removeMcpRow(i)}
+                            title="Remove row"
+                            class="shrink-0 px-1 text-sm leading-none text-neutral-400 transition hover:text-neutral-700 dark:text-neutral-500 dark:hover:text-neutral-300"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      )}
+                    </Index>
+                  </div>
+
                   <label class="flex items-center gap-2 text-[11px] font-medium text-neutral-600 dark:text-neutral-300">
                     <input
                       type="checkbox"

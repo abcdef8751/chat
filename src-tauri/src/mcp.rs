@@ -64,7 +64,12 @@ pub struct McpServerConfig {
     /// Executable for `stdio` servers.
     pub command: String,
     pub args: Vec<String>,
+    /// Extra environment variables for `stdio` servers.
     pub env: HashMap<String, String>,
+    /// Extra request headers for `http` servers (e.g. `Authorization`). A
+    /// protocol-critical name is ignored; see [`is_protected_header`].
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 impl Default for McpServerConfig {
@@ -81,6 +86,7 @@ impl Default for McpServerConfig {
             command: String::new(),
             args: Vec::new(),
             env: HashMap::new(),
+            headers: HashMap::new(),
         }
     }
 }
@@ -590,6 +596,48 @@ async fn read_body_capped(response: reqwest::Response) -> Result<String, String>
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// Header names this client owns. A user-configured header must never override
+/// them: `content-type` and `accept` decide the framing, `mcp-protocol-version`
+/// is the negotiated revision, and `mcp-session-id` is assigned by the server.
+const PROTECTED_HEADERS: [&str; 4] = [
+    "content-type",
+    "accept",
+    "mcp-protocol-version",
+    "mcp-session-id",
+];
+
+fn is_protected_header(name: &str) -> bool {
+    PROTECTED_HEADERS
+        .iter()
+        .any(|protected| name.eq_ignore_ascii_case(protected))
+}
+
+/// Apply the server's configured headers to a request. Keys are trimmed and a
+/// blank key is skipped; values are used verbatim. A protected key is silently
+/// ignored, because letting it through would duplicate the header (reqwest
+/// appends) and break the handshake. A key/value `reqwest` cannot represent is
+/// skipped too instead of panicking (the config file is user-editable).
+fn apply_configured_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &HashMap<String, String>,
+) -> reqwest::RequestBuilder {
+    use reqwest::header::{HeaderName, HeaderValue};
+    for (key, value) in headers {
+        let key = key.trim();
+        if key.is_empty() || is_protected_header(key) {
+            continue;
+        }
+        let (Ok(name), Ok(value)) = (
+            HeaderName::try_from(key),
+            HeaderValue::try_from(value.as_str()),
+        ) else {
+            continue;
+        };
+        request = request.header(name, value);
+    }
+    request
+}
+
 /// One JSON-RPC POST. Handles both a plain JSON body and a streamable-SSE body
 /// (reading events until the reply with the request's id). Returns `None` for
 /// a notification (no id) that the server acknowledged without a body.
@@ -597,6 +645,7 @@ async fn http_request(
     client: &reqwest::Client,
     url: &str,
     session: &mut Option<String>,
+    headers: &HashMap<String, String>,
     payload: &Value,
 ) -> Result<Option<Value>, String> {
     let mut request = client
@@ -605,6 +654,7 @@ async fn http_request(
         .header("accept", "application/json, text/event-stream")
         .header("mcp-protocol-version", PROTOCOL_VERSION)
         .json(payload);
+    request = apply_configured_headers(request, headers);
     if let Some(id) = session.as_deref() {
         request = request.header("mcp-session-id", id);
     }
@@ -705,14 +755,21 @@ async fn http_call(
     tokio::time::timeout(timeout, async {
         let client = reqwest::Client::new();
         let mut session: Option<String> = None;
-        let init = http_request(&client, url, &mut session, &initialize_request())
-            .await?
-            .ok_or_else(|| "MCP initialize returned no response".to_string())?;
+        let init = http_request(
+            &client,
+            url,
+            &mut session,
+            &config.headers,
+            &initialize_request(),
+        )
+        .await?
+        .ok_or_else(|| "MCP initialize returned no response".to_string())?;
         check_jsonrpc_error(&init)?;
         http_request(
             &client,
             url,
             &mut session,
+            &config.headers,
             &initialized_notification(),
         )
         .await?;
@@ -722,7 +779,7 @@ async fn http_call(
             "method": method,
             "params": params,
         });
-        let response = http_request(&client, url, &mut session, &request)
+        let response = http_request(&client, url, &mut session, &config.headers, &request)
             .await?
             .ok_or_else(|| format!("MCP {method} returned no response"))?;
         check_jsonrpc_error(&response)?;
@@ -1023,20 +1080,55 @@ mod tests {
         let _ = stream.flush();
     }
 
+    /// Raw HTTP requests the mock has received, in arrival order. Tests use it
+    /// to assert on what actually went over the wire.
+    type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// The body of a recorded JSON-RPC request.
+    fn request_message(request: &str) -> Value {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        serde_json::from_str(body).unwrap_or(Value::Null)
+    }
+
+    fn request_method(request: &str) -> String {
+        request_message(request)
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Every value sent for `name` (there should be exactly one).
+    fn request_header_values(request: &str, name: &str) -> Vec<String> {
+        let head = request.split("\r\n\r\n").next().unwrap_or(request);
+        head.lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_string())
+            })
+            .collect()
+    }
+
     /// A tiny HTTP MCP server: initialize / initialized / tools/list /
-    /// tools/call, six requests in total (one discovery and one call session).
-    fn start_mcp_http_mock() -> (u16, JoinHandle<()>) {
+    /// tools/call. `requests` is the number of connections it accepts before
+    /// the thread exits (a discovery + call sequence is six: one discovery
+    /// session plus one call session).
+    fn start_mcp_http_mock(requests: usize) -> (u16, JoinHandle<()>, RecordedRequests) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let recorded: RecordedRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = recorded.clone();
         let handle = std::thread::spawn(move || {
-            for _ in 0..6 {
+            for _ in 0..requests {
                 let (mut stream, _) = match listener.accept() {
                     Ok(x) => x,
                     Err(_) => return,
                 };
                 let request = read_request(&mut stream);
-                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                let message: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                recorder.lock().unwrap().push(request.clone());
+                let message = request_message(&request);
                 let method = message.get("method").and_then(Value::as_str).unwrap_or("");
                 let id = message.get("id").cloned().unwrap_or(Value::Null);
                 match method {
@@ -1103,12 +1195,12 @@ mod tests {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         });
-        (port, handle)
+        (port, handle, recorded)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reload_discovers_http_tools_and_calls_them() {
-        let (port, handle) = start_mcp_http_mock();
+        let (port, handle, _recorded) = start_mcp_http_mock(6);
         let dir = temp_dir("http");
         std::fs::write(
             dir.join("mcp.json"),
@@ -1168,6 +1260,189 @@ mod tests {
         assert!(!snapshot.status.servers[0].connected);
         assert!(snapshot.status.servers[0].error.is_some());
         assert!(state.tool_specs().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_headers_ride_initialize_and_tools_list() {
+        let (port, handle, recorded) = start_mcp_http_mock(3);
+        let config = McpServerConfig {
+            id: "srv-h".into(),
+            name: "Headers".into(),
+            enabled: true,
+            transport: "http".into(),
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::from([
+                ("Authorization".to_string(), "Bearer s3cr3t".to_string()),
+                // Keys are trimmed, so this is `X-Vendor-Key`.
+                (" X-Vendor-Key ".to_string(), "abc".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        let result = http_call(&config, "tools/list", json!({}), DISCOVERY_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(result["tools"][0]["name"], "echo");
+        handle.join().unwrap();
+
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        for method in ["initialize", "notifications/initialized", "tools/list"] {
+            let request = recorded
+                .iter()
+                .find(|r| request_method(r) == method)
+                .unwrap_or_else(|| panic!("no {method} request recorded"));
+            assert_eq!(
+                request_header_values(request, "authorization"),
+                vec!["Bearer s3cr3t"],
+                "{method} must carry the configured Authorization header"
+            );
+            assert_eq!(
+                request_header_values(request, "x-vendor-key"),
+                vec!["abc"],
+                "{method} must carry the trimmed key"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protocol_headers_cannot_be_overridden() {
+        let (port, handle, recorded) = start_mcp_http_mock(3);
+        let config = McpServerConfig {
+            id: "srv-p".into(),
+            name: "Protected".into(),
+            enabled: true,
+            transport: "http".into(),
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::from([
+                ("accept".to_string(), "text/plain".to_string()),
+                ("Content-Type".to_string(), "text/html".to_string()),
+                ("MCP-Protocol-Version".to_string(), "9999-01-01".to_string()),
+                ("Authorization".to_string(), "Bearer ok".to_string()),
+                // Not representable as an HTTP header value; must be skipped,
+                // not panicked on.
+                ("X-Bad".to_string(), "line1\nline2".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        http_call(&config, "tools/list", json!({}), DISCOVERY_TIMEOUT)
+            .await
+            .unwrap();
+        handle.join().unwrap();
+
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        for request in recorded.iter() {
+            // reqwest appends headers, so a second value would mean the user's
+            // value got through (and could break the handshake).
+            assert_eq!(
+                request_header_values(request, "accept"),
+                vec!["application/json, text/event-stream"]
+            );
+            assert_eq!(
+                request_header_values(request, "content-type"),
+                vec!["application/json"]
+            );
+            assert_eq!(
+                request_header_values(request, "mcp-protocol-version"),
+                vec![PROTOCOL_VERSION]
+            );
+            assert_eq!(
+                request_header_values(request, "authorization"),
+                vec!["Bearer ok"]
+            );
+        }
+        let all = recorded.join("\n").to_ascii_lowercase();
+        assert!(!all.contains("text/plain"), "user accept leaked onto the wire");
+        assert!(
+            !all.contains("text/html"),
+            "user content-type leaked onto the wire"
+        );
+        assert!(
+            !all.contains("9999-01-01"),
+            "user protocol version leaked onto the wire"
+        );
+        assert!(!all.contains("line1"), "an invalid header value must be skipped");
+        assert!(is_protected_header("ACCEPT"));
+        assert!(!is_protected_header("authorization"));
+    }
+
+    #[test]
+    fn config_round_trips_headers_and_env_and_legacy_files_still_load() {
+        let dir = temp_dir("config");
+        let path = dir.join("mcp.json");
+        let config = McpServerConfig {
+            id: "srv".into(),
+            name: "Round trip".into(),
+            enabled: true,
+            transport: "stdio".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "server".into()],
+            env: HashMap::from([("API_KEY".to_string(), "k".to_string())]),
+            headers: HashMap::from([("Authorization".to_string(), "Bearer t".to_string())]),
+            ..Default::default()
+        };
+        write_configs(&path, std::slice::from_ref(&config)).unwrap();
+        let read = read_configs(&path);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].headers, config.headers);
+        assert_eq!(read[0].env, config.env);
+        assert_eq!(read[0].args, config.args);
+        assert_eq!(read[0].command, "npx");
+
+        // An `mcp.json` written before `headers` existed still parses, and the
+        // missing map is empty rather than an error.
+        std::fs::write(
+            &path,
+            r#"[{"id":"legacy","name":"Legacy","transport":"http","url":"http://127.0.0.1:1/mcp"}]"#,
+        )
+        .unwrap();
+        let legacy = read_configs(&path);
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].headers.is_empty());
+        assert!(legacy[0].env.is_empty());
+        assert!(legacy[0].enabled, "an omitted `enabled` still means on");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdio_env_is_passed_to_the_child() {
+        let dir = temp_dir("stdio-env");
+        let script = dir.join("stdio-mock.sh");
+        // A minimal stdio MCP server: answer initialize and tools/list, echoing
+        // the injected env var in the discovered tool's description.
+        std::fs::write(
+            &script,
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{}}\n' ;;
+    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"envcheck","description":"%s"}]}}\n' "$MCP_TEST_TOKEN" ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let config = McpServerConfig {
+            id: "srv-env".into(),
+            name: "Env".into(),
+            enabled: true,
+            transport: "stdio".into(),
+            command: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: HashMap::from([("MCP_TEST_TOKEN".to_string(), "s3cr3t-token".to_string())]),
+            ..Default::default()
+        };
+
+        let tools = discover(&config).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]["description"], "s3cr3t-token",
+            "the child must receive the configured environment"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

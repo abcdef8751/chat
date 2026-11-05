@@ -173,6 +173,8 @@ export interface McpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Extra request headers for `http` servers (protocol headers are ignored). */
+  headers: Record<string, string>;
 }
 
 export interface McpServerStatus {
