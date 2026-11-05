@@ -78,9 +78,10 @@ check, the real-export import, the real models.dev catalog parse, and a live
 desktop-notification smoke test). `tsc --noEmit` and `npm run build` are clean.
 The Android target also
 type-checks (`cargo check --target aarch64-linux-android`, NDK clang wired via
-`CC_aarch64_linux_android` etc.). The GUI e2e needs a display and is run
-separately; it **passed** for this batch (`npm run e2e` → `ALL ASSERTIONS
-PASSED`), alongside the Rust suite, `tsc` and the production build.
+`CC_aarch64_linux_android` etc. — including the app-private filesystem branch).
+The GUI e2e needs a display and is run separately; it passed for the **previous**
+batch, and this batch did not run it (see the residuals under "Next / open
+items"), so it is not a claim about the current tree.
 
 `cargo clippy --all-targets -- -D warnings` currently reports **12 pre-existing
 lints** under clippy 1.97 — `manual_inspect` (`sync.rs`), `field_reassign_with_default`
